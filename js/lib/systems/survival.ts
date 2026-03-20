@@ -21,6 +21,7 @@ export class SurvivalSystem {
     private reflexActive = false;
     private lastTickTime = 0;
     private reflexTimeout: NodeJS.Timeout | null = null;
+    private lastLowHealthFlee = 0;
 
     constructor(
         bot: Bot,
@@ -42,17 +43,15 @@ export class SurvivalSystem {
 
         this.bot.on("goal_reached", () => {
             if (this.reflexActive) {
-                // Prevent jitter: Don't drop lock if we are still critically low and starving
-                if (this.bot.health < 6 && !this.getBestFood()) {
-                    log.debug(
-                        "Survival goal reached, but health is still critical. Keeping reflex lock.",
-                    );
-                    return;
-                }
                 log.debug("Survival goal reached; releasing reflex lock");
                 this.clearReflexState();
             }
         });
+    }
+
+    public reset(): void {
+        this.clearReflexState();
+        this.lastLowHealthFlee = 0;
     }
 
     private clearReflexState(): void {
@@ -64,29 +63,28 @@ export class SurvivalSystem {
     }
 
     private async evaluatePriorities(): Promise<void> {
+        if (this.bot.health <= 0) return; // Dead bots don't run
         if (this.reflexActive) return;
 
         const threats = getThreats(this.bot);
         const topThreat = threats.length > 0 ? threats[0] : null;
         const inImmediateDanger = topThreat && topThreat.threatScore > 50;
 
-        // 1. Immediate external threat overrides everything. Flee!
+        // 1. Immediate point-blank combat defense
+        // If an enemy is in melee range, turning our back is a death sentence due to knockback.
+        // We must strike first to knock them back, THEN flee.
+        if (topThreat && topThreat.distance <= 4.5) {
+            await this.triggerDefend(topThreat);
+            return;
+        }
+
+        // 2. Immediate external threat overrides everything. Flee!
         if (inImmediateDanger) {
             this.triggerFlee(threats, topThreat.name);
             return;
         }
 
-        // 2. Immediate point-blank combat defense
-        if (topThreat && topThreat.distance < 6) {
-            const hasWeapon = this.getBestWeapon();
-            if (hasWeapon) {
-                await this.triggerDefend(topThreat);
-                return;
-            }
-        }
-
         // 3. Eat if food is low OR if health is low (to trigger passive healing)
-        // Only execute this if we aren't actively running from a high-threat mob
         if (
             this.bot.food < 15 ||
             (this.bot.health < 20 && this.bot.food < 20)
@@ -98,10 +96,12 @@ export class SurvivalSystem {
             }
         }
 
-        // 4. If we have absolutely no food and health is critically low,
-        // trigger a retreat to a safer static area as a last resort
+        // 4. Retreat to safe area if health is critically low and we have no food
         if (this.bot.health < 6 && !this.getBestFood()) {
-            this.triggerFlee(threats, "low_health_no_food");
+            if (Date.now() - this.lastLowHealthFlee > 15000) {
+                this.lastLowHealthFlee = Date.now();
+                this.triggerFlee(threats, "low_health_no_food");
+            }
             return;
         }
     }
@@ -166,7 +166,8 @@ export class SurvivalSystem {
         } catch (err) {
             log.error("Auto-defend failed", { err: String(err) });
         } finally {
-            setTimeout(() => this.clearReflexState(), 1000);
+            // Drop lock quickly (800ms) so the bot can evaluate if it needs to hit again or flee
+            setTimeout(() => this.clearReflexState(), 800);
         }
     }
 

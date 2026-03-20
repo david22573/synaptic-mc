@@ -29,32 +29,9 @@ const { pathfinder, Movements } = pkg;
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 
-const bot = mineflayer.createBot({
-    host: "localhost",
-    port: 25565,
-    username: "CraftBot",
-    version: "1.19",
-});
-
-bot.loadPlugin(pathfinder);
-
-const client = new ControlPlaneClient(config.WS_URL, {
-    onCommand: (decision) => void executeDecision(decision),
-    onUnlock: () => {
-        log.debug("Bot unlocked from control plane");
-    },
-});
-
-const survival = new SurvivalSystem(bot, client, {
-    onInterrupt: (reason: string) => {
-        if (taskAbortController) {
-            log.info(`LLM Task interrupted by survival reflex: ${reason}`);
-            taskAbortController.abort();
-            taskAbortController = null;
-        }
-    },
-    stopMovement: () => stopMovement(),
-});
+let bot: mineflayer.Bot;
+let client: ControlPlaneClient;
+let survival: SurvivalSystem;
 
 // ==========================================
 // STATE HELPERS
@@ -65,12 +42,19 @@ function taskLabel(task: Pick<models.ActiveTask, "action" | "target">) {
 }
 
 function stopMovement() {
+    if (!bot) return;
     try {
         bot.clearControlStates();
-    } catch {}
+    } catch (err) {
+        log.debug("Failed to clear control states", { err: String(err) });
+    }
     try {
-        (bot as any).pathfinder.setGoal(null);
-    } catch {}
+        if ((bot as any).pathfinder) {
+            (bot as any).pathfinder.setGoal(null);
+        }
+    } catch (err) {
+        log.debug("Failed to clear pathfinder goal", { err: String(err) });
+    }
 }
 
 function completeTask(
@@ -79,7 +63,7 @@ function completeTask(
         | "task_failed"
         | "task_aborted" = "task_completed",
 ) {
-    if (!currentTask) return;
+    if (!currentTask || !client) return;
 
     client.sendEvent(
         status,
@@ -174,7 +158,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-
         if (taskAbortController?.signal === signal) {
             taskAbortController = null;
         }
@@ -182,101 +165,163 @@ async function executeDecision(decision: models.IncomingDecision) {
 }
 
 // ==========================================
-// BOT LIFECYCLE
+// BOT LIFECYCLE & BOOTSTRAP
 // ==========================================
 
-bot.on("login", () => log.info("Bot logged in"));
+async function bootstrap() {
+    log.info("Bootstrapping bot... fetching dynamic config.");
+    await config.loadConfig();
 
-bot.once("spawn", () => {
-    log.info("Bot spawned", { env_path: config.ENV_PATH, cwd: process.cwd() });
+    log.info(
+        "Config loaded. Connecting to Minecraft server at 127.0.0.1:25565...",
+    );
 
-    const movements = new Movements(bot);
-    movements.canDig = true;
+    bot = mineflayer.createBot({
+        host: "127.0.0.1",
+        port: 25565,
+        username: "CraftBot",
+        version: "1.19",
+    });
 
-    const leafNames = [
-        "oak_leaves",
-        "birch_leaves",
-        "spruce_leaves",
-        "jungle_leaves",
-        "acacia_leaves",
-        "dark_oak_leaves",
-        "mangrove_leaves",
-        "azalea_leaves",
-        "flowering_azalea_leaves",
-        "cherry_leaves",
-    ];
-    for (const name of leafNames) {
-        const block = bot.registry.blocksByName[name];
-        if (block) {
-            movements.blocksToAvoid.delete(block.id);
-        }
-    }
-    (bot as any).pathfinder.setMovements(movements);
+    bot.on("error", (err: unknown) =>
+        log.error("Bot error", {
+            err: err instanceof Error ? err.message : String(err),
+        }),
+    );
+    bot.on("end", (reason: unknown) =>
+        log.error("Bot connection ended", { reason }),
+    );
+    bot.on("kicked", (reason: unknown) =>
+        log.error("Bot was kicked", { reason }),
+    );
 
-    client.connect();
-    survival.start();
+    bot.loadPlugin(pathfinder);
 
-    if (config.ENABLE_VIEWER) {
-        try {
-            viewer(bot, {
-                port: config.VIEWER_PORT,
-                firstPerson: true,
-                viewDistance: 2,
-            });
-            log.info("Prismarine viewer started", { port: config.VIEWER_PORT });
-        } catch (err) {
-            log.error("Viewer failed to start", {
-                err: err instanceof Error ? err.message : String(err),
-            });
-        }
-    }
-});
-
-bot.on("death", () => {
-    log.warn("Bot died; resetting local execution state");
-    if (taskAbortController) {
-        taskAbortController.abort();
-        taskAbortController = null;
-    }
-    currentTask = null;
-    stopMovement();
-
-    client.sendEvent("death", "died", "", "killed_in_action", 0);
-});
-
-bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));
-bot.on("end", (reason: unknown) =>
-    log.error("Bot connection ended", { reason }),
-);
-bot.on("error", (err: unknown) =>
-    log.error("Bot error", {
-        err: err instanceof Error ? err.message : String(err),
-    }),
-);
-
-// ==========================================
-// TELEMETRY SYNC
-// ==========================================
-
-setInterval(() => {
-    if (!bot.entity || !bot.entities) return;
-
-    const state = {
-        health: Math.round(bot.health),
-        food: Math.round(bot.food),
-        time_of_day: bot.time.timeOfDay,
-        position: {
-            x: Math.round(bot.entity.position.x),
-            y: Math.round(bot.entity.position.y),
-            z: Math.round(bot.entity.position.z),
+    client = new ControlPlaneClient(config.WS_URL, {
+        onCommand: (decision) => void executeDecision(decision),
+        onUnlock: () => {
+            log.debug("Bot unlocked from control plane");
         },
-        threats: getThreats(bot)
-            .slice(0, 3)
-            .map((t) => ({ name: t.name })),
-        inventory: bot.inventory
-            .items()
-            .map((i) => ({ name: i.name, count: i.count })),
-    };
+    });
 
-    client.sendState(state);
-}, 2000);
+    survival = new SurvivalSystem(bot, client, {
+        onInterrupt: (reason: string) => {
+            if (taskAbortController) {
+                log.info(`LLM Task interrupted by survival reflex: ${reason}`);
+                taskAbortController.abort();
+                taskAbortController = null;
+            }
+        },
+        stopMovement: () => stopMovement(),
+    });
+
+    bot.on("login", () => log.info("Bot logged in"));
+
+    let isFirstSpawn = true;
+
+    // Use .on instead of .once so movements are re-injected when respawning
+    bot.on("spawn", () => {
+        log.info("Bot spawned", {
+            env_path: config.ENV_PATH,
+            cwd: process.cwd(),
+            isFirstSpawn,
+        });
+
+        const movements = new Movements(bot);
+        movements.canDig = true;
+
+        const leafNames = [
+            "oak_leaves",
+            "birch_leaves",
+            "spruce_leaves",
+            "jungle_leaves",
+            "acacia_leaves",
+            "dark_oak_leaves",
+            "mangrove_leaves",
+            "azalea_leaves",
+            "flowering_azalea_leaves",
+            "cherry_leaves",
+        ];
+        for (const name of leafNames) {
+            const block = bot.registry.blocksByName[name];
+            if (block) {
+                movements.blocksToAvoid.delete(block.id);
+            }
+        }
+        (bot as any).pathfinder.setMovements(movements);
+
+        if (isFirstSpawn) {
+            isFirstSpawn = false;
+            client.connect();
+            survival.start();
+
+            if (config.ENABLE_VIEWER) {
+                try {
+                    viewer(bot, {
+                        port: config.VIEWER_PORT,
+                        firstPerson: true,
+                        viewDistance: 2,
+                    });
+                    log.info("Prismarine viewer started", {
+                        port: config.VIEWER_PORT,
+                    });
+                } catch (err) {
+                    log.error("Viewer failed to start", {
+                        err: err instanceof Error ? err.message : String(err),
+                    });
+                }
+            }
+        }
+    });
+
+    bot.on("death", () => {
+        log.warn("Bot died; resetting local execution state");
+        if (taskAbortController) {
+            taskAbortController.abort();
+            taskAbortController = null;
+        }
+        currentTask = null;
+        stopMovement();
+
+        survival.reset();
+        client.sendEvent("death", "died", "", "killed_in_action", 0);
+    });
+
+    // ==========================================
+    // TELEMETRY SYNC
+    // ==========================================
+    setInterval(() => {
+        if (!bot || !bot.entity || !bot.entities) return;
+
+        const nearbyBed = bot.findBlock({
+            maxDistance: 32,
+            matching: (block: any) => block?.name.includes("bed"),
+        });
+
+        const state = {
+            health: Math.round(bot.health),
+            food: Math.round(bot.food),
+            time_of_day: bot.time.timeOfDay,
+            has_bed_nearby: !!nearbyBed,
+            position: {
+                x: Math.round(bot.entity.position.x),
+                y: Math.round(bot.entity.position.y),
+                z: Math.round(bot.entity.position.z),
+            },
+            threats: getThreats(bot)
+                .slice(0, 3)
+                .map((t) => ({ name: t.name })),
+            inventory: bot.inventory
+                .items()
+                .map((i) => ({ name: i.name, count: i.count })),
+        };
+
+        client.sendState(state);
+    }, 2000);
+}
+
+// Start the engine
+bootstrap().catch((err) => {
+    log.error("Fatal startup error", { err: String(err) });
+    process.exit(1);
+});

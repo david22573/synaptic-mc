@@ -40,10 +40,11 @@ function isInFoliage(bot: any): boolean {
     const pos = bot.entity.position.floored();
     const at = bot.blockAt(pos);
     const below = bot.blockAt(pos.offset(0, -1, 0));
+
+    // Removed the buggy jump/fall check
     return (
         (at && TREE_BLOCKS.has(at.name)) ||
-        (below && TREE_BLOCKS.has(below.name)) ||
-        (below && below.name === "air" && !bot.entity.onGround)
+        (below && TREE_BLOCKS.has(below.name))
     );
 }
 
@@ -52,12 +53,16 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
 
     try {
         bot.pathfinder.setGoal(null);
-    } catch {}
-    bot.clearControlStates();
+    } catch (_err) {}
+
+    try {
+        bot.clearControlStates();
+    } catch (_err) {}
 
     const MAX_ATTEMPTS = 16;
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
         if (signal.aborted) throw new Error("aborted");
+
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
@@ -66,7 +71,9 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
         if (below && TREE_BLOCKS.has(below.name) && bot.canDigBlock(below)) {
             try {
                 await bot.dig(below);
-            } catch {}
+            } catch (_err) {
+                // Ignore dig errors during a panic escape
+            }
         }
 
         await new Promise<void>((resolve) => {
@@ -151,15 +158,22 @@ export function moveToGoal(
             resolve();
         };
 
+        const safeStop = () => {
+            try {
+                bot.clearControlStates();
+                stopMovement();
+            } catch (_err) {
+                // Ignore cleanup errors during teardown
+            }
+        };
+
         const onAbort = () => {
-            bot.clearControlStates();
-            stopMovement();
+            safeStop();
             finish(new Error("aborted"));
         };
 
         const onGoalReached = () => {
-            bot.clearControlStates();
-            stopMovement();
+            safeStop();
             finish();
         };
 
@@ -167,14 +181,12 @@ export function moveToGoal(
             if (results.status === "noPath") {
                 setTimeout(() => {
                     if (!settled) {
-                        bot.clearControlStates();
-                        stopMovement();
+                        safeStop();
                         finish(new Error("NoPath - Bot is likely trapped"));
                     }
                 }, 3500);
             } else if (results.status === "timeout") {
-                bot.clearControlStates();
-                stopMovement();
+                safeStop();
                 finish(
                     new Error("PathfinderTimeout - Calculation took too long"),
                 );
@@ -182,8 +194,7 @@ export function moveToGoal(
         };
 
         const timer = setTimeout(() => {
-            bot.clearControlStates();
-            stopMovement();
+            safeStop();
             finish(new Error("timeout"));
         }, timeoutMs);
 
@@ -192,7 +203,8 @@ export function moveToGoal(
         bot.on("path_update", onPathUpdate);
 
         try {
-            bot.pathfinder.setGoal(goal);
+            // true enables dynamic pathfinding to stop computational freezes
+            bot.pathfinder.setGoal(goal, true);
         } catch (err) {
             finish(err instanceof Error ? err : new Error(String(err)));
         }
@@ -249,11 +261,13 @@ async function makeRoomInInventory(
 
 async function placePortableUtility(bot: any, blockName: string): Promise<any> {
     const item = bot.inventory.items().find((i: any) => i.name === blockName);
+
     if (!item) return null;
 
     await bot.equip(item, "hand");
 
     const pos = bot.entity.position.floored();
+
     const candidates = [
         bot.blockAt(pos.offset(1, -1, 0)),
         bot.blockAt(pos.offset(-1, -1, 0)),
@@ -293,6 +307,37 @@ export async function runTask(
     switch (decision.action) {
         case "idle": {
             await waitForMs(1500, signal);
+            return;
+        }
+
+        case "build": {
+            await escapeTree(bot, signal);
+
+            const targetBlockName = decision.target?.name;
+            if (!targetBlockName || targetBlockName === "none") {
+                throw new Error("missing build target");
+            }
+
+            const item = bot.inventory
+                .items()
+                .find((i: any) => i.name === targetBlockName);
+
+            if (!item) {
+                throw new Error(`missing ${targetBlockName} in inventory`);
+            }
+
+            const placedBlock = await placePortableUtility(
+                bot,
+                targetBlockName,
+            );
+
+            if (!placedBlock) {
+                throw new Error(
+                    `could not find a valid surface to place ${targetBlockName}`,
+                );
+            }
+
+            await waitForMs(500, signal);
             return;
         }
 
@@ -340,6 +385,7 @@ export async function runTask(
 
         case "retreat": {
             await escapeTree(bot, signal);
+
             const threats = getThreats();
             const safePos = computeSafeRetreat(threats);
 
@@ -355,6 +401,7 @@ export async function runTask(
 
         case "gather": {
             await escapeTree(bot, signal);
+
             const targetBlockName = decision.target?.name;
             if (!targetBlockName || targetBlockName === "none") {
                 throw new Error("missing gather target");
@@ -388,7 +435,7 @@ export async function runTask(
             try {
                 const tool = bot.pathfinder.bestHarvestTool(block);
                 if (tool) await bot.equip(tool, "hand");
-            } catch {}
+            } catch (_err) {}
 
             await bot.dig(block);
             await waitForMs(500, signal);
@@ -420,6 +467,7 @@ export async function runTask(
             }
 
             const itemType = bot.registry.itemsByName[targetRecipeName];
+
             if (!itemType) {
                 throw new Error(`unknown item: ${targetRecipeName}`);
             }
@@ -428,6 +476,7 @@ export async function runTask(
             let isPortableTable = false;
 
             const recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
+
             if (recipes.length === 0) {
                 throw new Error(
                     `no valid recipe or missing ingredients for ${targetRecipeName}`,
@@ -442,6 +491,7 @@ export async function runTask(
                         bot,
                         "crafting_table",
                     );
+
                     if (!craftingTable) {
                         throw new Error(
                             "requires crafting table but none nearby or in inventory",
@@ -470,10 +520,11 @@ export async function runTask(
 
             if (isPortableTable && craftingTable) {
                 await makeRoomInInventory(bot, 1);
+
                 const pickaxe = bot.pathfinder.bestHarvestTool(craftingTable);
                 if (pickaxe) await bot.equip(pickaxe, "hand");
                 await bot.dig(craftingTable);
-                await waitForMs(1000, signal); // Allow time for entity pickup
+                await waitForMs(1000, signal);
             }
             return;
         }
@@ -523,6 +574,7 @@ export async function runTask(
                             "rabbit",
                         ].includes(i.name),
                     );
+
                 const fuel = bot.inventory
                     .items()
                     .find((i: any) =>
@@ -540,6 +592,7 @@ export async function runTask(
 
                 if (isPortableFurnace && furnace) {
                     await makeRoomInInventory(bot, 1);
+
                     const pickaxe = bot.pathfinder.bestHarvestTool(furnace);
                     if (pickaxe) await bot.equip(pickaxe, "hand");
                     await bot.dig(furnace);
@@ -608,6 +661,7 @@ export async function runTask(
                                     i.name.includes("sword") ||
                                     i.name.includes("axe"),
                             );
+
                         if (weapon) await bot.equip(weapon, "hand");
 
                         await bot.lookAt(
@@ -619,7 +673,7 @@ export async function runTask(
                             true,
                         );
                         bot.attack(targetEntity);
-                    } catch {}
+                    } catch (_err) {}
                 }
 
                 await waitForMs(500, signal);
@@ -639,7 +693,7 @@ export async function runTask(
                 bot,
                 new goals.GoalNearXZ(targetX, targetZ, 2),
                 signal,
-                timeouts.explore ?? 20000,
+                timeouts.explore ?? 45000, // Make sure your Go config.json matches this bump
                 stopMovement,
             );
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,6 +21,28 @@ type Telemetry struct {
 	tasksFailed    int
 	replans        int
 	panics         int
+	activeSessions int32
+}
+
+func (t *Telemetry) RecordSessionStart() {
+	atomic.AddInt32(&t.activeSessions, 1)
+}
+
+func (t *Telemetry) RecordSessionEnd() {
+	atomic.AddInt32(&t.activeSessions, -1)
+}
+
+func (t *Telemetry) ActiveSessions() int32 {
+	return atomic.LoadInt32(&t.activeSessions)
+}
+
+func (t *Telemetry) AvgLatency() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.llmInvocations == 0 {
+		return 0
+	}
+	return t.totalLatency / time.Duration(t.llmInvocations)
 }
 
 func NewTelemetry(logger *slog.Logger) *Telemetry {

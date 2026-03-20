@@ -20,11 +20,12 @@ type Vec3 struct {
 }
 
 type GameState struct {
-	Health    float64 `json:"health"`
-	Food      float64 `json:"food"`
-	TimeOfDay int     `json:"time_of_day"`
-	Position  Vec3    `json:"position"`
-	Threats   []struct {
+	Health       float64 `json:"health"`
+	Food         float64 `json:"food"`
+	TimeOfDay    int     `json:"time_of_day"`
+	HasBedNearby bool    `json:"has_bed_nearby"`
+	Position     Vec3    `json:"position"`
+	Threats      []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
 	Inventory []struct {
@@ -58,6 +59,7 @@ type Engine struct {
 	lastHealth    float64
 	lastThreat    string
 	lastPos       Vec3
+	wg            sync.WaitGroup
 }
 
 func NewEngine(
@@ -89,6 +91,7 @@ func (e *Engine) Run(ctx context.Context) {
 		e.mu.Lock()
 		e.cancelPlanningLocked()
 		e.mu.Unlock()
+		e.wg.Wait()
 		_ = e.conn.Close()
 	}()
 
@@ -206,6 +209,7 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	var state GameState
 	if err := json.Unmarshal(payload, &state); err != nil {
+		e.logger.Error("Failed to decode state", slog.Any("error", err))
 		return
 	}
 
@@ -271,8 +275,9 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 }
 
 func (e *Engine) evaluateRoutinesLocked(state GameState) {
+	// 1. Sleep Routine (Requires nearby bed to execute)
 	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 {
-		if !e.hasRoutineTaskLocked("sleep", "bed") {
+		if state.HasBedNearby && !e.hasRoutineTaskLocked("sleep", "bed") {
 			e.injectTaskLocked(Action{
 				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
 				Action:    "sleep",
@@ -283,10 +288,13 @@ func (e *Engine) evaluateRoutinesLocked(state GameState) {
 		}
 	}
 
+	// 2. Inventory Parsing
 	hasCraftingTable := false
 	hasFurnace := false
 	rawMeatCount := 0
 	fuelCount := 0
+	plankCount := 0
+	cobbleCount := 0
 
 	for _, item := range state.Inventory {
 		switch item.Name {
@@ -294,33 +302,42 @@ func (e *Engine) evaluateRoutinesLocked(state GameState) {
 			hasCraftingTable = true
 		case "furnace":
 			hasFurnace = true
+		case "cobblestone":
+			cobbleCount += item.Count
 		case "beef", "porkchop", "mutton", "chicken", "rabbit":
 			rawMeatCount += item.Count
-		case "coal", "charcoal", "oak_planks", "birch_planks":
+		case "coal", "charcoal":
+			fuelCount += item.Count
+		}
+
+		if strings.HasSuffix(item.Name, "_planks") {
+			plankCount += item.Count
 			fuelCount += item.Count
 		}
 	}
 
-	if !hasCraftingTable && !e.hasRoutineTaskLocked("craft", "crafting_table") {
+	// 3. Mandatory Tool Routines
+	if !hasCraftingTable && plankCount >= 4 && !e.hasRoutineTaskLocked("craft", "crafting_table") {
 		e.injectTaskLocked(Action{
 			ID:        fmt.Sprintf("routine-craft-table-%d", time.Now().UnixNano()),
 			Action:    "craft",
 			Target:    Target{Type: "recipe", Name: "crafting_table"},
-			Rationale: "Mandatory tool: Crafting table is missing from inventory",
+			Rationale: "Mandatory tool missing: Auto-crafting since we have planks",
 			Priority:  PriRoutine,
 		})
 	}
 
-	if !hasFurnace && !e.hasRoutineTaskLocked("craft", "furnace") {
+	if !hasFurnace && cobbleCount >= 8 && !e.hasRoutineTaskLocked("craft", "furnace") {
 		e.injectTaskLocked(Action{
 			ID:        fmt.Sprintf("routine-craft-furnace-%d", time.Now().UnixNano()),
 			Action:    "craft",
 			Target:    Target{Type: "recipe", Name: "furnace"},
-			Rationale: "Mandatory tool: Furnace is missing from inventory",
+			Rationale: "Mandatory tool missing: Auto-crafting since we have cobblestone",
 			Priority:  PriRoutine,
 		})
 	}
 
+	// 4. Auto-Cooking Routine
 	if hasFurnace && rawMeatCount > 0 && fuelCount > 0 && !e.hasRoutineTaskLocked("smelt", "food") {
 		e.injectTaskLocked(Action{
 			ID:        fmt.Sprintf("routine-smelt-%d", time.Now().UnixNano()),
@@ -415,8 +432,9 @@ func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessa
 func (e *Engine) processNextTask() {
 	e.mu.Lock()
 	task := e.dequeueNextTaskLocked()
+	e.mu.Unlock()
+
 	if task == nil {
-		e.mu.Unlock()
 		return
 	}
 
@@ -428,8 +446,8 @@ func (e *Engine) processNextTask() {
 			e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, X: e.lastPos.X, Y: e.lastPos.Y, Z: e.lastPos.Z, Status: "COMPLETED"})
 			e.logger.Info("Location marked in spatial memory", slog.String("name", locName))
 		}
+
 		e.inFlightTask = nil
-		e.mu.Unlock()
 		go e.processNextTask()
 		return
 	}
@@ -443,12 +461,10 @@ func (e *Engine) processNextTask() {
 			go e.setSummaryAsync("Known Location: "+locName, msg)
 		}
 		e.inFlightTask = nil
-		e.mu.Unlock()
 		go e.processNextTask()
 		return
 	}
 
-	e.mu.Unlock()
 	_ = e.sendCommand(*task)
 }
 
@@ -487,23 +503,20 @@ func (e *Engine) cancelPlanningLocked() {
 
 func (e *Engine) sendCommand(action Action) error {
 	payload, _ := json.Marshal(action)
-	e.uiHub.Broadcast(map[string]interface{}{"type": "command_dispatch", "payload": action})
-
-	if err := e.writeJSON(map[string]interface{}{"type": "command", "payload": json.RawMessage(payload)}); err != nil {
-		e.mu.Lock()
-		if e.inFlightTask != nil && e.inFlightTask.ID == action.ID {
-			e.inFlightTask = nil
-			e.lastReplan = time.Time{}
-		}
-		e.mu.Unlock()
-		return err
+	msg := WSMessage{
+		Type:    TypeCommand,
+		Payload: json.RawMessage(payload),
 	}
-	return nil
+	return e.writeJSON(msg)
 }
 
 func (e *Engine) sendControlMessage(msgType, reason string) {
 	payload, _ := json.Marshal(map[string]string{"reason": reason})
-	_ = e.writeJSON(map[string]interface{}{"type": msgType, "payload": json.RawMessage(payload)})
+	msg := WSMessage{
+		Type:    WSMessageType(msgType),
+		Payload: json.RawMessage(payload),
+	}
+	_ = e.writeJSON(msg)
 }
 
 func (e *Engine) writeJSON(v interface{}) error {
@@ -513,7 +526,9 @@ func (e *Engine) writeJSON(v interface{}) error {
 }
 
 func (e *Engine) setSummaryAsync(key, value string) {
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = e.memory.SetSummary(ctx, e.sessionID, key, value)

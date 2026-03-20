@@ -1,0 +1,22 @@
+{
+    "ws_url": "ws://localhost:8080/ws",
+    "viewer_port": 3000,
+    "enable_viewer": false,
+    "debug_chat": false,
+    "task_timeouts": {
+        "gather": 30000,
+        "craft": 20000,
+        "hunt": 30000,
+        "explore": 45000,
+        "build": 20000,
+        "retreat": 15000,
+        "idle": 3000
+    },
+    "threat_weights": {
+        "warden": 1000,
+        "creeper": 50,
+        "skeleton": 20,
+        "zombie": 10,
+        "spider": 10
+    }
+}

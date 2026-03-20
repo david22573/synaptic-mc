@@ -3,10 +3,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
@@ -66,6 +68,18 @@ func main() {
 	// Phase 4: Wire UI Observability Hub
 	uiHub := NewUIHub(logger)
 
+	config, err := LoadConfig("./config.json")
+	if err != nil {
+		logger.Error("Failed to load config", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	// Add new route before http.ListenAndServe:
+	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(config)
+	})
+
 	// Route 1: JS Bot WebSocket
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -89,6 +103,17 @@ func main() {
 
 	logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
 	logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		health := map[string]interface{}{
+			"status":          "healthy",
+			"active_sessions": telemetry.ActiveSessions(),
+			"llm_avg_latency": telemetry.AvgLatency().String(),
+			"timestamp":       time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(health)
+	})
 
 	if err := http.ListenAndServe(Port, nil); err != nil {
 		logger.Error("Server crashed", slog.Any("error", err))

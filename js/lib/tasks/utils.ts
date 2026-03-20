@@ -1,0 +1,299 @@
+import type { Bot } from "mineflayer";
+import pkg from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
+
+const { goals } = pkg;
+
+// ==========================================
+// CONSTANTS
+// ==========================================
+
+const TREE_BLOCKS = new Set([
+    "oak_leaves",
+    "birch_leaves",
+    "spruce_leaves",
+    "jungle_leaves",
+    "acacia_leaves",
+    "dark_oak_leaves",
+    "mangrove_leaves",
+    "azalea_leaves",
+    "flowering_azalea_leaves",
+    "cherry_leaves",
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "jungle_log",
+    "acacia_log",
+    "dark_oak_log",
+    "mangrove_log",
+]);
+
+const TRASH_ITEMS = new Set([
+    "dirt",
+    "cobblestone",
+    "gravel",
+    "rotten_flesh",
+    "spider_eye",
+    "bone",
+    "string",
+    "andesite",
+    "diorite",
+    "granite",
+    "seeds",
+    "tall_grass",
+    "grass",
+]);
+
+// ==========================================
+// MOVEMENT & POSITION HELPERS
+// ==========================================
+
+export function isOnSolidGround(bot: any): boolean {
+    if (!bot.entity.onGround) return false;
+
+    const pos = bot.entity.position.floored();
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
+}
+
+export function isInFoliage(bot: any): boolean {
+    const pos = bot.entity.position.floored();
+    const at = bot.blockAt(pos);
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return (
+        (at && TREE_BLOCKS.has(at.name)) ||
+        (below && TREE_BLOCKS.has(below.name))
+    );
+}
+
+export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
+    if (!isInFoliage(bot)) return;
+
+    try {
+        bot.pathfinder.setGoal(null);
+    } catch (_err) {}
+
+    try {
+        bot.clearControlStates();
+    } catch (_err) {}
+
+    const MAX_ATTEMPTS = 16;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        if (signal.aborted) throw new Error("aborted");
+
+        if (isOnSolidGround(bot)) return;
+
+        const pos = bot.entity.position.floored();
+        const below = bot.blockAt(pos.offset(0, -1, 0));
+
+        if (below && TREE_BLOCKS.has(below.name) && bot.canDigBlock(below)) {
+            try {
+                await bot.dig(below);
+            } catch (_err) {}
+        }
+
+        await new Promise<void>((resolve) => {
+            let ticks = 0;
+            const check = () => {
+                ticks++;
+                if (isOnSolidGround(bot) || ticks > 10) {
+                    bot.removeListener("physicsTick", check);
+                    resolve();
+                }
+            };
+            bot.on("physicsTick", check);
+            setTimeout(() => {
+                bot.removeListener("physicsTick", check);
+                resolve();
+            }, 1500);
+        });
+    }
+
+    if (!isOnSolidGround(bot)) {
+        throw new Error("EscapeTree - could not reach ground");
+    }
+}
+
+export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(new Error("aborted"));
+            return;
+        }
+
+        const timer = setTimeout(() => {
+            cleanup();
+            resolve();
+        }, ms);
+
+        const onAbort = () => {
+            clearTimeout(timer);
+            cleanup();
+            reject(new Error("aborted"));
+        };
+
+        const cleanup = () => {
+            signal.removeEventListener("abort", onAbort);
+        };
+
+        signal.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+export function moveToGoal(
+    bot: any,
+    goal: any,
+    signal: AbortSignal,
+    timeoutMs: number,
+    stopMovement: () => void,
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(new Error("aborted"));
+            return;
+        }
+
+        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
+            return resolve();
+        }
+
+        let settled = false;
+
+        const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+
+            clearTimeout(timer);
+            signal.removeEventListener("abort", onAbort);
+            bot.removeListener("goal_reached", onGoalReached);
+            bot.removeListener("path_update", onPathUpdate);
+
+            if (err) {
+                reject(err);
+                return;
+            }
+            resolve();
+        };
+
+        const safeStop = () => {
+            try {
+                bot.clearControlStates();
+                stopMovement();
+            } catch (_err) {}
+        };
+
+        const onAbort = () => {
+            safeStop();
+            finish(new Error("aborted"));
+        };
+
+        const onGoalReached = () => {
+            safeStop();
+            finish();
+        };
+
+        const onPathUpdate = (results: any) => {
+            if (results.status === "noPath") {
+                setTimeout(() => {
+                    if (!settled) {
+                        safeStop();
+                        finish(new Error("NoPath - Bot is likely trapped"));
+                    }
+                }, 3500);
+            } else if (results.status === "timeout") {
+                safeStop();
+                finish(
+                    new Error("PathfinderTimeout - Calculation took too long"),
+                );
+            }
+        };
+
+        const timer = setTimeout(() => {
+            safeStop();
+            finish(new Error("timeout"));
+        }, timeoutMs);
+
+        signal.addEventListener("abort", onAbort, { once: true });
+        bot.once("goal_reached", onGoalReached);
+        bot.on("path_update", onPathUpdate);
+
+        try {
+            bot.pathfinder.setGoal(goal, true);
+        } catch (err) {
+            finish(err instanceof Error ? err : new Error(String(err)));
+        }
+    });
+}
+
+export function findNearestBlockByName(bot: Bot, blockName: string): any {
+    return bot.findBlock({
+        maxDistance: 32,
+        matching: (block: any) => block?.name === blockName,
+    });
+}
+
+// ==========================================
+// INVENTORY MANAGEMENT
+// ==========================================
+
+export async function makeRoomInInventory(
+    bot: any,
+    slotsNeeded: number = 1,
+): Promise<void> {
+    if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
+
+    const inventory = bot.inventory.items();
+    const sortedItems = [...inventory].sort((a, b) => {
+        const aIsTrash = TRASH_ITEMS.has(a.name) ? -1 : 1;
+        const bIsTrash = TRASH_ITEMS.has(b.name) ? -1 : 1;
+        if (aIsTrash !== bIsTrash) return aIsTrash - bIsTrash;
+        return a.count - b.count;
+    });
+
+    let slotsFreed = 0;
+    for (const item of sortedItems) {
+        if (slotsFreed >= slotsNeeded) break;
+        try {
+            await bot.tossStack(item);
+            slotsFreed++;
+        } catch (err) {
+            // Ignore failure, try next item
+        }
+    }
+}
+
+// ==========================================
+// BLOCK PLACEMENT
+// ==========================================
+
+export async function placePortableUtility(
+    bot: any,
+    blockName: string,
+): Promise<any> {
+    const item = bot.inventory.items().find((i: any) => i.name === blockName);
+
+    if (!item) return null;
+
+    await bot.equip(item, "hand");
+
+    const pos = bot.entity.position.floored();
+
+    const candidates = [
+        bot.blockAt(pos.offset(1, -1, 0)),
+        bot.blockAt(pos.offset(-1, -1, 0)),
+        bot.blockAt(pos.offset(0, -1, 1)),
+        bot.blockAt(pos.offset(0, -1, -1)),
+    ];
+
+    for (const refBlock of candidates) {
+        if (refBlock && refBlock.name !== "air" && refBlock.name !== "water") {
+            try {
+                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                return findNearestBlockByName(bot, blockName);
+            } catch (err) {
+                // Ignore placement failure, check next adjacent block
+            }
+        }
+    }
+    return null;
+}
