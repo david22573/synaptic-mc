@@ -2,60 +2,16 @@ import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 
-// ==========================================
-// LOGGER
-// ==========================================
+import pkg from "mineflayer-pathfinder";
+import mineflayer from "mineflayer";
+import WebSocket from "ws";
+import { mineflayer as viewer } from "prismarine-viewer";
 
-interface Logger {
-    info: (msg: string, meta?: Record<string, unknown>) => void;
-    warn: (msg: string, meta?: Record<string, unknown>) => void;
-    error: (msg: string, meta?: Record<string, unknown>) => void;
-    debug: (msg: string, meta?: Record<string, unknown>) => void;
-}
+import { log } from "./lib/logger.js";
+import * as models from "./lib/models.js";
+import { runTask } from "./lib/tasks/task.js";
 
-const log: Logger = {
-    info: (msg, meta = {}) =>
-        console.log(
-            JSON.stringify({
-                level: "INFO",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        ),
-
-    warn: (msg, meta = {}) =>
-        console.warn(
-            JSON.stringify({
-                level: "WARN",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        ),
-
-    error: (msg, meta = {}) =>
-        console.error(
-            JSON.stringify({
-                level: "ERROR",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        ),
-
-    debug: (msg, meta = {}) => {
-        if (!DEBUG) return;
-        console.log(
-            JSON.stringify({
-                level: "DEBUG",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        );
-    },
-};
+const { pathfinder, Movements, goals } = pkg;
 
 function loadEnv(): string {
     const candidates = [
@@ -76,20 +32,9 @@ function loadEnv(): string {
 
 const loadedEnvPath = loadEnv();
 
-import pkg from "mineflayer-pathfinder";
-const { pathfinder, Movements, goals } = pkg;
-import mineflayer from "mineflayer";
-import WebSocket from "ws";
-import { mineflayer as viewer } from "prismarine-viewer";
-
-// ==========================================
-// CONFIG
-// ==========================================
-
 const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
 const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
 const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-const DEBUG = process.env.DEBUG === "true";
 
 const WS_URL = "ws://localhost:8080/ws";
 
@@ -102,53 +47,13 @@ const bot = mineflayer.createBot({
 
 bot.loadPlugin(pathfinder);
 
-// ==========================================
-// TYPES
-// ==========================================
-
-interface DecisionTarget {
-    type: string;
-    name: string;
-}
-
-interface IncomingDecision {
-    id: string;
-    action: string;
-    target: DecisionTarget;
-    rationale?: string;
-}
-
-interface ActiveTask {
-    id: string;
-    action: string;
-    target: DecisionTarget;
-    startTime: number;
-}
-
-interface ThreatInfo {
-    id: number;
-    name: string;
-    distance: number;
-    threatScore: number;
-    position: {
-        x: number;
-        y: number;
-        z: number;
-    };
-}
-
-// ==========================================
-// STATE
-// ==========================================
-
 let ws: WebSocket;
-let currentTask: ActiveTask | null = null;
+let currentTask: models.ActiveTask | null = null;
 let awaitingCommand = false;
 let reflexActive = false;
 let reflexTimeout: NodeJS.Timeout | null = null;
 let lastReflexTime = 0;
 let taskAbortController: AbortController | null = null;
-let isBusy = false;
 
 const TASK_TIMEOUTS: Record<string, number> = {
     attack: 20000,
@@ -169,11 +74,7 @@ const THREAT_WEIGHTS: Record<string, number> = {
 // STATE HELPERS
 // ==========================================
 
-function updateBusyState() {
-    isBusy = reflexActive || awaitingCommand || currentTask !== null;
-}
-
-function taskLabel(task: Pick<ActiveTask, "action" | "target">) {
+function taskLabel(task: Pick<models.ActiveTask, "action" | "target">) {
     return `${task.action} ${task.target?.name || "none"}`.trim();
 }
 
@@ -183,23 +84,20 @@ function stopMovement() {
     } catch {}
 
     try {
-        bot.pathfinder.setGoal(null);
+        (bot as any).pathfinder.setGoal(null);
     } catch {}
 
     try {
-        bot.pathfinder.stop();
+        (bot as any).pathfinder.stop();
     } catch {}
 }
 
 function clearReflexState() {
     reflexActive = false;
-
     if (reflexTimeout) {
         clearTimeout(reflexTimeout);
         reflexTimeout = null;
     }
-
-    updateBusyState();
 }
 
 function resetExecutionState() {
@@ -212,7 +110,27 @@ function resetExecutionState() {
     awaitingCommand = false;
     clearReflexState();
     stopMovement();
-    updateBusyState();
+}
+
+function completeTask(
+    status:
+        | "task_completed"
+        | "task_failed"
+        | "task_aborted" = "task_completed",
+) {
+    if (!currentTask) {
+        return;
+    }
+
+    sendEvent(
+        status,
+        taskLabel(currentTask),
+        currentTask.id,
+        "",
+        currentTask.startTime,
+    );
+
+    currentTask = null;
 }
 
 // ==========================================
@@ -237,8 +155,7 @@ function connectControlPlane() {
 
             if (msg.type === "command") {
                 awaitingCommand = false;
-                updateBusyState();
-                void executeDecision(msg.payload as IncomingDecision);
+                void executeDecision(msg.payload as models.IncomingDecision);
                 return;
             }
 
@@ -248,14 +165,12 @@ function connectControlPlane() {
                     payload: msg.payload,
                 });
                 awaitingCommand = false;
-                updateBusyState();
             }
         } catch (err) {
             log.error("Failed to parse control-plane message", {
                 err: err instanceof Error ? err.message : String(err),
             });
             awaitingCommand = false;
-            updateBusyState();
         }
     });
 
@@ -303,7 +218,7 @@ function sendEvent(
 // THREATS / REFLEXES
 // ==========================================
 
-function getThreats(): ThreatInfo[] {
+function getThreats(): models.ThreatInfo[] {
     return Object.values(bot.entities)
         .filter(
             (e: any) => (e.type === "mob" || e.type === "hostile") && e.name,
@@ -328,7 +243,7 @@ function getThreats(): ThreatInfo[] {
         .sort((a, b) => b.threatScore - a.threatScore);
 }
 
-function computeSafeRetreat(threats: ThreatInfo[]) {
+function computeSafeRetreat(threats: models.ThreatInfo[]) {
     let cx = 0;
     let cz = 0;
     let totalWeight = 0;
@@ -362,7 +277,7 @@ function computeSafeRetreat(threats: ThreatInfo[]) {
     };
 }
 
-function triggerReflexRetreat(threats: ThreatInfo[]) {
+function triggerReflexRetreat(threats: models.ThreatInfo[]) {
     const primaryThreat = threats[0];
     const cause =
         primaryThreat?.name || (bot.health < 6 ? "low_health" : "unknown");
@@ -378,7 +293,6 @@ function triggerReflexRetreat(threats: ThreatInfo[]) {
     }
 
     reflexActive = true;
-    updateBusyState();
     stopMovement();
 
     const startTime = Date.now();
@@ -393,7 +307,7 @@ function triggerReflexRetreat(threats: ThreatInfo[]) {
         safe_z: Math.round(safePos.z),
     });
 
-    bot.pathfinder.setGoal(
+    (bot as any).pathfinder.setGoal(
         new goals.GoalNear(safePos.x, bot.entity.position.y, safePos.z, 2),
     );
 
@@ -419,269 +333,10 @@ function triggerReflexRetreat(threats: ThreatInfo[]) {
         }),
     );
 
-// ==========================================
-// TASK HELPERS
-// ==========================================
-
-function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        const timer = setTimeout(() => {
-            cleanup();
-            resolve();
-        }, ms);
-
-        const onAbort = () => {
-            clearTimeout(timer);
-            cleanup();
-            reject(new Error("aborted"));
-        };
-
-        const cleanup = () => {
-            signal.removeEventListener("abort", onAbort);
-        };
-
-        signal.addEventListener("abort", onAbort, { once: true });
-    });
-}
-
-function moveToGoal(
-    goal: any,
-    signal: AbortSignal,
-    timeoutMs: number,
-): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        let settled = false;
-
-        const cleanup = () => {
-            clearTimeout(timer);
-            signal.removeEventListener("abort", onAbort);
-            bot.removeListener("goal_reached", onGoalReached);
-        };
-
-        const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-
-            if (err) {
-                reject(err);
-                return;
-            }
-
-            resolve();
-        };
-
-        const onAbort = () => {
-            stopMovement();
-            finish(new Error("aborted"));
-        };
-
-        const onGoalReached = () => {
-            stopMovement();
-            finish();
-        };
-
-        const timer = setTimeout(() => {
-            stopMovement();
-            finish(new Error("timeout"));
-        }, timeoutMs);
-
-        signal.addEventListener("abort", onAbort, { once: true });
-        bot.once("goal_reached", onGoalReached);
-        bot.pathfinder.setGoal(goal);
-    });
-}
-
-function findNearestBlockByName(blockName: string) {
-    return bot.findBlock({
-        maxDistance: 32,
-        matching: (block: any) => block?.name === blockName,
-    });
-}
-
-// ==========================================
-// TASK LIFECYCLE
-// ==========================================
-
-function completeTask(
-    status:
-        | "task_completed"
-        | "task_failed"
-        | "task_aborted" = "task_completed",
-) {
-    if (!currentTask) {
-        updateBusyState();
-        return;
-    }
-
-    sendEvent(
-        status,
-        taskLabel(currentTask),
-        currentTask.id,
-        "",
-        currentTask.startTime,
-    );
-
-    currentTask = null;
-    updateBusyState();
-}
-
-async function runTask(
-    decision: IncomingDecision,
-    signal: AbortSignal,
-): Promise<void> {
-    switch (decision.action) {
-        case "idle": {
-            await waitForMs(1500, signal);
-            return;
-        }
-
-        case "retreat": {
-            const threats = getThreats();
-            const safePos = computeSafeRetreat(threats);
-
-            await moveToGoal(
-                new goals.GoalNear(
-                    safePos.x,
-                    bot.entity.position.y ?? 64,
-                    safePos.z,
-                    2,
-                ),
-                signal,
-                TASK_TIMEOUTS.retreat!,
-            );
-
-            return;
-        }
-
-        case "attack": {
-            const targetName = decision.target?.name;
-            if (!targetName || targetName === "none") {
-                throw new Error("missing attack target");
-            }
-
-            const attackStartedAt = Date.now();
-            let hasSeenTarget = false;
-            let lastSeenAt = 0;
-
-            while (Date.now() - attackStartedAt < TASK_TIMEOUTS.attack!) {
-                if (signal.aborted) {
-                    throw new Error("aborted");
-                }
-
-                const targetEntity = bot.nearestEntity(
-                    (e: any) => e.name === targetName && e.isValid,
-                );
-
-                if (!targetEntity) {
-                    if (hasSeenTarget && Date.now() - lastSeenAt > 1500) {
-                        stopMovement();
-                        return;
-                    }
-
-                    if (!hasSeenTarget && Date.now() - attackStartedAt > 3000) {
-                        throw new Error(`target not found: ${targetName}`);
-                    }
-
-                    await waitForMs(250, signal);
-                    continue;
-                }
-
-                hasSeenTarget = true;
-                lastSeenAt = Date.now();
-
-                bot.pathfinder.setGoal(
-                    new goals.GoalFollow(targetEntity, 2),
-                    true,
-                );
-
-                const dist = bot.entity.position.distanceTo(
-                    targetEntity.position,
-                );
-
-                if (!targetEntity || !targetEntity.position) {
-                    throw new Error(
-                        `Target ${targetName} is no longer in range or valid.`,
-                    );
-                }
-
-                if (dist < 3.2) {
-                    try {
-                        await bot.lookAt(
-                            targetEntity.position.offset(
-                                0,
-                                targetEntity.height ?? 1.6,
-                                0,
-                            ),
-                            true,
-                        );
-                    } catch {}
-
-                    try {
-                        bot.attack(targetEntity);
-                    } catch {}
-                }
-
-                await waitForMs(450, signal);
-            }
-
-            throw new Error("timeout");
-        }
-
-        case "mine": {
-            const targetBlockName = decision.target?.name;
-            if (!targetBlockName || targetBlockName === "none") {
-                throw new Error("missing mine target");
-            }
-
-            const block = findNearestBlockByName(targetBlockName);
-            if (!block) {
-                throw new Error(`block not found: ${targetBlockName}`);
-            }
-
-            await moveToGoal(
-                new goals.GoalNear(
-                    block.position.x,
-                    block.position.y,
-                    block.position.z,
-                    1,
-                ),
-                signal,
-                12000,
-            );
-
-            if (signal.aborted) {
-                throw new Error("aborted");
-            }
-
-            if (!bot.canDigBlock(block)) {
-                throw new Error(`cannot dig block: ${targetBlockName}`);
-            }
-
-            await bot.dig(block);
-            return;
-        }
-
-        default:
-            throw new Error(`unsupported action: ${decision.action}`);
-    }
-}
-
-async function executeDecision(decision: IncomingDecision) {
+async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) {
         log.error("Received malformed command", { decision });
         awaitingCommand = false;
-        updateBusyState();
         return;
     }
 
@@ -706,10 +361,8 @@ async function executeDecision(decision: IncomingDecision) {
         target: decision.target || { type: "none", name: "none" },
         startTime: Date.now(),
     };
-    updateBusyState();
 
     stopMovement();
-
     sendEvent(
         "task_started",
         taskLabel(currentTask),
@@ -719,14 +372,25 @@ async function executeDecision(decision: IncomingDecision) {
     );
 
     const timeoutMs = TASK_TIMEOUTS[decision.action] || 10000;
-
     let timeoutId: NodeJS.Timeout | null = null;
+
     const timeoutPromise = new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => reject(new Error("timeout")), timeoutMs);
     });
 
     try {
-        await Promise.race([runTask(decision, signal), timeoutPromise]);
+        await Promise.race([
+            runTask(
+                bot,
+                decision,
+                signal,
+                TASK_TIMEOUTS,
+                getThreats,
+                computeSafeRetreat,
+                stopMovement,
+            ),
+            timeoutPromise,
+        ]);
 
         if (!signal.aborted) {
             completeTask("task_completed");
@@ -756,8 +420,6 @@ async function executeDecision(decision: IncomingDecision) {
         if (taskAbortController?.signal === signal) {
             taskAbortController = null;
         }
-
-        updateBusyState();
     }
 }
 
@@ -777,7 +439,7 @@ bot.once("spawn", () => {
         viewer_port: VIEWER_PORT,
     });
 
-    bot.pathfinder.setMovements(new Movements(bot));
+    (bot as any).pathfinder.setMovements(new Movements(bot));
     connectControlPlane();
 
     if (ENABLE_VIEWER) {
@@ -856,7 +518,6 @@ bot.on("physicTick", () => {
 
 setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (isBusy) return;
 
     const state = {
         health: Math.round(bot.health),
@@ -876,5 +537,4 @@ setInterval(() => {
 
     ws.send(JSON.stringify({ type: "state", payload: state }));
     awaitingCommand = true;
-    updateBusyState();
 }, 2000);
