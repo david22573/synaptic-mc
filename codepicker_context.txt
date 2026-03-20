@@ -1,7 +1,7 @@
-Project Context Dump (20 Mar 26 01:33 PDT)
+Project Context Dump (20 Mar 26 03:36 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 14
+Total Files: 15
 
 # Project Structure
 <file_tree>
@@ -19,6 +19,7 @@ Total Files: 14
 - main.go
 - memory.go
 - telemetry.go
+- ui_hub.go
 </file_tree>
 
 # File Contents
@@ -59,6 +60,7 @@ clean: ## Clean up Go cache and Node modules
 </file>
 
 <file path="brain.go">
+// brain.go
 package main
 
 import (
@@ -69,7 +71,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"time"
 )
 
@@ -95,33 +96,30 @@ type LLMPlan struct {
 }
 
 type Brain interface {
-	EvaluatePlan(ctx context.Context, t Tick, sessionID string) (*LLMPlan, error)
+	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error)
 }
 
 type LLMBrain struct {
 	apiURL    string
 	model     string
+	apiKey    string
 	client    *http.Client
 	memory    MemoryBank
 	telemetry *Telemetry
 }
 
-func NewLLMBrain(apiURL, model string, mem MemoryBank, tel *Telemetry) *LLMBrain {
+func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *LLMBrain {
 	return &LLMBrain{
 		apiURL:    apiURL,
 		model:     model,
+		apiKey:    apiKey,
 		memory:    mem,
 		telemetry: tel,
 		client:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID string) (*LLMPlan, error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return nil, fmt.Errorf("OPENROUTER_API_KEY is not set")
-	}
-
+func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error) {
 	summary, err := b.memory.GetSummary(ctx, sessionID)
 	if err != nil {
 		summary = "No active summary."
@@ -132,18 +130,32 @@ func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID string) (
 		history = "No recent memory available."
 	}
 
-	systemPrompt := fmt.Sprintf(`You are an autonomous Minecraft survival agent. 
+	systemPrompt := fmt.Sprintf(`You are the strategic commander of an autonomous Minecraft survival agent. 
+You operate at a MACRO level. Do not micromanage movement.
 You MUST output a valid JSON object. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
 The "tasks" field MUST be an array of objects.
 
+Valid macro actions:
+- "gather": Collect resources (wood, stone).
+- "craft": Create items. 
+- "hunt": Track and kill entities.
+- "explore": Move to new map chunks.
+- "build": Place blocks to create structures.
+- "retreat": Move to safety.
+- "idle": Wait and observe.
+- "mark_location": Save your current coordinates to memory (target.name is the label, e.g., "base").
+- "recall_location": Retrieve coordinates from memory into your summary context.
+
+Target types: "block", "entity", "recipe", "location", "none".
+
 Example format:
 {
-  "objective": "Gather resources",
+  "objective": "Establish a secure base",
   "tasks": [
     { 
-      "action": "mine", 
-      "target": { "type": "block", "name": "oak_log" }, 
-      "rationale": "Need wood" 
+      "action": "mark_location", 
+      "target": { "type": "location", "name": "home_base" }, 
+      "rationale": "Remembering this spot to return to later" 
     }
   ]
 }
@@ -153,11 +165,14 @@ Example format:
 
 --- RECENT MEMORY ---
 %s
+
+--- CRITICAL SYSTEM OVERRIDE ---
+%s
 ---------------------
 
-Analyze the state and memory. Generate a sequential list of 1-3 tasks.
-Valid actions: "attack", "retreat", "mine", "idle".
-Target types: "entity", "block", "none".`, summary, history)
+Analyze the state payload (health, position, threats, AND INVENTORY). 
+Pay strict attention to any SYSTEM OVERRIDE warnings.
+Generate a sequential list of 1-3 tasks.`, summary, history, systemOverride)
 
 	payload := map[string]interface{}{
 		"model": b.model,
@@ -180,7 +195,7 @@ Target types: "entity", "block", "none".`, summary, history)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Authorization", "Bearer "+b.apiKey)
 	req.Header.Set("HTTP-Referer", "http://localhost:8080")
 	req.Header.Set("X-Title", "CraftD Bot Controller")
 
@@ -241,6 +256,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -271,6 +287,7 @@ type Engine struct {
 	conn      *websocket.Conn
 	memory    MemoryBank
 	telemetry *Telemetry
+	uiHub     *UIHub
 	logger    *slog.Logger
 
 	mu      sync.Mutex
@@ -279,10 +296,11 @@ type Engine struct {
 	taskQueue    []Action
 	inFlightTask *Action
 
-	planEpoch  int
-	planning   bool
-	planCancel context.CancelFunc
-	sessionID  string
+	planEpoch      int
+	planning       bool
+	planCancel     context.CancelFunc
+	sessionID      string
+	systemOverride string
 
 	lastReplan    time.Time
 	panicCooldown time.Time
@@ -296,6 +314,7 @@ func NewEngine(
 	c *websocket.Conn,
 	mem MemoryBank,
 	tel *Telemetry,
+	uiHub *UIHub,
 	baseLogger *slog.Logger,
 ) *Engine {
 	sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
@@ -305,6 +324,7 @@ func NewEngine(
 		conn:       c,
 		memory:     mem,
 		telemetry:  tel,
+		uiHub:      uiHub,
 		logger:     baseLogger.With(slog.String("session_id", sessionID)),
 		taskQueue:  make([]Action, 0),
 		planEpoch:  0,
@@ -357,9 +377,7 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
-	var nextTask *Action
-	var summaryKey string
-	var summaryValue string
+	e.uiHub.Broadcast(map[string]interface{}{"type": "event_stream", "payload": eventPayload})
 
 	e.mu.Lock()
 
@@ -374,117 +392,71 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		slog.String("action", eventPayload.Action),
 		slog.String("command_id", eventPayload.CommandID),
 		slog.Int("duration_ms", eventPayload.Duration),
-		slog.Int("plan_epoch", e.planEpoch),
 	}
 
 	switch eventPayload.Event {
+	case "death":
+		e.telemetry.RecordTaskStatus("FAILED")
+		e.resetExecutionStateLocked()
+
+		// Set high-priority recovery directive
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.", e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause)
+		e.lastReplan = time.Time{} // Force immediate replan
+
+		meta.Status = "FAILED"
+		e.memory.LogEvent("death", "Died due to: "+eventPayload.Cause, meta)
+		e.logger.Warn("Bot died, triggering emergency recovery replan", slog.String("cause", eventPayload.Cause))
+
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
 		e.resetExecutionStateLocked()
-
-		// The JS SurvivalSystem handles panics for ~8s. Suppress LLM planning during this window.
 		e.panicCooldown = time.Now().Add(8 * time.Second)
-
 		meta.Status = "PANIC"
 		e.memory.LogEvent("evasion", "Fled from threat: "+eventPayload.Cause, meta)
-
-		e.logger.Warn(
-			"Reflex triggered by client",
-			append(logCtx, slog.String("cause", eventPayload.Cause))...,
-		)
-
-	case "task_started":
-		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring task_started for non-current task", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
-			e.mu.Unlock()
-			return
-		}
-
-		meta.Status = "STARTED"
-		e.memory.LogEvent(eventPayload.Action, "Started task ID: "+eventPayload.CommandID, meta)
-		e.logger.Debug("Task started", logCtx...)
+		e.logger.Warn("Reflex triggered by client", append(logCtx, slog.String("cause", eventPayload.Cause))...)
 
 	case "task_completed":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring stale task_completed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
-
 		e.telemetry.RecordTaskStatus("COMPLETED")
 		meta.Status = "COMPLETED"
 		e.memory.LogEvent(eventPayload.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
-
 		e.inFlightTask = nil
-		nextTask = e.dequeueNextTaskLocked()
-
-	case "task_failed":
-		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring stale task_failed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
-			e.mu.Unlock()
-			return
-		}
-
-		e.telemetry.RecordTaskStatus("FAILED")
-		meta.Status = "FAILED"
-		e.memory.LogEvent(eventPayload.Action, "Task failed", meta)
-		e.logger.Error("Task failed", append(logCtx, slog.String("event", eventPayload.Event))...)
-
-		summaryKey = "Last Failure"
-		summaryValue = eventPayload.Action + " (task_failed)"
-
-		e.resetExecutionStateLocked()
-
-	case "task_aborted":
-		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring stale task_aborted event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
-			e.mu.Unlock()
-			return
-		}
-
-		e.telemetry.RecordTaskStatus("ABORTED")
-		meta.Status = "ABORTED"
-		e.memory.LogEvent(eventPayload.Action, "Task aborted", meta)
-		e.logger.Warn("Task aborted", append(logCtx, slog.String("event", eventPayload.Event))...)
-
-		summaryKey = "Last Failure"
-		summaryValue = eventPayload.Action + " (task_aborted)"
-
-		e.resetExecutionStateLocked()
-
-	default:
-		e.logger.Warn("Ignoring unknown event type", slog.String("event", eventPayload.Event))
 		e.mu.Unlock()
+		go e.processNextTask()
 		return
+
+	case "task_failed", "task_aborted":
+		if !e.matchesInFlightLocked(eventPayload.CommandID) {
+			e.mu.Unlock()
+			return
+		}
+		status := strings.ToUpper(strings.Split(eventPayload.Event, "_")[1])
+		e.telemetry.RecordTaskStatus(status)
+		meta.Status = status
+		e.memory.LogEvent(eventPayload.Action, "Task "+status, meta)
+		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", eventPayload.Event))...)
+
+		e.resetExecutionStateLocked()
+		go e.setSummaryAsync("Last Failure", eventPayload.Action+" ("+eventPayload.Event+")")
 	}
 
 	e.mu.Unlock()
-
-	if summaryKey != "" {
-		e.setSummaryAsync(summaryKey, summaryValue)
-	}
-
-	if nextTask != nil {
-		_ = e.sendCommand(*nextTask)
-	}
 }
 
 func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	var state GameState
 	if err := json.Unmarshal(payload, &state); err != nil {
-		e.logger.Warn("Failed to decode state payload", slog.Any("error", err))
 		return
 	}
 
-	var epochAtStart int
-	var sessionID string
-	var shouldPlan bool
+	e.uiHub.Broadcast(map[string]interface{}{"type": "state_update", "payload": state})
 
 	e.mu.Lock()
-
 	e.lastPos = state.Position
-
 	topThreat := ""
 	if len(state.Threats) > 0 {
 		topThreat = state.Threats[0].Name
@@ -492,60 +464,57 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 
 	healthDropped := state.Health < e.lastHealth && state.Health < 15
 	newThreat := topThreat != "" && topThreat != e.lastThreat
-	timeSinceReplan := time.Since(e.lastReplan)
-
-	busy := e.inFlightTask != nil || len(e.taskQueue) > 0 || e.planning
+	criticalOverride := healthDropped || newThreat
 
 	e.lastHealth = state.Health
 	e.lastThreat = topThreat
 
-	// Abort if busy or if the JS client is currently handling a panic reflex
-	if busy || time.Now().Before(e.panicCooldown) {
+	if time.Now().Before(e.panicCooldown) {
 		e.mu.Unlock()
 		return
 	}
 
-	needsReplan := e.lastReplan.IsZero() ||
-		timeSinceReplan > 10*time.Second ||
-		healthDropped ||
-		newThreat
+	if e.planning && criticalOverride {
+		e.cancelPlanningLocked()
+	}
+
+	busy := e.inFlightTask != nil || len(e.taskQueue) > 0
+	timeSinceReplan := time.Since(e.lastReplan)
+	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
+
+	if busy && !criticalOverride {
+		e.mu.Unlock()
+		return
+	}
+
+	if criticalOverride && busy {
+		e.resetExecutionStateLocked()
+		go e.sendControlMessage("noop", "critical state interrupt")
+	}
 
 	if !needsReplan {
 		e.mu.Unlock()
 		return
 	}
 
-	epochAtStart = e.planEpoch
-	sessionID = e.sessionID
+	epochAtStart := e.planEpoch
+	sessionID := e.sessionID
+	sysOverride := e.systemOverride
+	e.systemOverride = "" // Clear after injecting
 
 	planCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	e.planCancel = cancel
 	e.planning = true
 	e.lastReplan = time.Now()
-	shouldPlan = true
 
 	e.mu.Unlock()
 
-	if !shouldPlan {
-		return
-	}
-
 	e.telemetry.RecordReplan()
-	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID)
+	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride)
 }
 
-func (e *Engine) evaluateAndQueuePlan(
-	ctx context.Context,
-	payload json.RawMessage,
-	epochAtStart int,
-	sessionID string,
-) {
-	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID)
-
-	var nextTask *Action
-	var sendMsgType string
-	var sendReason string
-	var objective string
+func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessage, epochAtStart int, sessionID, sysOverride string) {
+	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID, sysOverride)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -556,27 +525,19 @@ func (e *Engine) evaluateAndQueuePlan(
 	e.planning = false
 
 	if e.planEpoch != epochAtStart {
-		e.logger.Debug(
-			"Discarding stale plan",
-			slog.Int("start_epoch", epochAtStart),
-			slog.Int("current_epoch", e.planEpoch),
-		)
 		return
 	}
 
 	if err != nil {
-		e.logger.Error("Planning failed", slog.Any("error", err))
-		sendMsgType = "planning_error"
-		sendReason = "Failed to generate valid plan"
-		go e.sendControlMessage(sendMsgType, sendReason)
+		if ctx.Err() != context.Canceled {
+			e.logger.Error("Planning failed", slog.Any("error", err))
+			go e.sendControlMessage("planning_error", "Failed to generate valid plan")
+		}
 		return
 	}
 
 	if plan == nil || len(plan.Tasks) == 0 {
-		e.logger.Info("Planner returned no tasks")
-		sendMsgType = "noop"
-		sendReason = "No actionable tasks generated"
-		go e.sendControlMessage(sendMsgType, sendReason)
+		go e.sendControlMessage("noop", "No actionable tasks generated")
 		return
 	}
 
@@ -584,33 +545,60 @@ func (e *Engine) evaluateAndQueuePlan(
 		if plan.Tasks[i].ID == "" {
 			plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
 		}
-
-		if plan.Tasks[i].Target.Type == "" {
-			plan.Tasks[i].Target.Type = "none"
-		}
-		if plan.Tasks[i].Target.Name == "" {
-			plan.Tasks[i].Target.Name = "none"
-		}
 	}
 
-	objective = plan.Objective
+	e.uiHub.Broadcast(map[string]interface{}{"type": "objective_update", "payload": plan.Objective})
+	go e.setSummaryAsync("Current Objective", plan.Objective)
+
 	e.taskQueue = append(e.taskQueue[:0], plan.Tasks...)
-	nextTask = e.dequeueNextTaskLocked()
-
-	e.logger.Info(
-		"New LLM plan generated",
-		slog.String("objective", plan.Objective),
-		slog.Int("task_count", len(plan.Tasks)),
-	)
-
-	go e.setSummaryAsync("Current Objective", objective)
-
-	if nextTask != nil {
-		go e.sendCommand(*nextTask)
-	}
+	e.mu.Unlock()
+	e.processNextTask()
+	e.mu.Lock() // Re-lock for defer
 }
 
-// resetExecutionStateLocked consolidates clearing the queue and bumping the epoch. Must hold e.mu.
+// processNextTask handles execution delegation (Internal Go Memory tasks vs JS Client tasks)
+func (e *Engine) processNextTask() {
+	e.mu.Lock()
+	task := e.dequeueNextTaskLocked()
+	if task == nil {
+		e.mu.Unlock()
+		return
+	}
+
+	// INTERCEPT: Go-Side Internal Tasks
+	if task.Action == "mark_location" {
+		locName := task.Target.Name
+		err := e.memory.MarkLocation(context.Background(), locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+		if err == nil {
+			msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+			e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, X: e.lastPos.X, Y: e.lastPos.Y, Z: e.lastPos.Z, Status: "COMPLETED"})
+			e.logger.Info("Location marked in spatial memory", slog.String("name", locName))
+		}
+		e.inFlightTask = nil
+		e.mu.Unlock()
+		go e.processNextTask() // Immediately grab next task
+		return
+	}
+
+	if task.Action == "recall_location" {
+		locName := task.Target.Name
+		loc, err := e.memory.GetLocation(context.Background(), locName)
+		if err == nil {
+			msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", locName, loc.X, loc.Y, loc.Z)
+			e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, Status: "COMPLETED"})
+			go e.setSummaryAsync("Known Location: "+locName, msg)
+		}
+		e.inFlightTask = nil
+		e.mu.Unlock()
+		go e.processNextTask()
+		return
+	}
+
+	// External Task -> Send to JS Client
+	e.mu.Unlock()
+	_ = e.sendCommand(*task)
+}
+
 func (e *Engine) resetExecutionStateLocked() {
 	e.planEpoch++
 	e.taskQueue = nil
@@ -623,7 +611,6 @@ func (e *Engine) dequeueNextTaskLocked() *Action {
 	if e.inFlightTask != nil || len(e.taskQueue) == 0 {
 		return nil
 	}
-
 	nextTask := e.taskQueue[0]
 	e.taskQueue = e.taskQueue[1:]
 	e.inFlightTask = &nextTask
@@ -634,17 +621,7 @@ func (e *Engine) matchesInFlightLocked(commandID string) bool {
 	if e.inFlightTask == nil {
 		return false
 	}
-	if commandID == "" {
-		return true
-	}
-	return e.inFlightTask.ID == commandID
-}
-
-func (e *Engine) currentTaskIDLocked() string {
-	if e.inFlightTask == nil {
-		return ""
-	}
-	return e.inFlightTask.ID
+	return commandID == "" || e.inFlightTask.ID == commandID
 }
 
 func (e *Engine) cancelPlanningLocked() {
@@ -656,61 +633,24 @@ func (e *Engine) cancelPlanningLocked() {
 }
 
 func (e *Engine) sendCommand(action Action) error {
-	payload, err := json.Marshal(action)
-	if err != nil {
-		e.logger.Error("Failed to marshal command payload", slog.Any("error", err))
-		return err
-	}
+	payload, _ := json.Marshal(action)
+	e.uiHub.Broadcast(map[string]interface{}{"type": "command_dispatch", "payload": action})
 
-	response := map[string]interface{}{
-		"type":    "command",
-		"payload": json.RawMessage(payload),
-	}
-
-	if err := e.writeJSON(response); err != nil {
-		e.logger.Error(
-			"Failed to send command to bot",
-			slog.Any("error", err),
-			slog.String("command_id", action.ID),
-			slog.String("action", action.Action),
-		)
-
+	if err := e.writeJSON(map[string]interface{}{"type": "command", "payload": json.RawMessage(payload)}); err != nil {
 		e.mu.Lock()
 		if e.inFlightTask != nil && e.inFlightTask.ID == action.ID {
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
 		e.mu.Unlock()
-
 		return err
 	}
-
-	e.logger.Debug(
-		"Command dispatched",
-		slog.String("command_id", action.ID),
-		slog.String("action", action.Action),
-		slog.String("target_type", action.Target.Type),
-		slog.String("target_name", action.Target.Name),
-	)
-
 	return nil
 }
 
 func (e *Engine) sendControlMessage(msgType, reason string) {
-	payload, err := json.Marshal(map[string]string{"reason": reason})
-	if err != nil {
-		e.logger.Error("Failed to marshal control payload", slog.Any("error", err))
-		return
-	}
-
-	response := map[string]interface{}{
-		"type":    msgType,
-		"payload": json.RawMessage(payload),
-	}
-
-	if err := e.writeJSON(response); err != nil {
-		e.logger.Error("Failed to send control message", slog.Any("error", err), slog.String("type", msgType))
-	}
+	payload, _ := json.Marshal(map[string]string{"reason": reason})
+	_ = e.writeJSON(map[string]interface{}{"type": msgType, "payload": json.RawMessage(payload)})
 }
 
 func (e *Engine) writeJSON(v interface{}) error {
@@ -723,10 +663,7 @@ func (e *Engine) setSummaryAsync(key, value string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-
-		if err := e.memory.SetSummary(ctx, e.sessionID, key, value); err != nil {
-			e.logger.Warn("Failed to persist session summary", slog.String("key", key), slog.Any("error", err))
-		}
+		_ = e.memory.SetSummary(ctx, e.sessionID, key, value)
 	}()
 }
 
@@ -923,7 +860,32 @@ bot.on("login", () => log.info("Bot logged in"));
 bot.once("spawn", () => {
     log.info("Bot spawned", { env_path: config.ENV_PATH, cwd: process.cwd() });
 
-    (bot as any).pathfinder.setMovements(new Movements(bot));
+    const movements = new Movements(bot);
+    movements.canDig = true;
+
+    // Leaf blocks are flagged as obstacles in some pathfinder versions.
+    // When the bot is on a tree it can't compute any path out, so we
+    // must explicitly remove all leaf variants from the avoidance set.
+    const leafNames = [
+        "oak_leaves",
+        "birch_leaves",
+        "spruce_leaves",
+        "jungle_leaves",
+        "acacia_leaves",
+        "dark_oak_leaves",
+        "mangrove_leaves",
+        "azalea_leaves",
+        "flowering_azalea_leaves",
+        "cherry_leaves",
+    ];
+    for (const name of leafNames) {
+        const block = bot.registry.blocksByName[name];
+        if (block) {
+            movements.blocksToAvoid.delete(block.id);
+        }
+    }
+    (bot as any).pathfinder.setMovements(movements);
+
     client.connect();
     survival.start();
 
@@ -951,6 +913,14 @@ bot.on("death", () => {
     }
     currentTask = null;
     stopMovement();
+
+    client.sendEvent(
+        "death",
+        "died",
+        "",
+        "killed_in_action", // Alternatively extract cause from chat logs if desired
+        0,
+    );
 });
 
 bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));
@@ -1020,9 +990,12 @@ export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
 export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
 
 export const TASK_TIMEOUTS: Record<string, number> = {
-    attack: 20000,
+    gather: 30000,
+    craft: 20000,
+    hunt: 30000,
+    explore: 20000,
+    build: 20000,
     retreat: 15000,
-    mine: 20000,
     idle: 3000,
 };
 
@@ -1353,12 +1326,7 @@ export class SurvivalSystem {
 
         const safePos = computeSafeRetreat(this.bot, threats);
         (this.bot as any).pathfinder.setGoal(
-            new goals.GoalNear(
-                safePos.x,
-                this.bot.entity.position?.y ?? 64,
-                safePos.z,
-                2,
-            ),
+            new goals.GoalNearXZ(safePos.x, safePos.z, 2),
         );
 
         this.reflexTimeout = setTimeout(() => {
@@ -1451,6 +1419,7 @@ export class SurvivalSystem {
 </file>
 
 <file path="js\lib\tasks\task.ts">
+// js/lib/tasks/task.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
@@ -1460,6 +1429,91 @@ const { goals } = pkg;
 // ==========================================
 // TASK HELPERS
 // ==========================================
+
+const TREE_BLOCKS = new Set([
+    "oak_leaves",
+    "birch_leaves",
+    "spruce_leaves",
+    "jungle_leaves",
+    "acacia_leaves",
+    "dark_oak_leaves",
+    "mangrove_leaves",
+    "azalea_leaves",
+    "flowering_azalea_leaves",
+    "cherry_leaves",
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "jungle_log",
+    "acacia_log",
+    "dark_oak_log",
+    "mangrove_log",
+]);
+
+function isOnSolidGround(bot: any): boolean {
+    if (!bot.entity.onGround) return false;
+    const pos = bot.entity.position.floored();
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
+}
+
+function isInFoliage(bot: any): boolean {
+    const pos = bot.entity.position.floored();
+    const at = bot.blockAt(pos);
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return (
+        (at && TREE_BLOCKS.has(at.name)) ||
+        (below && TREE_BLOCKS.has(below.name)) ||
+        (below && below.name === "air" && !bot.entity.onGround)
+    );
+}
+
+export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
+    if (!isInFoliage(bot)) return;
+
+    // Kill any active pathfinder goal — it won't work from inside foliage
+    try {
+        bot.pathfinder.setGoal(null);
+    } catch {}
+    bot.clearControlStates();
+
+    const MAX_ATTEMPTS = 16;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        if (signal.aborted) throw new Error("aborted");
+        if (isOnSolidGround(bot)) return;
+
+        const pos = bot.entity.position.floored();
+        const below = bot.blockAt(pos.offset(0, -1, 0));
+
+        // Dig the leaf/log block below so we fall through
+        if (below && TREE_BLOCKS.has(below.name) && bot.canDigBlock(below)) {
+            try {
+                await bot.dig(below);
+            } catch {}
+        }
+
+        // Let gravity do the work — poll onGround every 150 ms
+        await new Promise<void>((resolve) => {
+            let ticks = 0;
+            const check = () => {
+                ticks++;
+                if (isOnSolidGround(bot) || ticks > 10) {
+                    bot.removeListener("physicsTick", check);
+                    resolve();
+                }
+            };
+            bot.on("physicsTick", check);
+            // Fallback timeout so we never hang
+            setTimeout(() => {
+                bot.removeListener("physicsTick", check);
+                resolve();
+            }, 1500);
+        });
+    }
+    // If we're still stuck after all attempts, throw so the task fails cleanly
+    if (!isOnSolidGround(bot))
+        throw new Error("EscapeTree - could not reach ground");
+}
 
 export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -1500,7 +1554,6 @@ export function moveToGoal(
             return;
         }
 
-        // Prevent hanging if already at the target
         if (goal.isEnd && goal.isEnd(bot.entity.position)) {
             return resolve();
         }
@@ -1524,21 +1577,31 @@ export function moveToGoal(
         };
 
         const onAbort = () => {
+            bot.clearControlStates();
             stopMovement();
             finish(new Error("aborted"));
         };
 
         const onGoalReached = () => {
+            bot.clearControlStates();
             stopMovement();
             finish();
         };
 
         const onPathUpdate = (results: any) => {
-            // Instantly fail if the pathfinder realizes it's trapped
             if (results.status === "noPath") {
-                stopMovement();
-                finish(new Error("NoPath - Bot is likely trapped"));
+                // "noPath" can fire transiently when the bot is inside leaf
+                // or log blocks and the pathfinder is still recalculating.
+                // Only abort if we still have no path after a short grace period.
+                setTimeout(() => {
+                    if (!settled) {
+                        bot.clearControlStates();
+                        stopMovement();
+                        finish(new Error("NoPath - Bot is likely trapped"));
+                    }
+                }, 3500);
             } else if (results.status === "timeout") {
+                bot.clearControlStates();
                 stopMovement();
                 finish(
                     new Error("PathfinderTimeout - Calculation took too long"),
@@ -1547,6 +1610,7 @@ export function moveToGoal(
         };
 
         const timer = setTimeout(() => {
+            bot.clearControlStates();
             stopMovement();
             finish(new Error("timeout"));
         }, timeoutMs);
@@ -1593,17 +1657,14 @@ export async function runTask(
         }
 
         case "retreat": {
+            await escapeTree(bot, signal);
+
             const threats = getThreats();
             const safePos = computeSafeRetreat(threats);
 
             await moveToGoal(
                 bot,
-                new goals.GoalNear(
-                    safePos.x,
-                    bot.entity.position?.y ?? 64,
-                    safePos.z,
-                    2,
-                ),
+                new goals.GoalNearXZ(safePos.x, safePos.z, 2),
                 signal,
                 timeouts.retreat ?? 15000,
                 stopMovement,
@@ -1611,52 +1672,178 @@ export async function runTask(
             return;
         }
 
-        case "attack": {
+        case "gather": {
+            await escapeTree(bot, signal);
+
+            const targetBlockName = decision.target?.name;
+            if (!targetBlockName || targetBlockName === "none") {
+                throw new Error("missing gather target");
+            }
+
+            const block = findNearestBlockByName(bot, targetBlockName);
+            if (!block) {
+                throw new Error(`block not found: ${targetBlockName}`);
+            }
+
+            // Path to block
+            await moveToGoal(
+                bot,
+                new goals.GoalNear(
+                    block.position.x,
+                    block.position.y,
+                    block.position.z,
+                    1.5,
+                ),
+                signal,
+                timeouts.gather ?? 30000,
+                stopMovement,
+            );
+
+            if (signal.aborted) throw new Error("aborted");
+
+            if (!bot.canDigBlock(block)) {
+                throw new Error(`cannot dig block: ${targetBlockName}`);
+            }
+
+            // Attempt to equip the best tool before digging (fail silently if none exists)
+            try {
+                const tool = bot.pathfinder.bestHarvestTool(block);
+                if (tool) await bot.equip(tool, "hand");
+            } catch {}
+
+            await bot.dig(block);
+
+            // Wait for item to spawn and pick it up
+            await waitForMs(500, signal);
+            const drop = bot.nearestEntity(
+                (e: any) =>
+                    e.name === "item" &&
+                    e.position.distanceTo(block.position) < 3,
+            );
+
+            if (drop) {
+                await moveToGoal(
+                    bot,
+                    new goals.GoalFollow(drop, 0),
+                    signal,
+                    3000,
+                    stopMovement,
+                ).catch(() => {}); // Ignore failure, it might have been picked up mid-pathing
+            }
+            return;
+        }
+
+        case "craft": {
+            await escapeTree(bot, signal);
+
+            const targetRecipeName = decision.target?.name;
+            if (!targetRecipeName || targetRecipeName === "none") {
+                throw new Error("missing craft target");
+            }
+
+            const itemType = bot.registry.itemsByName[targetRecipeName];
+            if (!itemType) {
+                throw new Error(`unknown item: ${targetRecipeName}`);
+            }
+
+            const craftingTable = findNearestBlockByName(bot, "crafting_table");
+            const recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
+
+            if (recipes.length === 0) {
+                throw new Error(
+                    `no valid recipe or missing ingredients for ${targetRecipeName}`,
+                );
+            }
+
+            const recipe = recipes[0];
+
+            if (recipe.requiresTable) {
+                if (!craftingTable) {
+                    throw new Error(
+                        "requires crafting table but none are nearby",
+                    );
+                }
+
+                await moveToGoal(
+                    bot,
+                    new goals.GoalNear(
+                        craftingTable.position.x,
+                        craftingTable.position.y,
+                        craftingTable.position.z,
+                        2,
+                    ),
+                    signal,
+                    timeouts.craft ?? 20000,
+                    stopMovement,
+                );
+            }
+
+            if (signal.aborted) throw new Error("aborted");
+
+            await bot.craft(recipe, 1, craftingTable);
+            return;
+        }
+
+        case "hunt": {
+            await escapeTree(bot, signal);
             const targetName = decision.target?.name;
             if (!targetName || targetName === "none") {
-                throw new Error("missing attack target");
+                throw new Error("missing hunt target");
             }
 
             const attackStartedAt = Date.now();
             let hasSeenTarget = false;
-            let lastSeenAt = 0;
 
-            while (Date.now() - attackStartedAt < (timeouts.attack ?? 20000)) {
-                if (signal.aborted) {
-                    throw new Error("aborted");
-                }
+            while (Date.now() - attackStartedAt < (timeouts.hunt ?? 30000)) {
+                if (signal.aborted) throw new Error("aborted");
 
                 const targetEntity = bot.nearestEntity(
                     (e: any) => e.name === targetName && e.isValid,
                 );
 
                 if (!targetEntity) {
-                    if (hasSeenTarget && Date.now() - lastSeenAt > 1500) {
+                    if (hasSeenTarget) {
+                        // Target died or despawned. Look for dropped loot.
+                        const drop = bot.nearestEntity(
+                            (e: any) =>
+                                e.name === "item" &&
+                                bot.entity.position.distanceTo(e.position) < 10,
+                        );
+                        if (drop) {
+                            await moveToGoal(
+                                bot,
+                                new goals.GoalFollow(drop, 0),
+                                signal,
+                                5000,
+                                stopMovement,
+                            ).catch(() => {});
+                        }
                         stopMovement();
                         return;
                     }
-
-                    if (!hasSeenTarget && Date.now() - attackStartedAt > 3000) {
-                        throw new Error(`target not found: ${targetName}`);
-                    }
-
-                    await waitForMs(250, signal);
-                    continue;
+                    throw new Error(`target not found: ${targetName}`);
                 }
 
                 hasSeenTarget = true;
-                lastSeenAt = Date.now();
-
                 bot.pathfinder.setGoal(
                     new goals.GoalFollow(targetEntity, 2),
                     true,
                 );
-                const dist = bot.entity.position.distanceTo(
-                    targetEntity.position,
-                );
 
-                if (dist < 3.2) {
+                if (
+                    bot.entity.position.distanceTo(targetEntity.position) < 3.2
+                ) {
                     try {
+                        // Equip best weapon
+                        const weapon = bot.inventory
+                            .items()
+                            .find(
+                                (i: any) =>
+                                    i.name.includes("sword") ||
+                                    i.name.includes("axe"),
+                            );
+                        if (weapon) await bot.equip(weapon, "hand");
+
                         await bot.lookAt(
                             targetEntity.position.offset(
                                 0,
@@ -1665,52 +1852,31 @@ export async function runTask(
                             ),
                             true,
                         );
-                    } catch {}
-
-                    try {
                         bot.attack(targetEntity);
                     } catch {}
                 }
 
-                await waitForMs(450, signal);
+                await waitForMs(500, signal); // Wait for hit cooldown
             }
 
             throw new Error("timeout");
         }
 
-        case "mine": {
-            const targetBlockName = decision.target?.name;
-            if (!targetBlockName || targetBlockName === "none") {
-                throw new Error("missing mine target");
-            }
+        case "explore": {
+            await escapeTree(bot, signal);
 
-            const block = findNearestBlockByName(bot, targetBlockName);
-            if (!block) {
-                throw new Error(`block not found: ${targetBlockName}`);
-            }
+            // Pick a random point ~30 blocks away to uncover new chunks
+            const angle = Math.random() * Math.PI * 2;
+            const targetX = bot.entity.position.x + Math.cos(angle) * 30;
+            const targetZ = bot.entity.position.z + Math.sin(angle) * 30;
 
             await moveToGoal(
                 bot,
-                new goals.GoalNear(
-                    block.position.x,
-                    block.position.y,
-                    block.position.z,
-                    1,
-                ),
+                new goals.GoalNearXZ(targetX, targetZ, 2),
                 signal,
-                timeouts.mine ?? 20000,
+                timeouts.explore ?? 20000,
                 stopMovement,
             );
-
-            if (signal.aborted) {
-                throw new Error("aborted");
-            }
-
-            if (!bot.canDigBlock(block)) {
-                throw new Error(`cannot dig block: ${targetBlockName}`);
-            }
-
-            await bot.dig(block);
             return;
         }
 
@@ -1785,6 +1951,7 @@ export function computeSafeRetreat(bot: Bot, threats: models.ThreatInfo[]) {
 </file>
 
 <file path="main.go">
+// main.go
 package main
 
 import (
@@ -1814,7 +1981,6 @@ func main() {
 		log.Println("[!] No .env file found. Relying on system environment or defaults.")
 	}
 
-	// Configure structured JSON logging
 	logLevel := slog.LevelInfo
 	if os.Getenv("DEBUG") == "true" {
 		logLevel = slog.LevelDebug
@@ -1822,11 +1988,16 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		logger.Error("Fatal: OPENROUTER_API_KEY environment variable is not set")
+		os.Exit(1)
+	}
+
 	apiURL := os.Getenv("LLM_API_URL")
 	if apiURL == "" {
 		apiURL = DefaultAPI
 	}
-
 	modelName := os.Getenv("LLM_MODEL")
 	if modelName == "" {
 		modelName = DefaultModel
@@ -1843,26 +2014,35 @@ func main() {
 	telemetry := NewTelemetry(logger)
 	go telemetry.StartReporting(context.Background())
 
-	brain := NewLLMBrain(apiURL, modelName, memory, telemetry)
-	logger.Info("Brain wired", slog.String("api", apiURL), slog.String("model", modelName))
+	brain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
 
+	// Phase 4: Wire UI Observability Hub
+	uiHub := NewUIHub(logger)
+
+	// Route 1: JS Bot WebSocket
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
 			return
 		}
+		logger.Info("Bot connected", slog.String("remote_addr", r.RemoteAddr))
 
-		clientIP := r.RemoteAddr
-		logger.Info("Bot connected", slog.String("remote_addr", clientIP))
-
-		engine := NewEngine(brain, conn, memory, telemetry, logger)
+		engine := NewEngine(brain, conn, memory, telemetry, uiHub, logger)
 		engine.Run(context.Background())
 
-		logger.Info("Bot disconnected", slog.String("remote_addr", clientIP))
+		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
 	})
 
+	// Route 2: UI Dashboard WebSocket Feed
+	http.HandleFunc("/ui/ws", uiHub.HandleConnections)
+
+	// Route 3: Simple static HTML dashboard (Optional, serves from current dir if exists)
+	http.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
+
 	logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
+	logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
+
 	if err := http.ListenAndServe(Port, nil); err != nil {
 		logger.Error("Server crashed", slog.Any("error", err))
 		os.Exit(1)
@@ -1897,6 +2077,8 @@ type MemoryBank interface {
 	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
+	MarkLocation(ctx context.Context, name string, x, y, z float64) error
+	GetLocation(ctx context.Context, name string) (*Vec3, error)
 	Close() error
 }
 
@@ -1919,11 +2101,14 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	schema := `
 	PRAGMA journal_mode=WAL;
 	PRAGMA synchronous=NORMAL;
+	PRAGMA busy_timeout=5000;
 
 	CREATE TABLE IF NOT EXISTS events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1972,7 +2157,6 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 	return mem, nil
 }
 
-// processBatches handles asynchronous batched writes to prevent DB locking on the main thread
 func (s *SQLiteMemory) processBatches(ctx context.Context) {
 	defer s.wg.Done()
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -2035,7 +2219,6 @@ func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
 }
 
 func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
-	// Order by deterministic ID to prevent collision on same-second timestamps
 	query := `SELECT timestamp, action, details, status FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {
@@ -2094,6 +2277,25 @@ func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string
 		return "No active summary.", nil
 	}
 	return summary.String(), nil
+}
+
+func (s *SQLiteMemory) MarkLocation(ctx context.Context, name string, x, y, z float64) error {
+	query := `
+	INSERT INTO spatial_memory (name, x, y, z) 
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT(name) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z;`
+	_, err := s.db.ExecContext(ctx, query, name, x, y, z)
+	return err
+}
+
+func (s *SQLiteMemory) GetLocation(ctx context.Context, name string) (*Vec3, error) {
+	query := `SELECT x, y, z FROM spatial_memory WHERE name = ?`
+	var vec Vec3
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&vec.X, &vec.Y, &vec.Z)
+	if err != nil {
+		return nil, err
+	}
+	return &vec, nil
 }
 
 func (s *SQLiteMemory) Close() error {
@@ -2202,14 +2404,89 @@ func (t *Telemetry) StartReporting(ctx context.Context) {
 
 </file>
 
+<file path="ui_hub.go">
+package main
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"sync"
+
+	"github.com/gorilla/websocket"
+)
+
+type UIHub struct {
+	clients map[*websocket.Conn]bool
+	mu      sync.Mutex
+	logger  *slog.Logger
+}
+
+func NewUIHub(logger *slog.Logger) *UIHub {
+	return &UIHub{
+		clients: make(map[*websocket.Conn]bool),
+		logger:  logger,
+	}
+}
+
+func (h *UIHub) HandleConnections(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		h.logger.Error("UI Hub upgrade failed", slog.Any("error", err))
+		return
+	}
+
+	h.mu.Lock()
+	h.clients[ws] = true
+	h.mu.Unlock()
+
+	h.logger.Info("UI Client connected")
+
+	// Read loop to detect disconnects
+	go func() {
+		defer func() {
+			h.mu.Lock()
+			delete(h.clients, ws)
+			h.mu.Unlock()
+			ws.Close()
+			h.logger.Info("UI Client disconnected")
+		}()
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				break
+			}
+		}
+	}()
+}
+
+func (h *UIHub) Broadcast(msg interface{}) {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for client := range h.clients {
+		err := client.WriteMessage(websocket.TextMessage, payload)
+		if err != nil {
+			client.Close()
+			delete(h.clients, client)
+		}
+	}
+}
+
+</file>
+
 
 
 ```json
 {
-  "total_bytes": 56937,
-  "file_count": 14,
-  "estimated_tokens": 14459,
+  "total_bytes": 67343,
+  "file_count": 15,
+  "estimated_tokens": 17072,
   "mode": "full",
-  "generated_at": "2026-03-20T01:33:43.2229294-07:00"
+  "generated_at": "2026-03-20T03:36:14.6619438-07:00"
 }
 ```

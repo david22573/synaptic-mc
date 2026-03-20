@@ -1,6 +1,5 @@
 import { type Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
-
 import * as config from "../config.js";
 import * as models from "../models.js";
 import { log } from "../logger.js";
@@ -43,6 +42,13 @@ export class SurvivalSystem {
 
         this.bot.on("goal_reached", () => {
             if (this.reflexActive) {
+                // Prevent jitter: Don't drop lock if we are still critically low and starving
+                if (this.bot.health < 6 && !this.getBestFood()) {
+                    log.debug(
+                        "Survival goal reached, but health is still critical. Keeping reflex lock.",
+                    );
+                    return;
+                }
                 log.debug("Survival goal reached; releasing reflex lock");
                 this.clearReflexState();
             }
@@ -62,13 +68,15 @@ export class SurvivalSystem {
 
         const threats = getThreats(this.bot);
         const topThreat = threats.length > 0 ? threats[0] : null;
+        const inImmediateDanger = topThreat && topThreat.threatScore > 50;
 
-        if (this.bot.health < 6 || (topThreat && topThreat.threatScore > 50)) {
-            const cause = topThreat?.name || "low_health";
-            this.triggerFlee(threats, cause);
+        // 1. Immediate external threat overrides everything. Flee!
+        if (inImmediateDanger) {
+            this.triggerFlee(threats, topThreat.name);
             return;
         }
 
+        // 2. Immediate point-blank combat defense
         if (topThreat && topThreat.distance < 6) {
             const hasWeapon = this.getBestWeapon();
             if (hasWeapon) {
@@ -77,12 +85,24 @@ export class SurvivalSystem {
             }
         }
 
-        if (this.bot.food < 15) {
+        // 3. Eat if food is low OR if health is low (to trigger passive healing)
+        // Only execute this if we aren't actively running from a high-threat mob
+        if (
+            this.bot.food < 15 ||
+            (this.bot.health < 20 && this.bot.food < 20)
+        ) {
             const food = this.getBestFood();
             if (food) {
                 await this.triggerEat(food);
                 return;
             }
+        }
+
+        // 4. If we have absolutely no food and health is critically low,
+        // trigger a retreat to a safer static area as a last resort
+        if (this.bot.health < 6 && !this.getBestFood()) {
+            this.triggerFlee(threats, "low_health_no_food");
+            return;
         }
     }
 
@@ -110,12 +130,7 @@ export class SurvivalSystem {
 
         const safePos = computeSafeRetreat(this.bot, threats);
         (this.bot as any).pathfinder.setGoal(
-            new goals.GoalNear(
-                safePos.x,
-                this.bot.entity.position?.y ?? 64,
-                safePos.z,
-                2,
-            ),
+            new goals.GoalNearXZ(safePos.x, safePos.z, 2),
         );
 
         this.reflexTimeout = setTimeout(() => {

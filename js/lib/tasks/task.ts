@@ -1,13 +1,94 @@
-// js/lib/tasks/task.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
+import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
 // ==========================================
 // TASK HELPERS
 // ==========================================
+
+const TREE_BLOCKS = new Set([
+    "oak_leaves",
+    "birch_leaves",
+    "spruce_leaves",
+    "jungle_leaves",
+    "acacia_leaves",
+    "dark_oak_leaves",
+    "mangrove_leaves",
+    "azalea_leaves",
+    "flowering_azalea_leaves",
+    "cherry_leaves",
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "jungle_log",
+    "acacia_log",
+    "dark_oak_log",
+    "mangrove_log",
+]);
+
+function isOnSolidGround(bot: any): boolean {
+    if (!bot.entity.onGround) return false;
+    const pos = bot.entity.position.floored();
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
+}
+
+function isInFoliage(bot: any): boolean {
+    const pos = bot.entity.position.floored();
+    const at = bot.blockAt(pos);
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return (
+        (at && TREE_BLOCKS.has(at.name)) ||
+        (below && TREE_BLOCKS.has(below.name)) ||
+        (below && below.name === "air" && !bot.entity.onGround)
+    );
+}
+
+export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
+    if (!isInFoliage(bot)) return;
+
+    try {
+        bot.pathfinder.setGoal(null);
+    } catch {}
+    bot.clearControlStates();
+
+    const MAX_ATTEMPTS = 16;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        if (signal.aborted) throw new Error("aborted");
+        if (isOnSolidGround(bot)) return;
+
+        const pos = bot.entity.position.floored();
+        const below = bot.blockAt(pos.offset(0, -1, 0));
+
+        if (below && TREE_BLOCKS.has(below.name) && bot.canDigBlock(below)) {
+            try {
+                await bot.dig(below);
+            } catch {}
+        }
+
+        await new Promise<void>((resolve) => {
+            let ticks = 0;
+            const check = () => {
+                ticks++;
+                if (isOnSolidGround(bot) || ticks > 10) {
+                    bot.removeListener("physicsTick", check);
+                    resolve();
+                }
+            };
+            bot.on("physicsTick", check);
+            setTimeout(() => {
+                bot.removeListener("physicsTick", check);
+                resolve();
+            }, 1500);
+        });
+    }
+
+    if (!isOnSolidGround(bot))
+        throw new Error("EscapeTree - could not reach ground");
+}
 
 export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -84,9 +165,13 @@ export function moveToGoal(
 
         const onPathUpdate = (results: any) => {
             if (results.status === "noPath") {
-                bot.clearControlStates();
-                stopMovement();
-                finish(new Error("NoPath - Bot is likely trapped"));
+                setTimeout(() => {
+                    if (!settled) {
+                        bot.clearControlStates();
+                        stopMovement();
+                        finish(new Error("NoPath - Bot is likely trapped"));
+                    }
+                }, 3500);
             } else if (results.status === "timeout") {
                 bot.clearControlStates();
                 stopMovement();
@@ -121,6 +206,74 @@ export function findNearestBlockByName(bot: Bot, blockName: string): any {
     });
 }
 
+// Drops low value items to make space, preventing tool loss
+async function makeRoomInInventory(
+    bot: any,
+    slotsNeeded: number = 1,
+): Promise<void> {
+    if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
+
+    const inventory = bot.inventory.items();
+    const trashNames = [
+        "dirt",
+        "cobblestone",
+        "gravel",
+        "rotten_flesh",
+        "spider_eye",
+        "bone",
+        "string",
+        "andesite",
+        "diorite",
+        "granite",
+        "seeds",
+    ];
+
+    const sortedItems = [...inventory].sort((a, b) => {
+        const aIsTrash = trashNames.includes(a.name) ? -1 : 1;
+        const bIsTrash = trashNames.includes(b.name) ? -1 : 1;
+        if (aIsTrash !== bIsTrash) return aIsTrash - bIsTrash;
+        return a.count - b.count;
+    });
+
+    let slotsFreed = 0;
+    for (const item of sortedItems) {
+        if (slotsFreed >= slotsNeeded) break;
+        try {
+            await bot.tossStack(item);
+            slotsFreed++;
+        } catch (err) {
+            // Ignore failure, try next item
+        }
+    }
+}
+
+async function placePortableUtility(bot: any, blockName: string): Promise<any> {
+    const item = bot.inventory.items().find((i: any) => i.name === blockName);
+    if (!item) return null;
+
+    await bot.equip(item, "hand");
+
+    const pos = bot.entity.position.floored();
+    const candidates = [
+        bot.blockAt(pos.offset(1, -1, 0)),
+        bot.blockAt(pos.offset(-1, -1, 0)),
+        bot.blockAt(pos.offset(0, -1, 1)),
+        bot.blockAt(pos.offset(0, -1, -1)),
+    ];
+
+    for (const refBlock of candidates) {
+        if (refBlock && refBlock.name !== "air" && refBlock.name !== "water") {
+            try {
+                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                return findNearestBlockByName(bot, blockName);
+            } catch (err) {
+                // Ignore placement failure, check next adjacent block
+            }
+        }
+    }
+    return null;
+}
+
 // ==========================================
 // TASK EXECUTION
 // ==========================================
@@ -143,18 +296,56 @@ export async function runTask(
             return;
         }
 
+        case "sleep": {
+            await escapeTree(bot, signal);
+
+            const bed = bot.findBlock({
+                maxDistance: 32,
+                matching: (block: any) => block?.name.includes("bed"),
+            });
+
+            if (!bed) {
+                throw new Error("no bed found nearby");
+            }
+
+            await moveToGoal(
+                bot,
+                new goals.GoalNear(
+                    bed.position.x,
+                    bed.position.y,
+                    bed.position.z,
+                    1.5,
+                ),
+                signal,
+                20000,
+                stopMovement,
+            );
+
+            if (signal.aborted) throw new Error("aborted");
+
+            try {
+                await bot.sleep(bed);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (
+                    msg.includes("It's not night") ||
+                    msg.includes("can't sleep")
+                ) {
+                    return;
+                }
+                throw new Error(`sleep interaction failed: ${msg}`);
+            }
+            return;
+        }
+
         case "retreat": {
+            await escapeTree(bot, signal);
             const threats = getThreats();
             const safePos = computeSafeRetreat(threats);
 
             await moveToGoal(
                 bot,
-                new goals.GoalNear(
-                    safePos.x,
-                    bot.entity.position?.y ?? 64,
-                    safePos.z,
-                    2,
-                ),
+                new goals.GoalNearXZ(safePos.x, safePos.z, 2),
                 signal,
                 timeouts.retreat ?? 15000,
                 stopMovement,
@@ -163,17 +354,18 @@ export async function runTask(
         }
 
         case "gather": {
+            await escapeTree(bot, signal);
             const targetBlockName = decision.target?.name;
             if (!targetBlockName || targetBlockName === "none") {
                 throw new Error("missing gather target");
             }
 
             const block = findNearestBlockByName(bot, targetBlockName);
+
             if (!block) {
                 throw new Error(`block not found: ${targetBlockName}`);
             }
 
-            // Path to block
             await moveToGoal(
                 bot,
                 new goals.GoalNear(
@@ -193,16 +385,14 @@ export async function runTask(
                 throw new Error(`cannot dig block: ${targetBlockName}`);
             }
 
-            // Attempt to equip the best tool before digging (fail silently if none exists)
             try {
                 const tool = bot.pathfinder.bestHarvestTool(block);
                 if (tool) await bot.equip(tool, "hand");
             } catch {}
 
             await bot.dig(block);
-
-            // Wait for item to spawn and pick it up
             await waitForMs(500, signal);
+
             const drop = bot.nearestEntity(
                 (e: any) =>
                     e.name === "item" &&
@@ -216,12 +406,14 @@ export async function runTask(
                     signal,
                     3000,
                     stopMovement,
-                ).catch(() => {}); // Ignore failure, it might have been picked up mid-pathing
+                ).catch(() => {});
             }
             return;
         }
 
         case "craft": {
+            await escapeTree(bot, signal);
+
             const targetRecipeName = decision.target?.name;
             if (!targetRecipeName || targetRecipeName === "none") {
                 throw new Error("missing craft target");
@@ -232,9 +424,10 @@ export async function runTask(
                 throw new Error(`unknown item: ${targetRecipeName}`);
             }
 
-            const craftingTable = findNearestBlockByName(bot, "crafting_table");
-            const recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
+            let craftingTable = findNearestBlockByName(bot, "crafting_table");
+            let isPortableTable = false;
 
+            const recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
             if (recipes.length === 0) {
                 throw new Error(
                     `no valid recipe or missing ingredients for ${targetRecipeName}`,
@@ -245,9 +438,16 @@ export async function runTask(
 
             if (recipe.requiresTable) {
                 if (!craftingTable) {
-                    throw new Error(
-                        "requires crafting table but none are nearby",
+                    craftingTable = await placePortableUtility(
+                        bot,
+                        "crafting_table",
                     );
+                    if (!craftingTable) {
+                        throw new Error(
+                            "requires crafting table but none nearby or in inventory",
+                        );
+                    }
+                    isPortableTable = true;
                 }
 
                 await moveToGoal(
@@ -267,10 +467,91 @@ export async function runTask(
             if (signal.aborted) throw new Error("aborted");
 
             await bot.craft(recipe, 1, craftingTable);
+
+            if (isPortableTable && craftingTable) {
+                await makeRoomInInventory(bot, 1);
+                const pickaxe = bot.pathfinder.bestHarvestTool(craftingTable);
+                if (pickaxe) await bot.equip(pickaxe, "hand");
+                await bot.dig(craftingTable);
+                await waitForMs(1000, signal); // Allow time for entity pickup
+            }
+            return;
+        }
+
+        case "smelt": {
+            await escapeTree(bot, signal);
+
+            let furnace = findNearestBlockByName(bot, "furnace");
+            let isPortableFurnace = false;
+
+            if (!furnace) {
+                furnace = await placePortableUtility(bot, "furnace");
+                if (!furnace) {
+                    throw new Error(
+                        "requires furnace but none nearby or in inventory",
+                    );
+                }
+                isPortableFurnace = true;
+            }
+
+            await moveToGoal(
+                bot,
+                new goals.GoalNear(
+                    furnace.position.x,
+                    furnace.position.y,
+                    furnace.position.z,
+                    2,
+                ),
+                signal,
+                20000,
+                stopMovement,
+            );
+
+            if (signal.aborted) throw new Error("aborted");
+
+            const furnaceBlock = bot.openFurnace(furnace);
+
+            try {
+                const rawMeat = bot.inventory
+                    .items()
+                    .find((i: any) =>
+                        [
+                            "beef",
+                            "porkchop",
+                            "mutton",
+                            "chicken",
+                            "rabbit",
+                        ].includes(i.name),
+                    );
+                const fuel = bot.inventory
+                    .items()
+                    .find((i: any) =>
+                        ["coal", "charcoal", "oak_planks"].includes(i.name),
+                    );
+
+                if (rawMeat && fuel) {
+                    await furnaceBlock.putFuel(fuel.type, null, 1);
+                    await furnaceBlock.putInput(rawMeat.type, null, 1);
+                    await waitForMs(11000, signal);
+                    await furnaceBlock.takeOutput();
+                }
+            } finally {
+                furnaceBlock.close();
+
+                if (isPortableFurnace && furnace) {
+                    await makeRoomInInventory(bot, 1);
+                    const pickaxe = bot.pathfinder.bestHarvestTool(furnace);
+                    if (pickaxe) await bot.equip(pickaxe, "hand");
+                    await bot.dig(furnace);
+                    await waitForMs(1000, signal);
+                }
+            }
             return;
         }
 
         case "hunt": {
+            await escapeTree(bot, signal);
+
             const targetName = decision.target?.name;
             if (!targetName || targetName === "none") {
                 throw new Error("missing hunt target");
@@ -288,12 +569,12 @@ export async function runTask(
 
                 if (!targetEntity) {
                     if (hasSeenTarget) {
-                        // Target died or despawned. Look for dropped loot.
                         const drop = bot.nearestEntity(
                             (e: any) =>
                                 e.name === "item" &&
                                 bot.entity.position.distanceTo(e.position) < 10,
                         );
+
                         if (drop) {
                             await moveToGoal(
                                 bot,
@@ -310,6 +591,7 @@ export async function runTask(
                 }
 
                 hasSeenTarget = true;
+
                 bot.pathfinder.setGoal(
                     new goals.GoalFollow(targetEntity, 2),
                     true,
@@ -319,7 +601,6 @@ export async function runTask(
                     bot.entity.position.distanceTo(targetEntity.position) < 3.2
                 ) {
                     try {
-                        // Equip best weapon
                         const weapon = bot.inventory
                             .items()
                             .find(
@@ -341,14 +622,15 @@ export async function runTask(
                     } catch {}
                 }
 
-                await waitForMs(500, signal); // Wait for hit cooldown
+                await waitForMs(500, signal);
             }
 
             throw new Error("timeout");
         }
 
         case "explore": {
-            // Pick a random point ~30 blocks away to uncover new chunks
+            await escapeTree(bot, signal);
+
             const angle = Math.random() * Math.PI * 2;
             const targetX = bot.entity.position.x + Math.cos(angle) * 30;
             const targetZ = bot.entity.position.z + Math.sin(angle) * 30;
@@ -360,6 +642,7 @@ export async function runTask(
                 timeouts.explore ?? 20000,
                 stopMovement,
             );
+
             return;
         }
 

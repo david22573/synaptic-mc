@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,10 +20,11 @@ type Vec3 struct {
 }
 
 type GameState struct {
-	Health   float64 `json:"health"`
-	Food     float64 `json:"food"`
-	Position Vec3    `json:"position"`
-	Threats  []struct {
+	Health    float64 `json:"health"`
+	Food      float64 `json:"food"`
+	TimeOfDay int     `json:"time_of_day"`
+	Position  Vec3    `json:"position"`
+	Threats   []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
 	Inventory []struct {
@@ -148,9 +150,8 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.telemetry.RecordTaskStatus("FAILED")
 		e.resetExecutionStateLocked()
 
-		// Set high-priority recovery directive
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.", e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause)
-		e.lastReplan = time.Time{} // Force immediate replan
+		e.lastReplan = time.Time{}
 
 		meta.Status = "FAILED"
 		e.memory.LogEvent("death", "Died due to: "+eventPayload.Cause, meta)
@@ -159,7 +160,8 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
 		e.resetExecutionStateLocked()
-		e.panicCooldown = time.Now().Add(8 * time.Second)
+
+		e.panicCooldown = time.Now().Add(10 * time.Second)
 		meta.Status = "PANIC"
 		e.memory.LogEvent("evasion", "Fled from threat: "+eventPayload.Cause, meta)
 		e.logger.Warn("Reflex triggered by client", append(logCtx, slog.String("cause", eventPayload.Cause))...)
@@ -190,6 +192,11 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", eventPayload.Event))...)
 
 		e.resetExecutionStateLocked()
+
+		if time.Now().Before(e.panicCooldown) {
+			e.lastReplan = time.Now()
+		}
+
 		go e.setSummaryAsync("Last Failure", eventPayload.Action+" ("+eventPayload.Event+")")
 	}
 
@@ -212,11 +219,12 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	}
 
 	healthDropped := state.Health < e.lastHealth && state.Health < 15
-	newThreat := topThreat != "" && topThreat != e.lastThreat
-	criticalOverride := healthDropped || newThreat
+	criticalOverride := healthDropped
 
 	e.lastHealth = state.Health
 	e.lastThreat = topThreat
+
+	e.evaluateRoutinesLocked(state)
 
 	if time.Now().Before(e.panicCooldown) {
 		e.mu.Unlock()
@@ -249,7 +257,7 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	epochAtStart := e.planEpoch
 	sessionID := e.sessionID
 	sysOverride := e.systemOverride
-	e.systemOverride = "" // Clear after injecting
+	e.systemOverride = ""
 
 	planCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	e.planCancel = cancel
@@ -260,6 +268,100 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 
 	e.telemetry.RecordReplan()
 	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride)
+}
+
+func (e *Engine) evaluateRoutinesLocked(state GameState) {
+	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 {
+		if !e.hasRoutineTaskLocked("sleep", "bed") {
+			e.injectTaskLocked(Action{
+				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
+				Action:    "sleep",
+				Target:    Target{Type: "block", Name: "bed"},
+				Rationale: "Mandatory daily routine: Sleep to skip the night",
+				Priority:  PriRoutine,
+			})
+		}
+	}
+
+	hasCraftingTable := false
+	hasFurnace := false
+	rawMeatCount := 0
+	fuelCount := 0
+
+	for _, item := range state.Inventory {
+		switch item.Name {
+		case "crafting_table":
+			hasCraftingTable = true
+		case "furnace":
+			hasFurnace = true
+		case "beef", "porkchop", "mutton", "chicken", "rabbit":
+			rawMeatCount += item.Count
+		case "coal", "charcoal", "oak_planks", "birch_planks":
+			fuelCount += item.Count
+		}
+	}
+
+	if !hasCraftingTable && !e.hasRoutineTaskLocked("craft", "crafting_table") {
+		e.injectTaskLocked(Action{
+			ID:        fmt.Sprintf("routine-craft-table-%d", time.Now().UnixNano()),
+			Action:    "craft",
+			Target:    Target{Type: "recipe", Name: "crafting_table"},
+			Rationale: "Mandatory tool: Crafting table is missing from inventory",
+			Priority:  PriRoutine,
+		})
+	}
+
+	if !hasFurnace && !e.hasRoutineTaskLocked("craft", "furnace") {
+		e.injectTaskLocked(Action{
+			ID:        fmt.Sprintf("routine-craft-furnace-%d", time.Now().UnixNano()),
+			Action:    "craft",
+			Target:    Target{Type: "recipe", Name: "furnace"},
+			Rationale: "Mandatory tool: Furnace is missing from inventory",
+			Priority:  PriRoutine,
+		})
+	}
+
+	if hasFurnace && rawMeatCount > 0 && fuelCount > 0 && !e.hasRoutineTaskLocked("smelt", "food") {
+		e.injectTaskLocked(Action{
+			ID:        fmt.Sprintf("routine-smelt-%d", time.Now().UnixNano()),
+			Action:    "smelt",
+			Target:    Target{Type: "category", Name: "food"},
+			Rationale: "Routine: Cooking raw food to restore hunger safely",
+			Priority:  PriRoutine,
+		})
+	}
+}
+
+func (e *Engine) hasRoutineTaskLocked(action, targetName string) bool {
+	if e.inFlightTask != nil && e.inFlightTask.Action == action && e.inFlightTask.Target.Name == targetName {
+		return true
+	}
+	for _, t := range e.taskQueue {
+		if t.Action == action && t.Target.Name == targetName {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) injectTaskLocked(task Action) {
+	e.taskQueue = append(e.taskQueue, task)
+
+	sort.SliceStable(e.taskQueue, func(i, j int) bool {
+		return e.taskQueue[i].Priority < e.taskQueue[j].Priority
+	})
+
+	if e.inFlightTask != nil && e.inFlightTask.Priority > task.Priority {
+		e.logger.Info("Routine interrupting in-flight LLM task", slog.String("routine", task.Action))
+		go e.sendControlMessage("abort_task", "Routine interrupt: "+task.Rationale)
+
+		e.inFlightTask = nil
+		e.lastReplan = time.Time{}
+	}
+
+	if e.inFlightTask == nil {
+		go e.processNextTask()
+	}
 }
 
 func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessage, epochAtStart int, sessionID, sysOverride string) {
@@ -300,12 +402,16 @@ func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessa
 	go e.setSummaryAsync("Current Objective", plan.Objective)
 
 	e.taskQueue = append(e.taskQueue[:0], plan.Tasks...)
+
+	sort.SliceStable(e.taskQueue, func(i, j int) bool {
+		return e.taskQueue[i].Priority < e.taskQueue[j].Priority
+	})
+
 	e.mu.Unlock()
 	e.processNextTask()
-	e.mu.Lock() // Re-lock for defer
+	e.mu.Lock()
 }
 
-// processNextTask handles execution delegation (Internal Go Memory tasks vs JS Client tasks)
 func (e *Engine) processNextTask() {
 	e.mu.Lock()
 	task := e.dequeueNextTaskLocked()
@@ -314,7 +420,6 @@ func (e *Engine) processNextTask() {
 		return
 	}
 
-	// INTERCEPT: Go-Side Internal Tasks
 	if task.Action == "mark_location" {
 		locName := task.Target.Name
 		err := e.memory.MarkLocation(context.Background(), locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
@@ -325,7 +430,7 @@ func (e *Engine) processNextTask() {
 		}
 		e.inFlightTask = nil
 		e.mu.Unlock()
-		go e.processNextTask() // Immediately grab next task
+		go e.processNextTask()
 		return
 	}
 
@@ -343,7 +448,6 @@ func (e *Engine) processNextTask() {
 		return
 	}
 
-	// External Task -> Send to JS Client
 	e.mu.Unlock()
 	_ = e.sendCommand(*task)
 }

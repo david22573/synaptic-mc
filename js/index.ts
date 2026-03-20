@@ -124,6 +124,7 @@ async function executeDecision(decision: models.IncomingDecision) {
     };
 
     stopMovement();
+
     client.sendEvent(
         "task_started",
         taskLabel(currentTask),
@@ -173,6 +174,7 @@ async function executeDecision(decision: models.IncomingDecision) {
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
+
         if (taskAbortController?.signal === signal) {
             taskAbortController = null;
         }
@@ -188,7 +190,29 @@ bot.on("login", () => log.info("Bot logged in"));
 bot.once("spawn", () => {
     log.info("Bot spawned", { env_path: config.ENV_PATH, cwd: process.cwd() });
 
-    (bot as any).pathfinder.setMovements(new Movements(bot));
+    const movements = new Movements(bot);
+    movements.canDig = true;
+
+    const leafNames = [
+        "oak_leaves",
+        "birch_leaves",
+        "spruce_leaves",
+        "jungle_leaves",
+        "acacia_leaves",
+        "dark_oak_leaves",
+        "mangrove_leaves",
+        "azalea_leaves",
+        "flowering_azalea_leaves",
+        "cherry_leaves",
+    ];
+    for (const name of leafNames) {
+        const block = bot.registry.blocksByName[name];
+        if (block) {
+            movements.blocksToAvoid.delete(block.id);
+        }
+    }
+    (bot as any).pathfinder.setMovements(movements);
+
     client.connect();
     survival.start();
 
@@ -196,7 +220,7 @@ bot.once("spawn", () => {
         try {
             viewer(bot, {
                 port: config.VIEWER_PORT,
-                firstPerson: false,
+                firstPerson: true,
                 viewDistance: 2,
             });
             log.info("Prismarine viewer started", { port: config.VIEWER_PORT });
@@ -217,13 +241,7 @@ bot.on("death", () => {
     currentTask = null;
     stopMovement();
 
-    client.sendEvent(
-        "death",
-        "died",
-        "",
-        "killed_in_action", // Alternatively extract cause from chat logs if desired
-        0,
-    );
+    client.sendEvent("death", "died", "", "killed_in_action", 0);
 });
 
 bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));
@@ -246,6 +264,7 @@ setInterval(() => {
     const state = {
         health: Math.round(bot.health),
         food: Math.round(bot.food),
+        time_of_day: bot.time.timeOfDay,
         position: {
             x: Math.round(bot.entity.position.x),
             y: Math.round(bot.entity.position.y),
