@@ -1,0 +1,230 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+type EventMeta struct {
+	SessionID string
+	Status    string
+	X, Y, Z   float64
+}
+
+type MemoryBank interface {
+	LogEvent(action, details string, meta EventMeta)
+	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
+	SetSummary(ctx context.Context, sessionID, key, value string) error
+	GetSummary(ctx context.Context, sessionID string) (string, error)
+	Close() error
+}
+
+type pendingEvent struct {
+	action  string
+	details string
+	meta    EventMeta
+}
+
+type SQLiteMemory struct {
+	db        *sql.DB
+	eventChan chan pendingEvent
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
+}
+
+func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite: %w", err)
+	}
+
+	db.SetMaxOpenConns(1)
+
+	schema := `
+	PRAGMA journal_mode=WAL;
+	PRAGMA synchronous=NORMAL;
+
+	CREATE TABLE IF NOT EXISTS events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		action TEXT,
+		details TEXT,
+		status TEXT,
+		x REAL,
+		y REAL,
+		z REAL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
+
+	CREATE TABLE IF NOT EXISTS session_summary (
+		session_id TEXT NOT NULL,
+		key TEXT NOT NULL,
+		value TEXT NOT NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (session_id, key)
+	);
+
+	CREATE TABLE IF NOT EXISTS spatial_memory (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT UNIQUE,
+		x REAL,
+		y REAL,
+		z REAL
+	);
+	`
+	if _, err := db.Exec(schema); err != nil {
+		return nil, fmt.Errorf("failed to apply schema: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mem := &SQLiteMemory{
+		db:        db,
+		eventChan: make(chan pendingEvent, 1000),
+		cancel:    cancel,
+	}
+
+	mem.wg.Add(1)
+	go mem.processBatches(ctx)
+
+	return mem, nil
+}
+
+// processBatches handles asynchronous batched writes to prevent DB locking on the main thread
+func (s *SQLiteMemory) processBatches(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var batch []pendingEvent
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		tx, err := s.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			log.Printf("[-] Failed to begin tx for batch: %v", err)
+			return
+		}
+
+		stmt, err := tx.Prepare(`INSERT INTO events (session_id, action, details, status, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		defer stmt.Close()
+
+		for _, e := range batch {
+			_, err := stmt.Exec(e.meta.SessionID, e.action, e.details, e.meta.Status, e.meta.X, e.meta.Y, e.meta.Z)
+			if err != nil {
+				log.Printf("[-] Failed to insert event: %v", err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("[-] Failed to commit event batch: %v", err)
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case e := <-s.eventChan:
+			batch = append(batch, e)
+			if len(batch) >= 100 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
+	select {
+	case s.eventChan <- pendingEvent{action: action, details: details, meta: meta}:
+	default:
+		log.Println("[-] Event buffer full, dropping event")
+	}
+}
+
+func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
+	// Order by deterministic ID to prevent collision on same-second timestamps
+	query := `SELECT timestamp, action, details, status FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var events []string
+	for rows.Next() {
+		var timestamp time.Time
+		var action, details, status string
+		if err := rows.Scan(&timestamp, &action, &details, &status); err != nil {
+			return "", err
+		}
+		events = append(events, fmt.Sprintf("[%s] %s (%s): %s", timestamp.Format("15:04:05"), action, status, details))
+	}
+
+	var contextStr strings.Builder
+	for i := len(events) - 1; i >= 0; i-- {
+		contextStr.WriteString(events[i])
+		contextStr.WriteString("\n")
+	}
+
+	return contextStr.String(), nil
+}
+
+func (s *SQLiteMemory) SetSummary(ctx context.Context, sessionID, key, value string) error {
+	query := `
+	INSERT INTO session_summary (session_id, key, value, updated_at) 
+	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(session_id, key) DO UPDATE SET 
+		value = excluded.value, 
+		updated_at = CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, sessionID, key, value)
+	return err
+}
+
+func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string, error) {
+	query := `SELECT key, value FROM session_summary WHERE session_id = ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var summary strings.Builder
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return "", err
+		}
+		summary.WriteString(fmt.Sprintf("- %s: %s\n", key, value))
+	}
+
+	if summary.Len() == 0 {
+		return "No active summary.", nil
+	}
+	return summary.String(), nil
+}
+
+func (s *SQLiteMemory) Close() error {
+	s.cancel()
+	s.wg.Wait()
+	close(s.eventChan)
+	return s.db.Close()
+}
