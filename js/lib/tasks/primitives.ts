@@ -1,5 +1,5 @@
-import { type Bot } from "mineflayer";
-import { Entity } from "prismarine-entity";
+import type { Bot } from "mineflayer";
+import type { Entity } from "prismarine-entity";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;

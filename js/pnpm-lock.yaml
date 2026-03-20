@@ -14,6 +14,9 @@ importers:
       dotenv:
         specifier: ^17.3.1
         version: 17.3.1
+      minecraft-assets:
+        specifier: ^1.17.0
+        version: 1.17.0
       mineflayer:
         specifier: ^4.35.0
         version: 4.35.0
@@ -616,6 +619,9 @@ packages:
   mimic-response@3.1.0:
     resolution: {integrity: sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==}
     engines: {node: '>=10'}
+
+  minecraft-assets@1.17.0:
+    resolution: {integrity: sha512-dBs+8ABdnUp9E19LVg4Y2d6BPxUI02+qLXEEsGhcaB4VHfpIMZXcH6jVWg1pFNtBCOipPdQuIb2dBnXdVZlqfQ==}
 
   minecraft-data@3.105.0:
     resolution: {integrity: sha512-4bu0PYcd7qFDmLHYA0wzFYS9jqO4EpbbD4ntzdNg/wsLgqpQ/Mku8UbQcQFdap0X2zN+7Eiio0GYq2SOEoOCfg==}
@@ -1579,6 +1585,8 @@ snapshots:
   mime@1.6.0: {}
 
   mimic-response@3.1.0: {}
+
+  minecraft-assets@1.17.0: {}
 
   minecraft-data@3.105.0: {}
 

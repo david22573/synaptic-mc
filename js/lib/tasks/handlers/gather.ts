@@ -1,5 +1,5 @@
 import type { TaskContext } from "../registry.js";
-import { escapeTree, waitForMs } from "../task.js";
+import { escapeTree, waitForMs } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
@@ -33,7 +33,6 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
     // the exact name with no fallback.
     const isLogRequest =
         requestedTarget.endsWith("_log") || requestedTarget === "wood";
-
     const candidates: string[] = isLogRequest
         ? [requestedTarget, ...LOG_TYPES.filter((l) => l !== requestedTarget)]
         : [requestedTarget];
@@ -63,9 +62,7 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
     if (signal.aborted) throw new Error("aborted");
 
     // pathfinder.goto() is a Promise that resolves on goal_reached and
-    // rejects on noPath / timeout. It is far more reliable than manually
-    // listening to the "goal_reached" event, which can fire before the
-    // listener is registered when the bot is already adjacent.
+    // rejects on noPath / timeout.
     const gotoTimeout = timeouts.gather ?? 30000;
     const gotoPromise = (bot as any).pathfinder.goto(
         new goals.GoalGetToBlock(

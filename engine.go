@@ -512,13 +512,12 @@ func (e *Engine) evaluateAndQueuePlan(
 		return
 	}
 
-	if plan == nil || len(plan.Tasks) == 0 {
-		go e.sendControlMessage("noop", "No actionable tasks generated")
+	if plan == nil {
+		go e.sendControlMessage("noop", "Invalid plan payload received")
 		return
 	}
 
-	// ── If the tactical planner signals milestone completion, clear it
-	// so the next state tick kicks off a fresh milestone generation. ────
+	// ── FIX: Process Milestone Completion FIRST ────────────────────────
 	if plan.MilestoneComplete && e.activeMilestone != nil {
 		e.logger.Info("Milestone marked complete by tactical planner",
 			slog.String("milestone", e.activeMilestone.Description),
@@ -527,9 +526,16 @@ func (e *Engine) evaluateAndQueuePlan(
 			EventMeta{SessionID: e.sessionID, Status: "COMPLETED"},
 		)
 		go e.setSummaryAsync("Last Completed Milestone", e.activeMilestone.Description)
+
 		e.activeMilestone = nil
 		e.milestoneStallCount = 0
 		e.tasksCompletedThisMilestone = 0
+	}
+
+	// Now check if we have actionable tasks for the current tick
+	if len(plan.Tasks) == 0 {
+		go e.sendControlMessage("noop", "No actionable tasks generated")
+		return
 	}
 
 	for i := range plan.Tasks {
