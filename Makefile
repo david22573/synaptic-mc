@@ -18,7 +18,7 @@ run-server: ## Run the Go control plane directly
 
 run-bot: ## Run the Mineflayer TypeScript bot directly
 	@echo "==> Starting Mineflayer Bot..."
-	cd js && npx ts-node bot.ts
+	cd js && npx ts-node index.ts
 
 dev: ## Run both server and bot concurrently in one terminal
 	@echo "==> Starting CraftD Control Plane and Bot..."
@@ -26,7 +26,7 @@ dev: ## Run both server and bot concurrently in one terminal
 	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
 	go run *.go & \
 	sleep 2; \
-	cd js && npx ts-node bot.ts
+	cd js && npx ts-node index.ts
 
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."
