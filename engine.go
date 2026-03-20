@@ -1,3 +1,4 @@
+// engine.go
 package main
 
 import (
@@ -146,7 +147,7 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.telemetry.RecordPanic()
 		e.resetExecutionStateLocked()
 
-		// The JS SurvivalSystem handles panics for ~8s. Suppress LLM planning during this window.
+		// The JS SurvivalSystem handles panics for ~8s. Suppress normal planning.
 		e.panicCooldown = time.Now().Add(8 * time.Second)
 
 		meta.Status = "PANIC"
@@ -248,7 +249,6 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	e.mu.Lock()
 
 	e.lastPos = state.Position
-
 	topThreat := ""
 	if len(state.Threats) > 0 {
 		topThreat = state.Threats[0].Name
@@ -256,23 +256,43 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 
 	healthDropped := state.Health < e.lastHealth && state.Health < 15
 	newThreat := topThreat != "" && topThreat != e.lastThreat
-	timeSinceReplan := time.Since(e.lastReplan)
-
-	busy := e.inFlightTask != nil || len(e.taskQueue) > 0 || e.planning
+	criticalOverride := healthDropped || newThreat
 
 	e.lastHealth = state.Health
 	e.lastThreat = topThreat
 
-	// Abort if busy or if the JS client is currently handling a panic reflex
-	if busy || time.Now().Before(e.panicCooldown) {
+	// Abort if the JS client is currently handling a panic reflex
+	if time.Now().Before(e.panicCooldown) {
 		e.mu.Unlock()
 		return
 	}
 
-	needsReplan := e.lastReplan.IsZero() ||
-		timeSinceReplan > 10*time.Second ||
-		healthDropped ||
-		newThreat
+	// Context Cancellation: Preempt stale LLM calls if the environment changes critically
+	if e.planning {
+		if criticalOverride {
+			e.logger.Warn("Preempting ongoing LLM plan due to critical state change")
+			e.cancelPlanningLocked()
+		} else {
+			e.mu.Unlock()
+			return
+		}
+	}
+
+	busy := e.inFlightTask != nil || len(e.taskQueue) > 0
+	timeSinceReplan := time.Since(e.lastReplan)
+	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride
+
+	// Don't interrupt standard workflows for routine replans
+	if busy && !criticalOverride {
+		e.mu.Unlock()
+		return
+	}
+
+	// If critical and busy, flush the execution queue to allow new priorities
+	if criticalOverride && busy {
+		e.resetExecutionStateLocked()
+		go e.sendControlMessage("noop", "critical state interrupt")
+	}
 
 	if !needsReplan {
 		e.mu.Unlock()
@@ -329,6 +349,10 @@ func (e *Engine) evaluateAndQueuePlan(
 	}
 
 	if err != nil {
+		if ctx.Err() == context.Canceled {
+			e.logger.Debug("Planning cancelled gracefully via preemptive replan")
+			return
+		}
 		e.logger.Error("Planning failed", slog.Any("error", err))
 		sendMsgType = "planning_error"
 		sendReason = "Failed to generate valid plan"

@@ -35,6 +35,12 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		logger.Error("Fatal: OPENROUTER_API_KEY environment variable is not set")
+		os.Exit(1)
+	}
+
 	apiURL := os.Getenv("LLM_API_URL")
 	if apiURL == "" {
 		apiURL = DefaultAPI
@@ -56,7 +62,8 @@ func main() {
 	telemetry := NewTelemetry(logger)
 	go telemetry.StartReporting(context.Background())
 
-	brain := NewLLMBrain(apiURL, modelName, memory, telemetry)
+	// Pass apiKey on initialization to avoid reading environment variables on every tick
+	brain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
 	logger.Info("Brain wired", slog.String("api", apiURL), slog.String("model", modelName))
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {

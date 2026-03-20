@@ -34,7 +34,7 @@ export class SurvivalSystem {
     }
 
     public start(): void {
-        this.bot.on("physicTick", () => {
+        this.bot.on("physicsTick", () => {
             const now = Date.now();
             if (now - this.lastTickTime < 500) return;
             this.lastTickTime = now;

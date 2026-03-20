@@ -1,17 +1,21 @@
-Project Context Dump (19 Mar 26 23:03 PDT)
+Project Context Dump (20 Mar 26 01:33 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 10
+Total Files: 14
 
 # Project Structure
 <file_tree>
 - Makefile
 - brain.go
 - engine.go
-- js\bot.ts
+- js\index.ts
+- js\lib\config.ts
 - js\lib\logger.ts
 - js\lib\models.ts
+- js\lib\network\client.ts
+- js\lib\systems\survival.ts
 - js\lib\tasks\task.ts
+- js\lib\utils\threats.ts
 - main.go
 - memory.go
 - telemetry.go
@@ -39,15 +43,14 @@ run-server: ## Run the Go control plane directly
 
 run-bot: ## Run the Mineflayer TypeScript bot directly
 	@echo "==> Starting Mineflayer Bot..."
-	cd js && npx ts-node bot.ts
+	cd js && npx tsx index.ts
 
 dev: ## Run both server and bot concurrently in one terminal
 	@echo "==> Starting CraftD Control Plane and Bot..."
-	@# Trap SIGINT (Ctrl+C) to ensure the backgrounded Go server is killed
 	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
 	go run *.go & \
 	sleep 2; \
-	cd js && npx ts-node bot.ts
+	cd js && npx tsx index.ts
 
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."
@@ -281,10 +284,11 @@ type Engine struct {
 	planCancel context.CancelFunc
 	sessionID  string
 
-	lastReplan time.Time
-	lastHealth float64
-	lastThreat string
-	lastPos    Vec3
+	lastReplan    time.Time
+	panicCooldown time.Time
+	lastHealth    float64
+	lastThreat    string
+	lastPos       Vec3
 }
 
 func NewEngine(
@@ -331,10 +335,8 @@ func (e *Engine) Run(ctx context.Context) {
 		switch msg.Type {
 		case "event":
 			e.handleEvent(ctx, msg.Payload)
-
 		case "state":
 			e.handleState(ctx, msg.Payload)
-
 		default:
 			e.logger.Warn("Ignoring unknown message type", slog.String("type", msg.Type))
 		}
@@ -378,61 +380,40 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 	switch eventPayload.Event {
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
-		e.planEpoch++
-		e.taskQueue = nil
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.cancelPlanningLocked()
+		e.resetExecutionStateLocked()
+
+		// The JS SurvivalSystem handles panics for ~8s. Suppress LLM planning during this window.
+		e.panicCooldown = time.Now().Add(8 * time.Second)
 
 		meta.Status = "PANIC"
-		e.memory.LogEvent(
-			"evasion",
-			"Fled from threat: "+eventPayload.Cause,
-			meta,
-		)
+		e.memory.LogEvent("evasion", "Fled from threat: "+eventPayload.Cause, meta)
 
 		e.logger.Warn(
-			"Reflex triggered",
+			"Reflex triggered by client",
 			append(logCtx, slog.String("cause", eventPayload.Cause))...,
 		)
 
 	case "task_started":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring task_started for non-current task",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring task_started for non-current task", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		meta.Status = "STARTED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Started task ID: "+eventPayload.CommandID,
-			meta,
-		)
-
+		e.memory.LogEvent(eventPayload.Action, "Started task ID: "+eventPayload.CommandID, meta)
 		e.logger.Debug("Task started", logCtx...)
 
 	case "task_completed":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring stale task_completed event",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring stale task_completed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		e.telemetry.RecordTaskStatus("COMPLETED")
 		meta.Status = "COMPLETED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Finished successfully",
-			meta,
-		)
-
+		e.memory.LogEvent(eventPayload.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
 
 		e.inFlightTask = nil
@@ -440,73 +421,40 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 
 	case "task_failed":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring stale task_failed event",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring stale task_failed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		e.telemetry.RecordTaskStatus("FAILED")
 		meta.Status = "FAILED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Task failed",
-			meta,
-		)
-
-		e.logger.Error(
-			"Task failed",
-			append(logCtx, slog.String("event", eventPayload.Event))...,
-		)
+		e.memory.LogEvent(eventPayload.Action, "Task failed", meta)
+		e.logger.Error("Task failed", append(logCtx, slog.String("event", eventPayload.Event))...)
 
 		summaryKey = "Last Failure"
 		summaryValue = eventPayload.Action + " (task_failed)"
 
-		e.planEpoch++
-		e.taskQueue = nil
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.cancelPlanningLocked()
+		e.resetExecutionStateLocked()
 
 	case "task_aborted":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring stale task_aborted event",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring stale task_aborted event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		e.telemetry.RecordTaskStatus("ABORTED")
 		meta.Status = "ABORTED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Task aborted",
-			meta,
-		)
-
-		e.logger.Warn(
-			"Task aborted",
-			append(logCtx, slog.String("event", eventPayload.Event))...,
-		)
+		e.memory.LogEvent(eventPayload.Action, "Task aborted", meta)
+		e.logger.Warn("Task aborted", append(logCtx, slog.String("event", eventPayload.Event))...)
 
 		summaryKey = "Last Failure"
 		summaryValue = eventPayload.Action + " (task_aborted)"
 
-		e.planEpoch++
-		e.taskQueue = nil
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.cancelPlanningLocked()
+		e.resetExecutionStateLocked()
 
 	default:
-		e.logger.Warn(
-			"Ignoring unknown event type",
-			slog.String("event", eventPayload.Event),
-		)
+		e.logger.Warn("Ignoring unknown event type", slog.String("event", eventPayload.Event))
 		e.mu.Unlock()
 		return
 	}
@@ -529,7 +477,6 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
-	var deterministicTask *Action
 	var epochAtStart int
 	var sessionID string
 	var shouldPlan bool
@@ -552,39 +499,9 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	e.lastHealth = state.Health
 	e.lastThreat = topThreat
 
-	if busy {
+	// Abort if busy or if the JS client is currently handling a panic reflex
+	if busy || time.Now().Before(e.panicCooldown) {
 		e.mu.Unlock()
-		return
-	}
-
-	if state.Health < 10 && topThreat != "" {
-		e.telemetry.RecordReplan()
-		e.logger.Warn(
-			"Deterministic override: low health plus threat; retreating",
-			slog.Float64("health", state.Health),
-			slog.String("top_threat", topThreat),
-		)
-
-		e.lastReplan = time.Now()
-		e.taskQueue = []Action{
-			{
-				ID:     fmt.Sprintf("cmd-det-%d", time.Now().UnixNano()),
-				Action: "retreat",
-				Target: Target{
-					Type: "none",
-					Name: "none",
-				},
-				Rationale: "Health critical, threat present",
-			},
-		}
-
-		deterministicTask = e.dequeueNextTaskLocked()
-		e.mu.Unlock()
-
-		e.setSummaryAsync("Current Objective", "Emergency retreat")
-		if deterministicTask != nil {
-			_ = e.sendCommand(*deterministicTask)
-		}
 		return
 	}
 
@@ -614,7 +531,6 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	}
 
 	e.telemetry.RecordReplan()
-
 	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID)
 }
 
@@ -666,11 +582,7 @@ func (e *Engine) evaluateAndQueuePlan(
 
 	for i := range plan.Tasks {
 		if plan.Tasks[i].ID == "" {
-			plan.Tasks[i].ID = fmt.Sprintf(
-				"cmd-llm-%d-%d",
-				time.Now().UnixNano(),
-				i,
-			)
+			plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
 		}
 
 		if plan.Tasks[i].Target.Type == "" {
@@ -698,6 +610,15 @@ func (e *Engine) evaluateAndQueuePlan(
 	}
 }
 
+// resetExecutionStateLocked consolidates clearing the queue and bumping the epoch. Must hold e.mu.
+func (e *Engine) resetExecutionStateLocked() {
+	e.planEpoch++
+	e.taskQueue = nil
+	e.inFlightTask = nil
+	e.lastReplan = time.Time{}
+	e.cancelPlanningLocked()
+}
+
 func (e *Engine) dequeueNextTaskLocked() *Action {
 	if e.inFlightTask != nil || len(e.taskQueue) == 0 {
 		return nil
@@ -713,11 +634,9 @@ func (e *Engine) matchesInFlightLocked(commandID string) bool {
 	if e.inFlightTask == nil {
 		return false
 	}
-
 	if commandID == "" {
 		return true
 	}
-
 	return e.inFlightTask.ID == commandID
 }
 
@@ -790,11 +709,7 @@ func (e *Engine) sendControlMessage(msgType, reason string) {
 	}
 
 	if err := e.writeJSON(response); err != nil {
-		e.logger.Error(
-			"Failed to send control message",
-			slog.Any("error", err),
-			slog.String("type", msgType),
-		)
+		e.logger.Error("Failed to send control message", slog.Any("error", err), slog.String("type", msgType))
 	}
 }
 
@@ -810,30 +725,276 @@ func (e *Engine) setSummaryAsync(key, value string) {
 		defer cancel()
 
 		if err := e.memory.SetSummary(ctx, e.sessionID, key, value); err != nil {
-			e.logger.Warn(
-				"Failed to persist session summary",
-				slog.String("key", key),
-				slog.Any("error", err),
-			)
+			e.logger.Warn("Failed to persist session summary", slog.String("key", key), slog.Any("error", err))
 		}
 	}()
 }
 
 </file>
 
-<file path="js\bot.ts">
+<file path="js\index.ts">
+import pkg from "mineflayer-pathfinder";
+import mineflayer from "mineflayer";
+import { mineflayer as viewer } from "prismarine-viewer";
+
+import * as config from "./lib/config.js";
+import { log } from "./lib/logger.js";
+import * as models from "./lib/models.js";
+import { runTask } from "./lib/tasks/task.js";
+import { ControlPlaneClient } from "./lib/network/client.js";
+import { SurvivalSystem } from "./lib/systems/survival.js";
+import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
+
+const { pathfinder, Movements } = pkg;
+
+(log as any).warn = (msg: string, meta: Record<string, unknown> = {}) =>
+    console.warn(
+        JSON.stringify({
+            level: "WARN",
+            msg,
+            ...meta,
+            timestamp: new Date().toISOString(),
+        }),
+    );
+
+// ==========================================
+// GLOBALS & STATE
+// ==========================================
+
+let currentTask: models.ActiveTask | null = null;
+let taskAbortController: AbortController | null = null;
+
+const bot = mineflayer.createBot({
+    host: "localhost",
+    port: 25565,
+    username: "CraftBot",
+    version: "1.19",
+});
+
+bot.loadPlugin(pathfinder);
+
+const client = new ControlPlaneClient(config.WS_URL, {
+    onCommand: (decision) => void executeDecision(decision),
+    onUnlock: () => {
+        log.debug("Bot unlocked from control plane");
+    },
+});
+
+const survival = new SurvivalSystem(bot, client, {
+    onInterrupt: (reason: string) => {
+        if (taskAbortController) {
+            log.info(`LLM Task interrupted by survival reflex: ${reason}`);
+            taskAbortController.abort();
+            taskAbortController = null;
+        }
+    },
+    stopMovement: () => stopMovement(),
+});
+
+// ==========================================
+// STATE HELPERS
+// ==========================================
+
+function taskLabel(task: Pick<models.ActiveTask, "action" | "target">) {
+    return `${task.action} ${task.target?.name || "none"}`.trim();
+}
+
+function stopMovement() {
+    try {
+        bot.clearControlStates();
+    } catch {}
+    try {
+        (bot as any).pathfinder.setGoal(null);
+    } catch {}
+}
+
+function completeTask(
+    status:
+        | "task_completed"
+        | "task_failed"
+        | "task_aborted" = "task_completed",
+) {
+    if (!currentTask) return;
+
+    client.sendEvent(
+        status,
+        taskLabel(currentTask),
+        currentTask.id,
+        "",
+        currentTask.startTime,
+    );
+
+    currentTask = null;
+}
+
+// ==========================================
+// ORCHESTRATION
+// ==========================================
+
+async function executeDecision(decision: models.IncomingDecision) {
+    if (!decision?.action) {
+        log.error("Received malformed command", { decision });
+        return;
+    }
+
+    log.info("Executing decision", {
+        id: decision.id,
+        action: decision.action,
+        target_type: decision.target?.type,
+        target_name: decision.target?.name,
+    });
+
+    if (taskAbortController) {
+        taskAbortController.abort();
+    }
+
+    taskAbortController = new AbortController();
+    const signal = taskAbortController.signal;
+
+    currentTask = {
+        id: decision.id,
+        action: decision.action,
+        target: decision.target || { type: "none", name: "none" },
+        startTime: Date.now(),
+    };
+
+    stopMovement();
+    client.sendEvent(
+        "task_started",
+        taskLabel(currentTask),
+        decision.id,
+        "",
+        currentTask.startTime,
+    );
+
+    const timeoutMs = config.TASK_TIMEOUTS[decision.action] || 10000;
+    let timeoutId: NodeJS.Timeout | null = null;
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+    });
+
+    try {
+        await Promise.race([
+            runTask(
+                bot,
+                decision,
+                signal,
+                config.TASK_TIMEOUTS,
+                () => getThreats(bot),
+                (threats) => computeSafeRetreat(bot, threats),
+                stopMovement,
+            ),
+            timeoutPromise,
+        ]);
+
+        if (!signal.aborted) {
+            completeTask("task_completed");
+        }
+    } catch (err) {
+        const message =
+            err instanceof Error ? err.message : String(err || "unknown_error");
+
+        if (signal.aborted || message === "aborted") {
+            completeTask("task_aborted");
+        } else {
+            log.error("Task failed", {
+                id: decision.id,
+                action: decision.action,
+                error: message,
+            });
+            completeTask("task_failed");
+        }
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        stopMovement();
+        if (taskAbortController?.signal === signal) {
+            taskAbortController = null;
+        }
+    }
+}
+
+// ==========================================
+// BOT LIFECYCLE
+// ==========================================
+
+bot.on("login", () => log.info("Bot logged in"));
+
+bot.once("spawn", () => {
+    log.info("Bot spawned", { env_path: config.ENV_PATH, cwd: process.cwd() });
+
+    (bot as any).pathfinder.setMovements(new Movements(bot));
+    client.connect();
+    survival.start();
+
+    if (config.ENABLE_VIEWER) {
+        try {
+            viewer(bot, {
+                port: config.VIEWER_PORT,
+                firstPerson: true,
+                viewDistance: 2,
+            });
+            log.info("Prismarine viewer started", { port: config.VIEWER_PORT });
+        } catch (err) {
+            log.error("Viewer failed to start", {
+                err: err instanceof Error ? err.message : String(err),
+            });
+        }
+    }
+});
+
+bot.on("death", () => {
+    log.warn("Bot died; resetting local execution state");
+    if (taskAbortController) {
+        taskAbortController.abort();
+        taskAbortController = null;
+    }
+    currentTask = null;
+    stopMovement();
+});
+
+bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));
+bot.on("end", (reason: unknown) =>
+    log.error("Bot connection ended", { reason }),
+);
+bot.on("error", (err: unknown) =>
+    log.error("Bot error", {
+        err: err instanceof Error ? err.message : String(err),
+    }),
+);
+
+// ==========================================
+// TELEMETRY SYNC
+// ==========================================
+
+setInterval(() => {
+    if (!bot.entity || !bot.entities) return;
+
+    const state = {
+        health: Math.round(bot.health),
+        food: Math.round(bot.food),
+        position: {
+            x: Math.round(bot.entity.position.x),
+            y: Math.round(bot.entity.position.y),
+            z: Math.round(bot.entity.position.z),
+        },
+        threats: getThreats(bot)
+            .slice(0, 3)
+            .map((t) => ({ name: t.name })),
+        inventory: bot.inventory
+            .items()
+            .map((i) => ({ name: i.name, count: i.count })),
+    };
+
+    client.sendState(state);
+}, 2000);
+
+</file>
+
+<file path="js\lib\config.ts">
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
-
-import pkg from "mineflayer-pathfinder";
-import mineflayer from "mineflayer";
-import WebSocket from "ws";
-import { mineflayer as viewer } from "prismarine-viewer";
-import { log } from "./lib/logger.js";
-import * as models from "./lib/models.js";
-
-const { pathfinder, Movements, goals } = pkg;
 
 function loadEnv(): string {
     const candidates = [
@@ -852,483 +1013,26 @@ function loadEnv(): string {
     return "default-dotenv-lookup";
 }
 
-const loadedEnvPath = loadEnv();
+export const ENV_PATH = loadEnv();
+export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
+export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
+export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
+export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
 
-const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
-const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
-const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-
-const WS_URL = "ws://localhost:8080/ws";
-
-const bot = mineflayer.createBot({
-    host: "localhost",
-    port: 25565,
-    username: "CraftBot",
-    version: "1.19",
-});
-
-bot.loadPlugin(pathfinder);
-
-let ws: WebSocket;
-let currentTask: models.ActiveTask | null = null;
-let awaitingCommand = false;
-let reflexActive = false;
-let reflexTimeout: NodeJS.Timeout | null = null;
-let lastReflexTime = 0;
-let taskAbortController: AbortController | null = null;
-
-const TASK_TIMEOUTS: Record<string, number> = {
+export const TASK_TIMEOUTS: Record<string, number> = {
     attack: 20000,
     retreat: 15000,
     mine: 20000,
     idle: 3000,
 };
 
-const THREAT_WEIGHTS: Record<string, number> = {
+export const THREAT_WEIGHTS: Record<string, number> = {
     warden: 1000,
     creeper: 100,
     skeleton: 20,
     zombie: 10,
     spider: 10,
 };
-
-// ==========================================
-// STATE HELPERS
-// ==========================================
-
-function taskLabel(task: Pick<models.ActiveTask, "action" | "target">) {
-    return `${task.action} ${task.target?.name || "none"}`.trim();
-}
-
-function stopMovement() {
-    try {
-        bot.clearControlStates();
-    } catch {}
-
-    try {
-        bot.pathfinder.setGoal(null);
-    } catch {}
-
-    try {
-        bot.pathfinder.stop();
-    } catch {}
-}
-
-function clearReflexState() {
-    reflexActive = false;
-
-    if (reflexTimeout) {
-        clearTimeout(reflexTimeout);
-        reflexTimeout = null;
-    }
-}
-
-function resetExecutionState() {
-    if (taskAbortController) {
-        taskAbortController.abort();
-        taskAbortController = null;
-    }
-
-    currentTask = null;
-    awaitingCommand = false;
-    clearReflexState();
-    stopMovement();
-}
-
-// ==========================================
-// WEBSOCKET
-// ==========================================
-
-function connectControlPlane() {
-    ws = new WebSocket(WS_URL);
-
-    ws.on("open", () => {
-        log.info("Connected to Go Control Plane", {
-            ws_url: WS_URL,
-            env_path: loadedEnvPath,
-            enable_viewer: ENABLE_VIEWER,
-            viewer_port: VIEWER_PORT,
-        });
-    });
-
-    ws.on("message", (data: Buffer) => {
-        try {
-            const msg = JSON.parse(data.toString());
-
-            if (msg.type === "command") {
-                awaitingCommand = false;
-                void executeDecision(msg.payload as models.IncomingDecision);
-                return;
-            }
-
-            if (msg.type === "planning_error" || msg.type === "noop") {
-                log.debug("Control plane unlocked bot", {
-                    type: msg.type,
-                    payload: msg.payload,
-                });
-                awaitingCommand = false;
-            }
-        } catch (err) {
-            log.error("Failed to parse control-plane message", {
-                err: err instanceof Error ? err.message : String(err),
-            });
-            awaitingCommand = false;
-        }
-    });
-
-    ws.on("close", () => {
-        log.error("Disconnected from Control Plane. Retrying in 5s...");
-        resetExecutionState();
-        setTimeout(connectControlPlane, 5000);
-    });
-
-    ws.on("error", (err) => {
-        log.error("WebSocket error", {
-            err: err instanceof Error ? err.message : String(err),
-        });
-    });
-}
-
-function sendEvent(
-    event: string,
-    actionStr: string,
-    commandId = "",
-    cause = "",
-    startTime = 0,
-) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return;
-    }
-
-    const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
-
-    ws.send(
-        JSON.stringify({
-            type: "event",
-            payload: {
-                event,
-                action: actionStr,
-                command_id: commandId,
-                cause,
-                duration_ms,
-            },
-        }),
-    );
-}
-
-// ==========================================
-// THREATS / REFLEXES
-// ==========================================
-
-function getThreats(): models.ThreatInfo[] {
-    return Object.values(bot.entities)
-        .filter(
-            (e: any) => (e.type === "mob" || e.type === "hostile") && e.name,
-        )
-        .map((e: any) => {
-            const distance = bot.entity.position.distanceTo(e.position);
-            const baseThreat = THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
-            const threatScore = baseThreat * (10 / Math.max(distance, 1));
-
-            return {
-                id: e.id!,
-                name: e.name || "unknown",
-                distance: parseFloat(distance.toFixed(1)),
-                threatScore: Math.round(threatScore),
-                position: {
-                    x: e.position.x,
-                    y: e.position.y,
-                    z: e.position.z,
-                },
-            };
-        })
-        .sort((a, b) => b.threatScore - a.threatScore);
-}
-
-function computeSafeRetreat(threats: models.ThreatInfo[]) {
-    let cx = 0;
-    let cz = 0;
-    let totalWeight = 0;
-
-    for (const threat of threats) {
-        cx += threat.position.x * threat.threatScore;
-        cz += threat.position.z * threat.threatScore;
-        totalWeight += threat.threatScore;
-    }
-
-    if (totalWeight === 0) {
-        return {
-            x: bot.entity.position.x + (Math.random() - 0.5) * 20,
-            z: bot.entity.position.z + (Math.random() - 0.5) * 20,
-        };
-    }
-
-    cx /= totalWeight;
-    cz /= totalWeight;
-
-    let dx = bot.entity.position.x - cx;
-    let dz = bot.entity.position.z - cz;
-    const len = Math.sqrt(dx * dx + dz * dz) || 1;
-
-    dx /= len;
-    dz /= len;
-
-    return {
-        x: bot.entity.position.x + dx * 20,
-        z: bot.entity.position.z + dz * 20,
-    };
-}
-
-function triggerReflexRetreat(threats: models.ThreatInfo[]) {
-    const primaryThreat = threats[0];
-    const cause =
-        primaryThreat?.name || (bot.health < 6 ? "low_health" : "unknown");
-
-    if (DEBUG_CHAT) {
-        bot.chat(
-            `Reflex: Evading ${cause}! (Health: ${Math.round(bot.health)})`,
-        );
-    }
-
-    if (taskAbortController) {
-        taskAbortController.abort();
-    }
-
-    reflexActive = true;
-    stopMovement();
-
-    const startTime = Date.now();
-    sendEvent("panic_retreat", "evasion", "", cause, startTime);
-
-    const safePos = computeSafeRetreat(threats);
-
-    log.warn("Reflex retreat triggered", {
-        cause,
-        health: bot.health,
-        safe_x: Math.round(safePos.x),
-        safe_z: Math.round(safePos.z),
-    });
-
-    bot.pathfinder.setGoal(
-        new goals.GoalNear(safePos.x, bot.entity.position.y, safePos.z, 2),
-    );
-
-    if (reflexTimeout) {
-        clearTimeout(reflexTimeout);
-    }
-
-    reflexTimeout = setTimeout(() => {
-        log.debug("Reflex retreat timeout elapsed; clearing reflex state");
-        stopMovement();
-        clearReflexState();
-    }, 8000);
-}
-
-// Patch missing warn helper without changing logger shape everywhere
-(log as any).warn = (msg: string, meta: Record<string, unknown> = {}) =>
-    console.warn(
-        JSON.stringify({
-            level: "WARN",
-            msg,
-            ...meta,
-            timestamp: new Date().toISOString(),
-        }),
-    );
-
-async function executeDecision(decision: models.IncomingDecision) {
-    if (!decision?.action) {
-        log.error("Received malformed command", { decision });
-        awaitingCommand = false;
-        return;
-    }
-
-    log.info("Executing decision", {
-        id: decision.id,
-        action: decision.action,
-        target_type: decision.target?.type,
-        target_name: decision.target?.name,
-        rationale: decision.rationale,
-    });
-
-    if (taskAbortController) {
-        taskAbortController.abort();
-    }
-
-    taskAbortController = new AbortController();
-    const signal = taskAbortController.signal;
-
-    currentTask = {
-        id: decision.id,
-        action: decision.action,
-        target: decision.target || { type: "none", name: "none" },
-        startTime: Date.now(),
-    };
-
-    stopMovement();
-
-    sendEvent(
-        "task_started",
-        taskLabel(currentTask),
-        decision.id,
-        "",
-        currentTask.startTime,
-    );
-
-    const timeoutMs = TASK_TIMEOUTS[decision.action] || 10000;
-
-    let timeoutId: NodeJS.Timeout | null = null;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error("timeout")), timeoutMs);
-    });
-
-    try {
-        await Promise.race([runTask(decision, signal), timeoutPromise]);
-
-        if (!signal.aborted) {
-            completeTask("task_completed");
-        }
-    } catch (err) {
-        const message =
-            err instanceof Error ? err.message : String(err || "unknown_error");
-
-        if (signal.aborted || message === "aborted") {
-            completeTask("task_aborted");
-        } else {
-            log.error("Task failed", {
-                id: decision.id,
-                action: decision.action,
-                target: decision.target?.name,
-                error: message,
-            });
-            completeTask("task_failed");
-        }
-    } finally {
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-        }
-
-        stopMovement();
-
-        if (taskAbortController?.signal === signal) {
-            taskAbortController = null;
-        }
-    }
-}
-
-// ==========================================
-// BOT LIFECYCLE
-// ==========================================
-
-bot.on("login", () => {
-    log.info("Bot logged in");
-});
-
-bot.once("spawn", () => {
-    log.info("Bot spawned", {
-        env_path: loadedEnvPath,
-        cwd: process.cwd(),
-        enable_viewer: ENABLE_VIEWER,
-        viewer_port: VIEWER_PORT,
-    });
-
-    bot.pathfinder.setMovements(new Movements(bot));
-    connectControlPlane();
-
-    if (ENABLE_VIEWER) {
-        try {
-            viewer(bot, {
-                port: VIEWER_PORT,
-                firstPerson: true,
-                viewDistance: 2,
-            });
-
-            log.info("Prismarine viewer started", {
-                url: `http://localhost:${VIEWER_PORT}`,
-                port: VIEWER_PORT,
-            });
-        } catch (err) {
-            log.error("Viewer failed to start", {
-                err: err instanceof Error ? err.message : String(err),
-            });
-        }
-    } else {
-        log.info("Prismarine viewer disabled", {
-            enable_viewer: ENABLE_VIEWER,
-            env_path: loadedEnvPath,
-        });
-    }
-});
-
-bot.on("goal_reached", () => {
-    if (reflexActive && currentTask === null) {
-        log.debug("Reflex retreat goal reached");
-        clearReflexState();
-    }
-});
-
-bot.on("death", () => {
-    log.warn("Bot died; resetting local execution state");
-    resetExecutionState();
-});
-
-bot.on("kicked", (reason: unknown) => {
-    log.error("Bot was kicked", { reason });
-});
-
-bot.on("end", (reason: unknown) => {
-    log.error("Bot connection ended", { reason });
-});
-
-bot.on("error", (err: unknown) => {
-    log.error("Bot error", {
-        err: err instanceof Error ? err.message : String(err),
-    });
-});
-
-// ==========================================
-// HIGH-FREQUENCY REFLEX LOOP
-// ==========================================
-
-bot.on("physicTick", () => {
-    const now = Date.now();
-    const threats = getThreats();
-
-    if (
-        (threats.length > 0 && threats[0]!.threatScore > 50) ||
-        bot.health < 6
-    ) {
-        if (now - lastReflexTime > 2000) {
-            triggerReflexRetreat(threats);
-            lastReflexTime = now;
-        }
-    }
-});
-
-// ==========================================
-// LOW-FREQUENCY STATE SYNC
-// ==========================================
-
-setInterval(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const state = {
-        health: Math.round(bot.health),
-        food: Math.round(bot.food),
-        position: {
-            x: Math.round(bot.entity.position.x),
-            y: Math.round(bot.entity.position.y),
-            z: Math.round(bot.entity.position.z),
-        },
-        threats: getThreats()
-            .slice(0, 3)
-            .map((t) => ({ name: t.name })),
-        inventory: bot.inventory
-            .items()
-            .map((i) => ({ name: i.name, count: i.count })),
-    };
-
-    ws.send(JSON.stringify({ type: "state", payload: state }));
-    awaitingCommand = true;
-}, 2000);
 
 </file>
 
@@ -1418,16 +1122,346 @@ export interface ThreatInfo {
         y: number;
         z: number;
     };
+    entity?: any;
+}
+
+</file>
+
+<file path="js\lib\network\client.ts">
+import WebSocket from "ws";
+import { log } from "../logger.js";
+import * as models from "../models.js";
+
+export interface ControlPlaneEvents {
+    onCommand: (decision: models.IncomingDecision) => void;
+    onUnlock: () => void;
+}
+
+export class ControlPlaneClient {
+    private ws: WebSocket | null = null;
+    private readonly url: string;
+    private readonly callbacks: ControlPlaneEvents;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+
+    constructor(url: string, callbacks: ControlPlaneEvents) {
+        this.url = url;
+        this.callbacks = callbacks;
+    }
+
+    public connect(): void {
+        if (this.ws) {
+            this.ws.removeAllListeners();
+            this.ws.close();
+        }
+
+        this.ws = new WebSocket(this.url);
+
+        this.ws.on("open", () => {
+            log.info("Connected to Go Control Plane", { ws_url: this.url });
+        });
+
+        this.ws.on("message", (data: Buffer) => {
+            try {
+                const msg = JSON.parse(data.toString());
+
+                if (msg.type === "command") {
+                    this.callbacks.onCommand(
+                        msg.payload as models.IncomingDecision,
+                    );
+                    return;
+                }
+
+                if (msg.type === "planning_error" || msg.type === "noop") {
+                    log.debug("Control plane unlocked bot", {
+                        type: msg.type,
+                        payload: msg.payload,
+                    });
+                    this.callbacks.onUnlock();
+                }
+            } catch (err) {
+                log.error("Failed to parse control-plane message", {
+                    err: err instanceof Error ? err.message : String(err),
+                });
+                this.callbacks.onUnlock();
+            }
+        });
+
+        this.ws.on("close", () => {
+            log.error("Disconnected from Control Plane. Retrying in 5s...");
+            this.callbacks.onUnlock();
+            this.scheduleReconnect();
+        });
+
+        this.ws.on("error", (err) => {
+            log.error("WebSocket error", {
+                err: err instanceof Error ? err.message : String(err),
+            });
+        });
+    }
+
+    private scheduleReconnect(): void {
+        if (this.reconnectTimer) return;
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            this.connect();
+        }, 5000);
+    }
+
+    public sendEvent(
+        event: string,
+        actionStr: string,
+        commandId = "",
+        cause = "",
+        startTime = 0,
+    ): void {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
+
+        this.ws.send(
+            JSON.stringify({
+                type: "event",
+                payload: {
+                    event,
+                    action: actionStr,
+                    command_id: commandId,
+                    cause,
+                    duration_ms,
+                },
+            }),
+        );
+    }
+
+    public sendState(state: Record<string, unknown>): void {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        this.ws.send(JSON.stringify({ type: "state", payload: state }));
+    }
+}
+
+</file>
+
+<file path="js\lib\systems\survival.ts">
+import { type Bot } from "mineflayer";
+import pkg from "mineflayer-pathfinder";
+
+import * as config from "../config.js";
+import * as models from "../models.js";
+import { log } from "../logger.js";
+import { ControlPlaneClient } from "../network/client.js";
+import { getThreats, computeSafeRetreat } from "../utils/threats.js";
+
+const { goals } = pkg;
+
+export interface SurvivalConfig {
+    onInterrupt: (reason: string) => void;
+    stopMovement: () => void;
+}
+
+export class SurvivalSystem {
+    private bot: Bot;
+    private client: ControlPlaneClient;
+    private config: SurvivalConfig;
+
+    private reflexActive = false;
+    private lastTickTime = 0;
+    private reflexTimeout: NodeJS.Timeout | null = null;
+
+    constructor(
+        bot: Bot,
+        client: ControlPlaneClient,
+        sysConfig: SurvivalConfig,
+    ) {
+        this.bot = bot;
+        this.client = client;
+        this.config = sysConfig;
+    }
+
+    public start(): void {
+        this.bot.on("physicsTick", () => {
+            const now = Date.now();
+            if (now - this.lastTickTime < 500) return;
+            this.lastTickTime = now;
+            void this.evaluatePriorities();
+        });
+
+        this.bot.on("goal_reached", () => {
+            if (this.reflexActive) {
+                log.debug("Survival goal reached; releasing reflex lock");
+                this.clearReflexState();
+            }
+        });
+    }
+
+    private clearReflexState(): void {
+        this.reflexActive = false;
+        if (this.reflexTimeout) {
+            clearTimeout(this.reflexTimeout);
+            this.reflexTimeout = null;
+        }
+    }
+
+    private async evaluatePriorities(): Promise<void> {
+        if (this.reflexActive) return;
+
+        const threats = getThreats(this.bot);
+        const topThreat = threats.length > 0 ? threats[0] : null;
+
+        if (this.bot.health < 6 || (topThreat && topThreat.threatScore > 50)) {
+            const cause = topThreat?.name || "low_health";
+            this.triggerFlee(threats, cause);
+            return;
+        }
+
+        if (topThreat && topThreat.distance < 6) {
+            const hasWeapon = this.getBestWeapon();
+            if (hasWeapon) {
+                await this.triggerDefend(topThreat);
+                return;
+            }
+        }
+
+        if (this.bot.food < 15) {
+            const food = this.getBestFood();
+            if (food) {
+                await this.triggerEat(food);
+                return;
+            }
+        }
+    }
+
+    // ==========================================
+    // REFLEX ACTIONS
+    // ==========================================
+
+    private triggerFlee(threats: models.ThreatInfo[], cause: string): void {
+        log.warn("Reflex: Critical Flee triggered", {
+            cause,
+            health: this.bot.health,
+        });
+
+        this.reflexActive = true;
+        this.config.onInterrupt("panic_flee");
+        this.config.stopMovement();
+
+        this.client.sendEvent(
+            "panic_retreat",
+            "evasion",
+            "",
+            cause,
+            Date.now(),
+        );
+
+        const safePos = computeSafeRetreat(this.bot, threats);
+        (this.bot as any).pathfinder.setGoal(
+            new goals.GoalNear(
+                safePos.x,
+                this.bot.entity.position?.y ?? 64,
+                safePos.z,
+                2,
+            ),
+        );
+
+        this.reflexTimeout = setTimeout(() => {
+            this.config.stopMovement();
+            this.clearReflexState();
+        }, 8000);
+    }
+
+    private async triggerDefend(threat: models.ThreatInfo): Promise<void> {
+        log.info("Reflex: Auto-defending", { target: threat.name });
+
+        this.reflexActive = true;
+        this.config.onInterrupt("auto_defend");
+        this.config.stopMovement();
+
+        try {
+            const weapon = this.getBestWeapon();
+            if (weapon) {
+                await this.bot.equip(weapon, "hand");
+            }
+
+            if (threat.entity && threat.entity.position) {
+                await this.bot.lookAt(
+                    threat.entity.position.offset(
+                        0,
+                        threat.entity.height ?? 1.5,
+                        0,
+                    ),
+                    true,
+                );
+                this.bot.attack(threat.entity);
+            }
+        } catch (err) {
+            log.error("Auto-defend failed", { err: String(err) });
+        } finally {
+            setTimeout(() => this.clearReflexState(), 1000);
+        }
+    }
+
+    private async triggerEat(foodItem: any): Promise<void> {
+        log.info("Reflex: Auto-eating", { food: foodItem.name });
+
+        this.reflexActive = true;
+        this.config.onInterrupt("auto_eat");
+        this.config.stopMovement();
+
+        try {
+            await this.bot.equip(foodItem, "hand");
+            await this.bot.consume();
+        } catch (err) {
+            log.error("Auto-eat failed", { err: String(err) });
+        } finally {
+            this.clearReflexState();
+        }
+    }
+
+    // ==========================================
+    // UTILS
+    // ==========================================
+
+    private getBestWeapon(): any {
+        const items = this.bot.inventory.items();
+        return (
+            items.find((i) => i.name.includes("sword")) ||
+            items.find((i) => i.name.includes("axe")) ||
+            null
+        );
+    }
+
+    private getBestFood(): any {
+        const items = this.bot.inventory.items();
+        const edibleNames = [
+            "apple",
+            "bread",
+            "beef",
+            "porkchop",
+            "chicken",
+            "mutton",
+            "carrot",
+            "potato",
+        ];
+        return (
+            items.find((i) =>
+                edibleNames.some((name) => i.name.includes(name)),
+            ) || null
+        );
+    }
 }
 
 </file>
 
 <file path="js\lib\tasks\task.ts">
+import type { Bot } from "mineflayer";
+import pkg from "mineflayer-pathfinder";
+import * as models from "../models.js";
+
+const { goals } = pkg;
+
 // ==========================================
 // TASK HELPERS
 // ==========================================
 
-function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
+export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
         if (signal.aborted) {
             reject(new Error("aborted"));
@@ -1453,10 +1487,12 @@ function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
     });
 }
 
-function moveToGoal(
+export function moveToGoal(
+    bot: any,
     goal: any,
     signal: AbortSignal,
     timeoutMs: number,
+    stopMovement: () => void,
 ): Promise<void> {
     return new Promise((resolve, reject) => {
         if (signal.aborted) {
@@ -1464,24 +1500,26 @@ function moveToGoal(
             return;
         }
 
-        let settled = false;
+        // Prevent hanging if already at the target
+        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
+            return resolve();
+        }
 
-        const cleanup = () => {
-            clearTimeout(timer);
-            signal.removeEventListener("abort", onAbort);
-            bot.removeListener("goal_reached", onGoalReached);
-        };
+        let settled = false;
 
         const finish = (err?: Error) => {
             if (settled) return;
             settled = true;
-            cleanup();
+
+            clearTimeout(timer);
+            signal.removeEventListener("abort", onAbort);
+            bot.removeListener("goal_reached", onGoalReached);
+            bot.removeListener("path_update", onPathUpdate);
 
             if (err) {
                 reject(err);
                 return;
             }
-
             resolve();
         };
 
@@ -1495,6 +1533,19 @@ function moveToGoal(
             finish();
         };
 
+        const onPathUpdate = (results: any) => {
+            // Instantly fail if the pathfinder realizes it's trapped
+            if (results.status === "noPath") {
+                stopMovement();
+                finish(new Error("NoPath - Bot is likely trapped"));
+            } else if (results.status === "timeout") {
+                stopMovement();
+                finish(
+                    new Error("PathfinderTimeout - Calculation took too long"),
+                );
+            }
+        };
+
         const timer = setTimeout(() => {
             stopMovement();
             finish(new Error("timeout"));
@@ -1502,11 +1553,17 @@ function moveToGoal(
 
         signal.addEventListener("abort", onAbort, { once: true });
         bot.once("goal_reached", onGoalReached);
-        bot.pathfinder.setGoal(goal);
+        bot.on("path_update", onPathUpdate);
+
+        try {
+            bot.pathfinder.setGoal(goal);
+        } catch (err) {
+            finish(err instanceof Error ? err : new Error(String(err)));
+        }
     });
 }
 
-function findNearestBlockByName(blockName: string) {
+export function findNearestBlockByName(bot: Bot, blockName: string): any {
     return bot.findBlock({
         maxDistance: 32,
         matching: (block: any) => block?.name === blockName,
@@ -1514,33 +1571,20 @@ function findNearestBlockByName(blockName: string) {
 }
 
 // ==========================================
-// TASK LIFECYCLE
+// TASK EXECUTION
 // ==========================================
 
-function completeTask(
-    status:
-        | "task_completed"
-        | "task_failed"
-        | "task_aborted" = "task_completed",
-) {
-    if (!currentTask) {
-        return;
-    }
-
-    sendEvent(
-        status,
-        taskLabel(currentTask),
-        currentTask.id,
-        "",
-        currentTask.startTime,
-    );
-
-    currentTask = null;
-}
-
-async function runTask(
+export async function runTask(
+    bot: any,
     decision: models.IncomingDecision,
     signal: AbortSignal,
+    timeouts: Record<string, number>,
+    getThreats: () => models.ThreatInfo[],
+    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
+        x: number;
+        z: number;
+    },
+    stopMovement: () => void,
 ): Promise<void> {
     switch (decision.action) {
         case "idle": {
@@ -1553,16 +1597,17 @@ async function runTask(
             const safePos = computeSafeRetreat(threats);
 
             await moveToGoal(
+                bot,
                 new goals.GoalNear(
                     safePos.x,
-                    bot.entity.position.y ?? 64,
+                    bot.entity.position?.y ?? 64,
                     safePos.z,
                     2,
                 ),
                 signal,
-                TASK_TIMEOUTS.retreat!,
+                timeouts.retreat ?? 15000,
+                stopMovement,
             );
-
             return;
         }
 
@@ -1576,7 +1621,7 @@ async function runTask(
             let hasSeenTarget = false;
             let lastSeenAt = 0;
 
-            while (Date.now() - attackStartedAt < TASK_TIMEOUTS.attack!) {
+            while (Date.now() - attackStartedAt < (timeouts.attack ?? 20000)) {
                 if (signal.aborted) {
                     throw new Error("aborted");
                 }
@@ -1606,16 +1651,9 @@ async function runTask(
                     new goals.GoalFollow(targetEntity, 2),
                     true,
                 );
-
                 const dist = bot.entity.position.distanceTo(
                     targetEntity.position,
                 );
-
-                if (!targetEntity || !targetEntity.position) {
-                    throw new Error(
-                        `Target ${targetName} is no longer in range or valid.`,
-                    );
-                }
 
                 if (dist < 3.2) {
                     try {
@@ -1646,12 +1684,13 @@ async function runTask(
                 throw new Error("missing mine target");
             }
 
-            const block = findNearestBlockByName(targetBlockName);
+            const block = findNearestBlockByName(bot, targetBlockName);
             if (!block) {
                 throw new Error(`block not found: ${targetBlockName}`);
             }
 
             await moveToGoal(
+                bot,
                 new goals.GoalNear(
                     block.position.x,
                     block.position.y,
@@ -1659,7 +1698,8 @@ async function runTask(
                     1,
                 ),
                 signal,
-                12000,
+                timeouts.mine ?? 20000,
+                stopMovement,
             );
 
             if (signal.aborted) {
@@ -1677,260 +1717,69 @@ async function runTask(
         default:
             throw new Error(`unsupported action: ${decision.action}`);
     }
-} // ==========================================
-// TASK HELPERS
-// ==========================================
-
-function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        const timer = setTimeout(() => {
-            cleanup();
-            resolve();
-        }, ms);
-
-        const onAbort = () => {
-            clearTimeout(timer);
-            cleanup();
-            reject(new Error("aborted"));
-        };
-
-        const cleanup = () => {
-            signal.removeEventListener("abort", onAbort);
-        };
-
-        signal.addEventListener("abort", onAbort, { once: true });
-    });
 }
 
-function moveToGoal(
-    goal: any,
-    signal: AbortSignal,
-    timeoutMs: number,
-): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
+</file>
 
-        let settled = false;
+<file path="js\lib\utils\threats.ts">
+import { type Bot } from "mineflayer";
+import * as config from "../config.js";
+import * as models from "../models.js";
 
-        const cleanup = () => {
-            clearTimeout(timer);
-            signal.removeEventListener("abort", onAbort);
-            bot.removeListener("goal_reached", onGoalReached);
-        };
+export function getThreats(bot: Bot): models.ThreatInfo[] {
+    return Object.values(bot.entities)
+        .filter(
+            (e: any) => (e.type === "mob" || e.type === "hostile") && e.name,
+        )
+        .map((e: any) => {
+            const distance = bot.entity.position.distanceTo(e.position);
+            const baseThreat =
+                config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
+            const threatScore = baseThreat * (10 / Math.max(distance, 1));
 
-        const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-
-            if (err) {
-                reject(err);
-                return;
-            }
-
-            resolve();
-        };
-
-        const onAbort = () => {
-            stopMovement();
-            finish(new Error("aborted"));
-        };
-
-        const onGoalReached = () => {
-            stopMovement();
-            finish();
-        };
-
-        const timer = setTimeout(() => {
-            stopMovement();
-            finish(new Error("timeout"));
-        }, timeoutMs);
-
-        signal.addEventListener("abort", onAbort, { once: true });
-        bot.once("goal_reached", onGoalReached);
-        bot.pathfinder.setGoal(goal);
-    });
+            return {
+                id: e.id!,
+                name: e.name || "unknown",
+                distance: parseFloat(distance.toFixed(1)),
+                threatScore: Math.round(threatScore),
+                position: { x: e.position.x, y: e.position.y, z: e.position.z },
+                entity: e,
+            };
+        })
+        .sort((a, b) => b.threatScore - a.threatScore);
 }
 
-function findNearestBlockByName(blockName: string) {
-    return bot.findBlock({
-        maxDistance: 32,
-        matching: (block: any) => block?.name === blockName,
-    });
-}
+export function computeSafeRetreat(bot: Bot, threats: models.ThreatInfo[]) {
+    let cx = 0,
+        cz = 0,
+        totalWeight = 0;
 
-// ==========================================
-// TASK LIFECYCLE
-// ==========================================
-
-function completeTask(
-    status:
-        | "task_completed"
-        | "task_failed"
-        | "task_aborted" = "task_completed",
-) {
-    if (!currentTask) {
-        return;
+    for (const threat of threats) {
+        cx += threat.position.x * threat.threatScore;
+        cz += threat.position.z * threat.threatScore;
+        totalWeight += threat.threatScore;
     }
 
-    sendEvent(
-        status,
-        taskLabel(currentTask),
-        currentTask.id,
-        "",
-        currentTask.startTime,
-    );
-
-    currentTask = null;
-}
-
-async function runTask(
-    decision: models.IncomingDecision,
-    signal: AbortSignal,
-): Promise<void> {
-    switch (decision.action) {
-        case "idle": {
-            await waitForMs(1500, signal);
-            return;
-        }
-
-        case "retreat": {
-            const threats = getThreats();
-            const safePos = computeSafeRetreat(threats);
-
-            await moveToGoal(
-                new goals.GoalNear(
-                    safePos.x,
-                    bot.entity.position.y ?? 64,
-                    safePos.z,
-                    2,
-                ),
-                signal,
-                TASK_TIMEOUTS.retreat!,
-            );
-
-            return;
-        }
-
-        case "attack": {
-            const targetName = decision.target?.name;
-            if (!targetName || targetName === "none") {
-                throw new Error("missing attack target");
-            }
-
-            const attackStartedAt = Date.now();
-            let hasSeenTarget = false;
-            let lastSeenAt = 0;
-
-            while (Date.now() - attackStartedAt < TASK_TIMEOUTS.attack!) {
-                if (signal.aborted) {
-                    throw new Error("aborted");
-                }
-
-                const targetEntity = bot.nearestEntity(
-                    (e: any) => e.name === targetName && e.isValid,
-                );
-
-                if (!targetEntity) {
-                    if (hasSeenTarget && Date.now() - lastSeenAt > 1500) {
-                        stopMovement();
-                        return;
-                    }
-
-                    if (!hasSeenTarget && Date.now() - attackStartedAt > 3000) {
-                        throw new Error(`target not found: ${targetName}`);
-                    }
-
-                    await waitForMs(250, signal);
-                    continue;
-                }
-
-                hasSeenTarget = true;
-                lastSeenAt = Date.now();
-
-                bot.pathfinder.setGoal(
-                    new goals.GoalFollow(targetEntity, 2),
-                    true,
-                );
-
-                const dist = bot.entity.position.distanceTo(
-                    targetEntity.position,
-                );
-
-                if (!targetEntity || !targetEntity.position) {
-                    throw new Error(
-                        `Target ${targetName} is no longer in range or valid.`,
-                    );
-                }
-
-                if (dist < 3.2) {
-                    try {
-                        await bot.lookAt(
-                            targetEntity.position.offset(
-                                0,
-                                targetEntity.height ?? 1.6,
-                                0,
-                            ),
-                            true,
-                        );
-                    } catch {}
-
-                    try {
-                        bot.attack(targetEntity);
-                    } catch {}
-                }
-
-                await waitForMs(450, signal);
-            }
-
-            throw new Error("timeout");
-        }
-
-        case "mine": {
-            const targetBlockName = decision.target?.name;
-            if (!targetBlockName || targetBlockName === "none") {
-                throw new Error("missing mine target");
-            }
-
-            const block = findNearestBlockByName(targetBlockName);
-            if (!block) {
-                throw new Error(`block not found: ${targetBlockName}`);
-            }
-
-            await moveToGoal(
-                new goals.GoalNear(
-                    block.position.x,
-                    block.position.y,
-                    block.position.z,
-                    1,
-                ),
-                signal,
-                12000,
-            );
-
-            if (signal.aborted) {
-                throw new Error("aborted");
-            }
-
-            if (!bot.canDigBlock(block)) {
-                throw new Error(`cannot dig block: ${targetBlockName}`);
-            }
-
-            await bot.dig(block);
-            return;
-        }
-
-        default:
-            throw new Error(`unsupported action: ${decision.action}`);
+    // If no threats, pick a random vector
+    if (totalWeight === 0) {
+        return {
+            x: bot.entity.position.x + (Math.random() - 0.5) * 20,
+            z: bot.entity.position.z + (Math.random() - 0.5) * 20,
+        };
     }
+
+    cx /= totalWeight;
+    cz /= totalWeight;
+
+    let dx = bot.entity.position.x - cx;
+    let dz = bot.entity.position.z - cz;
+    const len = Math.sqrt(dx * dx + dz * dz) || 1;
+
+    // Normalize and project 20 blocks away from the center of mass of the threats
+    return {
+        x: bot.entity.position.x + (dx / len) * 20,
+        z: bot.entity.position.z + (dz / len) * 20,
+    };
 }
 
 </file>
@@ -2357,10 +2206,10 @@ func (t *Telemetry) StartReporting(ctx context.Context) {
 
 ```json
 {
-  "total_bytes": 57764,
-  "file_count": 10,
-  "estimated_tokens": 14592,
+  "total_bytes": 56937,
+  "file_count": 14,
+  "estimated_tokens": 14459,
   "mode": "full",
-  "generated_at": "2026-03-19T23:03:05.1701015-07:00"
+  "generated_at": "2026-03-20T01:33:43.2229294-07:00"
 }
 ```

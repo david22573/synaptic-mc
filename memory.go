@@ -1,3 +1,4 @@
+// memory.go
 package main
 
 import (
@@ -45,11 +46,15 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
+	// Enable concurrent reads and pooled connections for WAL mode
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	schema := `
 	PRAGMA journal_mode=WAL;
 	PRAGMA synchronous=NORMAL;
+	PRAGMA busy_timeout=5000;
 
 	CREATE TABLE IF NOT EXISTS events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,7 +166,6 @@ func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
 }
 
 func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
-	// Order by deterministic ID to prevent collision on same-second timestamps
 	query := `SELECT timestamp, action, details, status FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {

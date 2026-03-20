@@ -26,9 +26,12 @@ export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
 export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
 
 export const TASK_TIMEOUTS: Record<string, number> = {
-    attack: 20000,
+    gather: 30000,
+    craft: 20000,
+    hunt: 30000,
+    explore: 20000,
+    build: 20000,
     retreat: 15000,
-    mine: 20000,
     idle: 3000,
 };
 

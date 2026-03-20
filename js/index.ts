@@ -71,9 +71,6 @@ function stopMovement() {
     try {
         (bot as any).pathfinder.setGoal(null);
     } catch {}
-    try {
-        (bot as any).pathfinder.stop();
-    } catch {}
 }
 
 function completeTask(
