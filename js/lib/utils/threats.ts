@@ -9,6 +9,10 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
         )
         .map((e: any) => {
             const distance = bot.entity.position.distanceTo(e.position);
+            return { e, distance };
+        })
+        .filter(({ distance }) => distance <= 16) // Standard Minecraft mob aggro radius
+        .map(({ e, distance }) => {
             const baseThreat =
                 config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
             const threatScore = baseThreat * (10 / Math.max(distance, 1));

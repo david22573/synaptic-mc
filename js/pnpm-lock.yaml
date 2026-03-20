@@ -20,6 +20,9 @@ importers:
       mineflayer-pathfinder:
         specifier: ^2.4.5
         version: 2.4.5
+      prismarine-entity:
+        specifier: ^2.5.0
+        version: 2.5.0
       prismarine-viewer:
         specifier: ^1.33.0
         version: 1.33.0

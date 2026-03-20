@@ -60,7 +60,21 @@ type Engine struct {
 	lastThreat    string
 	lastPos       Vec3
 	wg            sync.WaitGroup
+
+	// ── Two-tier planning state ──────────────────────────────────────────
+	// activeMilestone is the current high-level goal. It is generated once
+	// and persists until the tactical planner signals completion, the bot
+	// dies, or it stalls too many times without progress.
+	activeMilestone     *MilestonePlan
+	milestoneGenerating bool
+	// milestoneStallCount tracks consecutive tactical replans that produced
+	// zero completed tasks. Too many stalls trigger a milestone regeneration.
+	milestoneStallCount int
+	// tasksCompletedThisMilestone resets on each new milestone.
+	tasksCompletedThisMilestone int
 }
+
+const maxMilestoneStalls = 5
 
 func NewEngine(
 	b Brain,
@@ -153,12 +167,23 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.telemetry.RecordTaskStatus("FAILED")
 		e.resetExecutionStateLocked()
 
-		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.", e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause)
+		// Death invalidates the active milestone — the bot may have lost
+		// critical items, so the previous goal is likely no longer valid.
+		e.activeMilestone = nil
+		e.milestoneStallCount = 0
+		e.tasksCompletedThisMilestone = 0
+
+		e.systemOverride = fmt.Sprintf(
+			"CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. "+
+				"Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.",
+			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause,
+		)
 		e.lastReplan = time.Time{}
 
 		meta.Status = "FAILED"
 		e.memory.LogEvent("death", "Died due to: "+eventPayload.Cause, meta)
-		e.logger.Warn("Bot died, triggering emergency recovery replan", slog.String("cause", eventPayload.Cause))
+		e.logger.Warn("Bot died — milestone cleared, triggering emergency recovery replan",
+			slog.String("cause", eventPayload.Cause))
 
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
@@ -179,6 +204,11 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.memory.LogEvent(eventPayload.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
 		e.inFlightTask = nil
+
+		// Track progress so we can detect stalls.
+		e.tasksCompletedThisMilestone++
+		e.milestoneStallCount = 0
+
 		e.mu.Unlock()
 		go e.processNextTask()
 		return
@@ -199,6 +229,20 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		if time.Now().Before(e.panicCooldown) {
 			e.lastReplan = time.Now()
 		}
+
+		// Count this replan cycle as a stall if we haven't made progress.
+		if e.tasksCompletedThisMilestone == 0 {
+			e.milestoneStallCount++
+			if e.milestoneStallCount >= maxMilestoneStalls {
+				e.logger.Warn("Milestone stalled — clearing for regeneration",
+					slog.Int("stall_count", e.milestoneStallCount),
+					slog.String("milestone", milestoneDesc(e.activeMilestone)),
+				)
+				e.activeMilestone = nil
+				e.milestoneStallCount = 0
+			}
+		}
+		e.tasksCompletedThisMilestone = 0
 
 		go e.setSummaryAsync("Last Failure", eventPayload.Action+" ("+eventPayload.Event+")")
 	}
@@ -244,6 +288,11 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
 
 	if busy && !criticalOverride {
+		// ── Milestone generation can happen in the background even while
+		// tasks are running — we just don't want to fire a tactical replan.
+		if e.activeMilestone == nil && !e.milestoneGenerating {
+			e.startMilestoneGenerationLocked(ctx, payload)
+		}
 		e.mu.Unlock()
 		return
 	}
@@ -258,9 +307,21 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
+	// ── If we don't have a milestone yet, kick one off and wait. ────────
+	// We won't do tactical planning until the milestone is available.
+	if e.activeMilestone == nil {
+		if !e.milestoneGenerating {
+			e.startMilestoneGenerationLocked(ctx, payload)
+		}
+		e.mu.Unlock()
+		return
+	}
+
+	// ── Normal tactical replan — we have a milestone, proceed. ──────────
 	epochAtStart := e.planEpoch
 	sessionID := e.sessionID
 	sysOverride := e.systemOverride
+	milestone := e.activeMilestone
 	e.systemOverride = ""
 
 	planCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -271,7 +332,48 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	e.mu.Unlock()
 
 	e.telemetry.RecordReplan()
-	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride)
+	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride, milestone)
+}
+
+// startMilestoneGenerationLocked fires a background goroutine to ask the
+// LLM for a new milestone. Must be called with e.mu held.
+func (e *Engine) startMilestoneGenerationLocked(ctx context.Context, payload json.RawMessage) {
+	e.milestoneGenerating = true
+	sessionID := e.sessionID
+
+	e.logger.Info("Generating new milestone...")
+
+	go func() {
+		mCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		milestone, err := e.brain.GenerateMilestone(mCtx, Tick{State: payload}, sessionID)
+
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.milestoneGenerating = false
+
+		if err != nil {
+			e.logger.Error("Failed to generate milestone", slog.Any("error", err))
+			return
+		}
+
+		e.activeMilestone = milestone
+		e.tasksCompletedThisMilestone = 0
+		e.milestoneStallCount = 0
+		// Reset replan timer so tactical planning fires on the next tick.
+		e.lastReplan = time.Time{}
+
+		e.logger.Info("New milestone set",
+			slog.String("id", milestone.ID),
+			slog.String("description", milestone.Description),
+		)
+		e.uiHub.Broadcast(map[string]interface{}{
+			"type":    "milestone_update",
+			"payload": milestone,
+		})
+		go e.setSummaryAsync("Active Milestone", milestone.Description)
+	}()
 }
 
 func (e *Engine) evaluateRoutinesLocked(state GameState) {
@@ -381,8 +483,14 @@ func (e *Engine) injectTaskLocked(task Action) {
 	}
 }
 
-func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessage, epochAtStart int, sessionID, sysOverride string) {
-	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID, sysOverride)
+func (e *Engine) evaluateAndQueuePlan(
+	ctx context.Context,
+	payload json.RawMessage,
+	epochAtStart int,
+	sessionID, sysOverride string,
+	milestone *MilestonePlan,
+) {
+	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID, sysOverride, milestone)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -407,6 +515,21 @@ func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessa
 	if plan == nil || len(plan.Tasks) == 0 {
 		go e.sendControlMessage("noop", "No actionable tasks generated")
 		return
+	}
+
+	// ── If the tactical planner signals milestone completion, clear it
+	// so the next state tick kicks off a fresh milestone generation. ────
+	if plan.MilestoneComplete && e.activeMilestone != nil {
+		e.logger.Info("Milestone marked complete by tactical planner",
+			slog.String("milestone", e.activeMilestone.Description),
+		)
+		go e.memory.LogEvent("milestone_complete", e.activeMilestone.Description,
+			EventMeta{SessionID: e.sessionID, Status: "COMPLETED"},
+		)
+		go e.setSummaryAsync("Last Completed Milestone", e.activeMilestone.Description)
+		e.activeMilestone = nil
+		e.milestoneStallCount = 0
+		e.tasksCompletedThisMilestone = 0
 	}
 
 	for i := range plan.Tasks {
@@ -533,4 +656,12 @@ func (e *Engine) setSummaryAsync(key, value string) {
 		defer cancel()
 		_ = e.memory.SetSummary(ctx, e.sessionID, key, value)
 	}()
+}
+
+// milestoneDesc is a nil-safe helper for logging.
+func milestoneDesc(m *MilestonePlan) string {
+	if m == nil {
+		return "<none>"
+	}
+	return m.Description
 }

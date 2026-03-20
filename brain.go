@@ -36,13 +36,28 @@ type Action struct {
 	Priority  Priority `json:"priority"`
 }
 
+// MilestonePlan represents a high-level, persistent goal that anchors
+// all tactical planning. It changes much less frequently than individual
+// tasks — only on completion, death, or explicit override.
+type MilestonePlan struct {
+	ID             string `json:"id"`
+	Description    string `json:"description"`
+	CompletionHint string `json:"completion_hint"` // Natural-language criteria the tactical planner can check
+}
+
 type LLMPlan struct {
 	Objective string   `json:"objective"`
 	Tasks     []Action `json:"tasks"`
+	// MilestoneComplete signals the tactical planner believes the active
+	// milestone has been achieved and a new one should be generated.
+	MilestoneComplete bool `json:"milestone_complete"`
 }
 
+// Brain is the planning interface. GenerateMilestone produces a slow,
+// high-level goal; EvaluatePlan produces 1-3 tactical steps anchored to it.
 type Brain interface {
-	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error)
+	GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error)
+	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error)
 }
 
 type LLMBrain struct {
@@ -65,7 +80,39 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 	}
 }
 
-func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error) {
+// GenerateMilestone asks the LLM for a single, concrete, high-level goal
+// given the current world state. This should be called infrequently — only
+// on first spawn, after milestone completion, or after death.
+func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
+	summary, err := b.memory.GetSummary(ctx, sessionID)
+	if err != nil {
+		summary = "No active summary."
+	}
+
+	systemPrompt := fmt.Sprintf(`You are the strategic director of an autonomous Minecraft agent.
+Your job is to pick ONE clear, achievable milestone for the bot to work toward next.
+
+Think in terms of classic Minecraft progression:
+- Punch trees → craft tools → gather stone → smelt ore → build shelter → get iron gear → explore, etc.
+
+Based on the current state and history, choose the single most valuable next milestone.
+Respond ONLY with a JSON object matching this exact format:
+{
+  "id": "milestone-<short-slug>",
+  "description": "A clear, one-sentence goal (e.g. 'Craft a full set of iron tools')",
+  "completion_hint": "What inventory or world state would confirm this milestone is done (e.g. 'Has iron_pickaxe, iron_axe, and iron_sword in inventory')"
+}
+
+--- ACTIVE CONTEXT (SUMMARY) ---
+%s`, summary)
+
+	return b.callLLMForMilestone(ctx, systemPrompt, string(t.State))
+}
+
+// EvaluatePlan generates 1-3 tactical tasks strictly anchored to the active
+// milestone. When the tactical planner believes the milestone is complete,
+// it sets milestone_complete: true so the engine can request a new one.
+func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
 	summary, err := b.memory.GetSummary(ctx, sessionID)
 	if err != nil {
 		summary = "No active summary."
@@ -76,35 +123,50 @@ func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOv
 		history = "No recent memory available."
 	}
 
-	systemPrompt := fmt.Sprintf(`You are the strategic commander of an autonomous Minecraft agent.
+	milestoneSection := "No active milestone. Focus on basic survival."
+	if milestone != nil {
+		milestoneSection = fmt.Sprintf(
+			"MILESTONE: %s\nCOMPLETION CRITERIA: %s",
+			milestone.Description,
+			milestone.CompletionHint,
+		)
+	}
+
+	systemPrompt := fmt.Sprintf(`You are the tactical commander of an autonomous Minecraft agent.
 Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
 
-YOUR ONLY GOAL IS TO ADVANCE THE CURRENT MILESTONE.
+YOUR ONLY JOB: Generate 1-3 sequential tasks that advance the ACTIVE MILESTONE below.
+Do NOT switch goals. Do NOT plan beyond the milestone.
 Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-The "tasks" field MUST be an array of objects.
+
+If you believe the milestone completion criteria have been met, set "milestone_complete": true.
 
 Valid macro actions:
 - "gather": Collect resources (wood, stone).
-- "craft": Create items. 
+- "craft": Create items.
 - "hunt": Track and kill entities.
 - "explore": Move to new map chunks.
 - "build": Place blocks to create structures.
-- "mark_location": Save your current coordinates to memory (target.name is the label, e.g., "base").
-- "recall_location": Retrieve coordinates from memory into your summary context.
+- "mark_location": Save current coordinates (target.name is the label, e.g., "base").
+- "recall_location": Retrieve coordinates from memory.
 
 Target types: "block", "entity", "recipe", "location", "none".
 
-Example format:
+Response format (JSON only):
 {
-  "objective": "Establish a secure base",
+  "objective": "One sentence describing the immediate sub-goal",
+  "milestone_complete": false,
   "tasks": [
-    { 
-      "action": "gather", 
-      "target": { "type": "block", "name": "oak_log" }, 
-      "rationale": "Gathering initial building materials" 
+    {
+      "action": "gather",
+      "target": { "type": "block", "name": "oak_log" },
+      "rationale": "Need logs to craft a crafting table"
     }
   ]
 }
+
+--- ACTIVE MILESTONE ---
+%s
 
 --- ACTIVE CONTEXT (SUMMARY) ---
 %s
@@ -116,14 +178,65 @@ Example format:
 %s
 ---------------------
 
-Analyze the state payload. Pay strict attention to any SYSTEM OVERRIDE warnings.
-Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, history, systemOverride)
+Analyze the state payload. Respect any SYSTEM OVERRIDE warnings.
+Generate 1-3 tasks that progress the active milestone.`,
+		milestoneSection, summary, history, systemOverride)
 
+	return b.callLLMForPlan(ctx, systemPrompt, string(t.State))
+}
+
+// ──────────────────────────────────────────────────
+// Internal HTTP helpers
+// ──────────────────────────────────────────────────
+
+func (b *LLMBrain) callLLMForMilestone(ctx context.Context, systemPrompt, userContent string) (*MilestonePlan, error) {
+	content, latency, err := b.doLLMRequest(ctx, systemPrompt, userContent)
+	b.telemetry.RecordLLMCall(latency, err)
+	if err != nil {
+		return nil, err
+	}
+
+	var milestone MilestonePlan
+	if err := json.Unmarshal([]byte(content), &milestone); err != nil {
+		return nil, fmt.Errorf("failed to parse milestone JSON: %w", err)
+	}
+	if milestone.ID == "" || milestone.Description == "" {
+		return nil, fmt.Errorf("milestone response missing required fields")
+	}
+	return &milestone, nil
+}
+
+func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent string) (*LLMPlan, error) {
+	content, latency, err := b.doLLMRequest(ctx, systemPrompt, userContent)
+	b.telemetry.RecordLLMCall(latency, err)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("[+] AI Latency: %v | Tasks Generated", latency)
+
+	var plan LLMPlan
+	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+		return nil, fmt.Errorf("failed to parse plan JSON: %w", err)
+	}
+
+	if len(plan.Tasks) > 3 {
+		plan.Tasks = plan.Tasks[:3]
+	}
+
+	for i := range plan.Tasks {
+		plan.Tasks[i].Priority = PriLLM
+	}
+
+	return &plan, nil
+}
+
+func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent string) (string, time.Duration, error) {
 	payload := map[string]interface{}{
 		"model": b.model,
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": string(t.State)},
+			{"role": "user", "content": userContent},
 		},
 		"response_format": map[string]string{"type": "json_object"},
 		"temperature":     0.1,
@@ -131,12 +244,12 @@ Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, h
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+		return "", 0, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return "", 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -144,20 +257,18 @@ Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, h
 	req.Header.Set("HTTP-Referer", "http://localhost:8080")
 	req.Header.Set("X-Title", "CraftD Bot Controller")
 
-	startTime := time.Now()
+	start := time.Now()
 	resp, err := b.client.Do(req)
-
-	latency := time.Since(startTime)
-	b.telemetry.RecordLLMCall(latency, err)
+	latency := time.Since(start)
 
 	if err != nil {
-		return nil, fmt.Errorf("API request failed: %w", err)
+		return "", latency, fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API HTTP %d: %s", resp.StatusCode, string(body))
+		return "", latency, fmt.Errorf("API HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -169,29 +280,12 @@ Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, h
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return "", latency, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	if len(result.Choices) == 0 {
-		return nil, fmt.Errorf("no choices returned")
+		return "", latency, fmt.Errorf("no choices returned")
 	}
 
-	content := result.Choices[0].Message.Content
-	log.Printf("[+] AI Latency: %v | Tasks Generated", time.Since(startTime))
-
-	var plan LLMPlan
-	if err := json.Unmarshal([]byte(content), &plan); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
-	}
-
-	if len(plan.Tasks) > 3 {
-		plan.Tasks = plan.Tasks[:3]
-	}
-
-	// Ensure all LLM-generated tasks are explicitly tagged as Priority 2
-	for i := range plan.Tasks {
-		plan.Tasks[i].Priority = PriLLM
-	}
-
-	return &plan, nil
+	return result.Choices[0].Message.Content, latency, nil
 }

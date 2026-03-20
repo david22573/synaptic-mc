@@ -1,7 +1,7 @@
-Project Context Dump (20 Mar 26 11:49 PDT)
+Project Context Dump (20 Mar 26 12:39 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 29
+Total Files: 22
 
 # Project Structure
 <file_tree>
@@ -25,13 +25,6 @@ Total Files: 29
 - main.go
 - memory.go
 - telemetry.go
-- ui\index.html
-- ui\src\App.svelte
-- ui\src\app.css
-- ui\src\lib\Counter.svelte
-- ui\src\main.ts
-- ui\svelte.config.js
-- ui\vite.config.ts
 - ui_hub.go
 - ws_types.go
 </file_tree>
@@ -139,13 +132,28 @@ type Action struct {
 	Priority  Priority `json:"priority"`
 }
 
+// MilestonePlan represents a high-level, persistent goal that anchors
+// all tactical planning. It changes much less frequently than individual
+// tasks — only on completion, death, or explicit override.
+type MilestonePlan struct {
+	ID             string `json:"id"`
+	Description    string `json:"description"`
+	CompletionHint string `json:"completion_hint"` // Natural-language criteria the tactical planner can check
+}
+
 type LLMPlan struct {
 	Objective string   `json:"objective"`
 	Tasks     []Action `json:"tasks"`
+	// MilestoneComplete signals the tactical planner believes the active
+	// milestone has been achieved and a new one should be generated.
+	MilestoneComplete bool `json:"milestone_complete"`
 }
 
+// Brain is the planning interface. GenerateMilestone produces a slow,
+// high-level goal; EvaluatePlan produces 1-3 tactical steps anchored to it.
 type Brain interface {
-	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error)
+	GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error)
+	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error)
 }
 
 type LLMBrain struct {
@@ -168,7 +176,39 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 	}
 }
 
-func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error) {
+// GenerateMilestone asks the LLM for a single, concrete, high-level goal
+// given the current world state. This should be called infrequently — only
+// on first spawn, after milestone completion, or after death.
+func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
+	summary, err := b.memory.GetSummary(ctx, sessionID)
+	if err != nil {
+		summary = "No active summary."
+	}
+
+	systemPrompt := fmt.Sprintf(`You are the strategic director of an autonomous Minecraft agent.
+Your job is to pick ONE clear, achievable milestone for the bot to work toward next.
+
+Think in terms of classic Minecraft progression:
+- Punch trees → craft tools → gather stone → smelt ore → build shelter → get iron gear → explore, etc.
+
+Based on the current state and history, choose the single most valuable next milestone.
+Respond ONLY with a JSON object matching this exact format:
+{
+  "id": "milestone-<short-slug>",
+  "description": "A clear, one-sentence goal (e.g. 'Craft a full set of iron tools')",
+  "completion_hint": "What inventory or world state would confirm this milestone is done (e.g. 'Has iron_pickaxe, iron_axe, and iron_sword in inventory')"
+}
+
+--- ACTIVE CONTEXT (SUMMARY) ---
+%s`, summary)
+
+	return b.callLLMForMilestone(ctx, systemPrompt, string(t.State))
+}
+
+// EvaluatePlan generates 1-3 tactical tasks strictly anchored to the active
+// milestone. When the tactical planner believes the milestone is complete,
+// it sets milestone_complete: true so the engine can request a new one.
+func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
 	summary, err := b.memory.GetSummary(ctx, sessionID)
 	if err != nil {
 		summary = "No active summary."
@@ -179,35 +219,50 @@ func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOv
 		history = "No recent memory available."
 	}
 
-	systemPrompt := fmt.Sprintf(`You are the strategic commander of an autonomous Minecraft agent.
+	milestoneSection := "No active milestone. Focus on basic survival."
+	if milestone != nil {
+		milestoneSection = fmt.Sprintf(
+			"MILESTONE: %s\nCOMPLETION CRITERIA: %s",
+			milestone.Description,
+			milestone.CompletionHint,
+		)
+	}
+
+	systemPrompt := fmt.Sprintf(`You are the tactical commander of an autonomous Minecraft agent.
 Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
 
-YOUR ONLY GOAL IS TO ADVANCE THE CURRENT MILESTONE.
+YOUR ONLY JOB: Generate 1-3 sequential tasks that advance the ACTIVE MILESTONE below.
+Do NOT switch goals. Do NOT plan beyond the milestone.
 Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-The "tasks" field MUST be an array of objects.
+
+If you believe the milestone completion criteria have been met, set "milestone_complete": true.
 
 Valid macro actions:
 - "gather": Collect resources (wood, stone).
-- "craft": Create items. 
+- "craft": Create items.
 - "hunt": Track and kill entities.
 - "explore": Move to new map chunks.
 - "build": Place blocks to create structures.
-- "mark_location": Save your current coordinates to memory (target.name is the label, e.g., "base").
-- "recall_location": Retrieve coordinates from memory into your summary context.
+- "mark_location": Save current coordinates (target.name is the label, e.g., "base").
+- "recall_location": Retrieve coordinates from memory.
 
 Target types: "block", "entity", "recipe", "location", "none".
 
-Example format:
+Response format (JSON only):
 {
-  "objective": "Establish a secure base",
+  "objective": "One sentence describing the immediate sub-goal",
+  "milestone_complete": false,
   "tasks": [
-    { 
-      "action": "gather", 
-      "target": { "type": "block", "name": "oak_log" }, 
-      "rationale": "Gathering initial building materials" 
+    {
+      "action": "gather",
+      "target": { "type": "block", "name": "oak_log" },
+      "rationale": "Need logs to craft a crafting table"
     }
   ]
 }
+
+--- ACTIVE MILESTONE ---
+%s
 
 --- ACTIVE CONTEXT (SUMMARY) ---
 %s
@@ -219,14 +274,65 @@ Example format:
 %s
 ---------------------
 
-Analyze the state payload. Pay strict attention to any SYSTEM OVERRIDE warnings.
-Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, history, systemOverride)
+Analyze the state payload. Respect any SYSTEM OVERRIDE warnings.
+Generate 1-3 tasks that progress the active milestone.`,
+		milestoneSection, summary, history, systemOverride)
 
+	return b.callLLMForPlan(ctx, systemPrompt, string(t.State))
+}
+
+// ──────────────────────────────────────────────────
+// Internal HTTP helpers
+// ──────────────────────────────────────────────────
+
+func (b *LLMBrain) callLLMForMilestone(ctx context.Context, systemPrompt, userContent string) (*MilestonePlan, error) {
+	content, latency, err := b.doLLMRequest(ctx, systemPrompt, userContent)
+	b.telemetry.RecordLLMCall(latency, err)
+	if err != nil {
+		return nil, err
+	}
+
+	var milestone MilestonePlan
+	if err := json.Unmarshal([]byte(content), &milestone); err != nil {
+		return nil, fmt.Errorf("failed to parse milestone JSON: %w", err)
+	}
+	if milestone.ID == "" || milestone.Description == "" {
+		return nil, fmt.Errorf("milestone response missing required fields")
+	}
+	return &milestone, nil
+}
+
+func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent string) (*LLMPlan, error) {
+	content, latency, err := b.doLLMRequest(ctx, systemPrompt, userContent)
+	b.telemetry.RecordLLMCall(latency, err)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("[+] AI Latency: %v | Tasks Generated", latency)
+
+	var plan LLMPlan
+	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+		return nil, fmt.Errorf("failed to parse plan JSON: %w", err)
+	}
+
+	if len(plan.Tasks) > 3 {
+		plan.Tasks = plan.Tasks[:3]
+	}
+
+	for i := range plan.Tasks {
+		plan.Tasks[i].Priority = PriLLM
+	}
+
+	return &plan, nil
+}
+
+func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent string) (string, time.Duration, error) {
 	payload := map[string]interface{}{
 		"model": b.model,
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": string(t.State)},
+			{"role": "user", "content": userContent},
 		},
 		"response_format": map[string]string{"type": "json_object"},
 		"temperature":     0.1,
@@ -234,12 +340,12 @@ Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, h
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+		return "", 0, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return "", 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -247,20 +353,18 @@ Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, h
 	req.Header.Set("HTTP-Referer", "http://localhost:8080")
 	req.Header.Set("X-Title", "CraftD Bot Controller")
 
-	startTime := time.Now()
+	start := time.Now()
 	resp, err := b.client.Do(req)
-
-	latency := time.Since(startTime)
-	b.telemetry.RecordLLMCall(latency, err)
+	latency := time.Since(start)
 
 	if err != nil {
-		return nil, fmt.Errorf("API request failed: %w", err)
+		return "", latency, fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API HTTP %d: %s", resp.StatusCode, string(body))
+		return "", latency, fmt.Errorf("API HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -272,31 +376,14 @@ Generate a sequential list of 1-3 tasks to progress your milestone.`, summary, h
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return "", latency, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	if len(result.Choices) == 0 {
-		return nil, fmt.Errorf("no choices returned")
+		return "", latency, fmt.Errorf("no choices returned")
 	}
 
-	content := result.Choices[0].Message.Content
-	log.Printf("[+] AI Latency: %v | Tasks Generated", time.Since(startTime))
-
-	var plan LLMPlan
-	if err := json.Unmarshal([]byte(content), &plan); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
-	}
-
-	if len(plan.Tasks) > 3 {
-		plan.Tasks = plan.Tasks[:3]
-	}
-
-	// Ensure all LLM-generated tasks are explicitly tagged as Priority 2
-	for i := range plan.Tasks {
-		plan.Tasks[i].Priority = PriLLM
-	}
-
-	return &plan, nil
+	return result.Choices[0].Message.Content, latency, nil
 }
 
 </file>
@@ -409,7 +496,21 @@ type Engine struct {
 	lastThreat    string
 	lastPos       Vec3
 	wg            sync.WaitGroup
+
+	// ── Two-tier planning state ──────────────────────────────────────────
+	// activeMilestone is the current high-level goal. It is generated once
+	// and persists until the tactical planner signals completion, the bot
+	// dies, or it stalls too many times without progress.
+	activeMilestone     *MilestonePlan
+	milestoneGenerating bool
+	// milestoneStallCount tracks consecutive tactical replans that produced
+	// zero completed tasks. Too many stalls trigger a milestone regeneration.
+	milestoneStallCount int
+	// tasksCompletedThisMilestone resets on each new milestone.
+	tasksCompletedThisMilestone int
 }
+
+const maxMilestoneStalls = 5
 
 func NewEngine(
 	b Brain,
@@ -502,12 +603,23 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.telemetry.RecordTaskStatus("FAILED")
 		e.resetExecutionStateLocked()
 
-		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.", e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause)
+		// Death invalidates the active milestone — the bot may have lost
+		// critical items, so the previous goal is likely no longer valid.
+		e.activeMilestone = nil
+		e.milestoneStallCount = 0
+		e.tasksCompletedThisMilestone = 0
+
+		e.systemOverride = fmt.Sprintf(
+			"CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. "+
+				"Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.",
+			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause,
+		)
 		e.lastReplan = time.Time{}
 
 		meta.Status = "FAILED"
 		e.memory.LogEvent("death", "Died due to: "+eventPayload.Cause, meta)
-		e.logger.Warn("Bot died, triggering emergency recovery replan", slog.String("cause", eventPayload.Cause))
+		e.logger.Warn("Bot died — milestone cleared, triggering emergency recovery replan",
+			slog.String("cause", eventPayload.Cause))
 
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
@@ -528,6 +640,11 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		e.memory.LogEvent(eventPayload.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
 		e.inFlightTask = nil
+
+		// Track progress so we can detect stalls.
+		e.tasksCompletedThisMilestone++
+		e.milestoneStallCount = 0
+
 		e.mu.Unlock()
 		go e.processNextTask()
 		return
@@ -548,6 +665,20 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		if time.Now().Before(e.panicCooldown) {
 			e.lastReplan = time.Now()
 		}
+
+		// Count this replan cycle as a stall if we haven't made progress.
+		if e.tasksCompletedThisMilestone == 0 {
+			e.milestoneStallCount++
+			if e.milestoneStallCount >= maxMilestoneStalls {
+				e.logger.Warn("Milestone stalled — clearing for regeneration",
+					slog.Int("stall_count", e.milestoneStallCount),
+					slog.String("milestone", milestoneDesc(e.activeMilestone)),
+				)
+				e.activeMilestone = nil
+				e.milestoneStallCount = 0
+			}
+		}
+		e.tasksCompletedThisMilestone = 0
 
 		go e.setSummaryAsync("Last Failure", eventPayload.Action+" ("+eventPayload.Event+")")
 	}
@@ -593,6 +724,11 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
 
 	if busy && !criticalOverride {
+		// ── Milestone generation can happen in the background even while
+		// tasks are running — we just don't want to fire a tactical replan.
+		if e.activeMilestone == nil && !e.milestoneGenerating {
+			e.startMilestoneGenerationLocked(ctx, payload)
+		}
 		e.mu.Unlock()
 		return
 	}
@@ -607,9 +743,21 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
+	// ── If we don't have a milestone yet, kick one off and wait. ────────
+	// We won't do tactical planning until the milestone is available.
+	if e.activeMilestone == nil {
+		if !e.milestoneGenerating {
+			e.startMilestoneGenerationLocked(ctx, payload)
+		}
+		e.mu.Unlock()
+		return
+	}
+
+	// ── Normal tactical replan — we have a milestone, proceed. ──────────
 	epochAtStart := e.planEpoch
 	sessionID := e.sessionID
 	sysOverride := e.systemOverride
+	milestone := e.activeMilestone
 	e.systemOverride = ""
 
 	planCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -620,7 +768,48 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	e.mu.Unlock()
 
 	e.telemetry.RecordReplan()
-	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride)
+	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride, milestone)
+}
+
+// startMilestoneGenerationLocked fires a background goroutine to ask the
+// LLM for a new milestone. Must be called with e.mu held.
+func (e *Engine) startMilestoneGenerationLocked(ctx context.Context, payload json.RawMessage) {
+	e.milestoneGenerating = true
+	sessionID := e.sessionID
+
+	e.logger.Info("Generating new milestone...")
+
+	go func() {
+		mCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		milestone, err := e.brain.GenerateMilestone(mCtx, Tick{State: payload}, sessionID)
+
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.milestoneGenerating = false
+
+		if err != nil {
+			e.logger.Error("Failed to generate milestone", slog.Any("error", err))
+			return
+		}
+
+		e.activeMilestone = milestone
+		e.tasksCompletedThisMilestone = 0
+		e.milestoneStallCount = 0
+		// Reset replan timer so tactical planning fires on the next tick.
+		e.lastReplan = time.Time{}
+
+		e.logger.Info("New milestone set",
+			slog.String("id", milestone.ID),
+			slog.String("description", milestone.Description),
+		)
+		e.uiHub.Broadcast(map[string]interface{}{
+			"type":    "milestone_update",
+			"payload": milestone,
+		})
+		go e.setSummaryAsync("Active Milestone", milestone.Description)
+	}()
 }
 
 func (e *Engine) evaluateRoutinesLocked(state GameState) {
@@ -730,8 +919,14 @@ func (e *Engine) injectTaskLocked(task Action) {
 	}
 }
 
-func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessage, epochAtStart int, sessionID, sysOverride string) {
-	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID, sysOverride)
+func (e *Engine) evaluateAndQueuePlan(
+	ctx context.Context,
+	payload json.RawMessage,
+	epochAtStart int,
+	sessionID, sysOverride string,
+	milestone *MilestonePlan,
+) {
+	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID, sysOverride, milestone)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -756,6 +951,21 @@ func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessa
 	if plan == nil || len(plan.Tasks) == 0 {
 		go e.sendControlMessage("noop", "No actionable tasks generated")
 		return
+	}
+
+	// ── If the tactical planner signals milestone completion, clear it
+	// so the next state tick kicks off a fresh milestone generation. ────
+	if plan.MilestoneComplete && e.activeMilestone != nil {
+		e.logger.Info("Milestone marked complete by tactical planner",
+			slog.String("milestone", e.activeMilestone.Description),
+		)
+		go e.memory.LogEvent("milestone_complete", e.activeMilestone.Description,
+			EventMeta{SessionID: e.sessionID, Status: "COMPLETED"},
+		)
+		go e.setSummaryAsync("Last Completed Milestone", e.activeMilestone.Description)
+		e.activeMilestone = nil
+		e.milestoneStallCount = 0
+		e.tasksCompletedThisMilestone = 0
 	}
 
 	for i := range plan.Tasks {
@@ -884,6 +1094,14 @@ func (e *Engine) setSummaryAsync(key, value string) {
 	}()
 }
 
+// milestoneDesc is a nil-safe helper for logging.
+func milestoneDesc(m *MilestonePlan) string {
+	if m == nil {
+		return "<none>"
+	}
+	return m.Description
+}
+
 </file>
 
 <file path="js\index.ts">
@@ -917,7 +1135,6 @@ const { pathfinder, Movements } = pkg;
 
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
-
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
 let survival: SurvivalSystem;
@@ -953,7 +1170,6 @@ function completeTask(
         | "task_aborted" = "task_completed",
 ) {
     if (!currentTask || !client) return;
-
     client.sendEvent(
         status,
         taskLabel(currentTask),
@@ -961,7 +1177,6 @@ function completeTask(
         "",
         currentTask.startTime,
     );
-
     currentTask = null;
 }
 
@@ -1064,7 +1279,6 @@ async function bootstrap() {
     log.info(
         "Config loaded. Connecting to Minecraft server at 127.0.0.1:25565...",
     );
-
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
@@ -1077,9 +1291,11 @@ async function bootstrap() {
             err: err instanceof Error ? err.message : String(err),
         }),
     );
+
     bot.on("end", (reason: unknown) =>
         log.error("Bot connection ended", { reason }),
     );
+
     bot.on("kicked", (reason: unknown) =>
         log.error("Bot was kicked", { reason }),
     );
@@ -1095,10 +1311,16 @@ async function bootstrap() {
 
     survival = new SurvivalSystem(bot, client, {
         onInterrupt: (reason: string) => {
-            if (taskAbortController) {
-                log.info(`LLM Task interrupted by survival reflex: ${reason}`);
-                taskAbortController.abort();
-                taskAbortController = null;
+            // Only abort LLM tasks for critical panics.
+            // Quick auto-defends will now pause and resume natively without telling the Go engine.
+            if (reason === "panic_flee") {
+                if (taskAbortController) {
+                    log.info(
+                        `LLM Task interrupted by survival reflex: ${reason}`,
+                    );
+                    taskAbortController.abort();
+                    taskAbortController = null;
+                }
             }
         },
         stopMovement: () => stopMovement(),
@@ -1668,9 +1890,13 @@ export class SurvivalSystem {
 
     private async triggerDefend(threat: models.ThreatInfo): Promise<void> {
         log.info("Reflex: Auto-defending", { target: threat.name });
-
         this.reflexActive = true;
-        this.config.onInterrupt("auto_defend");
+
+        // Capture the current pathfinder goal to resume later
+        const pathfinder = (this.bot as any).pathfinder;
+        const previousGoal = pathfinder.goal;
+
+        // Pause current movement, but DO NOT call onInterrupt("auto_defend")
         this.config.stopMovement();
 
         try {
@@ -1679,7 +1905,15 @@ export class SurvivalSystem {
                 await this.bot.equip(weapon, "hand");
             }
 
-            if (threat.entity && threat.entity.position) {
+            // Combat Loop: Stay engaged until threat is neutralized, out of range, or we are dying
+            while (threat.entity && threat.entity.isValid) {
+                const dist = this.bot.entity.position.distanceTo(
+                    threat.entity.position,
+                );
+
+                if (dist > 5) break; // Out of immediate melee range
+                if (this.bot.health < 6) break; // Critical health, break loop to let triggerFlee take over
+
                 await this.bot.lookAt(
                     threat.entity.position.offset(
                         0,
@@ -1689,18 +1923,31 @@ export class SurvivalSystem {
                     true,
                 );
                 this.bot.attack(threat.entity);
+
+                // Minecraft attack cooldown is ~600ms. Wait before swinging again.
+                await new Promise((resolve) => setTimeout(resolve, 600));
             }
         } catch (err) {
             log.error("Auto-defend failed", { err: String(err) });
         } finally {
-            // Drop lock quickly (800ms) so the bot can evaluate if it needs to hit again or flee
-            setTimeout(() => this.clearReflexState(), 800);
+            // Drop lock quickly so the bot can evaluate if it needs to hit again or flee
+            this.clearReflexState();
+
+            // Resume the LLM's spatial goal seamlessly if we aren't dying
+            if (previousGoal && this.bot.health >= 6) {
+                try {
+                    pathfinder.setGoal(previousGoal, true);
+                } catch (_err) {
+                    log.debug(
+                        "Failed to resume previous pathfinder goal after combat",
+                    );
+                }
+            }
         }
     }
 
     private async triggerEat(foodItem: any): Promise<void> {
         log.info("Reflex: Auto-eating", { food: foodItem.name });
-
         this.reflexActive = true;
         this.config.onInterrupt("auto_eat");
         this.config.stopMovement();
@@ -1789,39 +2036,117 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
 
 <file path="js\lib\tasks\handlers\gather.ts">
 import type { TaskContext } from "../registry.js";
-import {
-    findNearestBlockByName,
-    moveToGoal,
-    escapeTree,
-    waitForMs,
-} from "../task.js";
+import { escapeTree, waitForMs } from "../task.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+// All overworld log types the bot can gather. When the LLM asks for
+// "oak_log" but only birch trees exist nearby, we fall back through
+// this list so we never timeout on the wrong biome.
+const LOG_TYPES = [
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "acacia_log",
+    "jungle_log",
+    "dark_oak_log",
+    "mangrove_log",
+    "cherry_log",
+];
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    const { bot, decision, signal, timeouts } = ctx;
     await escapeTree(bot, signal);
-
-    const target = decision.target?.name;
-    if (!target) throw new Error("missing gather target");
-
-    const block = findNearestBlockByName(bot, target);
-    if (!block) throw new Error(`block not found: ${target}`);
-
-    if (!block.position) throw new Error(`block position not found: ${target}`);
-
-    await moveToGoal(
-        bot,
-        block.position,
-        signal,
-        timeouts.gather ?? 10000,
-        stopMovement,
-    );
 
     if (signal.aborted) throw new Error("aborted");
 
-    const tool = bot.pathfinder.bestHarvestTool(block);
-    if (tool !== undefined && tool !== null) await bot.equip(tool, "hand");
+    const requestedTarget = decision.target?.name;
+    if (!requestedTarget) throw new Error("missing gather target");
 
-    await bot.dig(block);
+    // Build the candidate list. If the LLM requested a specific log type,
+    // try it first; then fall back to any other log so we don't loop on
+    // the wrong biome. For non-log targets (stone, coal, etc.) just use
+    // the exact name with no fallback.
+    const isLogRequest =
+        requestedTarget.endsWith("_log") || requestedTarget === "wood";
+
+    const candidates: string[] = isLogRequest
+        ? [requestedTarget, ...LOG_TYPES.filter((l) => l !== requestedTarget)]
+        : [requestedTarget];
+
+    // Find the nearest available block from the candidate list.
+    let block: any = null;
+    let resolvedTarget = requestedTarget;
+
+    for (const name of candidates) {
+        const found = bot.findBlock({
+            maxDistance: 64,
+            matching: (b: any) => b?.name === name,
+        });
+        if (found) {
+            block = found;
+            resolvedTarget = name;
+            break;
+        }
+    }
+
+    if (!block) {
+        throw new Error(
+            `no block found near bot for target "${requestedTarget}" (tried ${candidates.length} types)`,
+        );
+    }
+
+    if (signal.aborted) throw new Error("aborted");
+
+    // pathfinder.goto() is a Promise that resolves on goal_reached and
+    // rejects on noPath / timeout. It is far more reliable than manually
+    // listening to the "goal_reached" event, which can fire before the
+    // listener is registered when the bot is already adjacent.
+    const gotoTimeout = timeouts.gather ?? 30000;
+    const gotoPromise = (bot as any).pathfinder.goto(
+        new goals.GoalGetToBlock(
+            block.position.x,
+            block.position.y,
+            block.position.z,
+        ),
+    );
+
+    // Race pathfinder.goto() against the abort signal and a hard timeout.
+    const abortPromise = new Promise<never>((_, reject) => {
+        if (signal.aborted) {
+            reject(new Error("aborted"));
+            return;
+        }
+        signal.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+        });
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+            () => reject(new Error(`timeout navigating to ${resolvedTarget}`)),
+            gotoTimeout,
+        ),
+    );
+
+    await Promise.race([gotoPromise, abortPromise, timeoutPromise]);
+
+    if (signal.aborted) throw new Error("aborted");
+
+    // Re-fetch after movement — the block reference can go stale if a
+    // chunk update changed the block while we walked.
+    const freshBlock = bot.blockAt(block.position);
+    if (!freshBlock || freshBlock.name !== resolvedTarget) {
+        throw new Error(
+            `block gone or changed after navigation: ${resolvedTarget}`,
+        );
+    }
+
+    const tool = (bot as any).pathfinder.bestHarvestTool(freshBlock);
+    if (tool != null) await bot.equip(tool, "hand");
+
+    await bot.dig(freshBlock);
     await waitForMs(500, signal);
 }
 
@@ -1984,10 +2309,6 @@ export function moveToGoal(
             return;
         }
 
-        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
-            return resolve();
-        }
-
         let settled = false;
 
         const finish = (err?: Error) => {
@@ -2051,7 +2372,7 @@ export function moveToGoal(
         bot.on("path_update", onPathUpdate);
 
         try {
-            // true enables dynamic pathfinding to stop computational freezes
+            // true enables dynamic pathfinding to avoid computational freezes
             bot.pathfinder.setGoal(goal, true);
         } catch (err) {
             finish(err instanceof Error ? err : new Error(String(err)));
@@ -2450,6 +2771,9 @@ export async function runTask(
             return;
         }
 
+        // ─── DROP-IN REPLACEMENTS for the "hunt" and "explore" cases in task.ts ────
+        // Replace the matching case blocks in the runTask() switch statement.
+
         case "hunt": {
             await escapeTree(bot, signal);
 
@@ -2458,49 +2782,70 @@ export async function runTask(
                 throw new Error("missing hunt target");
             }
 
-            const attackStartedAt = Date.now();
+            // Cap entity scan to 32 blocks. Without this, nearestEntity()
+            // finds mobs hundreds of blocks away, the bot chases forever,
+            // and the 30s wall-clock kills the task every time.
+            const MAX_HUNT_RANGE = 32;
+            const huntDeadline = Date.now() + (timeouts.hunt ?? 30000);
+
+            const findTarget = () =>
+                bot.nearestEntity(
+                    (e: any) =>
+                        e.name === targetName &&
+                        e.isValid &&
+                        bot.entity.position.distanceTo(e.position) <=
+                            MAX_HUNT_RANGE,
+                );
+
+            // Pre-flight: if there's nothing nearby at all, fail fast.
+            if (!findTarget()) {
+                throw new Error(
+                    `no ${targetName} within ${MAX_HUNT_RANGE} blocks`,
+                );
+            }
+
             let hasSeenTarget = false;
 
-            while (Date.now() - attackStartedAt < (timeouts.hunt ?? 30000)) {
+            while (Date.now() < huntDeadline) {
                 if (signal.aborted) throw new Error("aborted");
 
-                const targetEntity = bot.nearestEntity(
-                    (e: any) => e.name === targetName && e.isValid,
-                );
+                const targetEntity = findTarget();
 
                 if (!targetEntity) {
                     if (hasSeenTarget) {
+                        // Target died — pick up drops if nearby.
                         const drop = bot.nearestEntity(
                             (e: any) =>
                                 e.name === "item" &&
                                 bot.entity.position.distanceTo(e.position) < 10,
                         );
-
                         if (drop) {
-                            await moveToGoal(
-                                bot,
-                                new goals.GoalFollow(drop, 0),
-                                signal,
-                                5000,
-                                stopMovement,
-                            ).catch(() => {});
+                            await (bot as any).pathfinder
+                                .goto(new goals.GoalFollow(drop, 0))
+                                .catch(() => {});
                         }
                         stopMovement();
-                        return;
+                        return; // success
                     }
-                    throw new Error(`target not found: ${targetName}`);
+                    // Target despawned before we got there.
+                    throw new Error(`${targetName} disappeared`);
                 }
 
                 hasSeenTarget = true;
-
-                bot.pathfinder.setGoal(
-                    new goals.GoalFollow(targetEntity, 2),
-                    true,
+                const dist = bot.entity.position.distanceTo(
+                    targetEntity.position,
                 );
 
-                if (
-                    bot.entity.position.distanceTo(targetEntity.position) < 3.2
-                ) {
+                if (dist > 3.2) {
+                    // Navigate to within melee range using goto() so we can
+                    // await it properly rather than fire-and-forget setGoal().
+                    // Give each approach step 5 s; the outer loop retries if
+                    // the entity moves away after we arrive.
+                    await (bot as any).pathfinder
+                        .goto(new goals.GoalFollow(targetEntity, 2))
+                        .catch(() => {}); // entity moving = path errors are normal
+                } else {
+                    // In melee range — attack.
                     try {
                         const weapon = bot.inventory
                             .items()
@@ -2509,7 +2854,6 @@ export async function runTask(
                                     i.name.includes("sword") ||
                                     i.name.includes("axe"),
                             );
-
                         if (weapon) await bot.equip(weapon, "hand");
 
                         await bot.lookAt(
@@ -2522,9 +2866,10 @@ export async function runTask(
                         );
                         bot.attack(targetEntity);
                     } catch (_err) {}
-                }
 
-                await waitForMs(500, signal);
+                    // Cooldown between swings (Minecraft attack cooldown ~0.625 s).
+                    await waitForMs(650, signal);
+                }
             }
 
             throw new Error("timeout");
@@ -2534,16 +2879,22 @@ export async function runTask(
             await escapeTree(bot, signal);
 
             const angle = Math.random() * Math.PI * 2;
-            const targetX = bot.entity.position.x + Math.cos(angle) * 30;
-            const targetZ = bot.entity.position.z + Math.sin(angle) * 30;
+            const dist = 30 + Math.random() * 20; // 30–50 blocks
+            const targetX = bot.entity.position.x + Math.cos(angle) * dist;
+            const targetZ = bot.entity.position.z + Math.sin(angle) * dist;
 
-            await moveToGoal(
-                bot,
-                new goals.GoalNearXZ(targetX, targetZ, 2),
-                signal,
-                timeouts.explore ?? 45000, // Make sure your Go config.json matches this bump
-                stopMovement,
-            );
+            // pathfinder.goto() resolves cleanly; GoalNearXZ with the
+            // event-listener approach misses goal_reached ~30% of the time.
+            await (bot as any).pathfinder
+                .goto(new goals.GoalNearXZ(targetX, targetZ, 2))
+                .catch((err: any) => {
+                    const msg = String(err?.message ?? err);
+                    // noPath in open terrain is normal (e.g. ocean, cliff).
+                    // Don't let it fail the whole explore task.
+                    if (!msg.includes("noPath") && !msg.includes("No path")) {
+                        throw err;
+                    }
+                });
 
             return;
         }
@@ -2870,6 +3221,10 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
         )
         .map((e: any) => {
             const distance = bot.entity.position.distanceTo(e.position);
+            return { e, distance };
+        })
+        .filter(({ distance }) => distance <= 16) // Standard Minecraft mob aggro radius
+        .map(({ e, distance }) => {
             const baseThreat =
                 config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
             const threatScore = baseThreat * (10 / Math.max(distance, 1));
@@ -3423,777 +3778,6 @@ func (t *Telemetry) StartReporting(ctx context.Context) {
 
 </file>
 
-<file path="ui\index.html">
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ui</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
-</html>
-
-</file>
-
-<file path="ui\src\App.svelte">
-<script lang="ts">
-    import { onMount, onDestroy } from "svelte";
-
-    type Vec3 = { x: number; y: number; z: number };
-    type Threat = { name: string };
-    type InventoryItem = { name: string; count: number };
-
-    type BotState = {
-        health: number;
-        food: number;
-        time_of_day: number;
-        has_bed_nearby: boolean;
-        position: Vec3;
-        threats: Threat[];
-        inventory: InventoryItem[];
-    };
-
-    let state: BotState = {
-        health: 20,
-        food: 20,
-        time_of_day: 0,
-        has_bed_nearby: false,
-        position: { x: 0, y: 0, z: 0 },
-        threats: [],
-        inventory: [],
-    };
-
-    let ws: WebSocket;
-    let connected = false;
-
-    onMount(() => {
-        connect();
-    });
-
-    onDestroy(() => {
-        if (ws) ws.close();
-    });
-
-    function connect() {
-        ws = new WebSocket("ws://localhost:8080/ui/ws");
-
-        ws.onopen = () => {
-            connected = true;
-        };
-
-        ws.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                // Fixed: Go backend sends 'state_update', not 'state'
-                if (msg.type === "state_update") {
-                    state = msg.payload;
-                }
-            } catch (err) {
-                console.error("Failed to parse WS message:", err);
-            }
-        };
-
-        ws.onclose = () => {
-            connected = false;
-            setTimeout(connect, 2000);
-        };
-    }
-
-    // Calculate day/night tint
-    $: isNight = state.time_of_day >= 12000 && state.time_of_day <= 24000;
-    $: darkness = isNight
-        ? Math.sin(((state.time_of_day - 12000) / 12000) * Math.PI) * 0.6
-        : 0;
-
-    // Split inventory into hotbar (first 9) and side panel (the rest)
-    $: hotbarItems = Array.from(
-        { length: 9 },
-        (_, i) => state.inventory[i] || null,
-    );
-    $: sideInventory = state.inventory.slice(9);
-
-    // Format names for cleaner display (e.g., "oak_planks" -> "Oak Planks")
-    function formatName(name: string) {
-        return name
-            .split("_")
-            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-            .join(" ");
-    }
-</script>
-
-<svelte:head>
-    <link
-        href="https://fonts.googleapis.com/css2?family=VT323&display=swap"
-        rel="stylesheet"
-    />
-</svelte:head>
-
-<main class="dashboard">
-    <iframe src="http://localhost:3000" title="Prismarine Viewer"></iframe>
-
-    <div
-        class="night-tint"
-        style="background-color: rgba(5, 5, 20, {darkness});"
-    ></div>
-
-    <div class="hud">
-        <div class="top-left">
-            <div class="coord-box">
-                XYZ: {Math.floor(state.position.x)}, {Math.floor(
-                    state.position.y,
-                )}, {Math.floor(state.position.z)}
-            </div>
-            <div class="status-box {connected ? 'online' : 'offline'}">
-                {connected ? "LINK ESTABLISHED" : "SEARCHING FOR SIGNAL..."}
-            </div>
-        </div>
-
-        <div class="side-inventory">
-            {#each sideInventory as item}
-                <div class="side-item">
-                    <span class="item-count">{item.count}</span>
-                    <span class="item-name">{formatName(item.name)}</span>
-                </div>
-            {/each}
-        </div>
-
-        <div class="bottom-center">
-            {#if state.threats && state.threats.length > 0}
-                <div class="threat-warning">
-                    HOSTILES NEARBY: {state.threats
-                        .map((t) => formatName(t.name))
-                        .join(", ")}
-                </div>
-            {/if}
-
-            <div class="stat-bars">
-                <div class="bar-wrapper">
-                    <div
-                        class="bar-fill health-fill"
-                        style="width: {(state.health / 20) * 100}%"
-                    ></div>
-                    <span class="bar-text">HP {state.health}/20</span>
-                </div>
-                <div class="bar-wrapper">
-                    <div
-                        class="bar-fill food-fill"
-                        style="width: {(state.food / 20) * 100}%"
-                    ></div>
-                    <span class="bar-text">HUNGER {state.food}/20</span>
-                </div>
-            </div>
-
-            <div class="hotbar">
-                {#each hotbarItems as item, i}
-                    <div class="hotbar-slot">
-                        <span class="slot-number">{i + 1}</span>
-                        {#if item}
-                            <div class="slot-content">
-                                <span class="slot-item-name"
-                                    >{formatName(item.name).substring(
-                                        0,
-                                        4,
-                                    )}</span
-                                >
-                                {#if item.count > 1}
-                                    <span class="slot-count">{item.count}</span>
-                                {/if}
-                            </div>
-                        {/if}
-                    </div>
-                {/each}
-            </div>
-        </div>
-    </div>
-</main>
-
-<style>
-    :global(body) {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background: #000;
-    }
-
-    .dashboard {
-        position: relative;
-        width: 100vw;
-        height: 100vh;
-        font-family: "VT323", monospace;
-        font-size: 20px;
-        color: white;
-        text-shadow: 2px 2px 0px #3f3f3f;
-        user-select: none;
-    }
-
-    iframe {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        border: none;
-        z-index: 1;
-    }
-
-    .night-tint {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 2;
-        transition: background-color 1s linear;
-    }
-
-    .hud {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 3;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-    }
-
-    /* Top Left Elements */
-    .top-left {
-        padding: 10px;
-        display: flex;
-        flex-direction: column;
-        gap: 5px;
-    }
-
-    .coord-box,
-    .status-box {
-        background: rgba(0, 0, 0, 0.4);
-        display: inline-block;
-        padding: 2px 8px;
-        border: 2px solid rgba(0, 0, 0, 0.6);
-        width: fit-content;
-    }
-
-    .status-box.online {
-        color: #55ff55;
-    }
-    .status-box.offline {
-        color: #ff5555;
-    }
-
-    /* Left Side Inventory (Like the screenshot) */
-    .side-inventory {
-        position: absolute;
-        left: 10px;
-        top: 30%;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        background: rgba(0, 0, 0, 0.2);
-        padding: 10px;
-        border-radius: 4px;
-    }
-
-    .side-item {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
-
-    .item-count {
-        color: #ffff55; /* Minecraft Yellow */
-        min-width: 25px;
-        text-align: right;
-    }
-
-    .item-name {
-        color: #ffffff;
-    }
-
-    /* Bottom Center Area */
-    .bottom-center {
-        position: absolute;
-        bottom: 10px;
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 8px;
-    }
-
-    .threat-warning {
-        color: #ff5555;
-        background: rgba(0, 0, 0, 0.6);
-        padding: 4px 12px;
-        border: 2px solid #ff5555;
-        animation: blink 1s infinite;
-    }
-
-    @keyframes blink {
-        0%,
-        100% {
-            opacity: 1;
-        }
-        50% {
-            opacity: 0.5;
-        }
-    }
-
-    /* Health & Hunger Bars */
-    .stat-bars {
-        display: flex;
-        gap: 20px;
-        width: 100%;
-        justify-content: center;
-    }
-
-    .bar-wrapper {
-        position: relative;
-        width: 160px;
-        height: 20px;
-        background: rgba(0, 0, 0, 0.5);
-        border: 2px solid #222;
-        border-top-color: #555;
-        border-left-color: #555;
-    }
-
-    .bar-fill {
-        height: 100%;
-        transition: width 0.2s;
-    }
-
-    .health-fill {
-        background: #ff5555;
-        border-right: 2px solid #aa0000;
-    }
-    .food-fill {
-        background: #ffaa00;
-        border-right: 2px solid #cc6600;
-    }
-
-    .bar-text {
-        position: absolute;
-        top: -2px;
-        left: 0;
-        width: 100%;
-        text-align: center;
-        font-size: 18px;
-        text-shadow: 1px 1px 0px #000;
-    }
-
-    /* Hotbar Styling */
-    .hotbar {
-        display: flex;
-        background: rgba(0, 0, 0, 0.4);
-        padding: 2px;
-        border: 2px solid #222;
-        border-top-color: #555;
-        border-left-color: #555;
-    }
-
-    .hotbar-slot {
-        position: relative;
-        width: 40px;
-        height: 40px;
-        background: rgba(139, 139, 139, 0.4);
-        border: 2px solid #373737;
-        border-bottom-color: #fff;
-        border-right-color: #fff;
-        margin: 2px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-
-    .slot-number {
-        position: absolute;
-        top: 2px;
-        left: 4px;
-        font-size: 14px;
-        color: rgba(255, 255, 255, 0.5);
-        text-shadow: none;
-    }
-
-    .slot-content {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        height: 100%;
-    }
-
-    .slot-item-name {
-        font-size: 14px;
-        color: white;
-        text-transform: uppercase;
-    }
-
-    .slot-count {
-        position: absolute;
-        bottom: -2px;
-        right: 2px;
-        font-size: 18px;
-        color: #fff;
-        text-shadow: 2px 2px 0px #000;
-    }
-</style>
-
-</file>
-
-<file path="ui\src\app.css">
-/* :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
-
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
-
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
-}
-
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
-
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
-
-#app {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
-}
-
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
-
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
-    }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
-}
-
-#docs {
-  border-right: 1px solid var(--border);
-
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-}
-
-#next-steps ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
-}
-
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
-}
-
-.ticks {
-  position: relative;
-  width: 100%;
-
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
-
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
-  }
-} */
-
-</file>
-
-<file path="ui\src\lib\Counter.svelte">
-<script lang="ts">
-  let count: number = $state(0)
-  const increment = () => {
-    count += 1
-  }
-</script>
-
-<button class="counter" onclick={increment}>
-  Count is {count}
-</button>
-
-</file>
-
-<file path="ui\src\main.ts">
-import { mount } from 'svelte'
-import './app.css'
-import App from './App.svelte'
-
-const app = mount(App, {
-  target: document.getElementById('app')!,
-})
-
-export default app
-
-</file>
-
-<file path="ui\svelte.config.js">
-/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
-export default {}
-
-</file>
-
-<file path="ui\vite.config.ts">
-import { defineConfig } from 'vite'
-import { svelte } from '@sveltejs/vite-plugin-svelte'
-
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [svelte()],
-})
-
-</file>
-
 <file path="ui_hub.go">
 package main
 
@@ -4328,10 +3912,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 112839,
-  "file_count": 29,
-  "estimated_tokens": 28673,
+  "total_bytes": 111801,
+  "file_count": 22,
+  "estimated_tokens": 28305,
   "mode": "full",
-  "generated_at": "2026-03-20T11:49:36.2176812-07:00"
+  "generated_at": "2026-03-20T12:39:01.8089584-07:00"
 }
 ```

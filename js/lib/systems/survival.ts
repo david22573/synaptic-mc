@@ -141,9 +141,13 @@ export class SurvivalSystem {
 
     private async triggerDefend(threat: models.ThreatInfo): Promise<void> {
         log.info("Reflex: Auto-defending", { target: threat.name });
-
         this.reflexActive = true;
-        this.config.onInterrupt("auto_defend");
+
+        // Capture the current pathfinder goal to resume later
+        const pathfinder = (this.bot as any).pathfinder;
+        const previousGoal = pathfinder.goal;
+
+        // Pause current movement, but DO NOT call onInterrupt("auto_defend")
         this.config.stopMovement();
 
         try {
@@ -152,7 +156,15 @@ export class SurvivalSystem {
                 await this.bot.equip(weapon, "hand");
             }
 
-            if (threat.entity && threat.entity.position) {
+            // Combat Loop: Stay engaged until threat is neutralized, out of range, or we are dying
+            while (threat.entity && threat.entity.isValid) {
+                const dist = this.bot.entity.position.distanceTo(
+                    threat.entity.position,
+                );
+
+                if (dist > 5) break; // Out of immediate melee range
+                if (this.bot.health < 6) break; // Critical health, break loop to let triggerFlee take over
+
                 await this.bot.lookAt(
                     threat.entity.position.offset(
                         0,
@@ -162,18 +174,31 @@ export class SurvivalSystem {
                     true,
                 );
                 this.bot.attack(threat.entity);
+
+                // Minecraft attack cooldown is ~600ms. Wait before swinging again.
+                await new Promise((resolve) => setTimeout(resolve, 600));
             }
         } catch (err) {
             log.error("Auto-defend failed", { err: String(err) });
         } finally {
-            // Drop lock quickly (800ms) so the bot can evaluate if it needs to hit again or flee
-            setTimeout(() => this.clearReflexState(), 800);
+            // Drop lock quickly so the bot can evaluate if it needs to hit again or flee
+            this.clearReflexState();
+
+            // Resume the LLM's spatial goal seamlessly if we aren't dying
+            if (previousGoal && this.bot.health >= 6) {
+                try {
+                    pathfinder.setGoal(previousGoal, true);
+                } catch (_err) {
+                    log.debug(
+                        "Failed to resume previous pathfinder goal after combat",
+                    );
+                }
+            }
         }
     }
 
     private async triggerEat(foodItem: any): Promise<void> {
         log.info("Reflex: Auto-eating", { food: foodItem.name });
-
         this.reflexActive = true;
         this.config.onInterrupt("auto_eat");
         this.config.stopMovement();

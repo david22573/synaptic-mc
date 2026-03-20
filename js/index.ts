@@ -28,7 +28,6 @@ const { pathfinder, Movements } = pkg;
 
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
-
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
 let survival: SurvivalSystem;
@@ -64,7 +63,6 @@ function completeTask(
         | "task_aborted" = "task_completed",
 ) {
     if (!currentTask || !client) return;
-
     client.sendEvent(
         status,
         taskLabel(currentTask),
@@ -72,7 +70,6 @@ function completeTask(
         "",
         currentTask.startTime,
     );
-
     currentTask = null;
 }
 
@@ -175,7 +172,6 @@ async function bootstrap() {
     log.info(
         "Config loaded. Connecting to Minecraft server at 127.0.0.1:25565...",
     );
-
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
@@ -188,9 +184,11 @@ async function bootstrap() {
             err: err instanceof Error ? err.message : String(err),
         }),
     );
+
     bot.on("end", (reason: unknown) =>
         log.error("Bot connection ended", { reason }),
     );
+
     bot.on("kicked", (reason: unknown) =>
         log.error("Bot was kicked", { reason }),
     );
@@ -206,10 +204,16 @@ async function bootstrap() {
 
     survival = new SurvivalSystem(bot, client, {
         onInterrupt: (reason: string) => {
-            if (taskAbortController) {
-                log.info(`LLM Task interrupted by survival reflex: ${reason}`);
-                taskAbortController.abort();
-                taskAbortController = null;
+            // Only abort LLM tasks for critical panics.
+            // Quick auto-defends will now pause and resume natively without telling the Go engine.
+            if (reason === "panic_flee") {
+                if (taskAbortController) {
+                    log.info(
+                        `LLM Task interrupted by survival reflex: ${reason}`,
+                    );
+                    taskAbortController.abort();
+                    taskAbortController = null;
+                }
             }
         },
         stopMovement: () => stopMovement(),
