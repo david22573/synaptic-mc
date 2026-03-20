@@ -7,10 +7,11 @@ import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
 import { runTask } from "./lib/tasks/task.js";
 import { ControlPlaneClient } from "./lib/network/client.js";
+import { SurvivalSystem } from "./lib/systems/survival.js";
+import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 
-const { pathfinder, Movements, goals } = pkg;
+const { pathfinder, Movements } = pkg;
 
-// Patch missing warn helper without changing logger shape everywhere
 (log as any).warn = (msg: string, meta: Record<string, unknown> = {}) =>
     console.warn(
         JSON.stringify({
@@ -22,8 +23,11 @@ const { pathfinder, Movements, goals } = pkg;
     );
 
 // ==========================================
-// INITIALIZATION
+// GLOBALS & STATE
 // ==========================================
+
+let currentTask: models.ActiveTask | null = null;
+let taskAbortController: AbortController | null = null;
 
 const bot = mineflayer.createBot({
     host: "localhost",
@@ -34,21 +38,22 @@ const bot = mineflayer.createBot({
 
 bot.loadPlugin(pathfinder);
 
-let currentTask: models.ActiveTask | null = null;
-let awaitingCommand = false;
-let reflexActive = false;
-let reflexTimeout: NodeJS.Timeout | null = null;
-let lastReflexTime = 0;
-let taskAbortController: AbortController | null = null;
-
 const client = new ControlPlaneClient(config.WS_URL, {
-    onCommand: (decision) => {
-        awaitingCommand = false;
-        void executeDecision(decision);
-    },
+    onCommand: (decision) => void executeDecision(decision),
     onUnlock: () => {
-        awaitingCommand = false;
+        log.debug("Bot unlocked from control plane");
     },
+});
+
+const survival = new SurvivalSystem(bot, client, {
+    onInterrupt: (reason: string) => {
+        if (taskAbortController) {
+            log.info(`LLM Task interrupted by survival reflex: ${reason}`);
+            taskAbortController.abort();
+            taskAbortController = null;
+        }
+    },
+    stopMovement: () => stopMovement(),
 });
 
 // ==========================================
@@ -71,26 +76,6 @@ function stopMovement() {
     } catch {}
 }
 
-function clearReflexState() {
-    reflexActive = false;
-    if (reflexTimeout) {
-        clearTimeout(reflexTimeout);
-        reflexTimeout = null;
-    }
-}
-
-function resetExecutionState() {
-    if (taskAbortController) {
-        taskAbortController.abort();
-        taskAbortController = null;
-    }
-
-    currentTask = null;
-    awaitingCommand = false;
-    clearReflexState();
-    stopMovement();
-}
-
 function completeTask(
     status:
         | "task_completed"
@@ -111,103 +96,6 @@ function completeTask(
 }
 
 // ==========================================
-// THREATS / REFLEXES (Next refactor target)
-// ==========================================
-
-function getThreats(): models.ThreatInfo[] {
-    return Object.values(bot.entities)
-        .filter(
-            (e: any) => (e.type === "mob" || e.type === "hostile") && e.name,
-        )
-        .map((e: any) => {
-            const distance = bot.entity.position.distanceTo(e.position);
-            const baseThreat =
-                config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
-            const threatScore = baseThreat * (10 / Math.max(distance, 1));
-
-            return {
-                id: e.id!,
-                name: e.name || "unknown",
-                distance: parseFloat(distance.toFixed(1)),
-                threatScore: Math.round(threatScore),
-                position: { x: e.position.x, y: e.position.y, z: e.position.z },
-            };
-        })
-        .sort((a, b) => b.threatScore - a.threatScore);
-}
-
-function computeSafeRetreat(threats: models.ThreatInfo[]) {
-    let cx = 0,
-        cz = 0,
-        totalWeight = 0;
-
-    for (const threat of threats) {
-        cx += threat.position.x * threat.threatScore;
-        cz += threat.position.z * threat.threatScore;
-        totalWeight += threat.threatScore;
-    }
-
-    if (totalWeight === 0) {
-        return {
-            x: bot.entity.position.x + (Math.random() - 0.5) * 20,
-            z: bot.entity.position.z + (Math.random() - 0.5) * 20,
-        };
-    }
-
-    cx /= totalWeight;
-    cz /= totalWeight;
-
-    let dx = bot.entity.position.x - cx;
-    let dz = bot.entity.position.z - cz;
-    const len = Math.sqrt(dx * dx + dz * dz) || 1;
-
-    return {
-        x: bot.entity.position.x + (dx / len) * 20,
-        z: bot.entity.position.z + (dz / len) * 20,
-    };
-}
-
-function triggerReflexRetreat(threats: models.ThreatInfo[]) {
-    const primaryThreat = threats[0];
-    const cause =
-        primaryThreat?.name || (bot.health < 6 ? "low_health" : "unknown");
-
-    if (config.DEBUG_CHAT) {
-        bot.chat(
-            `Reflex: Evading ${cause}! (Health: ${Math.round(bot.health)})`,
-        );
-    }
-
-    if (taskAbortController) taskAbortController.abort();
-
-    reflexActive = true;
-    stopMovement();
-
-    client.sendEvent("panic_retreat", "evasion", "", cause, Date.now());
-
-    const safePos = computeSafeRetreat(threats);
-
-    log.warn("Reflex retreat triggered", {
-        cause,
-        health: bot.health,
-        safe_x: Math.round(safePos.x),
-        safe_z: Math.round(safePos.z),
-    });
-
-    (bot as any).pathfinder.setGoal(
-        new goals.GoalNear(safePos.x, bot.entity.position.y, safePos.z, 2),
-    );
-
-    if (reflexTimeout) clearTimeout(reflexTimeout);
-
-    reflexTimeout = setTimeout(() => {
-        log.debug("Reflex retreat timeout elapsed; clearing reflex state");
-        stopMovement();
-        clearReflexState();
-    }, 8000);
-}
-
-// ==========================================
 // ORCHESTRATION
 // ==========================================
 
@@ -224,7 +112,10 @@ async function executeDecision(decision: models.IncomingDecision) {
         target_name: decision.target?.name,
     });
 
-    if (taskAbortController) taskAbortController.abort();
+    if (taskAbortController) {
+        taskAbortController.abort();
+    }
+
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
 
@@ -258,14 +149,16 @@ async function executeDecision(decision: models.IncomingDecision) {
                 decision,
                 signal,
                 config.TASK_TIMEOUTS,
-                getThreats,
-                computeSafeRetreat,
+                () => getThreats(bot),
+                (threats) => computeSafeRetreat(bot, threats),
                 stopMovement,
             ),
             timeoutPromise,
         ]);
 
-        if (!signal.aborted) completeTask("task_completed");
+        if (!signal.aborted) {
+            completeTask("task_completed");
+        }
     } catch (err) {
         const message =
             err instanceof Error ? err.message : String(err || "unknown_error");
@@ -283,7 +176,9 @@ async function executeDecision(decision: models.IncomingDecision) {
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-        if (taskAbortController?.signal === signal) taskAbortController = null;
+        if (taskAbortController?.signal === signal) {
+            taskAbortController = null;
+        }
     }
 }
 
@@ -298,6 +193,7 @@ bot.once("spawn", () => {
 
     (bot as any).pathfinder.setMovements(new Movements(bot));
     client.connect();
+    survival.start();
 
     if (config.ENABLE_VIEWER) {
         try {
@@ -315,16 +211,14 @@ bot.once("spawn", () => {
     }
 });
 
-bot.on("goal_reached", () => {
-    if (reflexActive && currentTask === null) {
-        log.debug("Reflex retreat goal reached");
-        clearReflexState();
-    }
-});
-
 bot.on("death", () => {
     log.warn("Bot died; resetting local execution state");
-    resetExecutionState();
+    if (taskAbortController) {
+        taskAbortController.abort();
+        taskAbortController = null;
+    }
+    currentTask = null;
+    stopMovement();
 });
 
 bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));
@@ -338,25 +232,12 @@ bot.on("error", (err: unknown) =>
 );
 
 // ==========================================
-// SYSTEMS LOOPS
+// TELEMETRY SYNC
 // ==========================================
 
-bot.on("physicTick", () => {
-    const now = Date.now();
-    const threats = getThreats();
-
-    if (
-        (threats.length > 0 && threats[0]!.threatScore > 50) ||
-        bot.health < 6
-    ) {
-        if (now - lastReflexTime > 2000) {
-            triggerReflexRetreat(threats);
-            lastReflexTime = now;
-        }
-    }
-});
-
 setInterval(() => {
+    if (!bot.entity || !bot.entities) return;
+
     const state = {
         health: Math.round(bot.health),
         food: Math.round(bot.food),
@@ -365,7 +246,7 @@ setInterval(() => {
             y: Math.round(bot.entity.position.y),
             z: Math.round(bot.entity.position.z),
         },
-        threats: getThreats()
+        threats: getThreats(bot)
             .slice(0, 3)
             .map((t) => ({ name: t.name })),
         inventory: bot.inventory
@@ -374,5 +255,4 @@ setInterval(() => {
     };
 
     client.sendState(state);
-    awaitingCommand = true;
 }, 2000);

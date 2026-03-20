@@ -27,4 +27,5 @@ export interface ThreatInfo {
         y: number;
         z: number;
     };
+    entity?: any;
 }
