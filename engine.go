@@ -1,4 +1,3 @@
-// engine.go
 package main
 
 import (
@@ -6,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +36,7 @@ type Engine struct {
 	conn      *websocket.Conn
 	memory    MemoryBank
 	telemetry *Telemetry
+	uiHub     *UIHub
 	logger    *slog.Logger
 
 	mu      sync.Mutex
@@ -44,10 +45,11 @@ type Engine struct {
 	taskQueue    []Action
 	inFlightTask *Action
 
-	planEpoch  int
-	planning   bool
-	planCancel context.CancelFunc
-	sessionID  string
+	planEpoch      int
+	planning       bool
+	planCancel     context.CancelFunc
+	sessionID      string
+	systemOverride string
 
 	lastReplan    time.Time
 	panicCooldown time.Time
@@ -61,6 +63,7 @@ func NewEngine(
 	c *websocket.Conn,
 	mem MemoryBank,
 	tel *Telemetry,
+	uiHub *UIHub,
 	baseLogger *slog.Logger,
 ) *Engine {
 	sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
@@ -70,6 +73,7 @@ func NewEngine(
 		conn:       c,
 		memory:     mem,
 		telemetry:  tel,
+		uiHub:      uiHub,
 		logger:     baseLogger.With(slog.String("session_id", sessionID)),
 		taskQueue:  make([]Action, 0),
 		planEpoch:  0,
@@ -122,9 +126,7 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
-	var nextTask *Action
-	var summaryKey string
-	var summaryValue string
+	e.uiHub.Broadcast(map[string]interface{}{"type": "event_stream", "payload": eventPayload})
 
 	e.mu.Lock()
 
@@ -139,115 +141,70 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 		slog.String("action", eventPayload.Action),
 		slog.String("command_id", eventPayload.CommandID),
 		slog.Int("duration_ms", eventPayload.Duration),
-		slog.Int("plan_epoch", e.planEpoch),
 	}
 
 	switch eventPayload.Event {
+	case "death":
+		e.telemetry.RecordTaskStatus("FAILED")
+		e.resetExecutionStateLocked()
+
+		// Set high-priority recovery directive
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.", e.lastPos.X, e.lastPos.Y, e.lastPos.Z, eventPayload.Cause)
+		e.lastReplan = time.Time{} // Force immediate replan
+
+		meta.Status = "FAILED"
+		e.memory.LogEvent("death", "Died due to: "+eventPayload.Cause, meta)
+		e.logger.Warn("Bot died, triggering emergency recovery replan", slog.String("cause", eventPayload.Cause))
+
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
 		e.resetExecutionStateLocked()
-
-		// The JS SurvivalSystem handles panics for ~8s. Suppress normal planning.
 		e.panicCooldown = time.Now().Add(8 * time.Second)
-
 		meta.Status = "PANIC"
 		e.memory.LogEvent("evasion", "Fled from threat: "+eventPayload.Cause, meta)
-
-		e.logger.Warn(
-			"Reflex triggered by client",
-			append(logCtx, slog.String("cause", eventPayload.Cause))...,
-		)
-
-	case "task_started":
-		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring task_started for non-current task", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
-			e.mu.Unlock()
-			return
-		}
-
-		meta.Status = "STARTED"
-		e.memory.LogEvent(eventPayload.Action, "Started task ID: "+eventPayload.CommandID, meta)
-		e.logger.Debug("Task started", logCtx...)
+		e.logger.Warn("Reflex triggered by client", append(logCtx, slog.String("cause", eventPayload.Cause))...)
 
 	case "task_completed":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring stale task_completed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
-
 		e.telemetry.RecordTaskStatus("COMPLETED")
 		meta.Status = "COMPLETED"
 		e.memory.LogEvent(eventPayload.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
-
 		e.inFlightTask = nil
-		nextTask = e.dequeueNextTaskLocked()
-
-	case "task_failed":
-		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring stale task_failed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
-			e.mu.Unlock()
-			return
-		}
-
-		e.telemetry.RecordTaskStatus("FAILED")
-		meta.Status = "FAILED"
-		e.memory.LogEvent(eventPayload.Action, "Task failed", meta)
-		e.logger.Error("Task failed", append(logCtx, slog.String("event", eventPayload.Event))...)
-
-		summaryKey = "Last Failure"
-		summaryValue = eventPayload.Action + " (task_failed)"
-
-		e.resetExecutionStateLocked()
-
-	case "task_aborted":
-		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn("Ignoring stale task_aborted event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
-			e.mu.Unlock()
-			return
-		}
-
-		e.telemetry.RecordTaskStatus("ABORTED")
-		meta.Status = "ABORTED"
-		e.memory.LogEvent(eventPayload.Action, "Task aborted", meta)
-		e.logger.Warn("Task aborted", append(logCtx, slog.String("event", eventPayload.Event))...)
-
-		summaryKey = "Last Failure"
-		summaryValue = eventPayload.Action + " (task_aborted)"
-
-		e.resetExecutionStateLocked()
-
-	default:
-		e.logger.Warn("Ignoring unknown event type", slog.String("event", eventPayload.Event))
 		e.mu.Unlock()
+		go e.processNextTask()
 		return
+
+	case "task_failed", "task_aborted":
+		if !e.matchesInFlightLocked(eventPayload.CommandID) {
+			e.mu.Unlock()
+			return
+		}
+		status := strings.ToUpper(strings.Split(eventPayload.Event, "_")[1])
+		e.telemetry.RecordTaskStatus(status)
+		meta.Status = status
+		e.memory.LogEvent(eventPayload.Action, "Task "+status, meta)
+		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", eventPayload.Event))...)
+
+		e.resetExecutionStateLocked()
+		go e.setSummaryAsync("Last Failure", eventPayload.Action+" ("+eventPayload.Event+")")
 	}
 
 	e.mu.Unlock()
-
-	if summaryKey != "" {
-		e.setSummaryAsync(summaryKey, summaryValue)
-	}
-
-	if nextTask != nil {
-		_ = e.sendCommand(*nextTask)
-	}
 }
 
 func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	var state GameState
 	if err := json.Unmarshal(payload, &state); err != nil {
-		e.logger.Warn("Failed to decode state payload", slog.Any("error", err))
 		return
 	}
 
-	var epochAtStart int
-	var sessionID string
-	var shouldPlan bool
+	e.uiHub.Broadcast(map[string]interface{}{"type": "state_update", "payload": state})
 
 	e.mu.Lock()
-
 	e.lastPos = state.Position
 	topThreat := ""
 	if len(state.Threats) > 0 {
@@ -261,34 +218,24 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	e.lastHealth = state.Health
 	e.lastThreat = topThreat
 
-	// Abort if the JS client is currently handling a panic reflex
 	if time.Now().Before(e.panicCooldown) {
 		e.mu.Unlock()
 		return
 	}
 
-	// Context Cancellation: Preempt stale LLM calls if the environment changes critically
-	if e.planning {
-		if criticalOverride {
-			e.logger.Warn("Preempting ongoing LLM plan due to critical state change")
-			e.cancelPlanningLocked()
-		} else {
-			e.mu.Unlock()
-			return
-		}
+	if e.planning && criticalOverride {
+		e.cancelPlanningLocked()
 	}
 
 	busy := e.inFlightTask != nil || len(e.taskQueue) > 0
 	timeSinceReplan := time.Since(e.lastReplan)
-	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride
+	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
 
-	// Don't interrupt standard workflows for routine replans
 	if busy && !criticalOverride {
 		e.mu.Unlock()
 		return
 	}
 
-	// If critical and busy, flush the execution queue to allow new priorities
 	if criticalOverride && busy {
 		e.resetExecutionStateLocked()
 		go e.sendControlMessage("noop", "critical state interrupt")
@@ -299,37 +246,24 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
-	epochAtStart = e.planEpoch
-	sessionID = e.sessionID
+	epochAtStart := e.planEpoch
+	sessionID := e.sessionID
+	sysOverride := e.systemOverride
+	e.systemOverride = "" // Clear after injecting
 
 	planCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	e.planCancel = cancel
 	e.planning = true
 	e.lastReplan = time.Now()
-	shouldPlan = true
 
 	e.mu.Unlock()
 
-	if !shouldPlan {
-		return
-	}
-
 	e.telemetry.RecordReplan()
-	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID)
+	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID, sysOverride)
 }
 
-func (e *Engine) evaluateAndQueuePlan(
-	ctx context.Context,
-	payload json.RawMessage,
-	epochAtStart int,
-	sessionID string,
-) {
-	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID)
-
-	var nextTask *Action
-	var sendMsgType string
-	var sendReason string
-	var objective string
+func (e *Engine) evaluateAndQueuePlan(ctx context.Context, payload json.RawMessage, epochAtStart int, sessionID, sysOverride string) {
+	plan, err := e.brain.EvaluatePlan(ctx, Tick{State: payload}, sessionID, sysOverride)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -340,31 +274,19 @@ func (e *Engine) evaluateAndQueuePlan(
 	e.planning = false
 
 	if e.planEpoch != epochAtStart {
-		e.logger.Debug(
-			"Discarding stale plan",
-			slog.Int("start_epoch", epochAtStart),
-			slog.Int("current_epoch", e.planEpoch),
-		)
 		return
 	}
 
 	if err != nil {
-		if ctx.Err() == context.Canceled {
-			e.logger.Debug("Planning cancelled gracefully via preemptive replan")
-			return
+		if ctx.Err() != context.Canceled {
+			e.logger.Error("Planning failed", slog.Any("error", err))
+			go e.sendControlMessage("planning_error", "Failed to generate valid plan")
 		}
-		e.logger.Error("Planning failed", slog.Any("error", err))
-		sendMsgType = "planning_error"
-		sendReason = "Failed to generate valid plan"
-		go e.sendControlMessage(sendMsgType, sendReason)
 		return
 	}
 
 	if plan == nil || len(plan.Tasks) == 0 {
-		e.logger.Info("Planner returned no tasks")
-		sendMsgType = "noop"
-		sendReason = "No actionable tasks generated"
-		go e.sendControlMessage(sendMsgType, sendReason)
+		go e.sendControlMessage("noop", "No actionable tasks generated")
 		return
 	}
 
@@ -372,33 +294,60 @@ func (e *Engine) evaluateAndQueuePlan(
 		if plan.Tasks[i].ID == "" {
 			plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
 		}
-
-		if plan.Tasks[i].Target.Type == "" {
-			plan.Tasks[i].Target.Type = "none"
-		}
-		if plan.Tasks[i].Target.Name == "" {
-			plan.Tasks[i].Target.Name = "none"
-		}
 	}
 
-	objective = plan.Objective
+	e.uiHub.Broadcast(map[string]interface{}{"type": "objective_update", "payload": plan.Objective})
+	go e.setSummaryAsync("Current Objective", plan.Objective)
+
 	e.taskQueue = append(e.taskQueue[:0], plan.Tasks...)
-	nextTask = e.dequeueNextTaskLocked()
-
-	e.logger.Info(
-		"New LLM plan generated",
-		slog.String("objective", plan.Objective),
-		slog.Int("task_count", len(plan.Tasks)),
-	)
-
-	go e.setSummaryAsync("Current Objective", objective)
-
-	if nextTask != nil {
-		go e.sendCommand(*nextTask)
-	}
+	e.mu.Unlock()
+	e.processNextTask()
+	e.mu.Lock() // Re-lock for defer
 }
 
-// resetExecutionStateLocked consolidates clearing the queue and bumping the epoch. Must hold e.mu.
+// processNextTask handles execution delegation (Internal Go Memory tasks vs JS Client tasks)
+func (e *Engine) processNextTask() {
+	e.mu.Lock()
+	task := e.dequeueNextTaskLocked()
+	if task == nil {
+		e.mu.Unlock()
+		return
+	}
+
+	// INTERCEPT: Go-Side Internal Tasks
+	if task.Action == "mark_location" {
+		locName := task.Target.Name
+		err := e.memory.MarkLocation(context.Background(), locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+		if err == nil {
+			msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+			e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, X: e.lastPos.X, Y: e.lastPos.Y, Z: e.lastPos.Z, Status: "COMPLETED"})
+			e.logger.Info("Location marked in spatial memory", slog.String("name", locName))
+		}
+		e.inFlightTask = nil
+		e.mu.Unlock()
+		go e.processNextTask() // Immediately grab next task
+		return
+	}
+
+	if task.Action == "recall_location" {
+		locName := task.Target.Name
+		loc, err := e.memory.GetLocation(context.Background(), locName)
+		if err == nil {
+			msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", locName, loc.X, loc.Y, loc.Z)
+			e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, Status: "COMPLETED"})
+			go e.setSummaryAsync("Known Location: "+locName, msg)
+		}
+		e.inFlightTask = nil
+		e.mu.Unlock()
+		go e.processNextTask()
+		return
+	}
+
+	// External Task -> Send to JS Client
+	e.mu.Unlock()
+	_ = e.sendCommand(*task)
+}
+
 func (e *Engine) resetExecutionStateLocked() {
 	e.planEpoch++
 	e.taskQueue = nil
@@ -411,7 +360,6 @@ func (e *Engine) dequeueNextTaskLocked() *Action {
 	if e.inFlightTask != nil || len(e.taskQueue) == 0 {
 		return nil
 	}
-
 	nextTask := e.taskQueue[0]
 	e.taskQueue = e.taskQueue[1:]
 	e.inFlightTask = &nextTask
@@ -422,17 +370,7 @@ func (e *Engine) matchesInFlightLocked(commandID string) bool {
 	if e.inFlightTask == nil {
 		return false
 	}
-	if commandID == "" {
-		return true
-	}
-	return e.inFlightTask.ID == commandID
-}
-
-func (e *Engine) currentTaskIDLocked() string {
-	if e.inFlightTask == nil {
-		return ""
-	}
-	return e.inFlightTask.ID
+	return commandID == "" || e.inFlightTask.ID == commandID
 }
 
 func (e *Engine) cancelPlanningLocked() {
@@ -444,61 +382,24 @@ func (e *Engine) cancelPlanningLocked() {
 }
 
 func (e *Engine) sendCommand(action Action) error {
-	payload, err := json.Marshal(action)
-	if err != nil {
-		e.logger.Error("Failed to marshal command payload", slog.Any("error", err))
-		return err
-	}
+	payload, _ := json.Marshal(action)
+	e.uiHub.Broadcast(map[string]interface{}{"type": "command_dispatch", "payload": action})
 
-	response := map[string]interface{}{
-		"type":    "command",
-		"payload": json.RawMessage(payload),
-	}
-
-	if err := e.writeJSON(response); err != nil {
-		e.logger.Error(
-			"Failed to send command to bot",
-			slog.Any("error", err),
-			slog.String("command_id", action.ID),
-			slog.String("action", action.Action),
-		)
-
+	if err := e.writeJSON(map[string]interface{}{"type": "command", "payload": json.RawMessage(payload)}); err != nil {
 		e.mu.Lock()
 		if e.inFlightTask != nil && e.inFlightTask.ID == action.ID {
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
 		e.mu.Unlock()
-
 		return err
 	}
-
-	e.logger.Debug(
-		"Command dispatched",
-		slog.String("command_id", action.ID),
-		slog.String("action", action.Action),
-		slog.String("target_type", action.Target.Type),
-		slog.String("target_name", action.Target.Name),
-	)
-
 	return nil
 }
 
 func (e *Engine) sendControlMessage(msgType, reason string) {
-	payload, err := json.Marshal(map[string]string{"reason": reason})
-	if err != nil {
-		e.logger.Error("Failed to marshal control payload", slog.Any("error", err))
-		return
-	}
-
-	response := map[string]interface{}{
-		"type":    msgType,
-		"payload": json.RawMessage(payload),
-	}
-
-	if err := e.writeJSON(response); err != nil {
-		e.logger.Error("Failed to send control message", slog.Any("error", err), slog.String("type", msgType))
-	}
+	payload, _ := json.Marshal(map[string]string{"reason": reason})
+	_ = e.writeJSON(map[string]interface{}{"type": msgType, "payload": json.RawMessage(payload)})
 }
 
 func (e *Engine) writeJSON(v interface{}) error {
@@ -511,9 +412,6 @@ func (e *Engine) setSummaryAsync(key, value string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-
-		if err := e.memory.SetSummary(ctx, e.sessionID, key, value); err != nil {
-			e.logger.Warn("Failed to persist session summary", slog.String("key", key), slog.Any("error", err))
-		}
+		_ = e.memory.SetSummary(ctx, e.sessionID, key, value)
 	}()
 }

@@ -196,7 +196,7 @@ bot.once("spawn", () => {
         try {
             viewer(bot, {
                 port: config.VIEWER_PORT,
-                firstPerson: true,
+                firstPerson: false,
                 viewDistance: 2,
             });
             log.info("Prismarine viewer started", { port: config.VIEWER_PORT });
@@ -216,6 +216,14 @@ bot.on("death", () => {
     }
     currentTask = null;
     stopMovement();
+
+    client.sendEvent(
+        "death",
+        "died",
+        "",
+        "killed_in_action", // Alternatively extract cause from chat logs if desired
+        0,
+    );
 });
 
 bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));

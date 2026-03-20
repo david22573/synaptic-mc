@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -27,7 +28,6 @@ func main() {
 		log.Println("[!] No .env file found. Relying on system environment or defaults.")
 	}
 
-	// Configure structured JSON logging
 	logLevel := slog.LevelInfo
 	if os.Getenv("DEBUG") == "true" {
 		logLevel = slog.LevelDebug
@@ -45,7 +45,6 @@ func main() {
 	if apiURL == "" {
 		apiURL = DefaultAPI
 	}
-
 	modelName := os.Getenv("LLM_MODEL")
 	if modelName == "" {
 		modelName = DefaultModel
@@ -62,27 +61,35 @@ func main() {
 	telemetry := NewTelemetry(logger)
 	go telemetry.StartReporting(context.Background())
 
-	// Pass apiKey on initialization to avoid reading environment variables on every tick
 	brain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
-	logger.Info("Brain wired", slog.String("api", apiURL), slog.String("model", modelName))
 
+	// Phase 4: Wire UI Observability Hub
+	uiHub := NewUIHub(logger)
+
+	// Route 1: JS Bot WebSocket
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
 			return
 		}
+		logger.Info("Bot connected", slog.String("remote_addr", r.RemoteAddr))
 
-		clientIP := r.RemoteAddr
-		logger.Info("Bot connected", slog.String("remote_addr", clientIP))
-
-		engine := NewEngine(brain, conn, memory, telemetry, logger)
+		engine := NewEngine(brain, conn, memory, telemetry, uiHub, logger)
 		engine.Run(context.Background())
 
-		logger.Info("Bot disconnected", slog.String("remote_addr", clientIP))
+		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
 	})
 
+	// Route 2: UI Dashboard WebSocket Feed
+	http.HandleFunc("/ui/ws", uiHub.HandleConnections)
+
+	// Route 3: Simple static HTML dashboard (Optional, serves from current dir if exists)
+	http.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
+
 	logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
+	logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
+
 	if err := http.ListenAndServe(Port, nil); err != nil {
 		logger.Error("Server crashed", slog.Any("error", err))
 		os.Exit(1)

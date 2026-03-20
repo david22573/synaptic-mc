@@ -1,4 +1,3 @@
-// memory.go
 package main
 
 import (
@@ -24,6 +23,8 @@ type MemoryBank interface {
 	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
+	MarkLocation(ctx context.Context, name string, x, y, z float64) error
+	GetLocation(ctx context.Context, name string) (*Vec3, error)
 	Close() error
 }
 
@@ -46,7 +47,6 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	// Enable concurrent reads and pooled connections for WAL mode
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -103,7 +103,6 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 	return mem, nil
 }
 
-// processBatches handles asynchronous batched writes to prevent DB locking on the main thread
 func (s *SQLiteMemory) processBatches(ctx context.Context) {
 	defer s.wg.Done()
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -224,6 +223,25 @@ func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string
 		return "No active summary.", nil
 	}
 	return summary.String(), nil
+}
+
+func (s *SQLiteMemory) MarkLocation(ctx context.Context, name string, x, y, z float64) error {
+	query := `
+	INSERT INTO spatial_memory (name, x, y, z) 
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT(name) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z;`
+	_, err := s.db.ExecContext(ctx, query, name, x, y, z)
+	return err
+}
+
+func (s *SQLiteMemory) GetLocation(ctx context.Context, name string) (*Vec3, error) {
+	query := `SELECT x, y, z FROM spatial_memory WHERE name = ?`
+	var vec Vec3
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&vec.X, &vec.Y, &vec.Z)
+	if err != nil {
+		return nil, err
+	}
+	return &vec, nil
 }
 
 func (s *SQLiteMemory) Close() error {

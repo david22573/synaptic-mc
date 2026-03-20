@@ -34,7 +34,7 @@ type LLMPlan struct {
 }
 
 type Brain interface {
-	EvaluatePlan(ctx context.Context, t Tick, sessionID string) (*LLMPlan, error)
+	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error)
 }
 
 type LLMBrain struct {
@@ -50,14 +50,14 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 	return &LLMBrain{
 		apiURL:    apiURL,
 		model:     model,
-		apiKey:    apiKey, // Cached internally to avoid os.Getenv syscalls in the hot path
+		apiKey:    apiKey,
 		memory:    mem,
 		telemetry: tel,
 		client:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID string) (*LLMPlan, error) {
+func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string) (*LLMPlan, error) {
 	summary, err := b.memory.GetSummary(ctx, sessionID)
 	if err != nil {
 		summary = "No active summary."
@@ -68,37 +68,32 @@ func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID string) (
 		history = "No recent memory available."
 	}
 
-	// Refactored system prompt to enforce macro-level strategic thinking.
-	// We explicitly point out the inventory payload to ensure the LLM considers prerequisites.
 	systemPrompt := fmt.Sprintf(`You are the strategic commander of an autonomous Minecraft survival agent. 
 You operate at a MACRO level. Do not micromanage movement.
 You MUST output a valid JSON object. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
 The "tasks" field MUST be an array of objects.
 
 Valid macro actions:
-- "gather": Collect resources (wood, stone). The bot will automatically path, mine, and pick up drops.
-- "craft": Create items. The bot will automatically handle tables and component assembly.
-- "hunt": Track and kill entities, then collect their drops.
+- "gather": Collect resources (wood, stone).
+- "craft": Create items. 
+- "hunt": Track and kill entities.
 - "explore": Move to new map chunks.
 - "build": Place blocks to create structures.
 - "retreat": Move to safety.
 - "idle": Wait and observe.
+- "mark_location": Save your current coordinates to memory (target.name is the label, e.g., "base").
+- "recall_location": Retrieve coordinates from memory into your summary context.
 
-Target types: "block", "entity", "recipe", "direction", "none".
+Target types: "block", "entity", "recipe", "location", "none".
 
 Example format:
 {
-  "objective": "Acquire basic tools",
+  "objective": "Establish a secure base",
   "tasks": [
     { 
-      "action": "gather", 
-      "target": { "type": "block", "name": "oak_log" }, 
-      "rationale": "Need wood to craft a pickaxe" 
-    },
-    { 
-      "action": "craft", 
-      "target": { "type": "recipe", "name": "wooden_pickaxe" }, 
-      "rationale": "Required to mine stone" 
+      "action": "mark_location", 
+      "target": { "type": "location", "name": "home_base" }, 
+      "rationale": "Remembering this spot to return to later" 
     }
   ]
 }
@@ -108,11 +103,14 @@ Example format:
 
 --- RECENT MEMORY ---
 %s
+
+--- CRITICAL SYSTEM OVERRIDE ---
+%s
 ---------------------
 
 Analyze the state payload (health, position, threats, AND INVENTORY). 
-If your inventory lacks raw materials for an objective, generate tasks to gather them first.
-Generate a sequential list of 1-3 tasks.`, summary, history)
+Pay strict attention to any SYSTEM OVERRIDE warnings.
+Generate a sequential list of 1-3 tasks.`, summary, history, systemOverride)
 
 	payload := map[string]interface{}{
 		"model": b.model,
