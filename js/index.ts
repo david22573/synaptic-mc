@@ -1,42 +1,29 @@
-import * as dotenv from "dotenv";
-import * as fs from "fs";
-import * as path from "path";
-
 import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
-import WebSocket from "ws";
 import { mineflayer as viewer } from "prismarine-viewer";
 
+import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
 import { runTask } from "./lib/tasks/task.js";
+import { ControlPlaneClient } from "./lib/network/client.js";
 
 const { pathfinder, Movements, goals } = pkg;
 
-function loadEnv(): string {
-    const candidates = [
-        path.resolve(process.cwd(), ".env"),
-        path.resolve(process.cwd(), "../.env"),
-    ];
+// Patch missing warn helper without changing logger shape everywhere
+(log as any).warn = (msg: string, meta: Record<string, unknown> = {}) =>
+    console.warn(
+        JSON.stringify({
+            level: "WARN",
+            msg,
+            ...meta,
+            timestamp: new Date().toISOString(),
+        }),
+    );
 
-    for (const envPath of candidates) {
-        if (fs.existsSync(envPath)) {
-            dotenv.config({ path: envPath });
-            return envPath;
-        }
-    }
-
-    dotenv.config();
-    return "default-dotenv-lookup";
-}
-
-const loadedEnvPath = loadEnv();
-
-const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
-const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
-const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-
-const WS_URL = "ws://localhost:8080/ws";
+// ==========================================
+// INITIALIZATION
+// ==========================================
 
 const bot = mineflayer.createBot({
     host: "localhost",
@@ -47,7 +34,6 @@ const bot = mineflayer.createBot({
 
 bot.loadPlugin(pathfinder);
 
-let ws: WebSocket;
 let currentTask: models.ActiveTask | null = null;
 let awaitingCommand = false;
 let reflexActive = false;
@@ -55,20 +41,15 @@ let reflexTimeout: NodeJS.Timeout | null = null;
 let lastReflexTime = 0;
 let taskAbortController: AbortController | null = null;
 
-const TASK_TIMEOUTS: Record<string, number> = {
-    attack: 20000,
-    retreat: 15000,
-    mine: 20000,
-    idle: 3000,
-};
-
-const THREAT_WEIGHTS: Record<string, number> = {
-    warden: 1000,
-    creeper: 100,
-    skeleton: 20,
-    zombie: 10,
-    spider: 10,
-};
+const client = new ControlPlaneClient(config.WS_URL, {
+    onCommand: (decision) => {
+        awaitingCommand = false;
+        void executeDecision(decision);
+    },
+    onUnlock: () => {
+        awaitingCommand = false;
+    },
+});
 
 // ==========================================
 // STATE HELPERS
@@ -82,11 +63,9 @@ function stopMovement() {
     try {
         bot.clearControlStates();
     } catch {}
-
     try {
         (bot as any).pathfinder.setGoal(null);
     } catch {}
-
     try {
         (bot as any).pathfinder.stop();
     } catch {}
@@ -118,11 +97,9 @@ function completeTask(
         | "task_failed"
         | "task_aborted" = "task_completed",
 ) {
-    if (!currentTask) {
-        return;
-    }
+    if (!currentTask) return;
 
-    sendEvent(
+    client.sendEvent(
         status,
         taskLabel(currentTask),
         currentTask.id,
@@ -134,88 +111,7 @@ function completeTask(
 }
 
 // ==========================================
-// WEBSOCKET
-// ==========================================
-
-function connectControlPlane() {
-    ws = new WebSocket(WS_URL);
-
-    ws.on("open", () => {
-        log.info("Connected to Go Control Plane", {
-            ws_url: WS_URL,
-            env_path: loadedEnvPath,
-            enable_viewer: ENABLE_VIEWER,
-            viewer_port: VIEWER_PORT,
-        });
-    });
-
-    ws.on("message", (data: Buffer) => {
-        try {
-            const msg = JSON.parse(data.toString());
-
-            if (msg.type === "command") {
-                awaitingCommand = false;
-                void executeDecision(msg.payload as models.IncomingDecision);
-                return;
-            }
-
-            if (msg.type === "planning_error" || msg.type === "noop") {
-                log.debug("Control plane unlocked bot", {
-                    type: msg.type,
-                    payload: msg.payload,
-                });
-                awaitingCommand = false;
-            }
-        } catch (err) {
-            log.error("Failed to parse control-plane message", {
-                err: err instanceof Error ? err.message : String(err),
-            });
-            awaitingCommand = false;
-        }
-    });
-
-    ws.on("close", () => {
-        log.error("Disconnected from Control Plane. Retrying in 5s...");
-        resetExecutionState();
-        setTimeout(connectControlPlane, 5000);
-    });
-
-    ws.on("error", (err) => {
-        log.error("WebSocket error", {
-            err: err instanceof Error ? err.message : String(err),
-        });
-    });
-}
-
-function sendEvent(
-    event: string,
-    actionStr: string,
-    commandId = "",
-    cause = "",
-    startTime = 0,
-) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return;
-    }
-
-    const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
-
-    ws.send(
-        JSON.stringify({
-            type: "event",
-            payload: {
-                event,
-                action: actionStr,
-                command_id: commandId,
-                cause,
-                duration_ms,
-            },
-        }),
-    );
-}
-
-// ==========================================
-// THREATS / REFLEXES
+// THREATS / REFLEXES (Next refactor target)
 // ==========================================
 
 function getThreats(): models.ThreatInfo[] {
@@ -225,7 +121,8 @@ function getThreats(): models.ThreatInfo[] {
         )
         .map((e: any) => {
             const distance = bot.entity.position.distanceTo(e.position);
-            const baseThreat = THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
+            const baseThreat =
+                config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
             const threatScore = baseThreat * (10 / Math.max(distance, 1));
 
             return {
@@ -233,20 +130,16 @@ function getThreats(): models.ThreatInfo[] {
                 name: e.name || "unknown",
                 distance: parseFloat(distance.toFixed(1)),
                 threatScore: Math.round(threatScore),
-                position: {
-                    x: e.position.x,
-                    y: e.position.y,
-                    z: e.position.z,
-                },
+                position: { x: e.position.x, y: e.position.y, z: e.position.z },
             };
         })
         .sort((a, b) => b.threatScore - a.threatScore);
 }
 
 function computeSafeRetreat(threats: models.ThreatInfo[]) {
-    let cx = 0;
-    let cz = 0;
-    let totalWeight = 0;
+    let cx = 0,
+        cz = 0,
+        totalWeight = 0;
 
     for (const threat of threats) {
         cx += threat.position.x * threat.threatScore;
@@ -268,12 +161,9 @@ function computeSafeRetreat(threats: models.ThreatInfo[]) {
     let dz = bot.entity.position.z - cz;
     const len = Math.sqrt(dx * dx + dz * dz) || 1;
 
-    dx /= len;
-    dz /= len;
-
     return {
-        x: bot.entity.position.x + dx * 20,
-        z: bot.entity.position.z + dz * 20,
+        x: bot.entity.position.x + (dx / len) * 20,
+        z: bot.entity.position.z + (dz / len) * 20,
     };
 }
 
@@ -282,21 +172,18 @@ function triggerReflexRetreat(threats: models.ThreatInfo[]) {
     const cause =
         primaryThreat?.name || (bot.health < 6 ? "low_health" : "unknown");
 
-    if (DEBUG_CHAT) {
+    if (config.DEBUG_CHAT) {
         bot.chat(
             `Reflex: Evading ${cause}! (Health: ${Math.round(bot.health)})`,
         );
     }
 
-    if (taskAbortController) {
-        taskAbortController.abort();
-    }
+    if (taskAbortController) taskAbortController.abort();
 
     reflexActive = true;
     stopMovement();
 
-    const startTime = Date.now();
-    sendEvent("panic_retreat", "evasion", "", cause, startTime);
+    client.sendEvent("panic_retreat", "evasion", "", cause, Date.now());
 
     const safePos = computeSafeRetreat(threats);
 
@@ -311,9 +198,7 @@ function triggerReflexRetreat(threats: models.ThreatInfo[]) {
         new goals.GoalNear(safePos.x, bot.entity.position.y, safePos.z, 2),
     );
 
-    if (reflexTimeout) {
-        clearTimeout(reflexTimeout);
-    }
+    if (reflexTimeout) clearTimeout(reflexTimeout);
 
     reflexTimeout = setTimeout(() => {
         log.debug("Reflex retreat timeout elapsed; clearing reflex state");
@@ -322,21 +207,13 @@ function triggerReflexRetreat(threats: models.ThreatInfo[]) {
     }, 8000);
 }
 
-// Patch missing warn helper without changing logger shape everywhere
-(log as any).warn = (msg: string, meta: Record<string, unknown> = {}) =>
-    console.warn(
-        JSON.stringify({
-            level: "WARN",
-            msg,
-            ...meta,
-            timestamp: new Date().toISOString(),
-        }),
-    );
+// ==========================================
+// ORCHESTRATION
+// ==========================================
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) {
         log.error("Received malformed command", { decision });
-        awaitingCommand = false;
         return;
     }
 
@@ -345,13 +222,9 @@ async function executeDecision(decision: models.IncomingDecision) {
         action: decision.action,
         target_type: decision.target?.type,
         target_name: decision.target?.name,
-        rationale: decision.rationale,
     });
 
-    if (taskAbortController) {
-        taskAbortController.abort();
-    }
-
+    if (taskAbortController) taskAbortController.abort();
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
 
@@ -363,7 +236,7 @@ async function executeDecision(decision: models.IncomingDecision) {
     };
 
     stopMovement();
-    sendEvent(
+    client.sendEvent(
         "task_started",
         taskLabel(currentTask),
         decision.id,
@@ -371,7 +244,7 @@ async function executeDecision(decision: models.IncomingDecision) {
         currentTask.startTime,
     );
 
-    const timeoutMs = TASK_TIMEOUTS[decision.action] || 10000;
+    const timeoutMs = config.TASK_TIMEOUTS[decision.action] || 10000;
     let timeoutId: NodeJS.Timeout | null = null;
 
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -384,7 +257,7 @@ async function executeDecision(decision: models.IncomingDecision) {
                 bot,
                 decision,
                 signal,
-                TASK_TIMEOUTS,
+                config.TASK_TIMEOUTS,
                 getThreats,
                 computeSafeRetreat,
                 stopMovement,
@@ -392,9 +265,7 @@ async function executeDecision(decision: models.IncomingDecision) {
             timeoutPromise,
         ]);
 
-        if (!signal.aborted) {
-            completeTask("task_completed");
-        }
+        if (!signal.aborted) completeTask("task_completed");
     } catch (err) {
         const message =
             err instanceof Error ? err.message : String(err || "unknown_error");
@@ -405,21 +276,14 @@ async function executeDecision(decision: models.IncomingDecision) {
             log.error("Task failed", {
                 id: decision.id,
                 action: decision.action,
-                target: decision.target?.name,
                 error: message,
             });
             completeTask("task_failed");
         }
     } finally {
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-        }
-
+        if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-
-        if (taskAbortController?.signal === signal) {
-            taskAbortController = null;
-        }
+        if (taskAbortController?.signal === signal) taskAbortController = null;
     }
 }
 
@@ -427,43 +291,27 @@ async function executeDecision(decision: models.IncomingDecision) {
 // BOT LIFECYCLE
 // ==========================================
 
-bot.on("login", () => {
-    log.info("Bot logged in");
-});
+bot.on("login", () => log.info("Bot logged in"));
 
 bot.once("spawn", () => {
-    log.info("Bot spawned", {
-        env_path: loadedEnvPath,
-        cwd: process.cwd(),
-        enable_viewer: ENABLE_VIEWER,
-        viewer_port: VIEWER_PORT,
-    });
+    log.info("Bot spawned", { env_path: config.ENV_PATH, cwd: process.cwd() });
 
     (bot as any).pathfinder.setMovements(new Movements(bot));
-    connectControlPlane();
+    client.connect();
 
-    if (ENABLE_VIEWER) {
+    if (config.ENABLE_VIEWER) {
         try {
             viewer(bot, {
-                port: VIEWER_PORT,
+                port: config.VIEWER_PORT,
                 firstPerson: true,
                 viewDistance: 2,
             });
-
-            log.info("Prismarine viewer started", {
-                url: `http://localhost:${VIEWER_PORT}`,
-                port: VIEWER_PORT,
-            });
+            log.info("Prismarine viewer started", { port: config.VIEWER_PORT });
         } catch (err) {
             log.error("Viewer failed to start", {
                 err: err instanceof Error ? err.message : String(err),
             });
         }
-    } else {
-        log.info("Prismarine viewer disabled", {
-            enable_viewer: ENABLE_VIEWER,
-            env_path: loadedEnvPath,
-        });
     }
 });
 
@@ -479,22 +327,18 @@ bot.on("death", () => {
     resetExecutionState();
 });
 
-bot.on("kicked", (reason: unknown) => {
-    log.error("Bot was kicked", { reason });
-});
-
-bot.on("end", (reason: unknown) => {
-    log.error("Bot connection ended", { reason });
-});
-
-bot.on("error", (err: unknown) => {
+bot.on("kicked", (reason: unknown) => log.error("Bot was kicked", { reason }));
+bot.on("end", (reason: unknown) =>
+    log.error("Bot connection ended", { reason }),
+);
+bot.on("error", (err: unknown) =>
     log.error("Bot error", {
         err: err instanceof Error ? err.message : String(err),
-    });
-});
+    }),
+);
 
 // ==========================================
-// HIGH-FREQUENCY REFLEX LOOP
+// SYSTEMS LOOPS
 // ==========================================
 
 bot.on("physicTick", () => {
@@ -512,13 +356,7 @@ bot.on("physicTick", () => {
     }
 });
 
-// ==========================================
-// LOW-FREQUENCY STATE SYNC
-// ==========================================
-
 setInterval(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
     const state = {
         health: Math.round(bot.health),
         food: Math.round(bot.food),
@@ -535,6 +373,6 @@ setInterval(() => {
             .map((i) => ({ name: i.name, count: i.count })),
     };
 
-    ws.send(JSON.stringify({ type: "state", payload: state }));
+    client.sendState(state);
     awaitingCommand = true;
 }, 2000);
