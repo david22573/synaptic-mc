@@ -6,26 +6,55 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configure these to match your setup
-const MC_VERSION = "1.19";
-const SOURCE_DIR = path.resolve(
+const TARGET_VERSION = "1.19";
+const DATA_DIR = path.resolve(
     __dirname,
-    `../node_modules/minecraft-assets/data/${MC_VERSION}`,
+    "../node_modules/minecraft-assets/minecraft-assets/data",
 );
-const DEST_DIR = path.resolve(__dirname, `../public/assets/items`);
+const DEST_DIR = path.resolve(__dirname, "../public/assets/items");
+
+function findBestVersionFolder(): string | null {
+    if (!fs.existsSync(DATA_DIR)) {
+        console.error(`[!] Fatal: Cannot find ${DATA_DIR}`);
+        console.error(`[!] Did you run 'npm install minecraft-assets'?`);
+        return null;
+    }
+
+    const folders = fs.readdirSync(DATA_DIR);
+
+    // 1. Try exact match first (e.g., "1.19")
+    if (folders.includes(TARGET_VERSION)) {
+        return path.join(DATA_DIR, TARGET_VERSION);
+    }
+
+    // 2. Try fuzzy patch match (e.g., "1.19.4")
+    // Sorting reverse ensures we grab the highest patch version available
+    const fuzzyMatches = folders
+        .filter((f) => f.startsWith(`${TARGET_VERSION}.`))
+        .sort()
+        .reverse();
+    if (fuzzyMatches.length > 0) {
+        console.log(
+            `[i] Exact match for ${TARGET_VERSION} not found. Using closest available: ${fuzzyMatches[0]}`,
+        );
+        return path.join(DATA_DIR, fuzzyMatches[0]!);
+    }
+
+    // 3. Complete failure
+    console.error(
+        `[!] Fatal: Could not find any assets for ${TARGET_VERSION}.x`,
+    );
+    console.error(`[i] Available versions in package: ${folders.join(", ")}`);
+    return null;
+}
 
 function extractAssets() {
-    console.log(`[+] Starting asset extraction for Minecraft ${MC_VERSION}...`);
+    console.log(
+        `[+] Starting asset extraction for Minecraft ${TARGET_VERSION} branch...`,
+    );
 
-    // Safety check: Make sure the package is actually installed and the version exists
-    if (!fs.existsSync(SOURCE_DIR)) {
-        console.error(
-            `[!] Fuck. Couldn't find the assets folder for version ${MC_VERSION}.`,
-        );
-        console.error(`[!] Looked in: ${SOURCE_DIR}`);
-        console.error(
-            `[!] Did you run 'npm install minecraft-assets'? Or maybe check if the version folder is named '1.19.0' or similar in node_modules.`,
-        );
+    const sourceDir = findBestVersionFolder();
+    if (!sourceDir) {
         process.exit(1);
     }
 
@@ -36,8 +65,8 @@ function extractAssets() {
 
     // In Minecraft, some inventory items use the block texture (like dirt, cobblestone),
     // while others use dedicated item textures (like swords, apples). We need both.
-    const itemDir = path.join(SOURCE_DIR, "items");
-    const blockDir = path.join(SOURCE_DIR, "blocks");
+    const itemDir = path.join(sourceDir, "items");
+    const blockDir = path.join(sourceDir, "blocks");
 
     let copied = 0;
 
@@ -53,7 +82,6 @@ function extractAssets() {
                 const srcFile = path.join(srcDir, file);
                 const destFile = path.join(DEST_DIR, file);
 
-                // Copy the file, overwriting if it already exists
                 fs.copyFileSync(srcFile, destFile);
                 copied++;
             }

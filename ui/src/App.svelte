@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
+    import ItemIcon from "./components/ItemIcon.svelte";
 
     type Vec3 = { x: number; y: number; z: number };
     type Threat = { name: string };
@@ -46,7 +47,6 @@
         ws.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                // Fixed: Go backend sends 'state_update', not 'state'
                 if (msg.type === "state_update") {
                     state = msg.payload;
                 }
@@ -61,20 +61,17 @@
         };
     }
 
-    // Calculate day/night tint
     $: isNight = state.time_of_day >= 12000 && state.time_of_day <= 24000;
     $: darkness = isNight
         ? Math.sin(((state.time_of_day - 12000) / 12000) * Math.PI) * 0.6
         : 0;
 
-    // Split inventory into hotbar (first 9) and side panel (the rest)
     $: hotbarItems = Array.from(
         { length: 9 },
         (_, i) => state.inventory[i] || null,
     );
     $: sideInventory = state.inventory.slice(9);
 
-    // Format names for cleaner display (e.g., "oak_planks" -> "Oak Planks")
     function formatName(name: string) {
         return name
             .split("_")
@@ -113,6 +110,7 @@
         <div class="side-inventory">
             {#each sideInventory as item}
                 <div class="side-item">
+                    <ItemIcon name={item.name} size={24} />
                     <span class="item-count">{item.count}</span>
                     <span class="item-name">{formatName(item.name)}</span>
                 </div>
@@ -151,12 +149,7 @@
                         <span class="slot-number">{i + 1}</span>
                         {#if item}
                             <div class="slot-content">
-                                <span class="slot-item-name"
-                                    >{formatName(item.name).substring(
-                                        0,
-                                        4,
-                                    )}</span
-                                >
+                                <ItemIcon name={item.name} size={32} />
                                 {#if item.count > 1}
                                     <span class="slot-count">{item.count}</span>
                                 {/if}
@@ -222,7 +215,6 @@
         justify-content: space-between;
     }
 
-    /* Top Left Elements */
     .top-left {
         padding: 10px;
         display: flex;
@@ -246,7 +238,6 @@
         color: #ff5555;
     }
 
-    /* Left Side Inventory (Like the screenshot) */
     .side-inventory {
         position: absolute;
         left: 10px;
@@ -262,11 +253,11 @@
     .side-item {
         display: flex;
         align-items: center;
-        gap: 10px;
+        gap: 8px; /* Adjusted gap to fit the icon tightly */
     }
 
     .item-count {
-        color: #ffff55; /* Minecraft Yellow */
+        color: #ffff55;
         min-width: 25px;
         text-align: right;
     }
@@ -275,7 +266,6 @@
         color: #ffffff;
     }
 
-    /* Bottom Center Area */
     .bottom-center {
         position: absolute;
         bottom: 10px;
@@ -305,7 +295,6 @@
         }
     }
 
-    /* Health & Hunger Bars */
     .stat-bars {
         display: flex;
         gap: 20px;
@@ -347,7 +336,6 @@
         text-shadow: 1px 1px 0px #000;
     }
 
-    /* Hotbar Styling */
     .hotbar {
         display: flex;
         background: rgba(0, 0, 0, 0.4);
@@ -378,21 +366,16 @@
         font-size: 14px;
         color: rgba(255, 255, 255, 0.5);
         text-shadow: none;
+        z-index: 10;
     }
 
     .slot-content {
         display: flex;
-        flex-direction: column;
         align-items: center;
         justify-content: center;
         width: 100%;
         height: 100%;
-    }
-
-    .slot-item-name {
-        font-size: 14px;
-        color: white;
-        text-transform: uppercase;
+        position: relative;
     }
 
     .slot-count {
@@ -402,5 +385,6 @@
         font-size: 18px;
         color: #fff;
         text-shadow: 2px 2px 0px #000;
+        z-index: 10;
     }
 </style>

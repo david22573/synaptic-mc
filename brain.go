@@ -89,14 +89,26 @@ func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID stri
 		summary = "No active summary."
 	}
 
-	systemPrompt := fmt.Sprintf(`You are the strategic director of an autonomous Minecraft agent.
-Your job is to pick ONE clear, achievable milestone for the bot to work toward next.
+	systemPrompt := fmt.Sprintf(`You are the tactical commander of an autonomous Minecraft agent.
+Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
 
-Think in terms of classic Minecraft progression:
-- Punch trees → craft tools → gather stone → smelt ore → build shelter → get iron gear → explore, etc.
+YOUR ONLY JOB: Generate 1-3 sequential tasks that advance the ACTIVE MILESTONE below.
+Do NOT switch goals. Do NOT plan beyond the milestone.
+Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
 
-Based on the current state and history, choose the single most valuable next milestone.
-Respond ONLY with a JSON object matching this exact format:
+If you believe the milestone completion criteria have been met, set "milestone_complete": true.
+
+Valid macro actions:
+- "gather": Collect resources (wood, stone).
+- "craft": Create items. (Note: You CANNOT craft tools or tables directly from logs. You MUST craft planks first, then sticks/tables).
+- "hunt": Track and kill entities.
+- "explore": Move to new map chunks.
+- "build": Place blocks to create structures.
+- "mark_location": Save current coordinates (target.name is the label, e.g., "base").
+- "recall_location": Retrieve coordinates from memory.
+Target types: "block", "entity", "recipe", "location", "none".
+
+Response format (JSON only):
 {
   "id": "milestone-<short-slug>",
   "description": "A clear, one-sentence goal (e.g. 'Craft a full set of iron tools')",

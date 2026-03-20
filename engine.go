@@ -397,6 +397,7 @@ func (e *Engine) evaluateRoutinesLocked(state GameState) {
 	fuelCount := 0
 	plankCount := 0
 	cobbleCount := 0
+	logName := "" // Track the exact type of log we have (e.g., oak_log vs birch_log)
 
 	for _, item := range state.Inventory {
 		switch item.Name {
@@ -416,9 +417,28 @@ func (e *Engine) evaluateRoutinesLocked(state GameState) {
 			plankCount += item.Count
 			fuelCount += item.Count
 		}
+		if strings.HasSuffix(item.Name, "_log") {
+			logName = item.Name
+		}
 	}
 
 	// 3. Mandatory Tool Routines
+
+	// NEW: Auto-craft planks if we need a table but only have raw logs
+	if !hasCraftingTable && plankCount < 4 && logName != "" {
+		plankTarget := strings.Replace(logName, "_log", "_planks", 1)
+		if !e.hasRoutineTaskLocked("craft", plankTarget) {
+			e.injectTaskLocked(Action{
+				ID:        fmt.Sprintf("routine-craft-planks-%d", time.Now().UnixNano()),
+				Action:    "craft",
+				Target:    Target{Type: "recipe", Name: plankTarget},
+				Rationale: "Routine: Auto-crafting logs into planks to enable tool crafting",
+				Priority:  PriRoutine,
+			})
+		}
+	}
+
+	// Existing: Auto-craft table if we have planks
 	if !hasCraftingTable && plankCount >= 4 && !e.hasRoutineTaskLocked("craft", "crafting_table") {
 		e.injectTaskLocked(Action{
 			ID:        fmt.Sprintf("routine-craft-table-%d", time.Now().UnixNano()),

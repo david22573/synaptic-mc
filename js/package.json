@@ -4,6 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "tsx index.ts",
+    "extract-assets": "tsx scripts/extract_assets.ts",
+    "postinstall": "npm run extract-assets",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "type": "module",
