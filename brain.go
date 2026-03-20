@@ -30,6 +30,7 @@ type Target struct {
 
 type Action struct {
 	ID        string   `json:"id,omitempty"`
+	Source    string   `json:"source,omitempty"`
 	Action    string   `json:"action"`
 	Target    Target   `json:"target"`
 	Rationale string   `json:"rationale"`

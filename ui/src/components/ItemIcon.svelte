@@ -7,7 +7,7 @@
     // Reactively format the name and path in case the prop changes
     $: cleanName = name.replace("minecraft:", "").toLowerCase();
     $: formattedTitle = cleanName.replace(/_/g, " ");
-    $: imageSource = `../assets/items/${cleanName}.png`;
+    $: imageSource = `../../public/assets/items/${cleanName}.png`;
 
     function handleError() {
         hasError = true;

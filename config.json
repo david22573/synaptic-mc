@@ -4,7 +4,7 @@
     "enable_viewer": false,
     "debug_chat": false,
     "task_timeouts": {
-        "gather": 30000,
+        "gather": 60000,
         "craft": 20000,
         "hunt": 30000,
         "explore": 45000,

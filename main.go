@@ -1,9 +1,9 @@
-// main.go
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -63,9 +63,12 @@ func main() {
 	telemetry := NewTelemetry(logger)
 	go telemetry.StartReporting(context.Background())
 
-	brain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
+	rawBrain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
 
-	// Phase 4: Wire UI Observability Hub
+	// Phase 3: Wrap it for reliability
+	fallbackBrain := NewFallbackBrain()
+	brain := NewResilientBrain(rawBrain, fallbackBrain, logger)
+
 	uiHub := NewUIHub(logger)
 
 	config, err := LoadConfig("./config.json")
@@ -74,13 +77,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Add new route before http.ListenAndServe:
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(config)
 	})
 
-	// Route 1: JS Bot WebSocket
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -89,16 +90,20 @@ func main() {
 		}
 		logger.Info("Bot connected", slog.String("remote_addr", r.RemoteAddr))
 
-		engine := NewEngine(brain, conn, memory, telemetry, uiHub, logger)
-		engine.Run(context.Background())
+		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
+
+		// Subsystems injection
+		planner := NewLLMPlanner(brain, uiHub, memory, logger, sessionID)
+		routine := NewDefaultRoutineManager()
+		exec := NewWSExecutor(conn)
+
+		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID)
+		engine.Run(context.Background(), conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
 	})
 
-	// Route 2: UI Dashboard WebSocket Feed
 	http.HandleFunc("/ui/ws", uiHub.HandleConnections)
-
-	// Route 3: Simple static HTML dashboard (Optional, serves from current dir if exists)
 	http.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
 
 	logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))

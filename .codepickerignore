@@ -10,3 +10,4 @@ Dockerfile
 *.yaml
 *.yml
 ui
+js/scripts

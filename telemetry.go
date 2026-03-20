@@ -62,9 +62,10 @@ func (t *Telemetry) RecordLLMCall(duration time.Duration, err error) {
 func (t *Telemetry) RecordTaskStatus(status string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if status == "COMPLETED" {
+	switch status {
+	case "COMPLETED":
 		t.tasksCompleted++
-	} else if status == "FAILED" || status == "ABORTED" {
+	case "FAILED", "ABORTED":
 		t.tasksFailed++
 	}
 }
