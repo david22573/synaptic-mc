@@ -48,10 +48,11 @@ type Engine struct {
 	planCancel context.CancelFunc
 	sessionID  string
 
-	lastReplan time.Time
-	lastHealth float64
-	lastThreat string
-	lastPos    Vec3
+	lastReplan    time.Time
+	panicCooldown time.Time
+	lastHealth    float64
+	lastThreat    string
+	lastPos       Vec3
 }
 
 func NewEngine(
@@ -98,10 +99,8 @@ func (e *Engine) Run(ctx context.Context) {
 		switch msg.Type {
 		case "event":
 			e.handleEvent(ctx, msg.Payload)
-
 		case "state":
 			e.handleState(ctx, msg.Payload)
-
 		default:
 			e.logger.Warn("Ignoring unknown message type", slog.String("type", msg.Type))
 		}
@@ -145,61 +144,40 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 	switch eventPayload.Event {
 	case "panic_retreat":
 		e.telemetry.RecordPanic()
-		e.planEpoch++
-		e.taskQueue = nil
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.cancelPlanningLocked()
+		e.resetExecutionStateLocked()
+
+		// The JS SurvivalSystem handles panics for ~8s. Suppress LLM planning during this window.
+		e.panicCooldown = time.Now().Add(8 * time.Second)
 
 		meta.Status = "PANIC"
-		e.memory.LogEvent(
-			"evasion",
-			"Fled from threat: "+eventPayload.Cause,
-			meta,
-		)
+		e.memory.LogEvent("evasion", "Fled from threat: "+eventPayload.Cause, meta)
 
 		e.logger.Warn(
-			"Reflex triggered",
+			"Reflex triggered by client",
 			append(logCtx, slog.String("cause", eventPayload.Cause))...,
 		)
 
 	case "task_started":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring task_started for non-current task",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring task_started for non-current task", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		meta.Status = "STARTED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Started task ID: "+eventPayload.CommandID,
-			meta,
-		)
-
+		e.memory.LogEvent(eventPayload.Action, "Started task ID: "+eventPayload.CommandID, meta)
 		e.logger.Debug("Task started", logCtx...)
 
 	case "task_completed":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring stale task_completed event",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring stale task_completed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		e.telemetry.RecordTaskStatus("COMPLETED")
 		meta.Status = "COMPLETED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Finished successfully",
-			meta,
-		)
-
+		e.memory.LogEvent(eventPayload.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
 
 		e.inFlightTask = nil
@@ -207,73 +185,40 @@ func (e *Engine) handleEvent(ctx context.Context, payload json.RawMessage) {
 
 	case "task_failed":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring stale task_failed event",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring stale task_failed event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		e.telemetry.RecordTaskStatus("FAILED")
 		meta.Status = "FAILED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Task failed",
-			meta,
-		)
-
-		e.logger.Error(
-			"Task failed",
-			append(logCtx, slog.String("event", eventPayload.Event))...,
-		)
+		e.memory.LogEvent(eventPayload.Action, "Task failed", meta)
+		e.logger.Error("Task failed", append(logCtx, slog.String("event", eventPayload.Event))...)
 
 		summaryKey = "Last Failure"
 		summaryValue = eventPayload.Action + " (task_failed)"
 
-		e.planEpoch++
-		e.taskQueue = nil
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.cancelPlanningLocked()
+		e.resetExecutionStateLocked()
 
 	case "task_aborted":
 		if !e.matchesInFlightLocked(eventPayload.CommandID) {
-			e.logger.Warn(
-				"Ignoring stale task_aborted event",
-				append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...,
-			)
+			e.logger.Warn("Ignoring stale task_aborted event", append(logCtx, slog.String("current_in_flight", e.currentTaskIDLocked()))...)
 			e.mu.Unlock()
 			return
 		}
 
 		e.telemetry.RecordTaskStatus("ABORTED")
 		meta.Status = "ABORTED"
-		e.memory.LogEvent(
-			eventPayload.Action,
-			"Task aborted",
-			meta,
-		)
-
-		e.logger.Warn(
-			"Task aborted",
-			append(logCtx, slog.String("event", eventPayload.Event))...,
-		)
+		e.memory.LogEvent(eventPayload.Action, "Task aborted", meta)
+		e.logger.Warn("Task aborted", append(logCtx, slog.String("event", eventPayload.Event))...)
 
 		summaryKey = "Last Failure"
 		summaryValue = eventPayload.Action + " (task_aborted)"
 
-		e.planEpoch++
-		e.taskQueue = nil
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.cancelPlanningLocked()
+		e.resetExecutionStateLocked()
 
 	default:
-		e.logger.Warn(
-			"Ignoring unknown event type",
-			slog.String("event", eventPayload.Event),
-		)
+		e.logger.Warn("Ignoring unknown event type", slog.String("event", eventPayload.Event))
 		e.mu.Unlock()
 		return
 	}
@@ -296,7 +241,6 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 		return
 	}
 
-	var deterministicTask *Action
 	var epochAtStart int
 	var sessionID string
 	var shouldPlan bool
@@ -319,39 +263,9 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	e.lastHealth = state.Health
 	e.lastThreat = topThreat
 
-	if busy {
+	// Abort if busy or if the JS client is currently handling a panic reflex
+	if busy || time.Now().Before(e.panicCooldown) {
 		e.mu.Unlock()
-		return
-	}
-
-	if state.Health < 10 && topThreat != "" {
-		e.telemetry.RecordReplan()
-		e.logger.Warn(
-			"Deterministic override: low health plus threat; retreating",
-			slog.Float64("health", state.Health),
-			slog.String("top_threat", topThreat),
-		)
-
-		e.lastReplan = time.Now()
-		e.taskQueue = []Action{
-			{
-				ID:     fmt.Sprintf("cmd-det-%d", time.Now().UnixNano()),
-				Action: "retreat",
-				Target: Target{
-					Type: "none",
-					Name: "none",
-				},
-				Rationale: "Health critical, threat present",
-			},
-		}
-
-		deterministicTask = e.dequeueNextTaskLocked()
-		e.mu.Unlock()
-
-		e.setSummaryAsync("Current Objective", "Emergency retreat")
-		if deterministicTask != nil {
-			_ = e.sendCommand(*deterministicTask)
-		}
 		return
 	}
 
@@ -381,7 +295,6 @@ func (e *Engine) handleState(ctx context.Context, payload json.RawMessage) {
 	}
 
 	e.telemetry.RecordReplan()
-
 	go e.evaluateAndQueuePlan(planCtx, payload, epochAtStart, sessionID)
 }
 
@@ -433,11 +346,7 @@ func (e *Engine) evaluateAndQueuePlan(
 
 	for i := range plan.Tasks {
 		if plan.Tasks[i].ID == "" {
-			plan.Tasks[i].ID = fmt.Sprintf(
-				"cmd-llm-%d-%d",
-				time.Now().UnixNano(),
-				i,
-			)
+			plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
 		}
 
 		if plan.Tasks[i].Target.Type == "" {
@@ -465,6 +374,15 @@ func (e *Engine) evaluateAndQueuePlan(
 	}
 }
 
+// resetExecutionStateLocked consolidates clearing the queue and bumping the epoch. Must hold e.mu.
+func (e *Engine) resetExecutionStateLocked() {
+	e.planEpoch++
+	e.taskQueue = nil
+	e.inFlightTask = nil
+	e.lastReplan = time.Time{}
+	e.cancelPlanningLocked()
+}
+
 func (e *Engine) dequeueNextTaskLocked() *Action {
 	if e.inFlightTask != nil || len(e.taskQueue) == 0 {
 		return nil
@@ -480,11 +398,9 @@ func (e *Engine) matchesInFlightLocked(commandID string) bool {
 	if e.inFlightTask == nil {
 		return false
 	}
-
 	if commandID == "" {
 		return true
 	}
-
 	return e.inFlightTask.ID == commandID
 }
 
@@ -557,11 +473,7 @@ func (e *Engine) sendControlMessage(msgType, reason string) {
 	}
 
 	if err := e.writeJSON(response); err != nil {
-		e.logger.Error(
-			"Failed to send control message",
-			slog.Any("error", err),
-			slog.String("type", msgType),
-		)
+		e.logger.Error("Failed to send control message", slog.Any("error", err), slog.String("type", msgType))
 	}
 }
 
@@ -577,11 +489,7 @@ func (e *Engine) setSummaryAsync(key, value string) {
 		defer cancel()
 
 		if err := e.memory.SetSummary(ctx, e.sessionID, key, value); err != nil {
-			e.logger.Warn(
-				"Failed to persist session summary",
-				slog.String("key", key),
-				slog.Any("error", err),
-			)
+			e.logger.Warn("Failed to persist session summary", slog.String("key", key), slog.Any("error", err))
 		}
 	}()
 }
