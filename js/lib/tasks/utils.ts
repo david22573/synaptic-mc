@@ -264,15 +264,24 @@ export function moveToGoal(
             finish(new Error("timeout"));
         }, timeoutMs);
 
-        // Stuck detection loop
+        // Stuck detection loop with a Strike System
+        let stuckStrikes = 0;
+
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
 
+            // 0.5 blocks over 5 seconds can trigger false positives in water or dense jungles.
             if (dist < 0.5) {
-                safeStop();
-                finish(new Error("stuck"));
+                stuckStrikes++;
+                // Require 2 consecutive strikes (10 seconds total) before aborting
+                if (stuckStrikes >= 2) {
+                    safeStop();
+                    finish(new Error("stuck"));
+                }
             } else {
+                // Reset strikes if the bot makes meaningful progress
+                stuckStrikes = 0;
                 lastPos = currentPos.clone();
             }
         }, stuckTimeoutMs);

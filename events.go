@@ -17,11 +17,11 @@ func (e EventClientState) isEngineEvent() {}
 
 // EventClientAction represents a task lifecycle update (completed, failed, aborted).
 type EventClientAction struct {
-	Event     string // "task_completed", "task_failed", "death", "panic_retreat"
-	Action    string
-	CommandID string
-	Cause     string
-	Duration  int
+	Event     string `json:"event"`
+	Action    string `json:"action"`
+	CommandID string `json:"command_id"`
+	Cause     string `json:"cause"`
+	Duration  int    `json:"duration_ms"`
 }
 
 func (e EventClientAction) isEngineEvent() {}

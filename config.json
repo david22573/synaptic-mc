@@ -2,7 +2,7 @@
     "ws_url": "ws://localhost:8080/ws",
     "viewer_port": 3000,
     "enable_viewer": true,
-    "debug_chat": false,
+    "debug_chat": true,
     "task_timeouts": {
         "gather": 60000,
         "craft": 20000,

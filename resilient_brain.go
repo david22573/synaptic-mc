@@ -55,7 +55,9 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 		if attempt < MaxRetries {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				r.logger.Warn("Context timeout in primary brain, engaging fallback milestone")
+				// Fallback needs a fresh context since the parent one is now cancelled
+				return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
 			case <-time.After(backoff):
 				backoff *= 2 // Exponential backoff
 			}
@@ -63,7 +65,7 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 	}
 
 	r.logger.Error("Primary brain exhausted retries. Engaging fallback planner.", slog.Any("final_error", lastErr))
-	return r.fallback.GenerateMilestone(ctx, t, sessionID)
+	return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
 }
 
 func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
@@ -101,7 +103,9 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 		if attempt < MaxRetries {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				r.logger.Warn("Context timeout in primary brain, engaging fallback tactics")
+				// Pass context.Background() since the execution pipeline's context has expired
+				return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
 			case <-time.After(backoff):
 				backoff *= 2
 			}
@@ -109,5 +113,5 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 	}
 
 	r.logger.Error("Primary brain exhausted retries for tactics. Engaging fallback.", slog.Any("final_error", lastErr))
-	return r.fallback.EvaluatePlan(ctx, t, sessionID, systemOverride, milestone)
+	return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
 }

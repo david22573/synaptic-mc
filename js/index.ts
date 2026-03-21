@@ -9,6 +9,7 @@ import { runTask } from "./lib/tasks/task.js";
 import { ControlPlaneClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
+
 const { pathfinder, Movements } = pkg;
 
 let currentTask: models.ActiveTask | null = null;
@@ -66,6 +67,7 @@ async function executeDecision(decision: models.IncomingDecision) {
     abortActiveTask("preempted");
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
+
     currentTask = {
         id: decision.id,
         action: decision.action,
@@ -81,7 +83,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     const activeTask = currentTask;
 
     try {
-        // MOVED INSIDE THE TRY BLOCK:
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
         const timeoutMs = timeouts[decision.action] || 15000;
 
@@ -90,7 +91,7 @@ async function executeDecision(decision: models.IncomingDecision) {
                 bot,
                 decision,
                 signal,
-                timeouts, // Pass the safe timeouts object here
+                timeouts,
                 () => getThreats(bot),
                 (t) => computeSafeRetreat(bot, t, 20),
                 stopMovement,
@@ -110,12 +111,14 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
+
     bot = mineflayer.createBot({
         host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
     });
+
     bot.loadPlugin(pathfinder);
 
     client = new ControlPlaneClient(runtimeConfig.ws_url, {
@@ -132,15 +135,41 @@ async function bootstrap() {
 
     bot.on("spawn", () => {
         const movements = new Movements(bot);
+
+        // Base capabilities
         movements.canDig = true;
         movements.allow1by1towers = true;
         movements.allowParkour = true;
-        movements.allowSprinting = true;
+        movements.allowSprinting = true; // Fixed typo from previous iteration
+
+        // --- Exploration Optimizations ---
+
+        // 1. Tolerate Water: Lowering liquid cost makes the bot willing to cross rivers
+        // rather than generating massive, timeout-prone paths to avoid them.
+        const liquidBlocks = ["water", "lava"];
+        movements.liquids = new Set(
+            liquidBlocks
+                .map((name) => bot.registry.blocksByName[name]?.id)
+                .filter((id) => id !== undefined),
+        );
+
+        // 2. Prefer Open Terrain: Add a slight penalty to digging so the bot
+        // prefers walking around a hill rather than tunneling straight through it.
+        movements.digCost = 1.5;
+
+        // 3. Protect Inventory: Restrict scaffolding strictly to trash blocks.
+        // This prevents the bot from building bridges out of logs or food.
+        const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
+        movements.scafoldingBlocks = trashBlocks
+            .map((name) => bot.registry.blocksByName[name]?.id)
+            .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 5000;
 
-        // Fixed from 'client.ws'
+        // 4. Extended Compute: Exploration generates long-distance paths.
+        // Bumping from 5s to 10s prevents A* from giving up too early.
+        bot.pathfinder.thinkTimeout = 10000;
+
         if (!client.isConnected()) {
             client.connect();
             survival.start();
@@ -152,6 +181,12 @@ async function bootstrap() {
                 });
             }
         }
+    });
+
+    bot.on("death", () => {
+        log.warn("Bot died. Notifying control plane to reset milestone.");
+        abortActiveTask("bot_died");
+        client.sendEvent("death", "death", "", "environment/combat", 0);
     });
 
     setInterval(() => {
