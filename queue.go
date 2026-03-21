@@ -51,20 +51,23 @@ func (q *TaskQueue) Peek() *Action {
 	return &q.items[0]
 }
 
-// ClearBySource removes all tasks matching the specified source (e.g., wiping LLM tasks on death).
+// ClearBySource removes all tasks matching the specified source.
 func (q *TaskQueue) ClearBySource(source TaskSource) {
-	filtered := q.items[:0]
+	writeIndex := 0
 	for _, task := range q.items {
-		// Note: Ensure `Source string` is added to the `Action` struct in your ws_types.go / brain.go
 		if task.Source != string(source) {
-			filtered = append(filtered, task)
+			q.items[writeIndex] = task
+			writeIndex++
 		}
 	}
-	// Prevent memory leaks on the underlying array
-	for i := len(filtered); i < len(q.items); i++ {
+
+	// Zero out the remaining elements to prevent memory leaks
+	for i := writeIndex; i < len(q.items); i++ {
 		q.items[i] = Action{}
 	}
-	q.items = filtered
+
+	// Truncate the slice
+	q.items = q.items[:writeIndex]
 }
 
 // HasRoutineTarget checks if a routine is already queued for a specific target to prevent duplicates.

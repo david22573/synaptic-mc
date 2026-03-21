@@ -67,10 +67,19 @@ class AttackState implements FSMState {
             .items()
             .find((i) => i.name.includes("sword") || i.name.includes("axe"));
 
-        if (weapon) await ctx.bot.equip(weapon, "hand");
+        let cooldownMs = 650; // Default punch/sword cooldown
+
+        if (weapon) {
+            await ctx.bot.equip(weapon, "hand");
+            if (weapon.name.includes("axe")) {
+                cooldownMs = 1050; // Axes attack much slower but hit harder
+            } else if (weapon.name.includes("sword")) {
+                cooldownMs = 625;
+            }
+        }
 
         await attackEntity(ctx.bot, ctx.targetEntity);
-        await new Promise((resolve) => setTimeout(resolve, 650));
+        await new Promise((resolve) => setTimeout(resolve, cooldownMs));
 
         return this;
     }

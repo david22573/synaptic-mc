@@ -25,8 +25,12 @@ export class ControlPlaneClient {
 
     public connect(): void {
         if (this.ws) {
+            // Remove listeners to prevent memory leaks and duplicate callbacks
             this.ws.removeAllListeners();
-            this.ws.close();
+            // Terminate destroys the socket immediately, preventing lingering connections
+            // during aggressive reconnection loops
+            this.ws.terminate();
+            this.ws = null;
         }
 
         this.ws = new WebSocket(this.url);
@@ -34,6 +38,10 @@ export class ControlPlaneClient {
         this.ws.on("open", () => {
             log.info("Connected to Go Control Plane", { ws_url: this.url });
             this.reconnectAttempts = 0;
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer);
+                this.reconnectTimer = null;
+            }
         });
 
         this.ws.on("message", (data: Buffer) => {

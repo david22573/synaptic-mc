@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -142,7 +143,7 @@ func (b *LLMBrain) callLLMForMilestone(ctx context.Context, systemPrompt, userCo
 		return nil, err
 	}
 	var milestone MilestonePlan
-	if err := json.Unmarshal([]byte(content), &milestone); err != nil {
+	if err := json.Unmarshal([]byte(cleanJSON(content)), &milestone); err != nil {
 		return nil, err
 	}
 	return &milestone, nil
@@ -155,7 +156,7 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 		return nil, err
 	}
 	var plan LLMPlan
-	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+	if err := json.Unmarshal([]byte(cleanJSON(content)), &plan); err != nil {
 		return nil, err
 	}
 	for i := range plan.Tasks {
@@ -208,4 +209,12 @@ func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent s
 	}
 
 	return result.Choices[0].Message.Content, latency, result.Usage.PromptTokens, result.Usage.CompletionTokens, nil
+}
+
+func cleanJSON(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned)
 }

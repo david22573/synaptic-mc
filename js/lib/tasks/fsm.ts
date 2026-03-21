@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
+import { getErrorMessage } from "../utils/errors.js";
 
 export type TaskStatus = "RUNNING" | "SUCCESS" | "FAILED";
 
@@ -59,10 +60,10 @@ export class StateMachineRunner {
                     }
                     this.currentState = nextState;
                 }
-            } catch (err: any) {
+            } catch (err: unknown) {
                 return {
                     status: "FAILED",
-                    reason: `FSM_CRASH: ${err.message}`,
+                    reason: `FSM_CRASH: ${getErrorMessage(err)}`,
                 };
             }
         }

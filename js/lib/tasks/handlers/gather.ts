@@ -35,7 +35,7 @@ class MineState implements FSMState {
         const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
         if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
             return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
-        const tool = (gCtx.bot as any).pathfinder.bestHarvestTool(freshBlock);
+        const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
         if (tool) await gCtx.bot.equip(tool, "hand");
         try {
             await gCtx.bot.dig(freshBlock);

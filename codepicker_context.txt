@@ -1,4 +1,4 @@
-Project Context Dump (20 Mar 26 18:34 PDT)
+Project Context Dump (20 Mar 26 20:21 PDT)
 Format: xml
 Mode: FULL (No Truncation)
 Total Files: 39
@@ -235,19 +235,17 @@ CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. ERROR RECOVERY: If a task fails with 'PATHING_FAILED', 'PATHFINDER_TIMEOUT', or 'EXHAUSTED_CANDIDATES', you MUST use the "explore" action next.
-5. VANTAGE POINT: If you are at high altitude (Y > 100), use "explore".
+4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
+5. ERROR RECOVERY: Only use "explore" if a task fails with PATHING_FAILED, PATHFINDER_TIMEOUT, or EXHAUSTED_CANDIDATES.
+6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
 
 VALID TARGET TYPES (you MUST use one of these):
-- "block"     (e.g. oak_log, stone)
-- "entity"    (e.g. zombie, cow)
-- "recipe"    (e.g. stick, wooden_pickaxe, crafting_table)
-- "location"  (only with mark_location/recall_location)
-- "category"  (e.g. food, wood)
-- "none"      (for explore, idle, retreat, sleep)
-
-For "explore" ALWAYS use: {"type": "none", "name": "none"}
-Never invent new types like "biome".
+- "block"     (oak_log, stone, etc.)
+- "entity"    (zombie, cow, etc.)
+- "recipe"    (stick, wooden_pickaxe, crafting_table)
+- "location"  (only for mark/recall)
+- "category"  (food, wood)
+- "none"      (only for explore/idle/retreat/sleep)
 
 Valid macro actions: gather, craft, hunt, explore, build, smelt, mark_location, recall_location, idle, sleep, retreat, eat.`
 
@@ -1383,7 +1381,7 @@ async function executeDecision(decision: models.IncomingDecision) {
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
     bot = mineflayer.createBot({
-        host: "127.0.0.1",
+        host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
@@ -2367,17 +2365,24 @@ class PickDirectionState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
 
+        // Early-game: much shorter explores (prevents sluggish wandering)
+        const hasWood = eCtx.bot.inventory
+            .items()
+            .some((i) => i.name.includes("_log"));
+        const dist = hasWood
+            ? 48 + Math.random() * 48
+            : 24 + Math.random() * 24;
+
         const angle = Math.random() * Math.PI * 2;
-        const dist = 48 + Math.random() * 48;
 
         eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(angle) * dist;
         eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(angle) * dist;
 
-        // <-- ADDED LOGGING
         log.info("Picked exploration vector", {
             dist: Math.round(dist),
             targetX: Math.round(eCtx.targetX),
             targetZ: Math.round(eCtx.targetZ),
+            earlyGame: !hasWood,
         });
 
         return new NavigateState();
@@ -4482,12 +4487,13 @@ type DefaultRoutineManager struct {
 func NewDefaultRoutineManager() *DefaultRoutineManager {
 	return &DefaultRoutineManager{
 		routines: []Routine{
-			&PanicRoutine{},   // Environmental hazards
-			&CombatRoutine{},  // Self-defense
-			&EatingRoutine{},  // Nutrition
-			&SleepRoutine{},   // Time management
-			&ToolingRoutine{}, // Progression items
-			&CookingRoutine{}, // Resource processing
+			&PanicRoutine{},
+			&CombatRoutine{},
+			&EatingRoutine{},
+			&SleepRoutine{},
+			&ToolingRoutine{},
+			&CookingRoutine{},
+			&EarlyWoodRoutine{},
 		},
 	}
 }
@@ -4667,6 +4673,29 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 			Action:    string(ActionSmelt),
 			Target:    Target{Type: string(TargetCategory), Name: "food"},
 			Rationale: "Efficiency: Smelting raw food for better nutrition.",
+			Priority:  PriRoutine,
+		}
+	}
+	return nil
+}
+
+type EarlyWoodRoutine struct{}
+
+func (e *EarlyWoodRoutine) Name() string { return "early_wood" }
+func (e *EarlyWoodRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	logCount := 0
+	for _, item := range state.Inventory {
+		if strings.HasSuffix(item.Name, "_log") {
+			logCount += item.Count
+		}
+	}
+	if logCount == 0 && !isTaskActive(string(ActionGather), "wood", inFlight, queue) {
+		return &Action{
+			ID:        fmt.Sprintf("routine-wood-%d", time.Now().UnixNano()),
+			Source:    string(SourceRoutine),
+			Action:    string(ActionGather),
+			Target:    Target{Type: string(TargetBlock), Name: "wood"},
+			Rationale: "Early game priority: Must get wood immediately.",
 			Priority:  PriRoutine,
 		}
 	}
@@ -5072,10 +5101,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 139240,
+  "total_bytes": 140146,
   "file_count": 39,
-  "estimated_tokens": 35446,
+  "estimated_tokens": 35672,
   "mode": "full",
-  "generated_at": "2026-03-20T18:34:04.508002-07:00"
+  "generated_at": "2026-03-20T20:21:48.920763-07:00"
 }
 ```

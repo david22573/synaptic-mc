@@ -21,7 +21,7 @@ let runtimeConfig: config.Config;
 function stopMovement() {
     if (!bot) return;
     bot.clearControlStates();
-    if ((bot as any).pathfinder) (bot as any).pathfinder.setGoal(null);
+    if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
 
 function completeTask(
@@ -109,7 +109,7 @@ async function executeDecision(decision: models.IncomingDecision) {
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
     bot = mineflayer.createBot({
-        host: "127.0.0.1",
+        host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
@@ -135,8 +135,8 @@ async function bootstrap() {
         movements.allowParkour = true;
         movements.allowSprinting = true;
 
-        (bot as any).pathfinder.setMovements(movements);
-        (bot as any).pathfinder.thinkTimeout = 5000;
+        bot.pathfinder.setMovements(movements);
+        bot.pathfinder.thinkTimeout = 5000;
 
         // Fixed from 'client.ws'
         if (!client.isConnected()) {

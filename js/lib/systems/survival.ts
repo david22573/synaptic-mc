@@ -94,7 +94,7 @@ export class SurvivalSystem {
 
     private fleeTo(safePos: { x: number; z: number }) {
         try {
-            (this.bot as any).pathfinder.setGoal(
+            this.bot.pathfinder.setGoal(
                 new goals.GoalNearXZ(safePos.x, safePos.z, 2),
             );
         } catch (e) {

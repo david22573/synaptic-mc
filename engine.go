@@ -101,6 +101,8 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 	go e.loop(ctx)
 
 	for {
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
 		var msg struct {
 			Type    string          `json:"type"`
 			Payload json.RawMessage `json:"payload"`

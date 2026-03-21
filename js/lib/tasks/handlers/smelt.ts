@@ -33,7 +33,7 @@ class CleanupState implements FSMState {
 
         if (sCtx.isPortable && sCtx.furnaceBlock) {
             await makeRoomInInventory(sCtx.bot, 1);
-            const pickaxe = (sCtx.bot as any).pathfinder.bestHarvestTool(
+            const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
                 sCtx.furnaceBlock,
             );
             if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
