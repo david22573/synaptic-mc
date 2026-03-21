@@ -18,14 +18,16 @@ type ResilientBrain struct {
 	fallback  Brain
 	validator *PlanValidator
 	logger    *slog.Logger
+	telemetry *Telemetry
 }
 
-func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger) *ResilientBrain {
+func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger, tel *Telemetry) *ResilientBrain {
 	return &ResilientBrain{
 		primary:   primary,
 		fallback:  fallback,
 		validator: NewPlanValidator(),
 		logger:    logger.With(slog.String("component", "ResilientBrain")),
+		telemetry: tel,
 	}
 }
 
@@ -37,6 +39,7 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 		milestone, err := r.primary.GenerateMilestone(ctx, t, sessionID)
 		if err == nil {
 			if valErr := r.validator.ValidateMilestone(milestone); valErr != nil {
+				r.telemetry.RecordValidationFailure()
 				err = fmt.Errorf("validation failed: %w", valErr)
 			} else {
 				return milestone, nil
@@ -82,6 +85,7 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 		plan, err := r.primary.EvaluatePlan(ctx, t, sessionID, currentOverride, milestone)
 		if err == nil {
 			if valErr := r.validator.ValidateTactics(plan); valErr != nil {
+				r.telemetry.RecordValidationFailure()
 				err = fmt.Errorf("validation failed: %w", valErr)
 			} else {
 				return plan, nil

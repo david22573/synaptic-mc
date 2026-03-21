@@ -33,7 +33,11 @@ export const TASK_TIMEOUTS: Record<string, number> = {
     hunt: 30000,
     explore: 20000,
     build: 20000,
+    smelt: 30000,
     retreat: 15000,
+    sleep: 20000,
+    mark_location: 5000,
+    recall_location: 5000,
     idle: 3000,
 };
 
@@ -59,16 +63,15 @@ let configCache: Config | null = null;
 export async function loadConfig(): Promise<Config> {
     if (configCache) return configCache;
 
+    let timeoutId: NodeJS.Timeout | null = null;
+
     try {
-        // Force a 3-second timeout so fetch never hangs indefinitely
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
+        timeoutId = setTimeout(() => controller.abort(), 3000);
 
         const res = await fetch("http://127.0.0.1:8080/api/config", {
             signal: controller.signal,
         });
-
-        clearTimeout(timeoutId);
 
         if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
 
@@ -87,7 +90,8 @@ export async function loadConfig(): Promise<Config> {
             "Failed to fetch dynamic config, relying on static defaults",
             err instanceof Error ? err.message : String(err),
         );
-        return {
+
+        configCache = {
             ws_url: WS_URL,
             viewer_port: VIEWER_PORT,
             enable_viewer: ENABLE_VIEWER,
@@ -95,5 +99,9 @@ export async function loadConfig(): Promise<Config> {
             task_timeouts: TASK_TIMEOUTS,
             threat_weights: THREAT_WEIGHTS,
         };
+
+        return configCache;
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
     }
 }

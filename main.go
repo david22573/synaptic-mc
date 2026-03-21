@@ -60,16 +60,15 @@ func main() {
 	defer memory.Close()
 	logger.Info("Database initialized", slog.String("path", DatabasePath))
 
-	telemetry := NewTelemetry(logger)
+	telemetry := NewTelemetry(logger, 5.00)
 	go telemetry.StartReporting(context.Background())
 
 	rawBrain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
-
-	// Phase 3: Wrap it for reliability
 	fallbackBrain := NewFallbackBrain()
-	brain := NewResilientBrain(rawBrain, fallbackBrain, logger)
+	brain := NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
 
 	uiHub := NewUIHub(logger)
+	go uiHub.Run()
 
 	config, err := LoadConfig("./config.json")
 	if err != nil {
@@ -89,11 +88,11 @@ func main() {
 			return
 		}
 		logger.Info("Bot connected", slog.String("remote_addr", r.RemoteAddr))
+		telemetry.RecordSessionStart()
 
 		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 
-		// Subsystems injection
-		planner := NewLLMPlanner(brain, uiHub, memory, logger, sessionID)
+		planner := NewLLMPlanner(brain, uiHub, memory, telemetry, logger, sessionID)
 		routine := NewDefaultRoutineManager()
 		exec := NewWSExecutor(conn)
 
@@ -101,6 +100,7 @@ func main() {
 		engine.Run(context.Background(), conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
+		telemetry.RecordSessionEnd()
 	})
 
 	http.HandleFunc("/ui/ws", uiHub.HandleConnections)

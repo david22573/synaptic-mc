@@ -10,6 +10,7 @@ import {
     placePortableUtility,
     makeRoomInInventory,
     waitForMs,
+    moveToGoal,
 } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
 
@@ -20,11 +21,11 @@ interface SmeltContext extends StateContext {
     isPortable: boolean;
     meatType: number | null;
     fuelType: number | null;
+    stopMovement: () => void;
 }
 
 class CleanupState implements FSMState {
     name = "CLEANUP";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -40,9 +41,7 @@ class CleanupState implements FSMState {
             try {
                 await sCtx.bot.dig(sCtx.furnaceBlock);
                 await waitForMs(1000, sCtx.signal);
-            } catch (_err) {
-                // Ignore cleanup errors so we don't fail a successful smelt
-            }
+            } catch (_err) {}
         }
 
         sCtx.result = { status: "SUCCESS", reason: "SMELTING_COMPLETE" };
@@ -52,7 +51,6 @@ class CleanupState implements FSMState {
 
 class SmeltingState implements FSMState {
     name = "SMELTING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -64,7 +62,6 @@ class SmeltingState implements FSMState {
             await furnaceWindow.putFuel(sCtx.fuelType, null, 1);
             await furnaceWindow.putInput(sCtx.meatType, null, 1);
 
-            // Wait for smelt cycle. If signal aborts, it throws and jumps to catch block.
             await waitForMs(11000, sCtx.signal);
 
             await furnaceWindow.takeOutput();
@@ -76,7 +73,7 @@ class SmeltingState implements FSMState {
                         ? "aborted"
                         : "SMELT_INTERACTION_FAILED",
             };
-            return null; // Bypass cleanup if we failed hard/aborted
+            return null;
         } finally {
             if (furnaceWindow) {
                 try {
@@ -91,7 +88,6 @@ class SmeltingState implements FSMState {
 
 class ApproachFurnaceState implements FSMState {
     name = "APPROACHING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -99,15 +95,25 @@ class ApproachFurnaceState implements FSMState {
         const fPos = sCtx.furnaceBlock.position;
 
         try {
-            await (sCtx.bot as any).pathfinder.goto(
+            await moveToGoal(
+                sCtx.bot,
                 new goals.GoalNear(fPos.x, fPos.y, fPos.z, 2),
-                true,
+                {
+                    signal: sCtx.signal,
+                    timeoutMs: 15000,
+                    stopMovement: sCtx.stopMovement,
+                    dynamic: false,
+                },
             );
         } catch (err: any) {
-            sCtx.result = {
-                status: "FAILED",
-                reason: "FAILED_TO_REACH_FURNACE",
-            };
+            if (err.message === "aborted") {
+                sCtx.result = { status: "FAILED", reason: "aborted" };
+            } else {
+                sCtx.result = {
+                    status: "FAILED",
+                    reason: "FAILED_TO_REACH_FURNACE",
+                };
+            }
             return null;
         }
 
@@ -117,7 +123,6 @@ class ApproachFurnaceState implements FSMState {
 
 class LocateFurnaceState implements FSMState {
     name = "LOCATING_FURNACE";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -143,7 +148,6 @@ class LocateFurnaceState implements FSMState {
 
 class CheckResourcesState implements FSMState {
     name = "CHECKING_RESOURCES";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -156,6 +160,7 @@ class CheckResourcesState implements FSMState {
                     i.name,
                 ),
             );
+
         const fuel = sCtx.bot.inventory
             .items()
             .find((i: any) =>
@@ -175,7 +180,7 @@ class CheckResourcesState implements FSMState {
 }
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts } = ctx;
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {
@@ -183,13 +188,14 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         targetName: "furnace",
         targetEntity: null,
         searchRadius: 0,
-        timeoutMs: timeouts.smelt ?? 30000, // Gave this 30s instead of 20s to account for the 11s burn time safely
+        timeoutMs: timeouts.smelt ?? 30000,
         startTime: 0,
         signal,
         furnaceBlock: null,
         isPortable: false,
         meatType: null,
         fuelType: null,
+        stopMovement,
     };
 
     const fsm = new StateMachineRunner(new CheckResourcesState(), fsmCtx);

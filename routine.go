@@ -33,11 +33,12 @@ func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, 
 
 	// 1. Sleep Routine
 	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 {
-		if state.HasBedNearby && !hasRoutineTask("sleep", "bed") {
+		if state.HasBedNearby && !hasRoutineTask(string(ActionSleep), "bed") {
 			routines = append(routines, Action{
 				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
-				Action:    "sleep",
-				Target:    Target{Type: "block", Name: "bed"},
+				Source:    string(SourceRoutine),
+				Action:    string(ActionSleep),
+				Target:    Target{Type: string(TargetBlock), Name: "bed"},
 				Rationale: "Mandatory daily routine: Sleep to skip the night",
 				Priority:  PriRoutine,
 			})
@@ -79,43 +80,47 @@ func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, 
 	// 3. Mandatory Tool Routines
 	if !hasCraftingTable && plankCount < 4 && logName != "" {
 		plankTarget := strings.Replace(logName, "_log", "_planks", 1)
-		if !hasRoutineTask("craft", plankTarget) {
+		if !hasRoutineTask(string(ActionCraft), plankTarget) {
 			routines = append(routines, Action{
 				ID:        fmt.Sprintf("routine-craft-planks-%d", time.Now().UnixNano()),
-				Action:    "craft",
-				Target:    Target{Type: "recipe", Name: plankTarget},
+				Source:    string(SourceRoutine),
+				Action:    string(ActionCraft),
+				Target:    Target{Type: string(TargetRecipe), Name: plankTarget},
 				Rationale: "Routine: Auto-crafting logs into planks to enable tool crafting",
 				Priority:  PriRoutine,
 			})
 		}
 	}
 
-	if !hasCraftingTable && plankCount >= 4 && !hasRoutineTask("craft", "crafting_table") {
+	if !hasCraftingTable && plankCount >= 4 && !hasRoutineTask(string(ActionCraft), "crafting_table") {
 		routines = append(routines, Action{
 			ID:        fmt.Sprintf("routine-craft-table-%d", time.Now().UnixNano()),
-			Action:    "craft",
-			Target:    Target{Type: "recipe", Name: "crafting_table"},
+			Source:    string(SourceRoutine),
+			Action:    string(ActionCraft),
+			Target:    Target{Type: string(TargetRecipe), Name: "crafting_table"},
 			Rationale: "Mandatory tool missing: Auto-crafting since we have planks",
 			Priority:  PriRoutine,
 		})
 	}
 
-	if !hasFurnace && cobbleCount >= 8 && !hasRoutineTask("craft", "furnace") {
+	if !hasFurnace && cobbleCount >= 8 && !hasRoutineTask(string(ActionCraft), "furnace") {
 		routines = append(routines, Action{
 			ID:        fmt.Sprintf("routine-craft-furnace-%d", time.Now().UnixNano()),
-			Action:    "craft",
-			Target:    Target{Type: "recipe", Name: "furnace"},
+			Source:    string(SourceRoutine),
+			Action:    string(ActionCraft),
+			Target:    Target{Type: string(TargetRecipe), Name: "furnace"},
 			Rationale: "Mandatory tool missing: Auto-crafting since we have cobblestone",
 			Priority:  PriRoutine,
 		})
 	}
 
 	// 4. Auto-Cooking Routine
-	if hasFurnace && rawMeatCount > 0 && fuelCount > 0 && !hasRoutineTask("smelt", "food") {
+	if hasFurnace && rawMeatCount > 0 && fuelCount > 0 && !hasRoutineTask(string(ActionSmelt), "food") {
 		routines = append(routines, Action{
 			ID:        fmt.Sprintf("routine-smelt-%d", time.Now().UnixNano()),
-			Action:    "smelt",
-			Target:    Target{Type: "category", Name: "food"},
+			Source:    string(SourceRoutine),
+			Action:    string(ActionSmelt),
+			Target:    Target{Type: string(TargetCategory), Name: "food"},
 			Rationale: "Routine: Cooking raw food to restore hunger safely",
 			Priority:  PriRoutine,
 		})

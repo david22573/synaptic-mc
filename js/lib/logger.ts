@@ -1,52 +1,37 @@
+import { type TraceContext } from "./models.js";
+
 const DEBUG = process.env.DEBUG === "true";
 
+interface LogMeta extends Record<string, unknown> {
+    trace?: TraceContext;
+}
+
 interface Logger {
-    info: (msg: string, meta?: Record<string, unknown>) => void;
-    warn: (msg: string, meta?: Record<string, unknown>) => void;
-    error: (msg: string, meta?: Record<string, unknown>) => void;
-    debug: (msg: string, meta?: Record<string, unknown>) => void;
+    info: (msg: string, meta?: LogMeta) => void;
+    warn: (msg: string, meta?: LogMeta) => void;
+    error: (msg: string, meta?: LogMeta) => void;
+    debug: (msg: string, meta?: LogMeta) => void;
+}
+
+function formatLog(level: string, msg: string, meta: LogMeta = {}): string {
+    const { trace, ...rest } = meta;
+    return JSON.stringify({
+        level,
+        msg,
+        trace_id: trace?.trace_id,
+        action_id: trace?.action_id,
+        milestone_id: trace?.milestone_id,
+        ...rest,
+        timestamp: new Date().toISOString(),
+    });
 }
 
 export const log: Logger = {
-    info: (msg, meta = {}) =>
-        console.log(
-            JSON.stringify({
-                level: "INFO",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        ),
-
-    warn: (msg, meta = {}) =>
-        console.warn(
-            JSON.stringify({
-                level: "WARN",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        ),
-
-    error: (msg, meta = {}) =>
-        console.error(
-            JSON.stringify({
-                level: "ERROR",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        ),
-
-    debug: (msg, meta = {}) => {
+    info: (msg, meta) => console.log(formatLog("INFO", msg, meta)),
+    warn: (msg, meta) => console.warn(formatLog("WARN", msg, meta)),
+    error: (msg, meta) => console.error(formatLog("ERROR", msg, meta)),
+    debug: (msg, meta) => {
         if (!DEBUG) return;
-        console.log(
-            JSON.stringify({
-                level: "DEBUG",
-                msg,
-                ...meta,
-                timestamp: new Date().toISOString(),
-            }),
-        );
+        console.log(formatLog("DEBUG", msg, meta));
     },
 };

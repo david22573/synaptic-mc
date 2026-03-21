@@ -1,7 +1,5 @@
 package main
 
-import "encoding/json"
-
 type WSMessageType string
 
 const (
@@ -12,15 +10,11 @@ const (
 	TypeNoOp          WSMessageType = "noop"
 )
 
-type WSMessage struct {
-	Type    WSMessageType   `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-}
-
 type CommandPayload struct {
-	ID     string `json:"id"`
-	Action string `json:"action"`
-	Target Target `json:"target"`
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	Target    Target `json:"target"`
+	Rationale string `json:"rationale"`
 }
 
 type EventPayload struct {

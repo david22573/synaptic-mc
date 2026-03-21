@@ -1,87 +1,202 @@
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
 import type { TaskContext } from "../registry.js";
 import {
     findNearestBlockByName,
     placePortableUtility,
     makeRoomInInventory,
-    moveToGoal,
     escapeTree,
     waitForMs,
+    moveToGoal,
 } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
+interface CraftContext extends StateContext {
+    itemType: any;
+    recipe: any;
+    craftingTable: any;
+    isPortableTable: boolean;
+    stopMovement: () => void;
+}
+
+class CleanupState implements FSMState {
+    name = "CLEANUP";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+
+        if (cCtx.isPortableTable && cCtx.craftingTable) {
+            await makeRoomInInventory(cCtx.bot, 1);
+            const pickaxe = (cCtx.bot as any).pathfinder.bestHarvestTool(
+                cCtx.craftingTable,
+            );
+            if (pickaxe) await cCtx.bot.equip(pickaxe, "hand");
+
+            try {
+                await cCtx.bot.dig(cCtx.craftingTable);
+                await waitForMs(1000, cCtx.signal);
+            } catch (_err) {}
+        }
+
+        cCtx.result = { status: "SUCCESS", reason: "CRAFTING_COMPLETE" };
+        return null;
+    }
+}
+
+class CraftingState implements FSMState {
+    name = "CRAFTING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+
+        try {
+            await cCtx.bot.craft(cCtx.recipe, 1, cCtx.craftingTable);
+        } catch (err: any) {
+            cCtx.result = {
+                status: "FAILED",
+                reason: `CRAFT_ACTION_FAILED: ${err.message}`,
+            };
+            return null;
+        }
+
+        return new CleanupState();
+    }
+}
+
+class NavigateTableState implements FSMState {
+    name = "NAVIGATING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+
+        if (cCtx.recipe.requiresTable && cCtx.craftingTable) {
+            const pos = cCtx.craftingTable.position;
+
+            try {
+                await moveToGoal(
+                    cCtx.bot,
+                    new goals.GoalNear(pos.x, pos.y, pos.z, 2),
+                    {
+                        signal: cCtx.signal,
+                        timeoutMs: 15000,
+                        stopMovement: cCtx.stopMovement,
+                        dynamic: false,
+                    },
+                );
+            } catch (err: any) {
+                if (err.message === "aborted") {
+                    cCtx.result = { status: "FAILED", reason: "aborted" };
+                } else {
+                    cCtx.result = {
+                        status: "FAILED",
+                        reason: "FAILED_TO_REACH_TABLE",
+                    };
+                }
+                return null;
+            }
+        }
+
+        return new CraftingState();
+    }
+}
+
+class SetupRecipeState implements FSMState {
+    name = "SETUP_RECIPE";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+        const targetRecipeName = cCtx.targetName;
+
+        const itemType = cCtx.bot.registry.itemsByName[targetRecipeName];
+        if (!itemType) {
+            cCtx.result = {
+                status: "FAILED",
+                reason: `UNKNOWN_ITEM: ${targetRecipeName}`,
+            };
+            return null;
+        }
+        cCtx.itemType = itemType;
+
+        let craftingTable = findNearestBlockByName(cCtx.bot, "crafting_table");
+        let isPortableTable = false;
+
+        let recipes = cCtx.bot.recipesFor(itemType.id, null, 1, craftingTable);
+
+        if (recipes.length === 0 && !craftingTable) {
+            const hasTableInInv = cCtx.bot.inventory
+                .items()
+                .some((i: any) => i.name === "crafting_table");
+
+            if (hasTableInInv) {
+                craftingTable = await placePortableUtility(
+                    cCtx.bot,
+                    "crafting_table",
+                );
+
+                if (craftingTable) {
+                    isPortableTable = true;
+                    recipes = cCtx.bot.recipesFor(
+                        itemType.id,
+                        null,
+                        1,
+                        craftingTable,
+                    );
+                }
+            }
+        }
+
+        if (recipes.length === 0) {
+            cCtx.result = {
+                status: "FAILED",
+                reason: `MISSING_INGREDIENTS_OR_CRAFTING_TABLE_FOR_${targetRecipeName.toUpperCase()}`,
+            };
+            return null;
+        }
+
+        cCtx.recipe = recipes[0];
+        cCtx.craftingTable = craftingTable;
+        cCtx.isPortableTable = isPortableTable;
+        return new NavigateTableState();
+    }
+}
+
 export async function handleCraft(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
-    const targetRecipeName = decision.target?.name;
-    if (!targetRecipeName || targetRecipeName === "none") {
+    const targetName = decision.target?.name;
+    if (!targetName || targetName === "none") {
         throw new Error("missing craft target");
     }
 
-    const itemType = bot.registry.itemsByName[targetRecipeName];
-    if (!itemType) {
-        throw new Error(`unknown item: ${targetRecipeName}`);
-    }
+    const fsmCtx: CraftContext = {
+        bot,
+        targetName,
+        targetEntity: null,
+        searchRadius: 0,
+        timeoutMs: timeouts.craft ?? 20000,
+        startTime: 0,
+        signal,
+        itemType: null,
+        recipe: null,
+        craftingTable: null,
+        isPortableTable: false,
+        stopMovement,
+    };
 
-    let craftingTable = findNearestBlockByName(bot, "crafting_table");
-    let isPortableTable = false;
+    const fsm = new StateMachineRunner(new SetupRecipeState(), fsmCtx);
+    const result = await fsm.run();
 
-    // First attempt: Get recipes using whatever grid is currently available (2x2 or nearby table)
-    let recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
-
-    // If no recipe is found, we might need a 3x3 grid but our table is still in our inventory.
-    if (recipes.length === 0 && !craftingTable) {
-        const hasTableInInv = bot.inventory
-            .items()
-            .some((i) => i.name === "crafting_table");
-        if (hasTableInInv) {
-            // Deploy the portable table first so Mineflayer knows we have a 3x3 grid
-            craftingTable = await placePortableUtility(bot, "crafting_table");
-            if (craftingTable) {
-                isPortableTable = true;
-                // Re-evaluate recipes now that the table exists in the world
-                recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
-            }
-        }
-    }
-
-    // If it's STILL empty, we legitimately don't have the planks/sticks to make the item.
-    if (recipes.length === 0) {
-        throw new Error(
-            `no valid recipe or missing ingredients for ${targetRecipeName}`,
-        );
-    }
-
-    const recipe = recipes[0];
-
-    // If the recipe requires a table, navigate to it
-    if (recipe!.requiresTable && craftingTable) {
-        await moveToGoal(
-            bot,
-            new goals.GoalNear(
-                craftingTable.position.x,
-                craftingTable.position.y,
-                craftingTable.position.z,
-                2,
-            ),
-            signal,
-            timeouts.craft ?? 20000,
-            stopMovement,
-        );
-    }
-
-    if (signal.aborted) throw new Error("aborted");
-
-    await bot.craft(recipe!, 1, craftingTable);
-
-    // Cleanup: Break and pick up the portable table so we don't leave garbage everywhere
-    if (isPortableTable && craftingTable) {
-        await makeRoomInInventory(bot, 1);
-        const pickaxe = (bot as any).pathfinder.bestHarvestTool(craftingTable);
-        if (pickaxe) await bot.equip(pickaxe, "hand");
-        await bot.dig(craftingTable);
-        await waitForMs(1000, signal);
+    if (result.status === "FAILED") {
+        throw new Error(result.reason || "unknown_fsm_failure");
     }
 }

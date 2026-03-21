@@ -50,7 +50,6 @@ const TRASH_ITEMS = new Set([
 
 export function isOnSolidGround(bot: any): boolean {
     if (!bot.entity.onGround) return false;
-
     const pos = bot.entity.position.floored();
     const below = bot.blockAt(pos.offset(0, -1, 0));
     return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
@@ -80,12 +79,10 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
     const MAX_ATTEMPTS = 16;
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
         if (signal.aborted) throw new Error("aborted");
-
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
         const below = bot.blockAt(pos.offset(0, -1, 0));
-
         if (below && TREE_BLOCKS.has(below.name) && bot.canDigBlock(below)) {
             try {
                 await bot.dig(below);
@@ -140,13 +137,27 @@ export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
     });
 }
 
+export interface MoveOptions {
+    signal: AbortSignal;
+    timeoutMs: number;
+    stopMovement: () => void;
+    dynamic?: boolean;
+    stuckTimeoutMs?: number;
+}
+
 export function moveToGoal(
     bot: any,
     goal: any,
-    signal: AbortSignal,
-    timeoutMs: number,
-    stopMovement: () => void,
+    opts: MoveOptions,
 ): Promise<void> {
+    const {
+        signal,
+        timeoutMs,
+        stopMovement,
+        dynamic = false,
+        stuckTimeoutMs = 5000,
+    } = opts;
+
     return new Promise((resolve, reject) => {
         if (signal.aborted) {
             reject(new Error("aborted"));
@@ -158,12 +169,16 @@ export function moveToGoal(
         }
 
         let settled = false;
+        let lastPos = bot.entity.position.clone();
+        let stuckTimer: NodeJS.Timeout | null = null;
 
         const finish = (err?: Error) => {
             if (settled) return;
             settled = true;
 
             clearTimeout(timer);
+            if (stuckTimer) clearInterval(stuckTimer);
+
             signal.removeEventListener("abort", onAbort);
             bot.removeListener("goal_reached", onGoalReached);
             bot.removeListener("path_update", onPathUpdate);
@@ -197,14 +212,12 @@ export function moveToGoal(
                 setTimeout(() => {
                     if (!settled) {
                         safeStop();
-                        finish(new Error("NoPath - Bot is likely trapped"));
+                        finish(new Error("no_path"));
                     }
                 }, 3500);
             } else if (results.status === "timeout") {
                 safeStop();
-                finish(
-                    new Error("PathfinderTimeout - Calculation took too long"),
-                );
+                finish(new Error("pathfinder_timeout"));
             }
         };
 
@@ -213,12 +226,25 @@ export function moveToGoal(
             finish(new Error("timeout"));
         }, timeoutMs);
 
+        // Stuck detection loop
+        stuckTimer = setInterval(() => {
+            const currentPos = bot.entity.position;
+            const dist = lastPos.distanceTo(currentPos);
+
+            if (dist < 0.5) {
+                safeStop();
+                finish(new Error("stuck"));
+            } else {
+                lastPos = currentPos.clone();
+            }
+        }, stuckTimeoutMs);
+
         signal.addEventListener("abort", onAbort, { once: true });
         bot.once("goal_reached", onGoalReached);
         bot.on("path_update", onPathUpdate);
 
         try {
-            bot.pathfinder.setGoal(goal, true);
+            bot.pathfinder.setGoal(goal, dynamic);
         } catch (err) {
             finish(err instanceof Error ? err : new Error(String(err)));
         }
@@ -271,13 +297,11 @@ export async function placePortableUtility(
     blockName: string,
 ): Promise<any> {
     const item = bot.inventory.items().find((i: any) => i.name === blockName);
-
     if (!item) return null;
 
     await bot.equip(item, "hand");
 
     const pos = bot.entity.position.floored();
-
     const candidates = [
         bot.blockAt(pos.offset(1, -1, 0)),
         bot.blockAt(pos.offset(-1, -1, 0)),

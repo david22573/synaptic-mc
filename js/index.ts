@@ -12,16 +12,6 @@ import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 
 const { pathfinder, Movements } = pkg;
 
-(log as any).warn = (msg: string, meta: Record<string, unknown> = {}) =>
-    console.warn(
-        JSON.stringify({
-            level: "WARN",
-            msg,
-            ...meta,
-            timestamp: new Date().toISOString(),
-        }),
-    );
-
 // ==========================================
 // GLOBALS & STATE
 // ==========================================
@@ -31,6 +21,7 @@ let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
 let survival: SurvivalSystem;
+let runtimeConfig: config.Config;
 
 // ==========================================
 // STATE HELPERS
@@ -57,20 +48,34 @@ function stopMovement() {
 }
 
 function completeTask(
+    task: models.ActiveTask | null,
     status:
         | "task_completed"
         | "task_failed"
         | "task_aborted" = "task_completed",
+    cause: string = "",
 ) {
-    if (!currentTask || !client) return;
-    client.sendEvent(
-        status,
-        taskLabel(currentTask),
-        currentTask.id,
-        "",
-        currentTask.startTime,
-    );
-    currentTask = null;
+    if (!task || !client) return;
+
+    client.sendEvent(status, taskLabel(task), task.id, cause, task.startTime);
+
+    if (currentTask?.id === task.id) {
+        currentTask = null;
+    }
+}
+
+function abortActiveTask(reason: string) {
+    if (currentTask) {
+        log.info("Aborting active task", {
+            action: currentTask.action,
+            reason,
+        });
+        if (taskAbortController) {
+            taskAbortController.abort(reason);
+            taskAbortController = null;
+        }
+        completeTask(currentTask, "task_aborted", reason);
+    }
 }
 
 // ==========================================
@@ -83,16 +88,32 @@ async function executeDecision(decision: models.IncomingDecision) {
         return;
     }
 
+    if (survival && survival.isPanickingNow()) {
+        log.warn("Rejecting command due to active panic lock", {
+            action: decision.action,
+        });
+        client.sendEvent(
+            "task_aborted",
+            `${decision.action} ${decision.target?.name || "none"}`,
+            decision.id,
+            "panic_lock",
+            Date.now(),
+        );
+        return;
+    }
+
     log.info("Executing decision", {
         id: decision.id,
         action: decision.action,
         target_type: decision.target?.type,
         target_name: decision.target?.name,
+        trace: decision.trace || {
+            trace_id: "unknown",
+            action_id: decision.id,
+        },
     });
 
-    if (taskAbortController) {
-        taskAbortController.abort();
-    }
+    abortActiveTask("preempted_by_new_command");
 
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
@@ -102,19 +123,25 @@ async function executeDecision(decision: models.IncomingDecision) {
         action: decision.action,
         target: decision.target || { type: "none", name: "none" },
         startTime: Date.now(),
+        trace: decision.trace || {
+            trace_id: "unknown",
+            action_id: decision.id,
+        },
     };
 
     stopMovement();
 
+    const activeTask = currentTask;
+
     client.sendEvent(
         "task_started",
-        taskLabel(currentTask),
-        decision.id,
+        taskLabel(activeTask),
+        activeTask.id,
         "",
-        currentTask.startTime,
+        activeTask.startTime,
     );
 
-    const timeoutMs = config.TASK_TIMEOUTS[decision.action] || 10000;
+    const timeoutMs = runtimeConfig.task_timeouts[decision.action] || 10000;
     let timeoutId: NodeJS.Timeout | null = null;
 
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -127,34 +154,38 @@ async function executeDecision(decision: models.IncomingDecision) {
                 bot,
                 decision,
                 signal,
-                config.TASK_TIMEOUTS,
+                runtimeConfig.task_timeouts,
                 () => getThreats(bot),
-                (threats) => computeSafeRetreat(bot, threats),
+                (threats) => computeSafeRetreat(bot, threats, 20),
                 stopMovement,
             ),
             timeoutPromise,
         ]);
 
         if (!signal.aborted) {
-            completeTask("task_completed");
+            completeTask(activeTask, "task_completed");
         }
     } catch (err) {
         const message =
             err instanceof Error ? err.message : String(err || "unknown_error");
 
         if (signal.aborted || message === "aborted") {
-            completeTask("task_aborted");
+            // Task already completed through abortActiveTask if aborted locally
+            if (currentTask?.id === activeTask.id) {
+                completeTask(activeTask, "task_aborted", message);
+            }
         } else {
             log.error("Task failed", {
                 id: decision.id,
                 action: decision.action,
                 error: message,
             });
-            completeTask("task_failed");
+            completeTask(activeTask, "task_failed", message);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
+
         if (taskAbortController?.signal === signal) {
             taskAbortController = null;
         }
@@ -167,11 +198,13 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 async function bootstrap() {
     log.info("Bootstrapping bot... fetching dynamic config.");
-    await config.loadConfig();
+
+    runtimeConfig = await config.loadConfig();
 
     log.info(
-        "Config loaded. Connecting to Minecraft server at 127.0.0.1:25565...",
+        `Config loaded. Connecting to Minecraft server at 127.0.0.1:25565...`,
     );
+
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
@@ -195,25 +228,18 @@ async function bootstrap() {
 
     bot.loadPlugin(pathfinder);
 
-    client = new ControlPlaneClient(config.WS_URL, {
+    client = new ControlPlaneClient(runtimeConfig.ws_url, {
         onCommand: (decision) => void executeDecision(decision),
         onUnlock: () => {
             log.debug("Bot unlocked from control plane");
+            abortActiveTask("control_plane_unlock");
         },
     });
 
     survival = new SurvivalSystem(bot, client, {
         onInterrupt: (reason: string) => {
-            // Only abort LLM tasks for critical panics.
-            // Quick auto-defends will now pause and resume natively without telling the Go engine.
             if (reason === "panic_flee") {
-                if (taskAbortController) {
-                    log.info(
-                        `LLM Task interrupted by survival reflex: ${reason}`,
-                    );
-                    taskAbortController.abort();
-                    taskAbortController = null;
-                }
+                abortActiveTask("survival_panic_reflex");
             }
         },
         stopMovement: () => stopMovement(),
@@ -223,7 +249,6 @@ async function bootstrap() {
 
     let isFirstSpawn = true;
 
-    // Use .on instead of .once so movements are re-injected when respawning
     bot.on("spawn", () => {
         log.info("Bot spawned", {
             env_path: config.ENV_PATH,
@@ -252,6 +277,7 @@ async function bootstrap() {
                 movements.blocksToAvoid.delete(block.id);
             }
         }
+
         (bot as any).pathfinder.setMovements(movements);
 
         if (isFirstSpawn) {
@@ -259,15 +285,16 @@ async function bootstrap() {
             client.connect();
             survival.start();
 
-            if (config.ENABLE_VIEWER) {
+            if (runtimeConfig.enable_viewer) {
                 try {
                     viewer(bot, {
-                        port: config.VIEWER_PORT,
+                        port: runtimeConfig.viewer_port,
                         firstPerson: true,
                         viewDistance: 2,
                     });
+
                     log.info("Prismarine viewer started", {
-                        port: config.VIEWER_PORT,
+                        port: runtimeConfig.viewer_port,
                     });
                 } catch (err) {
                     log.error("Viewer failed to start", {
@@ -280,11 +307,7 @@ async function bootstrap() {
 
     bot.on("death", () => {
         log.warn("Bot died; resetting local execution state");
-        if (taskAbortController) {
-            taskAbortController.abort();
-            taskAbortController = null;
-        }
-        currentTask = null;
+        abortActiveTask("died");
         stopMovement();
 
         survival.reset();

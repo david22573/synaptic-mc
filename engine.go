@@ -13,18 +13,24 @@ import (
 )
 
 type Vec3 struct {
-	X float64
-	Y float64
-	Z float64
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	Z float64 `json:"z"`
 }
 
 type GameState struct {
-	Position     Vec3
-	Health       float64
-	Threats      []Threat
-	HasBedNearby bool
-	Inventory    []Item
-	TimeOfDay    int
+	Health       float64 `json:"health"`
+	Food         float64 `json:"food"`
+	TimeOfDay    int     `json:"time_of_day"`
+	HasBedNearby bool    `json:"has_bed_nearby"`
+	Position     Vec3    `json:"position"`
+	Threats      []struct {
+		Name string `json:"name"`
+	} `json:"threats"`
+	Inventory []struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	} `json:"inventory"`
 }
 
 type Engine struct {
@@ -36,15 +42,18 @@ type Engine struct {
 	uiHub     *UIHub
 	logger    *slog.Logger
 
-	// Event loop channel replaces e.mu Mutex
 	eventCh chan EngineEvent
 
 	queue        *TaskQueue
 	inFlightTask *Action
 
-	planEpoch      int
-	planning       bool
-	planCancel     context.CancelFunc
+	planEpoch         int
+	planning          bool
+	planCancel        context.CancelFunc
+	milestoneEpoch    int
+	milestonePlanning bool
+	milestoneCancel   context.CancelFunc
+
 	sessionID      string
 	systemOverride string
 
@@ -76,7 +85,7 @@ func NewEngine(
 		telemetry:  tel,
 		uiHub:      uiHub,
 		logger:     baseLogger.With(slog.String("session_id", sessionID)),
-		eventCh:    make(chan EngineEvent, 100), // Buffered to handle rapid client bursts
+		eventCh:    make(chan EngineEvent, 100),
 		queue:      NewTaskQueue(),
 		planEpoch:  0,
 		lastHealth: 20.0,
@@ -88,7 +97,6 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 	e.wg.Add(1)
 	go e.loop(ctx)
 
-	// Keep the WS reader tight. It parses raw messages and feeds the event loop.
 	for {
 		var msg struct {
 			Type    string          `json:"type"`
@@ -117,15 +125,15 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 		}
 	}
 
-	close(e.eventCh) // Triggers shutdown of the event loop
+	close(e.eventCh)
 	e.wg.Wait()
 	_ = e.exec.Close()
 }
 
-// loop is the single-threaded actor routine. All state mutations happen here.
 func (e *Engine) loop(ctx context.Context) {
 	defer e.wg.Done()
 	defer e.cancelPlanning()
+	defer e.cancelMilestonePlanning()
 
 	for {
 		select {
@@ -133,7 +141,7 @@ func (e *Engine) loop(ctx context.Context) {
 			return
 		case event, ok := <-e.eventCh:
 			if !ok {
-				return // Channel closed due to disconnect
+				return
 			}
 			e.processEvent(ctx, event)
 		}
@@ -150,6 +158,10 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 		e.handlePlanReady(ev)
 	case EventPlanError:
 		e.handlePlanError(ev)
+	case EventMilestoneReady:
+		e.handleMilestoneReady(ev)
+	case EventMilestoneError:
+		e.handleMilestoneError(ev)
 	}
 }
 
@@ -163,12 +175,12 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 15
-	criticalOverride := healthDropped
+
+	criticalOverride := healthDropped && time.Since(e.lastReplan) > 15*time.Second
 
 	e.lastHealth = ev.State.Health
 	e.lastThreat = topThreat
 
-	// Evaluate routines. queue.HasRoutineTarget replaces the old hasRoutineTaskLocked
 	newRoutines := e.routine.Evaluate(ev.State, e.inFlightTask, e.queue.items)
 	if len(newRoutines) > 0 {
 		e.queue.Push(newRoutines...)
@@ -199,8 +211,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	if busy && !criticalOverride {
 		if e.planner.GetActiveMilestone() == nil {
-			// milestone generation runs in its own goroutine managed by planner
-			go e.planner.GenerateMilestone(ctx, ev.RawPayload, e.sessionID)
+			e.triggerMilestoneGeneration(ctx, ev.RawPayload)
 		}
 		return
 	}
@@ -215,11 +226,10 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	if e.planner.GetActiveMilestone() == nil {
-		go e.planner.GenerateMilestone(ctx, ev.RawPayload, e.sessionID)
+		e.triggerMilestoneGeneration(ctx, ev.RawPayload)
 		return
 	}
 
-	// Trigger async LLM planning
 	epochAtStart := e.planEpoch
 	sysOverride := e.systemOverride
 	e.systemOverride = ""
@@ -230,8 +240,8 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	e.lastReplan = time.Now()
 
 	e.telemetry.RecordReplan()
+	traceID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
 
-	// Spin up async worker to call LLM, ensuring it feeds results back to the eventCh
 	go func() {
 		plan, err := e.planner.GenerateTactics(planCtx, ev.RawPayload, e.sessionID, sysOverride)
 		if err != nil {
@@ -240,8 +250,57 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 			}
 			return
 		}
-		e.eventCh <- EventPlanReady{Epoch: epochAtStart, Plan: plan}
+		e.eventCh <- EventPlanReady{Epoch: epochAtStart, TraceID: traceID, Plan: plan}
 	}()
+}
+
+func (e *Engine) triggerMilestoneGeneration(ctx context.Context, statePayload json.RawMessage) {
+	if e.milestonePlanning {
+		return
+	}
+
+	epochAtStart := e.milestoneEpoch
+	msCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	e.milestoneCancel = cancel
+	e.milestonePlanning = true
+
+	go func() {
+		milestone, err := e.planner.GenerateMilestone(msCtx, statePayload, e.sessionID)
+		if err != nil {
+			if msCtx.Err() != context.Canceled {
+				e.eventCh <- EventMilestoneError{Epoch: epochAtStart, Error: err}
+			}
+			return
+		}
+		e.eventCh <- EventMilestoneReady{Epoch: epochAtStart, Milestone: milestone}
+	}()
+}
+
+func (e *Engine) handleMilestoneReady(ev EventMilestoneReady) {
+	if e.milestoneCancel != nil {
+		e.milestoneCancel = nil
+	}
+	e.milestonePlanning = false
+
+	if e.milestoneEpoch != ev.Epoch {
+		e.telemetry.RecordStalePlan()
+		return
+	}
+
+	e.lastReplan = time.Time{}
+}
+
+func (e *Engine) handleMilestoneError(ev EventMilestoneError) {
+	if e.milestoneCancel != nil {
+		e.milestoneCancel = nil
+	}
+	e.milestonePlanning = false
+
+	if e.milestoneEpoch != ev.Epoch {
+		return
+	}
+
+	e.logger.Error("Milestone generation failed", slog.Any("error", ev.Error))
 }
 
 func (e *Engine) handlePlanReady(ev EventPlanReady) {
@@ -251,7 +310,13 @@ func (e *Engine) handlePlanReady(ev EventPlanReady) {
 	e.planning = false
 
 	if e.planEpoch != ev.Epoch {
-		return // Stale plan
+		e.telemetry.RecordStalePlan()
+		return
+	}
+
+	if ev.Plan != nil && ev.Plan.MilestoneComplete && len(ev.Plan.Tasks) == 0 {
+		e.lastReplan = time.Time{}
+		return
 	}
 
 	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
@@ -264,6 +329,14 @@ func (e *Engine) handlePlanReady(ev EventPlanReady) {
 			ev.Plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
 		}
 		ev.Plan.Tasks[i].Source = string(SourceLLM)
+
+		ev.Plan.Tasks[i].Trace = TraceContext{
+			TraceID:  ev.TraceID,
+			ActionID: ev.Plan.Tasks[i].ID,
+		}
+		if ms := e.planner.GetActiveMilestone(); ms != nil {
+			ev.Plan.Tasks[i].Trace.MilestoneID = ms.ID
+		}
 	}
 
 	e.uiHub.Broadcast(map[string]interface{}{"type": "objective_update", "payload": ev.Plan.Objective})
@@ -298,6 +371,10 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 		Z:         e.lastPos.Z,
 	}
 
+	if e.inFlightTask != nil {
+		meta.TraceID = e.inFlightTask.Trace.TraceID
+	}
+
 	logCtx := []any{
 		slog.String("action", ev.Action),
 		slog.String("command_id", ev.CommandID),
@@ -306,7 +383,7 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 
 	switch ev.Event {
 	case "death":
-		e.telemetry.RecordTaskStatus("FAILED")
+		e.telemetry.RecordTaskStatus(StatusFailed)
 		e.resetExecutionState()
 		e.planner.ClearMilestone()
 
@@ -317,7 +394,7 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 		)
 		e.lastReplan = time.Time{}
 
-		meta.Status = "FAILED"
+		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
 		e.logger.Warn("Bot died — milestone cleared", slog.String("cause", ev.Cause))
 
@@ -326,7 +403,7 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 		e.resetExecutionState()
 
 		e.panicCooldown = time.Now().Add(10 * time.Second)
-		meta.Status = "PANIC"
+		meta.Status = string(StatusPanic)
 		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
 		e.logger.Warn("Reflex triggered by client", append(logCtx, slog.String("cause", ev.Cause))...)
 
@@ -334,8 +411,8 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 		if !e.matchesInFlight(ev.CommandID) {
 			return
 		}
-		e.telemetry.RecordTaskStatus("COMPLETED")
-		meta.Status = "COMPLETED"
+		e.telemetry.RecordTaskStatus(StatusCompleted)
+		meta.Status = string(StatusCompleted)
 		go e.memory.LogEvent(ev.Action, "Finished successfully", meta)
 		e.logger.Info("Task completed", logCtx...)
 		e.inFlightTask = nil
@@ -348,11 +425,18 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 		if !e.matchesInFlight(ev.CommandID) {
 			return
 		}
-		status := strings.ToUpper(strings.Split(ev.Event, "_")[1])
+		statusStr := strings.ToUpper(strings.Split(ev.Event, "_")[1])
+		status := TaskStatus(statusStr)
+
+		failCause := ev.Cause
+		if failCause == "" {
+			failCause = "unknown reason"
+		}
+
 		e.telemetry.RecordTaskStatus(status)
-		meta.Status = status
-		go e.memory.LogEvent(ev.Action, "Task "+status, meta)
-		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", ev.Event))...)
+		meta.Status = string(status)
+		go e.memory.LogEvent(ev.Action, "Task "+string(status)+": "+failCause, meta)
+		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", ev.Event), slog.String("cause", failCause))...)
 
 		e.resetExecutionState()
 
@@ -365,7 +449,8 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 		}
 		e.tasksCompletedSinceReplan = 0
 
-		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+")")
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Previous task '%s' %s. Cause: %s. Adjust your plan accordingly.", ev.Action, string(status), failCause)
+		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
 	}
 }
 
@@ -377,51 +462,59 @@ func (e *Engine) processNextTask() {
 	e.inFlightTask = e.queue.Pop()
 	task := e.inFlightTask
 
-	if task.Action == "mark_location" {
+	if task.Action == string(ActionMarkLocation) {
 		locName := task.Target.Name
-		go func(name string, x, y, z float64) {
+		go func(name string, x, y, z float64, tID string) {
 			err := e.memory.MarkLocation(context.Background(), name, x, y, z)
 			if err == nil {
 				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", name, x, y, z)
-				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, X: x, Y: y, Z: z, Status: "COMPLETED"})
+				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: x, Y: y, Z: z, Status: "COMPLETED"})
 				e.logger.Info("Location marked in spatial memory", slog.String("name", name))
 			}
-			e.eventCh <- EventClientAction{Event: "task_completed", CommandID: task.ID}
-		}(locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionMarkLocation), CommandID: task.ID}
+		}(locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, task.Trace.TraceID)
 		return
 	}
 
-	if task.Action == "recall_location" {
+	if task.Action == string(ActionRecallLocation) {
 		locName := task.Target.Name
-		go func(name string) {
+		go func(name string, tID string) {
 			loc, err := e.memory.GetLocation(context.Background(), name)
 			if err == nil {
 				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, loc.X, loc.Y, loc.Z)
-				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, Status: "COMPLETED"})
+				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
 				e.setSummaryAsync("Known Location: "+name, msg)
 			}
-			e.eventCh <- EventClientAction{Event: "task_completed", CommandID: task.ID}
-		}(locName)
+			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
+		}(locName, task.Trace.TraceID)
 		return
 	}
 
-	_ = e.exec.Dispatch(*task)
+	if err := e.exec.Dispatch(*task); err != nil {
+		e.telemetry.RecordDispatchFailure()
+		e.logger.Error("Dispatch failed", slog.Any("error", err), slog.String("action", task.Action))
+		e.inFlightTask = nil
+		e.lastReplan = time.Time{}
+		e.systemOverride = "CRITICAL OVERRIDE: Executor dispatch failed with error: " + err.Error()
+	}
 }
 
 func (e *Engine) resetExecutionState() {
 	e.planEpoch++
+	e.milestoneEpoch++
 	e.queue.ClearBySource(SourceLLM)
-	e.queue.ClearBySource(SourceRoutine) // Or leave routines if you want them to survive interrupts
+	e.queue.ClearBySource(SourceRoutine)
 	e.inFlightTask = nil
 	e.lastReplan = time.Time{}
 	e.cancelPlanning()
+	e.cancelMilestonePlanning()
 }
 
 func (e *Engine) matchesInFlight(commandID string) bool {
 	if e.inFlightTask == nil {
 		return false
 	}
-	return commandID == "" || e.inFlightTask.ID == commandID
+	return e.inFlightTask.ID == commandID
 }
 
 func (e *Engine) cancelPlanning() {
@@ -430,6 +523,14 @@ func (e *Engine) cancelPlanning() {
 		e.planCancel = nil
 	}
 	e.planning = false
+}
+
+func (e *Engine) cancelMilestonePlanning() {
+	if e.milestoneCancel != nil {
+		e.milestoneCancel()
+		e.milestoneCancel = nil
+	}
+	e.milestonePlanning = false
 }
 
 func (e *Engine) setSummaryAsync(key, value string) {

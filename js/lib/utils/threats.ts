@@ -11,7 +11,7 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
             const distance = bot.entity.position.distanceTo(e.position);
             return { e, distance };
         })
-        .filter(({ distance }) => distance <= 16) // Standard Minecraft mob aggro radius
+        .filter(({ distance }) => distance <= 16)
         .map(({ e, distance }) => {
             const baseThreat =
                 config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
@@ -29,7 +29,11 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
         .sort((a, b) => b.threatScore - a.threatScore);
 }
 
-export function computeSafeRetreat(bot: Bot, threats: models.ThreatInfo[]) {
+export function computeSafeRetreat(
+    bot: Bot,
+    threats: models.ThreatInfo[],
+    distance: number = 20,
+) {
     let cx = 0,
         cz = 0,
         totalWeight = 0;
@@ -40,11 +44,10 @@ export function computeSafeRetreat(bot: Bot, threats: models.ThreatInfo[]) {
         totalWeight += threat.threatScore;
     }
 
-    // If no threats, pick a random vector
     if (totalWeight === 0) {
         return {
-            x: bot.entity.position.x + (Math.random() - 0.5) * 20,
-            z: bot.entity.position.z + (Math.random() - 0.5) * 20,
+            x: bot.entity.position.x + (Math.random() - 0.5) * distance,
+            z: bot.entity.position.z + (Math.random() - 0.5) * distance,
         };
     }
 
@@ -55,9 +58,8 @@ export function computeSafeRetreat(bot: Bot, threats: models.ThreatInfo[]) {
     let dz = bot.entity.position.z - cz;
     const len = Math.sqrt(dx * dx + dz * dz) || 1;
 
-    // Normalize and project 20 blocks away from the center of mass of the threats
     return {
-        x: bot.entity.position.x + (dx / len) * 20,
-        z: bot.entity.position.z + (dz / len) * 20,
+        x: bot.entity.position.x + (dx / len) * distance,
+        z: bot.entity.position.z + (dz / len) * distance,
     };
 }

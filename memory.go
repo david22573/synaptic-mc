@@ -14,6 +14,7 @@ import (
 
 type EventMeta struct {
 	SessionID string
+	TraceID   string
 	Status    string
 	X, Y, Z   float64
 }
@@ -67,7 +68,6 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		y REAL,
 		z REAL
 	);
-
 	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
 
 	CREATE TABLE IF NOT EXISTS session_summary (
@@ -89,6 +89,9 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply schema: %w", err)
 	}
+
+	// Safe migration for Phase 3 to add trace_id to existing DBs
+	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN trace_id TEXT DEFAULT ''`)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	mem := &SQLiteMemory{
@@ -120,7 +123,7 @@ func (s *SQLiteMemory) processBatches(ctx context.Context) {
 			return
 		}
 
-		stmt, err := tx.Prepare(`INSERT INTO events (session_id, action, details, status, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		stmt, err := tx.Prepare(`INSERT INTO events (session_id, trace_id, action, details, status, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			tx.Rollback()
 			return
@@ -128,7 +131,7 @@ func (s *SQLiteMemory) processBatches(ctx context.Context) {
 		defer stmt.Close()
 
 		for _, e := range batch {
-			_, err := stmt.Exec(e.meta.SessionID, e.action, e.details, e.meta.Status, e.meta.X, e.meta.Y, e.meta.Z)
+			_, err := stmt.Exec(e.meta.SessionID, e.meta.TraceID, e.action, e.details, e.meta.Status, e.meta.X, e.meta.Y, e.meta.Z)
 			if err != nil {
 				log.Printf("[-] Failed to insert event: %v", err)
 			}
@@ -165,7 +168,7 @@ func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
 }
 
 func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
-	query := `SELECT timestamp, action, details, status FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
+	query := `SELECT timestamp, action, details, status, COALESCE(trace_id, '') FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {
 		return "", err
@@ -175,11 +178,16 @@ func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, l
 	var events []string
 	for rows.Next() {
 		var timestamp time.Time
-		var action, details, status string
-		if err := rows.Scan(&timestamp, &action, &details, &status); err != nil {
+		var action, details, status, traceID string
+		if err := rows.Scan(&timestamp, &action, &details, &status, &traceID); err != nil {
 			return "", err
 		}
-		events = append(events, fmt.Sprintf("[%s] %s (%s): %s", timestamp.Format("15:04:05"), action, status, details))
+
+		traceStr := ""
+		if traceID != "" {
+			traceStr = fmt.Sprintf(" [Trace: %s]", traceID)
+		}
+		events = append(events, fmt.Sprintf("[%s] %s (%s)%s: %s", timestamp.Format("15:04:05"), action, status, traceStr, details))
 	}
 
 	var contextStr strings.Builder

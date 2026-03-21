@@ -5,17 +5,6 @@ import (
 	"strings"
 )
 
-var validActions = map[string]bool{
-	"gather": true, "craft": true, "hunt": true,
-	"explore": true, "build": true, "mark_location": true,
-	"recall_location": true,
-}
-
-var validTargetTypes = map[string]bool{
-	"block": true, "entity": true, "recipe": true,
-	"location": true, "category": true, "none": true,
-}
-
 // PlanValidator enforces strict schema and semantic rules on LLM outputs.
 type PlanValidator struct{}
 
@@ -41,13 +30,13 @@ func (v *PlanValidator) ValidateTactics(plan *LLMPlan) error {
 	}
 
 	for i, task := range plan.Tasks {
-		if !validActions[task.Action] {
+		if !IsValidAction(task.Action) {
 			return fmt.Errorf("task %d has invalid action: '%s'", i, task.Action)
 		}
-		if !validTargetTypes[task.Target.Type] {
+		if !IsValidTargetType(task.Target.Type) {
 			return fmt.Errorf("task %d has invalid target type: '%s'", i, task.Target.Type)
 		}
-		if task.Target.Type != "none" && strings.TrimSpace(task.Target.Name) == "" {
+		if task.Target.Type != string(TargetNone) && strings.TrimSpace(task.Target.Name) == "" {
 			return fmt.Errorf("task %d requires a target name for type '%s'", i, task.Target.Type)
 		}
 		if task.Rationale == "" {

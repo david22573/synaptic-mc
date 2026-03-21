@@ -12,6 +12,7 @@ import { handleSmelt } from "./handlers/smelt.js";
 
 // Utils
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
+import { normalizeDecision } from "./normalize.js";
 
 const { goals } = pkg;
 
@@ -21,7 +22,7 @@ const { goals } = pkg;
 
 export async function runTask(
     bot: Bot,
-    decision: models.IncomingDecision,
+    rawDecision: models.IncomingDecision,
     signal: AbortSignal,
     timeouts: Record<string, number>,
     getThreats: () => models.ThreatInfo[],
@@ -31,6 +32,9 @@ export async function runTask(
     },
     stopMovement: () => void,
 ): Promise<void> {
+    // 1. Normalize the decision targets centrally
+    const decision = normalizeDecision(bot, rawDecision);
+
     // Construct the standard context bundle
     const taskCtx = {
         bot,
@@ -74,10 +78,12 @@ export async function runTask(
 
         case "sleep": {
             await escapeTree(bot, signal);
+
             const bed = bot.findBlock({
                 maxDistance: 32,
                 matching: (block: any) => block?.name.includes("bed"),
             });
+
             if (!bed) {
                 throw new Error("no bed found nearby");
             }
@@ -90,9 +96,7 @@ export async function runTask(
                     bed.position.z,
                     1.5,
                 ),
-                signal,
-                20000,
-                stopMovement,
+                { signal, timeoutMs: 20000, stopMovement, dynamic: false },
             );
 
             if (signal.aborted) throw new Error("aborted");
@@ -114,15 +118,19 @@ export async function runTask(
 
         case "retreat": {
             await escapeTree(bot, signal);
+
             const threats = getThreats();
             const safePos = computeSafeRetreat(threats);
 
             await moveToGoal(
                 bot,
                 new goals.GoalNearXZ(safePos.x, safePos.z, 2),
-                signal,
-                timeouts.retreat ?? 15000,
-                stopMovement,
+                {
+                    signal,
+                    timeoutMs: timeouts.retreat ?? 15000,
+                    stopMovement,
+                    dynamic: false,
+                },
             );
             return;
         }

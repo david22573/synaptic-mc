@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,12 +26,18 @@ func NewWSExecutor(conn *websocket.Conn) *WSExecutor {
 }
 
 func (e *WSExecutor) Dispatch(action Action) error {
-	payload, err := json.Marshal(action)
+	payload, err := json.Marshal(CommandPayload{
+		ID:        action.ID,
+		Action:    action.Action,
+		Target:    action.Target,
+		Rationale: action.Rationale,
+	})
 	if err != nil {
 		return err
 	}
 	msg := WSMessage{
 		Type:    TypeCommand,
+		Trace:   action.Trace,
 		Payload: json.RawMessage(payload),
 	}
 	return e.writeJSON(msg)
@@ -55,5 +62,6 @@ func (e *WSExecutor) Close() error {
 func (e *WSExecutor) writeJSON(v interface{}) error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	e.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return e.conn.WriteJSON(v)
 }

@@ -30,14 +30,14 @@ func (f *FallbackBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sys
 		MilestoneComplete: false,
 		Tasks: []Action{
 			{
-				Action:    "gather",
-				Target:    Target{Type: "block", Name: "wood"},
+				Action:    string(ActionGather),
+				Target:    Target{Type: string(TargetBlock), Name: "wood"},
 				Rationale: "Fallback mode: Gathering generic wood to stay productive.",
 				Priority:  PriLLM,
 			},
 			{
-				Action:    "idle",
-				Target:    Target{Type: "none", Name: "none"},
+				Action:    string(ActionIdle),
+				Target:    Target{Type: string(TargetNone), Name: "none"},
 				Rationale: "Fallback mode: Yielding to routines.",
 				Priority:  PriLLM,
 			},

@@ -7,31 +7,47 @@ import { gotoEntity, attackEntity, findNearestEntity } from "../primitives.js";
 import { type TaskContext } from "../registry.js";
 import { escapeTree } from "../utils.js";
 
+interface HuntContext extends StateContext {
+    stopMovement: () => void;
+}
+
 class LootState implements FSMState {
     name = "LOOTING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
-        const droppedItems = findNearestEntity(ctx.bot, "item", 8);
+        const hCtx = ctx as HuntContext;
+        const droppedItems = findNearestEntity(hCtx.bot, "item", 8);
+
         if (droppedItems) {
-            const reached = await gotoEntity(ctx.bot, droppedItems, 0.5);
-            if (!reached) {
-                ctx.result = {
-                    status: "FAILED",
-                    reason: "FAILED_TO_REACH_LOOT",
-                };
-                return null;
+            try {
+                const reached = await gotoEntity(hCtx.bot, droppedItems, 0.5, {
+                    signal: hCtx.signal,
+                    timeoutMs: 10000,
+                    stopMovement: hCtx.stopMovement,
+                });
+
+                if (!reached) {
+                    hCtx.result = {
+                        status: "FAILED",
+                        reason: "FAILED_TO_REACH_LOOT",
+                    };
+                    return null;
+                }
+            } catch (err: any) {
+                if (err.message === "aborted") {
+                    hCtx.result = { status: "FAILED", reason: "aborted" };
+                    return null;
+                }
             }
         }
-        ctx.result = { status: "SUCCESS", reason: "HUNT_COMPLETE" };
+        hCtx.result = { status: "SUCCESS", reason: "HUNT_COMPLETE" };
         return null;
     }
 }
 
 class AttackState implements FSMState {
     name = "ATTACKING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -42,6 +58,7 @@ class AttackState implements FSMState {
         const dist = ctx.bot.entity.position.distanceTo(
             ctx.targetEntity.position,
         );
+
         if (dist > 3.2) {
             return new ApproachState();
         }
@@ -49,10 +66,11 @@ class AttackState implements FSMState {
         const weapon = ctx.bot.inventory
             .items()
             .find((i) => i.name.includes("sword") || i.name.includes("axe"));
+
         if (weapon) await ctx.bot.equip(weapon, "hand");
 
         await attackEntity(ctx.bot, ctx.targetEntity);
-        await new Promise((resolve) => setTimeout(resolve, 650)); // Minecraft attack cooldown
+        await new Promise((resolve) => setTimeout(resolve, 650));
 
         return this;
     }
@@ -60,36 +78,52 @@ class AttackState implements FSMState {
 
 class ApproachState implements FSMState {
     name = "APPROACHING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
-        if (!ctx.targetEntity || !ctx.targetEntity.isValid) {
-            ctx.result = {
+        const hCtx = ctx as HuntContext;
+
+        if (!hCtx.targetEntity || !hCtx.targetEntity.isValid) {
+            hCtx.result = {
                 status: "FAILED",
                 reason: "TARGET_LOST_OR_DESPAWNED",
             };
             return null;
         }
 
-        const reached = await gotoEntity(ctx.bot, ctx.targetEntity, 2);
-        if (!reached) {
-            const dist = ctx.bot.entity.position.distanceTo(
-                ctx.targetEntity.position,
-            );
-            if (dist > 32) {
-                ctx.result = { status: "FAILED", reason: "TARGET_RAN_TOO_FAR" };
+        try {
+            const reached = await gotoEntity(hCtx.bot, hCtx.targetEntity, 2, {
+                signal: hCtx.signal,
+                timeoutMs: 15000,
+                stopMovement: hCtx.stopMovement,
+            });
+
+            if (!reached) {
+                const dist = hCtx.bot.entity.position.distanceTo(
+                    hCtx.targetEntity.position,
+                );
+
+                if (dist > 32) {
+                    hCtx.result = {
+                        status: "FAILED",
+                        reason: "TARGET_RAN_TOO_FAR",
+                    };
+                    return null;
+                }
+            }
+        } catch (err: any) {
+            if (err.message === "aborted") {
+                hCtx.result = { status: "FAILED", reason: "aborted" };
                 return null;
             }
-            // If it failed but is still close, it might just be stuck on a block. Try approaching again.
         }
+
         return new AttackState();
     }
 }
 
 export class SearchState implements FSMState {
     name = "SEARCHING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -98,6 +132,7 @@ export class SearchState implements FSMState {
             ctx.targetName,
             ctx.searchRadius,
         );
+
         if (!entity) {
             ctx.result = {
                 status: "FAILED",
@@ -111,7 +146,7 @@ export class SearchState implements FSMState {
 }
 
 export async function handleHunt(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts } = ctx;
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
     const targetName = decision.target?.name;
@@ -119,7 +154,7 @@ export async function handleHunt(ctx: TaskContext): Promise<void> {
         throw new Error("missing hunt target");
     }
 
-    const fsmCtx: StateContext = {
+    const fsmCtx: HuntContext = {
         bot,
         targetName,
         targetEntity: null,
@@ -127,13 +162,13 @@ export async function handleHunt(ctx: TaskContext): Promise<void> {
         timeoutMs: timeouts.hunt ?? 30000,
         startTime: 0,
         signal,
+        stopMovement,
     };
 
     const fsm = new StateMachineRunner(new SearchState(), fsmCtx);
     const result = await fsm.run();
 
     if (result.status === "FAILED") {
-        // Pass the granular failure reason directly back up to the LLM
         throw new Error(result.reason || "unknown_fsm_failure");
     }
 }
