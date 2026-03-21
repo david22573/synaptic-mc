@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
 
-// External Handlers
+// Handlers
 import { handleGather } from "./handlers/gather.js";
 import { handleCraft } from "./handlers/craft.js";
 import { handleHunt } from "./handlers/hunt.js";
@@ -10,15 +10,10 @@ import { handleBuild } from "./handlers/build.js";
 import { handleExplore } from "./handlers/explore.js";
 import { handleSmelt } from "./handlers/smelt.js";
 
-// Utils
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeDecision } from "./normalize.js";
 
 const { goals } = pkg;
-
-// ==========================================
-// TASK EXECUTION
-// ==========================================
 
 export async function runTask(
     bot: Bot,
@@ -32,62 +27,50 @@ export async function runTask(
     },
     stopMovement: () => void,
 ): Promise<void> {
-    // 1. Normalize the decision targets centrally
     const decision = normalizeDecision(bot, rawDecision);
-
-    // Construct the standard context bundle
-    const taskCtx = {
-        bot,
-        decision,
-        signal,
-        timeouts,
-        stopMovement,
-    };
+    const taskCtx = { bot, decision, signal, timeouts, stopMovement };
 
     switch (decision.action) {
-        // --- DELEGATED FSM / MODULAR TASKS ---
         case "hunt":
             await handleHunt(taskCtx);
             return;
-
         case "gather":
             await handleGather(taskCtx);
             return;
-
         case "craft":
             await handleCraft(taskCtx);
             return;
-
         case "build":
             await handleBuild(taskCtx);
             return;
-
         case "smelt":
             await handleSmelt(taskCtx);
             return;
-
         case "explore":
             await handleExplore(taskCtx);
             return;
 
-        // --- INLINE FAST TASKS ---
-        case "idle": {
-            await waitForMs(1500, signal);
+        case "eat": {
+            const food = bot.inventory
+                .items()
+                .find((i) => i.name === decision.target.name);
+            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
+            await bot.equip(food, "hand");
+            await bot.consume();
             return;
         }
 
+        case "idle":
+            await waitForMs(1500, signal);
+            return;
+
         case "sleep": {
             await escapeTree(bot, signal);
-
             const bed = bot.findBlock({
                 maxDistance: 32,
-                matching: (block: any) => block?.name.includes("bed"),
+                matching: (b: any) => b?.name.includes("bed"),
             });
-
-            if (!bed) {
-                throw new Error("no bed found nearby");
-            }
-
+            if (!bed) throw new Error("no bed found");
             await moveToGoal(
                 bot,
                 new goals.GoalNear(
@@ -96,46 +79,24 @@ export async function runTask(
                     bed.position.z,
                     1.5,
                 ),
-                { signal, timeoutMs: 20000, stopMovement, dynamic: false },
+                { signal, timeoutMs: 20000, stopMovement },
             );
-
-            if (signal.aborted) throw new Error("aborted");
-
-            try {
-                await bot.sleep(bed);
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                if (
-                    msg.includes("It's not night") ||
-                    msg.includes("can't sleep")
-                ) {
-                    return; // Normal day/night cycle rejection, not a failure
-                }
-                throw new Error(`sleep interaction failed: ${msg}`);
-            }
+            await bot.sleep(bed);
             return;
         }
 
         case "retreat": {
             await escapeTree(bot, signal);
-
-            const threats = getThreats();
-            const safePos = computeSafeRetreat(threats);
-
-            await moveToGoal(
-                bot,
-                new goals.GoalNearXZ(safePos.x, safePos.z, 2),
-                {
-                    signal,
-                    timeoutMs: timeouts.retreat ?? 15000,
-                    stopMovement,
-                    dynamic: false,
-                },
-            );
+            const pos = computeSafeRetreat(getThreats());
+            await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
+                signal,
+                timeoutMs: 15000,
+                stopMovement,
+            });
             return;
         }
 
         default:
-            throw new Error(`unsupported action: ${decision.action}`);
+            throw new Error(`unsupported: ${decision.action}`);
     }
 }

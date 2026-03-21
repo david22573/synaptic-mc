@@ -10,6 +10,7 @@ export enum ActionType {
     Idle = "idle",
     Sleep = "sleep",
     Retreat = "retreat",
+    Eat = "eat",
 }
 
 export enum ClientEventType {
@@ -52,10 +53,6 @@ export interface ThreatInfo {
     name: string;
     distance: number;
     threatScore: number;
-    position: {
-        x: number;
-        y: number;
-        z: number;
-    };
+    position: { x: number; y: number; z: number };
     entity?: any;
 }

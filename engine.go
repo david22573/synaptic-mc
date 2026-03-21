@@ -34,13 +34,14 @@ type GameState struct {
 }
 
 type Engine struct {
-	planner   Planner
-	routine   RoutineManager
-	exec      Executor
-	memory    MemoryBank
-	telemetry *Telemetry
-	uiHub     *UIHub
-	logger    *slog.Logger
+	planner    Planner
+	routine    RoutineManager
+	exec       Executor
+	memory     MemoryBank
+	eventStore EventStore
+	telemetry  *Telemetry
+	uiHub      *UIHub
+	logger     *slog.Logger
 
 	eventCh chan EngineEvent
 
@@ -76,12 +77,14 @@ func NewEngine(
 	uiHub *UIHub,
 	baseLogger *slog.Logger,
 	sessionID string,
+	eventStore EventStore,
 ) *Engine {
 	return &Engine{
 		planner:    planner,
 		routine:    routine,
 		exec:       exec,
 		memory:     mem,
+		eventStore: eventStore,
 		telemetry:  tel,
 		uiHub:      uiHub,
 		logger:     baseLogger.With(slog.String("session_id", sessionID)),
@@ -153,13 +156,13 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 	case EventClientState:
 		e.handleStateUpdate(ctx, ev)
 	case EventClientAction:
-		e.handleClientAction(ev)
+		e.handleClientAction(ctx, ev)
 	case EventPlanReady:
-		e.handlePlanReady(ev)
+		e.handlePlanReady(ctx, ev)
 	case EventPlanError:
 		e.handlePlanError(ev)
 	case EventMilestoneReady:
-		e.handleMilestoneReady(ev)
+		e.handleMilestoneReady(ctx, ev)
 	case EventMilestoneError:
 		e.handleMilestoneError(ev)
 	}
@@ -174,7 +177,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		topThreat = ev.State.Threats[0].Name
 	}
 
-	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 15
+	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 5
 
 	criticalOverride := healthDropped && time.Since(e.lastReplan) > 15*time.Second
 
@@ -276,7 +279,7 @@ func (e *Engine) triggerMilestoneGeneration(ctx context.Context, statePayload js
 	}()
 }
 
-func (e *Engine) handleMilestoneReady(ev EventMilestoneReady) {
+func (e *Engine) handleMilestoneReady(ctx context.Context, ev EventMilestoneReady) {
 	if e.milestoneCancel != nil {
 		e.milestoneCancel = nil
 	}
@@ -286,6 +289,11 @@ func (e *Engine) handleMilestoneReady(ev EventMilestoneReady) {
 		e.telemetry.RecordStalePlan()
 		return
 	}
+
+	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerated", map[string]interface{}{
+		"id":          ev.Milestone.ID,
+		"description": ev.Milestone.Description,
+	})
 
 	e.lastReplan = time.Time{}
 }
@@ -303,7 +311,7 @@ func (e *Engine) handleMilestoneError(ev EventMilestoneError) {
 	e.logger.Error("Milestone generation failed", slog.Any("error", ev.Error))
 }
 
-func (e *Engine) handlePlanReady(ev EventPlanReady) {
+func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	if e.planCancel != nil {
 		e.planCancel = nil
 	}
@@ -345,6 +353,12 @@ func (e *Engine) handlePlanReady(ev EventPlanReady) {
 	e.queue.ClearBySource(SourceLLM)
 	e.queue.Push(ev.Plan.Tasks...)
 
+	e.eventStore.Append(ctx, e.sessionID, ev.TraceID, "TacticalPlanGenerated", map[string]interface{}{
+		"objective":    ev.Plan.Objective,
+		"task_count":   len(ev.Plan.Tasks),
+		"milestone_id": ev.Plan.Tasks[0].Trace.MilestoneID, // if exists
+	})
+
 	e.tasksCompletedSinceReplan = 0
 	e.processNextTask()
 }
@@ -363,13 +377,19 @@ func (e *Engine) handlePlanError(ev EventPlanError) {
 	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
 }
 
-func (e *Engine) handleClientAction(ev EventClientAction) {
+func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 	meta := EventMeta{
 		SessionID: e.sessionID,
 		X:         e.lastPos.X,
 		Y:         e.lastPos.Y,
 		Z:         e.lastPos.Z,
 	}
+
+	e.eventStore.Append(ctx, e.sessionID, meta.TraceID, strings.ToUpper(ev.Event), map[string]interface{}{
+		"action": ev.Action,
+		"cause":  ev.Cause,
+		"status": meta.Status,
+	})
 
 	if e.inFlightTask != nil {
 		meta.TraceID = e.inFlightTask.Trace.TraceID
@@ -396,6 +416,10 @@ func (e *Engine) handleClientAction(ev EventClientAction) {
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
+		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
+			"position": e.lastPos,
+			"cause":    ev.Cause,
+		})
 		e.logger.Warn("Bot died — milestone cleared", slog.String("cause", ev.Cause))
 
 	case "panic_retreat":

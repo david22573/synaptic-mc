@@ -258,3 +258,7 @@ func (s *SQLiteMemory) Close() error {
 	close(s.eventChan)
 	return s.db.Close()
 }
+
+func (e *Engine) DumpEvents(ctx context.Context) ([]DomainEvent, error) {
+	return e.eventStore.GetStream(ctx, e.sessionID)
+}

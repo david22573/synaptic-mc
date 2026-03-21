@@ -3,10 +3,9 @@ import {
     type StateContext,
     StateMachineRunner,
 } from "../fsm.js";
-import type { TaskContext } from "../registry.js";
+import { type TaskContext } from "../registry.js";
 import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
-
 const { goals } = pkg;
 
 const LOG_TYPES = [
@@ -31,29 +30,20 @@ interface GatherContext extends StateContext {
 class MineState implements FSMState {
     name = "MINING";
     async enter() {}
-
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
-
-        if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget) {
-            return advanceToNextCandidate(gCtx, "BLOCK_GONE_OR_CHANGED");
-        }
-
+        if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
+            return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
         const tool = (gCtx.bot as any).pathfinder.bestHarvestTool(freshBlock);
-        if (tool != null) await gCtx.bot.equip(tool, "hand");
-
+        if (tool) await gCtx.bot.equip(tool, "hand");
         try {
             await gCtx.bot.dig(freshBlock);
             await waitForMs(500, gCtx.signal);
-            gCtx.result = { status: "SUCCESS", reason: "GATHERED_BLOCK" };
+            gCtx.result = { status: "SUCCESS" };
             return null;
         } catch (err: any) {
-            if (err.message === "aborted") {
-                gCtx.result = { status: "FAILED", reason: "aborted" };
-                return null;
-            }
-            return advanceToNextCandidate(gCtx, `DIG_FAILED: ${err.message}`);
+            return advanceToNextCandidate(gCtx, `DIG_FAIL: ${err.message}`);
         }
     }
 }
@@ -61,35 +51,24 @@ class MineState implements FSMState {
 class NavigateState implements FSMState {
     name = "NAVIGATING";
     async enter() {}
-
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
-
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
         gCtx.resolvedTarget = gCtx.targetBlock.name;
-
         try {
             await moveToGoal(
                 gCtx.bot,
                 new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
                 {
                     signal: gCtx.signal,
-                    timeoutMs: 12000,
+                    timeoutMs: 8000,
                     stopMovement: gCtx.stopMovement,
-                    dynamic: false,
                 },
             );
             return new MineState();
         } catch (err: any) {
-            if (err.message === "aborted") {
-                gCtx.result = { status: "FAILED", reason: "aborted" };
-                return null;
-            }
-            return advanceToNextCandidate(
-                gCtx,
-                `PATHING_FAILED: ${err.message}`,
-            );
+            return advanceToNextCandidate(gCtx, `PATH_FAIL: ${err.message}`);
         }
     }
 }
@@ -97,67 +76,47 @@ class NavigateState implements FSMState {
 class SearchState implements FSMState {
     name = "SEARCHING";
     async enter() {}
-
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
-        const requestedTarget = gCtx.targetName;
-
-        const isLogRequest =
-            requestedTarget.endsWith("_log") || requestedTarget === "wood";
-
-        const candidates = isLogRequest
-            ? [
-                  requestedTarget,
-                  ...LOG_TYPES.filter((l) => l !== requestedTarget),
-              ]
-            : [requestedTarget];
-
-        const candidateIds = candidates
-            .map((name) => gCtx.bot.registry.blocksByName[name]?.id)
+        const candidates =
+            gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
+        const ids = candidates
+            .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
             .filter((id) => id !== undefined);
-
-        const blockPositions = gCtx.bot.findBlocks({
-            matching: candidateIds,
+        let blocks = gCtx.bot.findBlocks({
+            matching: ids,
             maxDistance: 48,
-            count: 15, // Increase count to bypass canopies effectively
+            count: 20,
         });
+        const botPos = gCtx.bot.entity.position;
 
-        if (blockPositions.length === 0) {
-            gCtx.result = {
-                status: "FAILED",
-                reason: `NO_${requestedTarget.toUpperCase()}_NEARBY_MUST_EXPLORE`,
-            };
+        // Vertical Clipping: Only consider blocks within 12 blocks of current Y
+        blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
+
+        if (blocks.length === 0) {
+            gCtx.result = { status: "FAILED", reason: "NO_REACHABLE_BLOCKS" };
             return null;
         }
 
-        const botPos = gCtx.bot.entity.position;
-
-        // Sort by distance but penalize heavily for height differences to favor ground logs
-        blockPositions.sort((a: any, b: any) => {
-            const distA = a.distanceTo(botPos);
-            const distB = b.distanceTo(botPos);
-            const heightPenA = Math.abs(a.y - botPos.y) * 3;
-            const heightPenB = Math.abs(b.y - botPos.y) * 3;
-            return distA + heightPenA - (distB + heightPenB);
-        });
-
-        gCtx.candidatePositions = blockPositions;
+        blocks.sort(
+            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
+        );
+        gCtx.candidatePositions = blocks;
         gCtx.currentIndex = 0;
-
         return new NavigateState();
     }
 }
 
 function advanceToNextCandidate(
     gCtx: GatherContext,
-    failReason: string,
+    reason: string,
 ): FSMState | null {
     gCtx.currentIndex++;
-    if (gCtx.currentIndex >= gCtx.candidatePositions.length) {
-        gCtx.result = {
-            status: "FAILED",
-            reason: `EXHAUSTED_ALL_CANDIDATES: Last error was ${failReason}`,
-        };
+    if (
+        gCtx.currentIndex >= gCtx.candidatePositions.length ||
+        gCtx.currentIndex > 5
+    ) {
+        gCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
         return null;
     }
     return new NavigateState();
@@ -166,13 +125,9 @@ function advanceToNextCandidate(
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
-
-    const targetName = decision.target?.name;
-    if (!targetName) throw new Error("missing gather target");
-
     const fsmCtx: GatherContext = {
         bot,
-        targetName,
+        targetName: decision.target?.name,
         targetEntity: null,
         searchRadius: 48,
         timeoutMs: timeouts.gather ?? 30000,
@@ -184,11 +139,9 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
-
-    const fsm = new StateMachineRunner(new SearchState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
-    }
+    const result = await new StateMachineRunner(
+        new SearchState(),
+        fsmCtx,
+    ).run();
+    if (result.status === "FAILED") throw new Error(result.reason);
 }

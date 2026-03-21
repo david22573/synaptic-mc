@@ -60,6 +60,14 @@ func main() {
 	defer memory.Close()
 	logger.Info("Database initialized", slog.String("path", DatabasePath))
 
+	eventStore, err := NewSQLiteEventStore("./events.db")
+	if err != nil {
+		logger.Error("Fatal: could not initialize event store", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer eventStore.Close()
+	logger.Info("Event Store initialized", slog.String("path", "./events.db"))
+
 	telemetry := NewTelemetry(logger, 5.00)
 	go telemetry.StartReporting(context.Background())
 
@@ -96,7 +104,7 @@ func main() {
 		routine := NewDefaultRoutineManager()
 		exec := NewWSExecutor(conn)
 
-		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID)
+		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID, eventStore)
 		engine.Run(context.Background(), conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))

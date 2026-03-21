@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
 	"time"
 )
@@ -77,107 +75,54 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
-CRITICAL GAME MECHANIC RULES:
-1. You CANNOT gather cobblestone, stone, or coal without a wooden_pickaxe.
-Do not ask to gather stone if it's not in the inventory.
-2. You CANNOT craft tools directly from logs.
-Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
-3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. ERROR RECOVERY (EXPLORE): If a task fails with a cause like 'NO_BLOCK_FOUND', 'NO_..._NEARBY_MUST_EXPLORE', or 'EXHAUSTED_ALL_CANDIDATES', you MUST use the "explore" action next to find a new area.
-5. ERROR RECOVERY (CRAFTING): If a task fails with 'MISSING_INGREDIENTS_OR_CRAFTING_TABLE' or 'UNKNOWN_ITEM', you MUST gather the raw materials AND ensure a crafting_table is placed.
-DO NOT retry the exact same action immediately if it just failed.
 
-Valid macro actions (Use strictly these):
-- "gather": Collect resources (wood, stone).
-- "craft": Create items. 
-- "hunt": Track and kill entities.
-- "explore": Move to new map chunks.
-- "build": Place blocks to create structures.
-- "smelt": Cook food or ores in a furnace.
-- "mark_location": Save current coordinates (target.name is the label, e.g., "base").
-- "recall_location": Retrieve coordinates from memory.
-- "idle": Wait for routines to finish.
-Target types: "block", "entity", "recipe", "location", "category", "none".`
+CRITICAL GAME MECHANIC RULES:
+1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
+2. You CANNOT gather stone or coal without a wooden_pickaxe.
+3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
+4. ERROR RECOVERY: If a task fails with 'PATHING_FAILED', 'PATHFINDER_TIMEOUT', or 'EXHAUSTED_CANDIDATES', you MUST use the "explore" action next to change your biome.
+5. VANTAGE POINT: If you are at high altitude (Y > 100) and struggle to find reachable resources, "explore" to reach flatter ground.
+
+Valid macro actions: "gather", "craft", "hunt", "explore", "build", "smelt", "mark_location", "recall_location", "idle", "eat".`
 
 func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
-	summary, err := b.memory.GetSummary(ctx, sessionID)
-	if err != nil {
-		summary = "No active summary."
-	}
-
+	summary, _ := b.memory.GetSummary(ctx, sessionID)
 	systemPrompt := fmt.Sprintf(`%s
 
-YOUR ONLY JOB: Generate a new high-level Milestone.
-
+Generate a new high-level Milestone.
 Response format (JSON only):
 {
   "id": "milestone-<short-slug>",
-  "description": "A clear, one-sentence goal (e.g. 'Craft a full set of iron tools')",
-  "completion_hint": "What inventory or world state would confirm this milestone is done"
+  "description": "Clear goal",
+  "completion_hint": "Inventory/world state trigger"
 }
 
---- ACTIVE CONTEXT (SUMMARY) ---
-%s`, BaseSystemRules, summary)
-
+ACTIVE CONTEXT: %s`, BaseSystemRules, summary)
 	return b.callLLMForMilestone(ctx, systemPrompt, string(t.State))
 }
 
 func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
-	summary, err := b.memory.GetSummary(ctx, sessionID)
-	if err != nil {
-		summary = "No active summary."
-	}
-
-	history, err := b.memory.GetRecentContext(ctx, sessionID, 6)
-	if err != nil {
-		history = "No recent memory available."
-	}
-
-	milestoneSection := "No active milestone. Focus on basic survival."
+	summary, _ := b.memory.GetSummary(ctx, sessionID)
+	history, _ := b.memory.GetRecentContext(ctx, sessionID, 6)
+	milestoneSection := "Focus on basic survival."
 	if milestone != nil {
-		milestoneSection = fmt.Sprintf(
-			"MILESTONE: %s\nCOMPLETION CRITERIA: %s",
-			milestone.Description,
-			milestone.CompletionHint,
-		)
+		milestoneSection = fmt.Sprintf("MILESTONE: %s\nCOMPLETION: %s", milestone.Description, milestone.CompletionHint)
 	}
 
 	systemPrompt := fmt.Sprintf(`%s
 
-YOUR ONLY JOB: Generate 1-3 sequential tasks that advance the ACTIVE MILESTONE below.
-Do NOT switch goals. Do NOT plan beyond the milestone.
-If you believe the milestone completion criteria have been met, set "milestone_complete": true.
-
+Generate 1-3 sequential tasks for the MILESTONE.
 Response format (JSON only):
 {
-  "objective": "One sentence describing the immediate sub-goal",
+  "objective": "Sub-goal description",
   "milestone_complete": false,
-  "tasks": [
-    {
-      "action": "gather",
-      "target": { "type": "block", "name": "oak_log" },
-      "rationale": "Need logs to craft planks"
-    }
-  ]
+  "tasks": [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "..." } ]
 }
 
---- ACTIVE MILESTONE ---
 %s
-
---- ACTIVE CONTEXT (SUMMARY) ---
-%s
-
---- RECENT MEMORY ---
-%s
-
---- CRITICAL SYSTEM OVERRIDE ---
-%s
----------------------
-
-Analyze the state payload. Respect any SYSTEM OVERRIDE warnings.
-Generate 1-3 tasks that progress the active milestone.`,
-		BaseSystemRules, milestoneSection, summary, history, systemOverride)
-
+SUMMARY: %s
+MEMORY: %s
+OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, systemOverride)
 	return b.callLLMForPlan(ctx, systemPrompt, string(t.State))
 }
 
@@ -187,13 +132,9 @@ func (b *LLMBrain) callLLMForMilestone(ctx context.Context, systemPrompt, userCo
 	if err != nil {
 		return nil, err
 	}
-
 	var milestone MilestonePlan
 	if err := json.Unmarshal([]byte(content), &milestone); err != nil {
-		return nil, fmt.Errorf("failed to parse milestone JSON: %w", err)
-	}
-	if milestone.ID == "" || milestone.Description == "" {
-		return nil, fmt.Errorf("milestone response missing required fields")
+		return nil, err
 	}
 	return &milestone, nil
 }
@@ -204,22 +145,13 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 	if err != nil {
 		return nil, err
 	}
-
-	log.Printf("[+] AI Latency: %v | Tasks Generated", latency)
-
 	var plan LLMPlan
 	if err := json.Unmarshal([]byte(content), &plan); err != nil {
-		return nil, fmt.Errorf("failed to parse plan JSON: %w", err)
+		return nil, err
 	}
-
-	if len(plan.Tasks) > 3 {
-		plan.Tasks = plan.Tasks[:3]
-	}
-
 	for i := range plan.Tasks {
 		plan.Tasks[i].Priority = PriLLM
 	}
-
 	return &plan, nil
 }
 
@@ -233,35 +165,18 @@ func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent s
 		"response_format": map[string]string{"type": "json_object"},
 		"temperature":     0.1,
 	}
-
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return "", 0, 0, 0, fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return "", 0, 0, 0, fmt.Errorf("failed to create request: %w", err)
-	}
-
+	jsonPayload, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+b.apiKey)
-	req.Header.Set("HTTP-Referer", "http://localhost:8080")
-	req.Header.Set("X-Title", "CraftD Bot Controller")
 
 	start := time.Now()
 	resp, err := b.client.Do(req)
 	latency := time.Since(start)
-
 	if err != nil {
-		return "", latency, 0, 0, fmt.Errorf("API request failed: %w", err)
+		return "", latency, 0, 0, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", latency, 0, 0, fmt.Errorf("API HTTP %d: %s", resp.StatusCode, string(body))
-	}
 
 	var result struct {
 		Choices []struct {
@@ -276,7 +191,7 @@ func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent s
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", latency, 0, 0, fmt.Errorf("failed to decode response: %w", err)
+		return "", latency, 0, 0, err
 	}
 
 	if len(result.Choices) == 0 {

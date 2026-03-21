@@ -11,4 +11,3 @@ Dockerfile
 *.yml
 ui
 js/scripts
-js

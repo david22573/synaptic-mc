@@ -10,7 +10,6 @@ export interface ControlPlaneEvents {
 export class ControlPlaneClient {
     private ws: WebSocket | null = null;
     private readonly url: string;
-
     private readonly callbacks: ControlPlaneEvents;
     private reconnectTimer: NodeJS.Timeout | null = null;
     private reconnectAttempts: number = 0;
@@ -18,6 +17,10 @@ export class ControlPlaneClient {
     constructor(url: string, callbacks: ControlPlaneEvents) {
         this.url = url;
         this.callbacks = callbacks;
+    }
+
+    public isConnected(): boolean {
+        return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
     }
 
     public connect(): void {
@@ -48,12 +51,6 @@ export class ControlPlaneClient {
                         return;
                     }
 
-                    if (!msg.trace || !msg.trace.trace_id) {
-                        log.debug("Command missing trace context", {
-                            action: decision.action,
-                        });
-                    }
-
                     decision.trace = msg.trace || {
                         trace_id: "unknown",
                         action_id: decision.id,
@@ -79,9 +76,7 @@ export class ControlPlaneClient {
         });
 
         this.ws.on("close", () => {
-            log.error(
-                "Disconnected from Control Plane. Initiating reconnect...",
-            );
+            log.error("Disconnected from Control Plane. Reconnecting...");
             this.callbacks.onUnlock();
             this.scheduleReconnect();
         });
@@ -95,7 +90,6 @@ export class ControlPlaneClient {
 
     private scheduleReconnect(): void {
         if (this.reconnectTimer) return;
-
         const baseDelay = 2000;
         const maxDelay = 30000;
         let delay = baseDelay * Math.pow(2, this.reconnectAttempts);
@@ -124,9 +118,7 @@ export class ControlPlaneClient {
         startTime = 0,
     ): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
         const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
-
         this.ws.send(
             JSON.stringify({
                 type: "event",
