@@ -6,6 +6,7 @@ import {
 import { type TaskContext } from "../registry.js";
 import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
+
 const { goals } = pkg;
 
 const LOG_TYPES = [
@@ -33,10 +34,13 @@ class MineState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
+
         if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
             return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
+
         const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
         if (tool) await gCtx.bot.equip(tool, "hand");
+
         try {
             await gCtx.bot.dig(freshBlock);
             await waitForMs(500, gCtx.signal);
@@ -56,13 +60,14 @@ class NavigateState implements FSMState {
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
         gCtx.resolvedTarget = gCtx.targetBlock.name;
+
         try {
             await moveToGoal(
                 gCtx.bot,
-                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
+                new goals.GoalNear(pos.x, pos.y, pos.z, 1.5),
                 {
                     signal: gCtx.signal,
-                    timeoutMs: 8000,
+                    timeoutMs: 15000,
                     stopMovement: gCtx.stopMovement,
                 },
             );
@@ -75,7 +80,6 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -87,9 +91,6 @@ class SearchState implements FSMState {
             .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
             .filter((id) => id !== undefined);
 
-        // Grab a massive net of blocks (256 instead of 20).
-        // This is still incredibly fast for Mineflayer but ensures
-        // we don't accidentally truncate valid lower blocks.
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
             maxDistance: 48,
@@ -98,7 +99,6 @@ class SearchState implements FSMState {
 
         const botPos = gCtx.bot.entity.position;
 
-        // Vertical Clipping: Only consider blocks within 12 blocks of current Y
         blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
 
         if (blocks.length === 0) {
@@ -106,12 +106,10 @@ class SearchState implements FSMState {
             return null;
         }
 
-        // Sort the surviving blocks by true 3D distance
         blocks.sort(
             (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
         );
 
-        // Slice down to the top 6 closest, valid candidates to save memory
         gCtx.candidatePositions = blocks.slice(0, 6);
         gCtx.currentIndex = 0;
 
@@ -136,7 +134,9 @@ function advanceToNextCandidate(
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
+
     const fsmCtx: GatherContext = {
         bot,
         targetName: decision.target?.name,
@@ -151,9 +151,11 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
+
     const result = await new StateMachineRunner(
         new SearchState(),
         fsmCtx,
     ).run();
+
     if (result.status === "FAILED") throw new Error(result.reason);
 }

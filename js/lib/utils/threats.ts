@@ -26,6 +26,7 @@ const HOSTILE_MOBS = new Set([
     "pillager",
     "evoker",
     "vindicator",
+    "warden", // Added Warden for 1.19 safety
 ]);
 
 export function getThreats(bot: Bot): models.ThreatInfo[] {
@@ -40,8 +41,12 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
         // 1. Skip invalid/dead entities to prevent "ghost mob" tracking bugs
         if (!e || !e.isValid || e === bot.entity) continue;
 
-        // 2. Ensure it's actually a hostile mob
-        if (e.type !== "mob" || !HOSTILE_MOBS.has(e.name!)) continue;
+        // 2. Ensure it's actually a hostile mob (Checking both "mob" and "hostile" for 1.19 compatibility)
+        if (
+            (e.type !== "mob" && e.type !== "hostile") ||
+            !HOSTILE_MOBS.has(e.name!)
+        )
+            continue;
 
         // 3. Check distance (skip math if it's too far away)
         const distance = botPos.distanceTo(e.position);

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -46,6 +47,12 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 			}
 		}
 
+		// If the engine intentionally aborted planning (e.g., evasion reflex), drop immediately.
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			r.logger.Debug("Primary brain context canceled (intentional preemption)")
+			return nil, context.Canceled
+		}
+
 		lastErr = err
 		r.logger.Warn("Milestone generation failed",
 			slog.Int("attempt", attempt),
@@ -55,8 +62,10 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 		if attempt < MaxRetries {
 			select {
 			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, context.Canceled
+				}
 				r.logger.Warn("Context timeout in primary brain, engaging fallback milestone")
-				// Fallback needs a fresh context since the parent one is now cancelled
 				return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
 			case <-time.After(backoff):
 				backoff *= 2 // Exponential backoff
@@ -73,7 +82,6 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 	backoff := InitialBackoff
 
 	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		// If we had a validation error previously, inject it as a system override to correct the LLM
 		currentOverride := systemOverride
 		if lastErr != nil && attempt > 1 {
 			correction := fmt.Sprintf("CRITICAL ERROR IN PREVIOUS OUTPUT: %v. Fix the JSON schema and semantic errors.", lastErr)
@@ -94,6 +102,12 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 			}
 		}
 
+		// If the engine intentionally aborted planning, drop immediately.
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			r.logger.Debug("Primary brain context canceled (intentional preemption)")
+			return nil, context.Canceled
+		}
+
 		lastErr = err
 		r.logger.Warn("Tactical planning failed",
 			slog.Int("attempt", attempt),
@@ -103,8 +117,10 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 		if attempt < MaxRetries {
 			select {
 			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, context.Canceled
+				}
 				r.logger.Warn("Context timeout in primary brain, engaging fallback tactics")
-				// Pass context.Background() since the execution pipeline's context has expired
 				return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
 			case <-time.After(backoff):
 				backoff *= 2

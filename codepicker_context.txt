@@ -1,4 +1,4 @@
-Project Context Dump (20 Mar 26 22:19 PDT)
+Project Context Dump (20 Mar 26 23:11 PDT)
 Format: xml
 Mode: FULL (No Truncation)
 Total Files: 43
@@ -612,7 +612,6 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 5
-
 	criticalOverride := healthDropped && time.Since(e.lastReplan) > 15*time.Second
 
 	e.lastHealth = ev.State.Health
@@ -671,7 +670,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	sysOverride := e.systemOverride
 	e.systemOverride = ""
 
-	planCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	planCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	e.planCancel = cancel
 	e.planning = true
 	e.lastReplan = time.Now()
@@ -697,7 +696,7 @@ func (e *Engine) triggerMilestoneGeneration(ctx context.Context, statePayload js
 	}
 
 	epochAtStart := e.milestoneEpoch
-	msCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	msCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	e.milestoneCancel = cancel
 	e.milestonePlanning = true
 
@@ -820,6 +819,8 @@ func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
 	})
 	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
 	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
+
+	e.lastReplan = time.Now()
 }
 
 func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
@@ -853,8 +854,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.planner.ClearMilestone()
 
 		e.systemOverride = fmt.Sprintf(
-			"CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. "+
-				"Your items dropped here and will despawn in 5 minutes. Formulate a recovery plan immediately.",
+			"CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Formulate a recovery plan immediately.",
 			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, ev.Cause,
 		)
 		e.lastReplan = time.Time{}
@@ -972,7 +972,6 @@ func (e *Engine) resetExecutionState() {
 	e.planEpoch++
 	e.milestoneEpoch++
 	e.queue.ClearBySource(SourceLLM)
-	e.queue.ClearBySource(SourceRoutine)
 	e.inFlightTask = nil
 	e.lastReplan = time.Time{}
 	e.cancelPlanning()
@@ -1127,11 +1126,11 @@ func (e EventClientState) isEngineEvent() {}
 
 // EventClientAction represents a task lifecycle update (completed, failed, aborted).
 type EventClientAction struct {
-	Event     string // "task_completed", "task_failed", "death", "panic_retreat"
-	Action    string
-	CommandID string
-	Cause     string
-	Duration  int
+	Event     string `json:"event"`
+	Action    string `json:"action"`
+	CommandID string `json:"command_id"`
+	Cause     string `json:"cause"`
+	Duration  int    `json:"duration_ms"`
 }
 
 func (e EventClientAction) isEngineEvent() {}
@@ -1304,6 +1303,7 @@ import { runTask } from "./lib/tasks/task.js";
 import { ControlPlaneClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
+
 const { pathfinder, Movements } = pkg;
 
 let currentTask: models.ActiveTask | null = null;
@@ -1312,6 +1312,7 @@ let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
+let lastDeathMessage: string = "unknown causes";
 
 function stopMovement() {
     if (!bot) return;
@@ -1347,20 +1348,26 @@ function abortActiveTask(reason: string) {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+
     if (survival?.isPanickingNow()) {
-        client.sendEvent(
-            "task_aborted",
-            "lock",
-            decision.id,
-            "panic",
-            Date.now(),
-        );
-        return;
+        if (decision.action === "retreat") {
+            survival.reset();
+        } else {
+            client.sendEvent(
+                "task_aborted",
+                "lock",
+                decision.id,
+                "panic",
+                Date.now(),
+            );
+            return;
+        }
     }
 
     abortActiveTask("preempted");
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
+
     currentTask = {
         id: decision.id,
         action: decision.action,
@@ -1376,7 +1383,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     const activeTask = currentTask;
 
     try {
-        // MOVED INSIDE THE TRY BLOCK:
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
         const timeoutMs = timeouts[decision.action] || 15000;
 
@@ -1385,7 +1391,7 @@ async function executeDecision(decision: models.IncomingDecision) {
                 bot,
                 decision,
                 signal,
-                timeouts, // Pass the safe timeouts object here
+                timeouts,
                 () => getThreats(bot),
                 (t) => computeSafeRetreat(bot, t, 20),
                 stopMovement,
@@ -1405,12 +1411,14 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
+
     bot = mineflayer.createBot({
         host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
     });
+
     bot.loadPlugin(pathfinder);
 
     client = new ControlPlaneClient(runtimeConfig.ws_url, {
@@ -1431,11 +1439,17 @@ async function bootstrap() {
         movements.allow1by1towers = true;
         movements.allowParkour = true;
         movements.allowSprinting = true;
+        movements.liquids = new Set([9, 10]);
+        movements.digCost = 1.5;
+
+        const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
+        movements.scafoldingBlocks = trashBlocks
+            .map((name) => bot.registry.blocksByName[name]?.id)
+            .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 5000;
+        bot.pathfinder.thinkTimeout = 10000;
 
-        // Fixed from 'client.ws'
         if (!client.isConnected()) {
             client.connect();
             survival.start();
@@ -1447,6 +1461,22 @@ async function bootstrap() {
                 });
             }
         }
+    });
+
+    bot.on("message", (msg) => {
+        const text = msg.toString();
+        if (text.includes(bot.username) && !text.startsWith("<")) {
+            lastDeathMessage = text;
+        }
+    });
+
+    bot.on("death", () => {
+        log.warn(
+            `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
+        );
+        abortActiveTask("bot_died");
+        client.sendEvent("death", "death", "", lastDeathMessage, 0);
+        lastDeathMessage = "unknown causes";
     });
 
     setInterval(() => {
@@ -1908,7 +1938,10 @@ export class SurvivalSystem {
                 t.distance < 12 &&
                 t.threatScore > 5 &&
                 t.name !== "low_health_no_food" &&
-                t.name !== "starvation",
+                t.name !== "starvation" &&
+                (this.bot.health <= 10 ||
+                    t.name === "creeper" ||
+                    t.name === "warden"),
         );
 
         if (immediateThreats.length > 0) {
@@ -1916,6 +1949,7 @@ export class SurvivalSystem {
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
+
                 const topThreat = immediateThreats[0]!;
                 if (!topThreat) return;
 
@@ -1936,7 +1970,6 @@ export class SurvivalSystem {
                 );
             }
 
-            // Flee further away (24 blocks) from the combined threat center of mass
             const safePos = computeSafeRetreat(this.bot, immediateThreats, 24);
             this.fleeTo(safePos);
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
@@ -2660,6 +2693,7 @@ import {
 import { type TaskContext } from "../registry.js";
 import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
+
 const { goals } = pkg;
 
 const LOG_TYPES = [
@@ -2687,10 +2721,13 @@ class MineState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
+
         if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
             return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
+
         const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
         if (tool) await gCtx.bot.equip(tool, "hand");
+
         try {
             await gCtx.bot.dig(freshBlock);
             await waitForMs(500, gCtx.signal);
@@ -2710,13 +2747,14 @@ class NavigateState implements FSMState {
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
         gCtx.resolvedTarget = gCtx.targetBlock.name;
+
         try {
             await moveToGoal(
                 gCtx.bot,
-                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
+                new goals.GoalNear(pos.x, pos.y, pos.z, 1.5),
                 {
                     signal: gCtx.signal,
-                    timeoutMs: 8000,
+                    timeoutMs: 15000,
                     stopMovement: gCtx.stopMovement,
                 },
             );
@@ -2729,7 +2767,6 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -2741,9 +2778,6 @@ class SearchState implements FSMState {
             .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
             .filter((id) => id !== undefined);
 
-        // Grab a massive net of blocks (256 instead of 20).
-        // This is still incredibly fast for Mineflayer but ensures
-        // we don't accidentally truncate valid lower blocks.
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
             maxDistance: 48,
@@ -2752,7 +2786,6 @@ class SearchState implements FSMState {
 
         const botPos = gCtx.bot.entity.position;
 
-        // Vertical Clipping: Only consider blocks within 12 blocks of current Y
         blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
 
         if (blocks.length === 0) {
@@ -2760,12 +2793,10 @@ class SearchState implements FSMState {
             return null;
         }
 
-        // Sort the surviving blocks by true 3D distance
         blocks.sort(
             (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
         );
 
-        // Slice down to the top 6 closest, valid candidates to save memory
         gCtx.candidatePositions = blocks.slice(0, 6);
         gCtx.currentIndex = 0;
 
@@ -2790,7 +2821,9 @@ function advanceToNextCandidate(
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
+
     const fsmCtx: GatherContext = {
         bot,
         targetName: decision.target?.name,
@@ -2805,10 +2838,12 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
+
     const result = await new StateMachineRunner(
         new SearchState(),
         fsmCtx,
     ).run();
+
     if (result.status === "FAILED") throw new Error(result.reason);
 }
 
@@ -3985,15 +4020,24 @@ export function moveToGoal(
             finish(new Error("timeout"));
         }, timeoutMs);
 
-        // Stuck detection loop
+        // Stuck detection loop with a Strike System
+        let stuckStrikes = 0;
+
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
 
+            // 0.5 blocks over 5 seconds can trigger false positives in water or dense jungles.
             if (dist < 0.5) {
-                safeStop();
-                finish(new Error("stuck"));
+                stuckStrikes++;
+                // Require 2 consecutive strikes (10 seconds total) before aborting
+                if (stuckStrikes >= 2) {
+                    safeStop();
+                    finish(new Error("stuck"));
+                }
             } else {
+                // Reset strikes if the bot makes meaningful progress
+                stuckStrikes = 0;
                 lastPos = currentPos.clone();
             }
         }, stuckTimeoutMs);
@@ -4131,6 +4175,7 @@ const HOSTILE_MOBS = new Set([
     "pillager",
     "evoker",
     "vindicator",
+    "warden", // Added Warden for 1.19 safety
 ]);
 
 export function getThreats(bot: Bot): models.ThreatInfo[] {
@@ -4145,8 +4190,12 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
         // 1. Skip invalid/dead entities to prevent "ghost mob" tracking bugs
         if (!e || !e.isValid || e === bot.entity) continue;
 
-        // 2. Ensure it's actually a hostile mob
-        if (e.type !== "mob" || !HOSTILE_MOBS.has(e.name!)) continue;
+        // 2. Ensure it's actually a hostile mob (Checking both "mob" and "hostile" for 1.19 compatibility)
+        if (
+            (e.type !== "mob" && e.type !== "hostile") ||
+            !HOSTILE_MOBS.has(e.name!)
+        )
+            continue;
 
         // 3. Check distance (skip math if it's too far away)
         const distance = botPos.distanceTo(e.position);
@@ -4932,6 +4981,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -4976,6 +5026,12 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 			}
 		}
 
+		// If the engine intentionally aborted planning (e.g., evasion reflex), drop immediately.
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			r.logger.Debug("Primary brain context canceled (intentional preemption)")
+			return nil, context.Canceled
+		}
+
 		lastErr = err
 		r.logger.Warn("Milestone generation failed",
 			slog.Int("attempt", attempt),
@@ -4985,7 +5041,11 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 		if attempt < MaxRetries {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, context.Canceled
+				}
+				r.logger.Warn("Context timeout in primary brain, engaging fallback milestone")
+				return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
 			case <-time.After(backoff):
 				backoff *= 2 // Exponential backoff
 			}
@@ -4993,7 +5053,7 @@ func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionI
 	}
 
 	r.logger.Error("Primary brain exhausted retries. Engaging fallback planner.", slog.Any("final_error", lastErr))
-	return r.fallback.GenerateMilestone(ctx, t, sessionID)
+	return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
 }
 
 func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
@@ -5001,7 +5061,6 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 	backoff := InitialBackoff
 
 	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		// If we had a validation error previously, inject it as a system override to correct the LLM
 		currentOverride := systemOverride
 		if lastErr != nil && attempt > 1 {
 			correction := fmt.Sprintf("CRITICAL ERROR IN PREVIOUS OUTPUT: %v. Fix the JSON schema and semantic errors.", lastErr)
@@ -5022,6 +5081,12 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 			}
 		}
 
+		// If the engine intentionally aborted planning, drop immediately.
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			r.logger.Debug("Primary brain context canceled (intentional preemption)")
+			return nil, context.Canceled
+		}
+
 		lastErr = err
 		r.logger.Warn("Tactical planning failed",
 			slog.Int("attempt", attempt),
@@ -5031,7 +5096,11 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 		if attempt < MaxRetries {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, context.Canceled
+				}
+				r.logger.Warn("Context timeout in primary brain, engaging fallback tactics")
+				return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
 			case <-time.After(backoff):
 				backoff *= 2
 			}
@@ -5039,7 +5108,7 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 	}
 
 	r.logger.Error("Primary brain exhausted retries for tactics. Engaging fallback.", slog.Any("final_error", lastErr))
-	return r.fallback.EvaluatePlan(ctx, t, sessionID, systemOverride, milestone)
+	return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
 }
 
 </file>
@@ -5076,7 +5145,7 @@ func NewDefaultRoutineManager() *DefaultRoutineManager {
 			&SleepRoutine{},
 			&ToolingRoutine{},
 			&CookingRoutine{},
-			&EarlyWoodRoutine{},
+			&WanderRoutine{},
 		},
 	}
 }
@@ -5127,16 +5196,30 @@ type CombatRoutine struct{}
 
 func (c *CombatRoutine) Name() string { return "combat" }
 func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if len(state.Threats) > 0 && state.Health < 10 {
+	if len(state.Threats) > 0 {
 		topThreat := state.Threats[0].Name
-		if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
-			return &Action{
-				ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionHunt),
-				Target:    Target{Type: string(TargetEntity), Name: topThreat},
-				Rationale: "Self-defense: Engaging threat at low health.",
-				Priority:  PriReflex,
+
+		if state.Health <= 10 {
+			if !isTaskActive(string(ActionRetreat), "safety", inFlight, queue) {
+				return &Action{
+					ID:        fmt.Sprintf("routine-retreat-%d", time.Now().UnixNano()),
+					Source:    string(SourceRoutine),
+					Action:    string(ActionRetreat),
+					Target:    Target{Type: string(TargetNone), Name: "safety"},
+					Rationale: "Emergency: Fleeing from threat at low health.",
+					Priority:  PriReflex,
+				}
+			}
+		} else if topThreat != "creeper" && topThreat != "warden" {
+			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
+				return &Action{
+					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
+					Source:    string(SourceRoutine),
+					Action:    string(ActionHunt),
+					Target:    Target{Type: string(TargetEntity), Name: topThreat},
+					Rationale: "Self-defense: Engaging threat.",
+					Priority:  PriReflex,
+				}
 			}
 		}
 	}
@@ -5262,24 +5345,18 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 	return nil
 }
 
-type EarlyWoodRoutine struct{}
+type WanderRoutine struct{}
 
-func (e *EarlyWoodRoutine) Name() string { return "early_wood" }
-func (e *EarlyWoodRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	logCount := 0
-	for _, item := range state.Inventory {
-		if strings.HasSuffix(item.Name, "_log") {
-			logCount += item.Count
-		}
-	}
-	if logCount == 0 && !isTaskActive(string(ActionGather), "wood", inFlight, queue) {
+func (w *WanderRoutine) Name() string { return "wander" }
+func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	if inFlight == nil && len(queue) == 0 {
 		return &Action{
-			ID:        fmt.Sprintf("routine-wood-%d", time.Now().UnixNano()),
+			ID:        fmt.Sprintf("routine-wander-%d", time.Now().UnixNano()),
 			Source:    string(SourceRoutine),
-			Action:    string(ActionGather),
-			Target:    Target{Type: string(TargetBlock), Name: "wood"},
-			Rationale: "Early game priority: Must get wood immediately.",
-			Priority:  PriRoutine,
+			Action:    string(ActionExplore),
+			Target:    Target{Type: string(TargetNone), Name: "none"},
+			Rationale: "Idle: Exploring the area to keep chunks loaded and discover resources.",
+			Priority:  Priority(3),
 		}
 	}
 	return nil
@@ -5684,10 +5761,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 158425,
+  "total_bytes": 160880,
   "file_count": 43,
-  "estimated_tokens": 40319,
+  "estimated_tokens": 40932,
   "mode": "full",
-  "generated_at": "2026-03-20T22:19:14.0105478-07:00"
+  "generated_at": "2026-03-20T23:11:21.6223862-07:00"
 }
 ```

@@ -238,7 +238,6 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	sysOverride := e.systemOverride
 	e.systemOverride = ""
 
-	// Increased timeout from 15s to 60s to account for LLM latency
 	planCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	e.planCancel = cancel
 	e.planning = true
@@ -389,7 +388,6 @@ func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
 	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
 	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
 
-	// Enforce 10-second backoff cooldown before retrying to prevent API spam
 	e.lastReplan = time.Now()
 }
 
@@ -542,7 +540,6 @@ func (e *Engine) resetExecutionState() {
 	e.planEpoch++
 	e.milestoneEpoch++
 	e.queue.ClearBySource(SourceLLM)
-	// Explicitly removed e.queue.ClearBySource(SourceRoutine) so we don't clear panic reflexes
 	e.inFlightTask = nil
 	e.lastReplan = time.Time{}
 	e.cancelPlanning()

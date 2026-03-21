@@ -54,7 +54,10 @@ export class SurvivalSystem {
                 t.distance < 12 &&
                 t.threatScore > 5 &&
                 t.name !== "low_health_no_food" &&
-                t.name !== "starvation",
+                t.name !== "starvation" &&
+                (this.bot.health <= 10 ||
+                    t.name === "creeper" ||
+                    t.name === "warden"),
         );
 
         if (immediateThreats.length > 0) {
@@ -62,6 +65,7 @@ export class SurvivalSystem {
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
+
                 const topThreat = immediateThreats[0]!;
                 if (!topThreat) return;
 
@@ -82,7 +86,6 @@ export class SurvivalSystem {
                 );
             }
 
-            // Flee further away (24 blocks) from the combined threat center of mass
             const safePos = computeSafeRetreat(this.bot, immediateThreats, 24);
             this.fleeTo(safePos);
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {

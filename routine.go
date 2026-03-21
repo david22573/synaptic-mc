@@ -29,7 +29,7 @@ func NewDefaultRoutineManager() *DefaultRoutineManager {
 			&SleepRoutine{},
 			&ToolingRoutine{},
 			&CookingRoutine{},
-			&EarlyWoodRoutine{},
+			&WanderRoutine{},
 		},
 	}
 }
@@ -80,16 +80,30 @@ type CombatRoutine struct{}
 
 func (c *CombatRoutine) Name() string { return "combat" }
 func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if len(state.Threats) > 0 && state.Health < 10 {
+	if len(state.Threats) > 0 {
 		topThreat := state.Threats[0].Name
-		if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
-			return &Action{
-				ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionHunt),
-				Target:    Target{Type: string(TargetEntity), Name: topThreat},
-				Rationale: "Self-defense: Engaging threat at low health.",
-				Priority:  PriReflex,
+
+		if state.Health <= 10 {
+			if !isTaskActive(string(ActionRetreat), "safety", inFlight, queue) {
+				return &Action{
+					ID:        fmt.Sprintf("routine-retreat-%d", time.Now().UnixNano()),
+					Source:    string(SourceRoutine),
+					Action:    string(ActionRetreat),
+					Target:    Target{Type: string(TargetNone), Name: "safety"},
+					Rationale: "Emergency: Fleeing from threat at low health.",
+					Priority:  PriReflex,
+				}
+			}
+		} else if topThreat != "creeper" && topThreat != "warden" {
+			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
+				return &Action{
+					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
+					Source:    string(SourceRoutine),
+					Action:    string(ActionHunt),
+					Target:    Target{Type: string(TargetEntity), Name: topThreat},
+					Rationale: "Self-defense: Engaging threat.",
+					Priority:  PriReflex,
+				}
 			}
 		}
 	}
@@ -215,24 +229,18 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 	return nil
 }
 
-type EarlyWoodRoutine struct{}
+type WanderRoutine struct{}
 
-func (e *EarlyWoodRoutine) Name() string { return "early_wood" }
-func (e *EarlyWoodRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	logCount := 0
-	for _, item := range state.Inventory {
-		if strings.HasSuffix(item.Name, "_log") {
-			logCount += item.Count
-		}
-	}
-	if logCount == 0 && !isTaskActive(string(ActionGather), "wood", inFlight, queue) {
+func (w *WanderRoutine) Name() string { return "wander" }
+func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	if inFlight == nil && len(queue) == 0 {
 		return &Action{
-			ID:        fmt.Sprintf("routine-wood-%d", time.Now().UnixNano()),
+			ID:        fmt.Sprintf("routine-wander-%d", time.Now().UnixNano()),
 			Source:    string(SourceRoutine),
-			Action:    string(ActionGather),
-			Target:    Target{Type: string(TargetBlock), Name: "wood"},
-			Rationale: "Early game priority: Must get wood immediately.",
-			Priority:  PriRoutine,
+			Action:    string(ActionExplore),
+			Target:    Target{Type: string(TargetNone), Name: "none"},
+			Rationale: "Idle: Exploring the area to keep chunks loaded and discover resources.",
+			Priority:  Priority(3),
 		}
 	}
 	return nil

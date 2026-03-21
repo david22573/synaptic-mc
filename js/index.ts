@@ -18,6 +18,7 @@ let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
+let lastDeathMessage: string = "unknown causes";
 
 function stopMovement() {
     if (!bot) return;
@@ -53,15 +54,20 @@ function abortActiveTask(reason: string) {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+
     if (survival?.isPanickingNow()) {
-        client.sendEvent(
-            "task_aborted",
-            "lock",
-            decision.id,
-            "panic",
-            Date.now(),
-        );
-        return;
+        if (decision.action === "retreat") {
+            survival.reset();
+        } else {
+            client.sendEvent(
+                "task_aborted",
+                "lock",
+                decision.id,
+                "panic",
+                Date.now(),
+            );
+            return;
+        }
     }
 
     abortActiveTask("preempted");
@@ -135,39 +141,19 @@ async function bootstrap() {
 
     bot.on("spawn", () => {
         const movements = new Movements(bot);
-
-        // Base capabilities
         movements.canDig = true;
         movements.allow1by1towers = true;
         movements.allowParkour = true;
-        movements.allowSprinting = true; // Fixed typo from previous iteration
-
-        // --- Exploration Optimizations ---
-
-        // 1. Tolerate Water: Lowering liquid cost makes the bot willing to cross rivers
-        // rather than generating massive, timeout-prone paths to avoid them.
-        const liquidBlocks = ["water", "lava"];
-        movements.liquids = new Set(
-            liquidBlocks
-                .map((name) => bot.registry.blocksByName[name]?.id)
-                .filter((id) => id !== undefined),
-        );
-
-        // 2. Prefer Open Terrain: Add a slight penalty to digging so the bot
-        // prefers walking around a hill rather than tunneling straight through it.
+        movements.allowSprinting = true;
+        movements.liquids = new Set([9, 10]);
         movements.digCost = 1.5;
 
-        // 3. Protect Inventory: Restrict scaffolding strictly to trash blocks.
-        // This prevents the bot from building bridges out of logs or food.
         const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
         movements.scafoldingBlocks = trashBlocks
             .map((name) => bot.registry.blocksByName[name]?.id)
             .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-
-        // 4. Extended Compute: Exploration generates long-distance paths.
-        // Bumping from 5s to 10s prevents A* from giving up too early.
         bot.pathfinder.thinkTimeout = 10000;
 
         if (!client.isConnected()) {
@@ -183,10 +169,20 @@ async function bootstrap() {
         }
     });
 
+    bot.on("message", (msg) => {
+        const text = msg.toString();
+        if (text.includes(bot.username) && !text.startsWith("<")) {
+            lastDeathMessage = text;
+        }
+    });
+
     bot.on("death", () => {
-        log.warn("Bot died. Notifying control plane to reset milestone.");
+        log.warn(
+            `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
+        );
         abortActiveTask("bot_died");
-        client.sendEvent("death", "death", "", "environment/combat", 0);
+        client.sendEvent("death", "death", "", lastDeathMessage, 0);
+        lastDeathMessage = "unknown causes";
     });
 
     setInterval(() => {
