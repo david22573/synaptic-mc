@@ -160,11 +160,11 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 	case EventPlanReady:
 		e.handlePlanReady(ctx, ev)
 	case EventPlanError:
-		e.handlePlanError(ev)
+		e.handlePlanError(ctx, ev)
 	case EventMilestoneReady:
 		e.handleMilestoneReady(ctx, ev)
 	case EventMilestoneError:
-		e.handleMilestoneError(ev)
+		e.handleMilestoneError(ctx, ev)
 	}
 }
 
@@ -298,7 +298,7 @@ func (e *Engine) handleMilestoneReady(ctx context.Context, ev EventMilestoneRead
 	e.lastReplan = time.Time{}
 }
 
-func (e *Engine) handleMilestoneError(ev EventMilestoneError) {
+func (e *Engine) handleMilestoneError(ctx context.Context, ev EventMilestoneError) {
 	if e.milestoneCancel != nil {
 		e.milestoneCancel = nil
 	}
@@ -308,6 +308,9 @@ func (e *Engine) handleMilestoneError(ev EventMilestoneError) {
 		return
 	}
 
+	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerationFailed", map[string]interface{}{
+		"error": ev.Error.Error(),
+	})
 	e.logger.Error("Milestone generation failed", slog.Any("error", ev.Error))
 }
 
@@ -354,16 +357,21 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	e.queue.Push(ev.Plan.Tasks...)
 
 	e.eventStore.Append(ctx, e.sessionID, ev.TraceID, "TacticalPlanGenerated", map[string]interface{}{
-		"objective":    ev.Plan.Objective,
-		"task_count":   len(ev.Plan.Tasks),
-		"milestone_id": ev.Plan.Tasks[0].Trace.MilestoneID, // if exists
+		"objective":  ev.Plan.Objective,
+		"task_count": len(ev.Plan.Tasks),
+		"milestone_id": func() string {
+			if len(ev.Plan.Tasks) > 0 {
+				return ev.Plan.Tasks[0].Trace.MilestoneID
+			}
+			return ""
+		}(),
 	})
 
 	e.tasksCompletedSinceReplan = 0
 	e.processNextTask()
 }
 
-func (e *Engine) handlePlanError(ev EventPlanError) {
+func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
 	if e.planCancel != nil {
 		e.planCancel = nil
 	}
@@ -373,6 +381,9 @@ func (e *Engine) handlePlanError(ev EventPlanError) {
 		return
 	}
 
+	e.eventStore.Append(ctx, e.sessionID, "", "TacticalPlanFailed", map[string]interface{}{
+		"error": ev.Error.Error(),
+	})
 	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
 	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
 }

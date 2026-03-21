@@ -17,7 +17,7 @@ import (
 const (
 	Port         = ":8080"
 	DefaultAPI   = "https://openrouter.ai/api/v1/chat/completions"
-	DefaultModel = "mistralai/mistral-small-2603"
+	DefaultModel = "deepseek/deepseek-v3.2"
 	DatabasePath = "./bot_memory.db"
 )
 

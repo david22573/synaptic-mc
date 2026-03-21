@@ -166,6 +166,10 @@ async function bootstrap() {
             threats: getThreats(bot)
                 .slice(0, 3)
                 .map((t) => ({ name: t.name })),
+            has_bed_nearby: !!bot.findBlock({
+                matching: (b) => b?.name.includes("bed"),
+                maxDistance: 32,
+            }),
             inventory: bot.inventory
                 .items()
                 .map((i) => ({ name: i.name, count: i.count })),
