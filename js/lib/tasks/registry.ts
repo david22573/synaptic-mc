@@ -7,6 +7,12 @@ export interface TaskContext {
     signal: AbortSignal;
     timeouts: Record<string, number>;
     stopMovement: () => void;
+
+    getThreats: () => any[];
+    computeSafeRetreat: (
+        threats: any[],
+        radius?: number,
+    ) => { x: number; z: number };
 }
 
 export type TaskHandler = (ctx: TaskContext) => Promise<void>;

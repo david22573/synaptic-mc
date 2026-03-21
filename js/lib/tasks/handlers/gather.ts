@@ -75,19 +75,27 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
+
         const candidates =
             gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
+
         const ids = candidates
             .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
             .filter((id) => id !== undefined);
+
+        // Grab a massive net of blocks (256 instead of 20).
+        // This is still incredibly fast for Mineflayer but ensures
+        // we don't accidentally truncate valid lower blocks.
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
             maxDistance: 48,
-            count: 20,
+            count: 256,
         });
+
         const botPos = gCtx.bot.entity.position;
 
         // Vertical Clipping: Only consider blocks within 12 blocks of current Y
@@ -98,11 +106,15 @@ class SearchState implements FSMState {
             return null;
         }
 
+        // Sort the surviving blocks by true 3D distance
         blocks.sort(
             (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
         );
-        gCtx.candidatePositions = blocks;
+
+        // Slice down to the top 6 closest, valid candidates to save memory
+        gCtx.candidatePositions = blocks.slice(0, 6);
         gCtx.currentIndex = 0;
+
         return new NavigateState();
     }
 }

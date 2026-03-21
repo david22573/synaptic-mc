@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
+import { type TaskContext } from "./registry.js";
 
 // Handlers
 import { handleGather } from "./handlers/gather.js";
@@ -9,6 +10,8 @@ import { handleHunt } from "./handlers/hunt.js";
 import { handleBuild } from "./handlers/build.js";
 import { handleExplore } from "./handlers/explore.js";
 import { handleSmelt } from "./handlers/smelt.js";
+import { handleMine } from "./handlers/mine.js";
+import { handleFarm } from "./handlers/farm.js";
 
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeDecision } from "./normalize.js";
@@ -28,7 +31,17 @@ export async function runTask(
     stopMovement: () => void,
 ): Promise<void> {
     const decision = normalizeDecision(bot, rawDecision);
-    const taskCtx = { bot, decision, signal, timeouts, stopMovement };
+
+    // Pass ALL dependencies into the TaskContext so external handlers can use them
+    const taskCtx: TaskContext = {
+        bot,
+        decision,
+        signal,
+        timeouts,
+        getThreats,
+        computeSafeRetreat,
+        stopMovement,
+    };
 
     switch (decision.action) {
         case "hunt":
@@ -45,6 +58,12 @@ export async function runTask(
             return;
         case "smelt":
             await handleSmelt(taskCtx);
+            return;
+        case "mine":
+            await handleMine(taskCtx);
+            return;
+        case "farm":
+            await handleFarm(taskCtx);
             return;
         case "explore":
             await handleExplore(taskCtx);

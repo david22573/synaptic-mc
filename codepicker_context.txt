@@ -1,7 +1,7 @@
-Project Context Dump (20 Mar 26 20:21 PDT)
+Project Context Dump (20 Mar 26 21:33 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 39
+Total Files: 41
 
 # Project Structure
 <file_tree>
@@ -32,6 +32,8 @@ Total Files: 39
 - js\lib\tasks\registry.ts
 - js\lib\tasks\task.ts
 - js\lib\tasks\utils.ts
+- js\lib\types.d.ts
+- js\lib\utils\errors.ts
 - js\lib\utils\threats.ts
 - llm_validator.go
 - main.go
@@ -161,6 +163,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -297,7 +300,7 @@ func (b *LLMBrain) callLLMForMilestone(ctx context.Context, systemPrompt, userCo
 		return nil, err
 	}
 	var milestone MilestonePlan
-	if err := json.Unmarshal([]byte(content), &milestone); err != nil {
+	if err := json.Unmarshal([]byte(cleanJSON(content)), &milestone); err != nil {
 		return nil, err
 	}
 	return &milestone, nil
@@ -310,7 +313,7 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 		return nil, err
 	}
 	var plan LLMPlan
-	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+	if err := json.Unmarshal([]byte(cleanJSON(content)), &plan); err != nil {
 		return nil, err
 	}
 	for i := range plan.Tasks {
@@ -363,6 +366,14 @@ func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent s
 	}
 
 	return result.Choices[0].Message.Content, latency, result.Usage.PromptTokens, result.Usage.CompletionTokens, nil
+}
+
+func cleanJSON(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned)
 }
 
 </file>
@@ -516,6 +527,8 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 	go e.loop(ctx)
 
 	for {
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
 		var msg struct {
 			Type    string          `json:"type"`
 			Payload json.RawMessage `json:"payload"`
@@ -1031,6 +1044,10 @@ func NewSQLiteEventStore(dbPath string) (*SQLiteEventStore, error) {
 	}
 
 	schema := `
+	PRAGMA journal_mode=WAL;
+	PRAGMA synchronous=NORMAL;
+	PRAGMA busy_timeout=5000;
+
 	CREATE TABLE IF NOT EXISTS domain_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		session_id TEXT NOT NULL,
@@ -1293,7 +1310,7 @@ let runtimeConfig: config.Config;
 function stopMovement() {
     if (!bot) return;
     bot.clearControlStates();
-    if ((bot as any).pathfinder) (bot as any).pathfinder.setGoal(null);
+    if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
 
 function completeTask(
@@ -1407,8 +1424,8 @@ async function bootstrap() {
         movements.allowParkour = true;
         movements.allowSprinting = true;
 
-        (bot as any).pathfinder.setMovements(movements);
-        (bot as any).pathfinder.thinkTimeout = 5000;
+        bot.pathfinder.setMovements(movements);
+        bot.pathfinder.thinkTimeout = 5000;
 
         // Fixed from 'client.ws'
         if (!client.isConnected()) {
@@ -1695,8 +1712,12 @@ export class ControlPlaneClient {
 
     public connect(): void {
         if (this.ws) {
+            // Remove listeners to prevent memory leaks and duplicate callbacks
             this.ws.removeAllListeners();
-            this.ws.close();
+            // Terminate destroys the socket immediately, preventing lingering connections
+            // during aggressive reconnection loops
+            this.ws.terminate();
+            this.ws = null;
         }
 
         this.ws = new WebSocket(this.url);
@@ -1704,6 +1725,10 @@ export class ControlPlaneClient {
         this.ws.on("open", () => {
             log.info("Connected to Go Control Plane", { ws_url: this.url });
             this.reconnectAttempts = 0;
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer);
+                this.reconnectTimer = null;
+            }
         });
 
         this.ws.on("message", (data: Buffer) => {
@@ -1908,7 +1933,7 @@ export class SurvivalSystem {
 
     private fleeTo(safePos: { x: number; z: number }) {
         try {
-            (this.bot as any).pathfinder.setGoal(
+            this.bot.pathfinder.setGoal(
                 new goals.GoalNearXZ(safePos.x, safePos.z, 2),
             );
         } catch (e) {
@@ -1922,6 +1947,7 @@ export class SurvivalSystem {
 <file path="js\lib\tasks\fsm.ts">
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
+import { getErrorMessage } from "../utils/errors.js";
 
 export type TaskStatus = "RUNNING" | "SUCCESS" | "FAILED";
 
@@ -1981,10 +2007,10 @@ export class StateMachineRunner {
                     }
                     this.currentState = nextState;
                 }
-            } catch (err: any) {
+            } catch (err: unknown) {
                 return {
                     status: "FAILED",
-                    reason: `FSM_CRASH: ${err.message}`,
+                    reason: `FSM_CRASH: ${getErrorMessage(err)}`,
                 };
             }
         }
@@ -2118,7 +2144,7 @@ class CleanupState implements FSMState {
 
         if (cCtx.isPortableTable && cCtx.craftingTable) {
             await makeRoomInInventory(cCtx.bot, 1);
-            const pickaxe = (cCtx.bot as any).pathfinder.bestHarvestTool(
+            const pickaxe = cCtx.bot.pathfinder.bestHarvestTool(
                 cCtx.craftingTable,
             );
             if (pickaxe) await cCtx.bot.equip(pickaxe, "hand");
@@ -2454,7 +2480,7 @@ class MineState implements FSMState {
         const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
         if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
             return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
-        const tool = (gCtx.bot as any).pathfinder.bestHarvestTool(freshBlock);
+        const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
         if (tool) await gCtx.bot.equip(tool, "hand");
         try {
             await gCtx.bot.dig(freshBlock);
@@ -2637,10 +2663,19 @@ class AttackState implements FSMState {
             .items()
             .find((i) => i.name.includes("sword") || i.name.includes("axe"));
 
-        if (weapon) await ctx.bot.equip(weapon, "hand");
+        let cooldownMs = 650; // Default punch/sword cooldown
+
+        if (weapon) {
+            await ctx.bot.equip(weapon, "hand");
+            if (weapon.name.includes("axe")) {
+                cooldownMs = 1050; // Axes attack much slower but hit harder
+            } else if (weapon.name.includes("sword")) {
+                cooldownMs = 625;
+            }
+        }
 
         await attackEntity(ctx.bot, ctx.targetEntity);
-        await new Promise((resolve) => setTimeout(resolve, 650));
+        await new Promise((resolve) => setTimeout(resolve, cooldownMs));
 
         return this;
     }
@@ -2781,7 +2816,7 @@ class CleanupState implements FSMState {
 
         if (sCtx.isPortable && sCtx.furnaceBlock) {
             await makeRoomInInventory(sCtx.bot, 1);
-            const pickaxe = (sCtx.bot as any).pathfinder.bestHarvestTool(
+            const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
                 sCtx.furnaceBlock,
             );
             if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
@@ -3561,6 +3596,25 @@ export async function placePortableUtility(
 
 </file>
 
+<file path="js\lib\types.d.ts">
+import { Pathfinder } from "mineflayer-pathfinder";
+
+declare module "mineflayer" {
+    interface Bot {
+        pathfinder: Pathfinder;
+    }
+}
+
+</file>
+
+<file path="js\lib\utils\errors.ts">
+export function getErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
+}
+
+</file>
+
 <file path="js\lib\utils\threats.ts">
 import { type Bot } from "mineflayer";
 import * as config from "../config.js";
@@ -4312,20 +4366,23 @@ func (q *TaskQueue) Peek() *Action {
 	return &q.items[0]
 }
 
-// ClearBySource removes all tasks matching the specified source (e.g., wiping LLM tasks on death).
+// ClearBySource removes all tasks matching the specified source.
 func (q *TaskQueue) ClearBySource(source TaskSource) {
-	filtered := q.items[:0]
+	writeIndex := 0
 	for _, task := range q.items {
-		// Note: Ensure `Source string` is added to the `Action` struct in your ws_types.go / brain.go
 		if task.Source != string(source) {
-			filtered = append(filtered, task)
+			q.items[writeIndex] = task
+			writeIndex++
 		}
 	}
-	// Prevent memory leaks on the underlying array
-	for i := len(filtered); i < len(q.items); i++ {
+
+	// Zero out the remaining elements to prevent memory leaks
+	for i := writeIndex; i < len(q.items); i++ {
 		q.items[i] = Action{}
 	}
-	q.items = filtered
+
+	// Truncate the slice
+	q.items = q.items[:writeIndex]
 }
 
 // HasRoutineTarget checks if a routine is already queued for a specific target to prevent duplicates.
@@ -5101,10 +5158,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 140146,
-  "file_count": 39,
-  "estimated_tokens": 35672,
+  "total_bytes": 141535,
+  "file_count": 41,
+  "estimated_tokens": 36053,
   "mode": "full",
-  "generated_at": "2026-03-20T20:21:48.920763-07:00"
+  "generated_at": "2026-03-20T21:33:30.0379987-07:00"
 }
 ```

@@ -93,7 +93,7 @@ VALID TARGET TYPES (you MUST use one of these):
 - "category"  (food, wood)
 - "none"      (only for explore/idle/retreat/sleep)
 
-Valid macro actions: gather, craft, hunt, explore, build, smelt, mark_location, recall_location, idle, sleep, retreat, eat.`
+Valid macro actions: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
 
 func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
 	summary, _ := b.memory.GetSummary(ctx, sessionID)

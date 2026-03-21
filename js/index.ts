@@ -66,7 +66,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     abortActiveTask("preempted");
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
-
     currentTask = {
         id: decision.id,
         action: decision.action,
@@ -80,15 +79,18 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     stopMovement();
     const activeTask = currentTask;
-    const timeoutMs = runtimeConfig.task_timeouts[decision.action] || 15000;
 
     try {
+        // MOVED INSIDE THE TRY BLOCK:
+        const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
+        const timeoutMs = timeouts[decision.action] || 15000;
+
         await Promise.race([
             runTask(
                 bot,
                 decision,
                 signal,
-                runtimeConfig.task_timeouts,
+                timeouts, // Pass the safe timeouts object here
                 () => getThreats(bot),
                 (t) => computeSafeRetreat(bot, t, 20),
                 stopMovement,

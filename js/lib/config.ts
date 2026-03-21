@@ -34,6 +34,8 @@ export const TASK_TIMEOUTS: Record<string, number> = {
     explore: 20000,
     build: 20000,
     smelt: 30000,
+    farm: 40000,
+    mine: 45000,
     retreat: 15000,
     sleep: 20000,
     mark_location: 5000,
@@ -83,6 +85,9 @@ export async function loadConfig(): Promise<Config> {
         if (configCache!.threat_weights) {
             Object.assign(THREAT_WEIGHTS, configCache!.threat_weights);
         }
+
+        configCache!.task_timeouts = TASK_TIMEOUTS;
+        configCache!.threat_weights = THREAT_WEIGHTS;
 
         return configCache!;
     } catch (err) {

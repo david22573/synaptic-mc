@@ -10,6 +10,8 @@ const (
 	ActionExplore        ActionType = "explore"
 	ActionBuild          ActionType = "build"
 	ActionSmelt          ActionType = "smelt"
+	ActionFarm           ActionType = "farm"
+	ActionMine           ActionType = "mine"
 	ActionMarkLocation   ActionType = "mark_location"
 	ActionRecallLocation ActionType = "recall_location"
 	ActionIdle           ActionType = "idle"
@@ -37,6 +39,8 @@ var ValidActions = map[string]bool{
 	string(ActionExplore):        true,
 	string(ActionBuild):          true,
 	string(ActionSmelt):          true,
+	string(ActionFarm):           true,
+	string(ActionMine):           true,
 	string(ActionMarkLocation):   true,
 	string(ActionRecallLocation): true,
 	string(ActionIdle):           true,

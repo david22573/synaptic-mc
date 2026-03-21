@@ -51,6 +51,7 @@ class CleanupState implements FSMState {
 
 class SmeltingState implements FSMState {
     name = "SMELTING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -62,8 +63,30 @@ class SmeltingState implements FSMState {
             await furnaceWindow.putFuel(sCtx.fuelType, null, 1);
             await furnaceWindow.putInput(sCtx.meatType, null, 1);
 
-            await waitForMs(11000, sCtx.signal);
+            // --- SMART POLLING LOOP ---
+            let itemSmelted = false;
+            const maxWaitMs = 20000; // 20 seconds max to account for heavy TPS lag
+            const pollIntervalMs = 500; // Check every half second
+            let elapsedMs = 0;
 
+            while (elapsedMs < maxWaitMs) {
+                if (sCtx.signal.aborted) throw new Error("aborted");
+
+                // Check if the furnace GUI has registered an item in the output slot
+                if (furnaceWindow.outputItem()) {
+                    itemSmelted = true;
+                    break;
+                }
+
+                await waitForMs(pollIntervalMs, sCtx.signal);
+                elapsedMs += pollIntervalMs;
+            }
+
+            if (!itemSmelted) {
+                throw new Error("FURNACE_TIMEOUT_OR_LAG");
+            }
+
+            // Safely extract the item now that we know it's there
             await furnaceWindow.takeOutput();
         } catch (err: any) {
             sCtx.result = {
@@ -71,7 +94,7 @@ class SmeltingState implements FSMState {
                 reason:
                     err.message === "aborted"
                         ? "aborted"
-                        : "SMELT_INTERACTION_FAILED",
+                        : `SMELT_INTERACTION_FAILED: ${err.message}`,
             };
             return null;
         } finally {

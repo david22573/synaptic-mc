@@ -5,6 +5,8 @@ export enum ActionType {
     Explore = "explore",
     Build = "build",
     Smelt = "smelt",
+    Farm = "farm",
+    Mine = "mine",
     MarkLocation = "mark_location",
     RecallLocation = "recall_location",
     Idle = "idle",

@@ -70,25 +70,59 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
 
     try {
         bot.pathfinder.setGoal(null);
-    } catch (_err) {}
-
-    try {
         bot.clearControlStates();
     } catch (_err) {}
 
-    const MAX_ATTEMPTS = 16;
+    // Increased from 16 to 30 to account for massive jungle/custom canopies
+    const MAX_ATTEMPTS = 30;
+
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
         if (signal.aborted) throw new Error("aborted");
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
-        const below = bot.blockAt(pos.offset(0, -1, 0));
-        if (below && TREE_BLOCKS.has(below.name) && bot.canDigBlock(below)) {
-            try {
-                await bot.dig(below);
-            } catch (_err) {}
+
+        // Check Head, Feet, and Below to clear a vertical falling shaft
+        const blocksToClear = [
+            bot.blockAt(pos.offset(0, 1, 0)), // Head (prevents suffocation lock)
+            bot.blockAt(pos), // Torso (if clipped inside a block)
+            bot.blockAt(pos.offset(0, -1, 0)), // Below (to fall down)
+        ];
+
+        let clearedSomething = false;
+
+        for (const targetBlock of blocksToClear) {
+            // If the block exists, is a tree part, and isn't air
+            if (
+                targetBlock &&
+                TREE_BLOCKS.has(targetBlock.name) &&
+                targetBlock.name !== "air"
+            ) {
+                try {
+                    // Equip the right tool (axes for logs, hands/swords for leaves)
+                    const tool = bot.pathfinder.bestHarvestTool(targetBlock);
+                    if (tool) await bot.equip(tool, "hand");
+
+                    // forceLook = true: Mineflayer sometimes fails reach-checks if the bot
+                    // is clipped inside the block. This forces the break.
+                    await bot.dig(targetBlock, true);
+                    clearedSomething = true;
+                } catch (err) {
+                    // Ignore specific dig errors, we'll try to wiggle out below
+                }
+            }
         }
 
+        // If we are stuck on a branch edge and couldn't dig anything directly below/inside us:
+        if (!clearedSomething && !isOnSolidGround(bot)) {
+            // Do a tiny random wiggle to fall off the edge of the leaf/branch
+            const dir = Math.random() > 0.5 ? "forward" : "back";
+            bot.setControlState(dir, true);
+            await new Promise((res) => setTimeout(res, 250));
+            bot.setControlState(dir, false);
+        }
+
+        // Wait a moment for gravity to pull the bot down after breaking the block
         await new Promise<void>((resolve) => {
             let ticks = 0;
             const check = () => {
@@ -99,15 +133,19 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
                 }
             };
             bot.on("physicsTick", check);
+
+            // Fallback timeout just in case physics ticks lag
             setTimeout(() => {
                 bot.removeListener("physicsTick", check);
                 resolve();
-            }, 1500);
+            }, 1000);
         });
     }
 
     if (!isOnSolidGround(bot)) {
-        throw new Error("EscapeTree - could not reach ground");
+        throw new Error(
+            "EscapeTree - could not reach ground after 30 attempts. Likely stuck in a massive canopy.",
+        );
     }
 }
 

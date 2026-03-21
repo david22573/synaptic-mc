@@ -13,6 +13,34 @@ const LOG_TO_PLANK_MAP: Record<string, string> = {
     cherry_log: "cherry_planks",
 };
 
+// Map common LLM shorthand/misspellings to strict Minecraft registry names
+const TARGET_ALIASES: Record<string, string> = {
+    // Farming Aliases
+    carrot: "carrots",
+    potato: "potatoes",
+    beetroot: "beetroots",
+    melon: "melon",
+    pumpkin: "pumpkin",
+    sugar_cane: "reeds",
+
+    // Mining Aliases
+    iron: "iron_ore",
+    gold: "gold_ore",
+    diamond: "diamond_ore",
+    coal: "coal_ore",
+    copper: "copper_ore",
+    lapis: "lapis_ore",
+    redstone: "redstone_ore",
+    emerald: "emerald_ore",
+    stone: "stone",
+    cobble: "cobblestone",
+
+    // Gathering Aliases
+    tree: "wood",
+    log: "wood",
+    timber: "wood",
+};
+
 export function normalizeDecision(
     bot: Bot,
     decision: models.IncomingDecision,
@@ -23,71 +51,59 @@ export function normalizeDecision(
     };
 
     const action = normalized.action;
-    let targetName = (normalized.target?.name || "none").toLowerCase().trim();
+    const originalTargetName = (normalized.target?.name || "none")
+        .toLowerCase()
+        .trim();
+    let targetName = originalTargetName;
 
-    let changed = false;
+    // 1. Apply static dictionary aliases first (fixes farm/mine targets)
+    if (TARGET_ALIASES[targetName]) {
+        targetName = TARGET_ALIASES[targetName]!;
+    }
 
-    // ── Craft normalization (most important for progression) ──
+    // 2. Apply action-specific dynamic normalization
     if (action === "craft") {
-        // sticks (LLM often says "sticks" plural)
         if (targetName === "sticks" || targetName === "stick") {
-            normalized.target.name = "stick";
-            changed = true;
-        }
-        // planks (already good, but now more robust)
-        else if (targetName === "planks") {
+            targetName = "stick";
+        } else if (targetName === "planks") {
             const invItems = bot.inventory.items();
+            let foundLog = false;
             for (const item of invItems) {
                 if (LOG_TO_PLANK_MAP[item.name]) {
-                    normalized.target.name = LOG_TO_PLANK_MAP[item.name]!;
-                    changed = true;
+                    targetName = LOG_TO_PLANK_MAP[item.name]!;
+                    foundLog = true;
                     break;
                 }
             }
-            if (!changed) throw new Error("MISSING_LOGS_FOR_PLANKS");
-        }
-        // table / workbench
-        else if (
+            if (!foundLog) throw new Error("MISSING_LOGS_FOR_PLANKS");
+        } else if (
             targetName === "table" ||
             targetName === "workbench" ||
             targetName === "crafting_table"
         ) {
-            normalized.target.name = "crafting_table";
-            changed = true;
-        }
-        // wooden_pickaxe (LLM sometimes says "wooden pickaxe" or "pickaxe")
-        else if (
+            targetName = "crafting_table";
+        } else if (
             targetName.includes("wooden_pickaxe") ||
             targetName === "pickaxe"
         ) {
-            normalized.target.name = "wooden_pickaxe";
-            changed = true;
+            targetName = "wooden_pickaxe";
+        } else if (targetName.includes("stone_pickaxe")) {
+            targetName = "stone_pickaxe";
         }
-        // stone_pickaxe (for later phases)
-        else if (targetName.includes("stone_pickaxe")) {
-            normalized.target.name = "stone_pickaxe";
-            changed = true;
-        }
-    }
-
-    // ── Build normalization ──
-    else if (action === "build") {
+    } else if (action === "build") {
         if (targetName === "table" || targetName === "workbench") {
-            normalized.target.name = "crafting_table";
-            changed = true;
+            targetName = "crafting_table";
         }
+    } else if (action === "gather" && targetName === "wood") {
+        // Handled naturally by the gather handler
     }
 
-    // ── Gather normalization (make "wood" more reliable) ──
-    else if (action === "gather" && targetName === "wood") {
-        // Keep as-is — the gather handler already expands it to LOG_TYPES
-        // but we can force the first available log if we want
-    }
-
-    if (changed) {
+    // 3. Log and apply changes if a normalization occurred
+    if (targetName !== originalTargetName) {
+        normalized.target.name = targetName;
         log.debug("Decision normalized", {
-            original_target: decision.target.name,
-            normalized_target: normalized.target.name,
+            original_target: originalTargetName,
+            normalized_target: targetName,
             action,
         });
     }

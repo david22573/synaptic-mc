@@ -11,3 +11,4 @@ Dockerfile
 *.yml
 ui
 js/scripts
+*.db*
