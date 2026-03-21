@@ -74,17 +74,24 @@ class PickDirectionState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
 
+        // Early-game: much shorter explores (prevents sluggish wandering)
+        const hasWood = eCtx.bot.inventory
+            .items()
+            .some((i) => i.name.includes("_log"));
+        const dist = hasWood
+            ? 48 + Math.random() * 48
+            : 24 + Math.random() * 24;
+
         const angle = Math.random() * Math.PI * 2;
-        const dist = 48 + Math.random() * 48;
 
         eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(angle) * dist;
         eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(angle) * dist;
 
-        // <-- ADDED LOGGING
         log.info("Picked exploration vector", {
             dist: Math.round(dist),
             targetX: Math.round(eCtx.targetX),
             targetZ: Math.round(eCtx.targetZ),
+            earlyGame: !hasWood,
         });
 
         return new NavigateState();

@@ -1,4 +1,4 @@
-Project Context Dump (20 Mar 26 18:24 PDT)
+Project Context Dump (20 Mar 26 18:34 PDT)
 Format: xml
 Mode: FULL (No Truncation)
 Total Files: 39
@@ -235,10 +235,21 @@ CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. ERROR RECOVERY: If a task fails with 'PATHING_FAILED', 'PATHFINDER_TIMEOUT', or 'EXHAUSTED_CANDIDATES', you MUST use the "explore" action next to change your biome.
-5. VANTAGE POINT: If you are at high altitude (Y > 100) and struggle to find reachable resources, "explore" to reach flatter ground.
+4. ERROR RECOVERY: If a task fails with 'PATHING_FAILED', 'PATHFINDER_TIMEOUT', or 'EXHAUSTED_CANDIDATES', you MUST use the "explore" action next.
+5. VANTAGE POINT: If you are at high altitude (Y > 100), use "explore".
 
-Valid macro actions: "gather", "craft", "hunt", "explore", "build", "smelt", "mark_location", "recall_location", "idle", "eat".`
+VALID TARGET TYPES (you MUST use one of these):
+- "block"     (e.g. oak_log, stone)
+- "entity"    (e.g. zombie, cow)
+- "recipe"    (e.g. stick, wooden_pickaxe, crafting_table)
+- "location"  (only with mark_location/recall_location)
+- "category"  (e.g. food, wood)
+- "none"      (for explore, idle, retreat, sleep)
+
+For "explore" ALWAYS use: {"type": "none", "name": "none"}
+Never invent new types like "biome".
+
+Valid macro actions: gather, craft, hunt, explore, build, smelt, mark_location, recall_location, idle, sleep, retreat, eat.`
 
 func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
 	summary, _ := b.memory.GetSummary(ctx, sessionID)
@@ -566,11 +577,11 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 	case EventPlanReady:
 		e.handlePlanReady(ctx, ev)
 	case EventPlanError:
-		e.handlePlanError(ev)
+		e.handlePlanError(ctx, ev)
 	case EventMilestoneReady:
 		e.handleMilestoneReady(ctx, ev)
 	case EventMilestoneError:
-		e.handleMilestoneError(ev)
+		e.handleMilestoneError(ctx, ev)
 	}
 }
 
@@ -704,7 +715,7 @@ func (e *Engine) handleMilestoneReady(ctx context.Context, ev EventMilestoneRead
 	e.lastReplan = time.Time{}
 }
 
-func (e *Engine) handleMilestoneError(ev EventMilestoneError) {
+func (e *Engine) handleMilestoneError(ctx context.Context, ev EventMilestoneError) {
 	if e.milestoneCancel != nil {
 		e.milestoneCancel = nil
 	}
@@ -714,6 +725,9 @@ func (e *Engine) handleMilestoneError(ev EventMilestoneError) {
 		return
 	}
 
+	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerationFailed", map[string]interface{}{
+		"error": ev.Error.Error(),
+	})
 	e.logger.Error("Milestone generation failed", slog.Any("error", ev.Error))
 }
 
@@ -760,16 +774,21 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	e.queue.Push(ev.Plan.Tasks...)
 
 	e.eventStore.Append(ctx, e.sessionID, ev.TraceID, "TacticalPlanGenerated", map[string]interface{}{
-		"objective":    ev.Plan.Objective,
-		"task_count":   len(ev.Plan.Tasks),
-		"milestone_id": ev.Plan.Tasks[0].Trace.MilestoneID, // if exists
+		"objective":  ev.Plan.Objective,
+		"task_count": len(ev.Plan.Tasks),
+		"milestone_id": func() string {
+			if len(ev.Plan.Tasks) > 0 {
+				return ev.Plan.Tasks[0].Trace.MilestoneID
+			}
+			return ""
+		}(),
 	})
 
 	e.tasksCompletedSinceReplan = 0
 	e.processNextTask()
 }
 
-func (e *Engine) handlePlanError(ev EventPlanError) {
+func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
 	if e.planCancel != nil {
 		e.planCancel = nil
 	}
@@ -779,6 +798,9 @@ func (e *Engine) handlePlanError(ev EventPlanError) {
 		return
 	}
 
+	e.eventStore.Append(ctx, e.sessionID, "", "TacticalPlanFailed", map[string]interface{}{
+		"error": ev.Error.Error(),
+	})
 	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
 	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
 }
@@ -1418,6 +1440,10 @@ async function bootstrap() {
             threats: getThreats(bot)
                 .slice(0, 3)
                 .map((t) => ({ name: t.name })),
+            has_bed_nearby: !!bot.findBlock({
+                matching: (b) => b?.name.includes("bed"),
+                maxDistance: 32,
+            }),
             inventory: bot.inventory
                 .items()
                 .map((i) => ({ name: i.name, count: i.count })),
@@ -3687,7 +3713,7 @@ import (
 const (
 	Port         = ":8080"
 	DefaultAPI   = "https://openrouter.ai/api/v1/chat/completions"
-	DefaultModel = "mistralai/mistral-small-2603"
+	DefaultModel = "deepseek/deepseek-v3.2"
 	DatabasePath = "./bot_memory.db"
 )
 
@@ -4066,10 +4092,6 @@ func (s *SQLiteMemory) Close() error {
 	s.wg.Wait()
 	close(s.eventChan)
 	return s.db.Close()
-}
-
-func (e *Engine) DumpEvents(ctx context.Context) ([]DomainEvent, error) {
-	return e.eventStore.GetStream(ctx, e.sessionID)
 }
 
 </file>
@@ -5050,10 +5072,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 138503,
+  "total_bytes": 139240,
   "file_count": 39,
-  "estimated_tokens": 35262,
+  "estimated_tokens": 35446,
   "mode": "full",
-  "generated_at": "2026-03-20T18:24:35.8666492-07:00"
+  "generated_at": "2026-03-20T18:34:04.508002-07:00"
 }
 ```

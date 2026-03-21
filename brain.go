@@ -80,19 +80,17 @@ CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. ERROR RECOVERY: If a task fails with 'PATHING_FAILED', 'PATHFINDER_TIMEOUT', or 'EXHAUSTED_CANDIDATES', you MUST use the "explore" action next.
-5. VANTAGE POINT: If you are at high altitude (Y > 100), use "explore".
+4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
+5. ERROR RECOVERY: Only use "explore" if a task fails with PATHING_FAILED, PATHFINDER_TIMEOUT, or EXHAUSTED_CANDIDATES.
+6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
 
 VALID TARGET TYPES (you MUST use one of these):
-- "block"     (e.g. oak_log, stone)
-- "entity"    (e.g. zombie, cow)
-- "recipe"    (e.g. stick, wooden_pickaxe, crafting_table)
-- "location"  (only with mark_location/recall_location)
-- "category"  (e.g. food, wood)
-- "none"      (for explore, idle, retreat, sleep)
-
-For "explore" ALWAYS use: {"type": "none", "name": "none"}
-Never invent new types like "biome".
+- "block"     (oak_log, stone, etc.)
+- "entity"    (zombie, cow, etc.)
+- "recipe"    (stick, wooden_pickaxe, crafting_table)
+- "location"  (only for mark/recall)
+- "category"  (food, wood)
+- "none"      (only for explore/idle/retreat/sleep)
 
 Valid macro actions: gather, craft, hunt, explore, build, smelt, mark_location, recall_location, idle, sleep, retreat, eat.`
 

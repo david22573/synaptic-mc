@@ -23,12 +23,13 @@ type DefaultRoutineManager struct {
 func NewDefaultRoutineManager() *DefaultRoutineManager {
 	return &DefaultRoutineManager{
 		routines: []Routine{
-			&PanicRoutine{},   // Environmental hazards
-			&CombatRoutine{},  // Self-defense
-			&EatingRoutine{},  // Nutrition
-			&SleepRoutine{},   // Time management
-			&ToolingRoutine{}, // Progression items
-			&CookingRoutine{}, // Resource processing
+			&PanicRoutine{},
+			&CombatRoutine{},
+			&EatingRoutine{},
+			&SleepRoutine{},
+			&ToolingRoutine{},
+			&CookingRoutine{},
+			&EarlyWoodRoutine{},
 		},
 	}
 }
@@ -208,6 +209,29 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 			Action:    string(ActionSmelt),
 			Target:    Target{Type: string(TargetCategory), Name: "food"},
 			Rationale: "Efficiency: Smelting raw food for better nutrition.",
+			Priority:  PriRoutine,
+		}
+	}
+	return nil
+}
+
+type EarlyWoodRoutine struct{}
+
+func (e *EarlyWoodRoutine) Name() string { return "early_wood" }
+func (e *EarlyWoodRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	logCount := 0
+	for _, item := range state.Inventory {
+		if strings.HasSuffix(item.Name, "_log") {
+			logCount += item.Count
+		}
+	}
+	if logCount == 0 && !isTaskActive(string(ActionGather), "wood", inFlight, queue) {
+		return &Action{
+			ID:        fmt.Sprintf("routine-wood-%d", time.Now().UnixNano()),
+			Source:    string(SourceRoutine),
+			Action:    string(ActionGather),
+			Target:    Target{Type: string(TargetBlock), Name: "wood"},
+			Rationale: "Early game priority: Must get wood immediately.",
 			Priority:  PriRoutine,
 		}
 	}
