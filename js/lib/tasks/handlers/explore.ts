@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/explore.ts
 import {
     type FSMState,
     type StateContext,
@@ -10,21 +11,22 @@ import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
+// FIX: Retain the last 20 chunk hops to prevent backtracking
+const visitedPoints: { x: number; z: number }[] = [];
+
 interface ExploreContext extends StateContext {
     targetX: number;
     targetZ: number;
-    attempts: number; // Track how many directions we've tried
+    attempts: number;
     stopMovement: () => void;
 }
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
-
         try {
             await moveToGoal(
                 eCtx.bot,
@@ -37,19 +39,22 @@ class NavigateState implements FSMState {
                 },
             );
 
-            // If we actually reached the destination without throwing an error
+            // Successfully reached new area. Record it to repel future exploration.
+            visitedPoints.push({
+                x: eCtx.bot.entity.position.x,
+                z: eCtx.bot.entity.position.z,
+            });
+            if (visitedPoints.length > 20) visitedPoints.shift();
+
             eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
             return null;
         } catch (err: any) {
             const msg = String(err?.message ?? err);
-
             if (eCtx.signal.aborted || msg.includes("aborted")) {
                 eCtx.result = { status: "FAILED", reason: "aborted" };
                 return null;
             }
 
-            // If pathing failed due to terrain, DO NOT report success yet.
-            // Loop back to PickDirectionState to try a new angle!
             log.warn("Exploration path failed, picking new direction", {
                 reason: msg,
             });
@@ -60,12 +65,10 @@ class NavigateState implements FSMState {
 
 class PickDirectionState implements FSMState {
     name = "PICKING_DIRECTION";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
-
         eCtx.attempts++;
         if (eCtx.attempts > 4) {
             eCtx.result = {
@@ -75,16 +78,32 @@ class PickDirectionState implements FSMState {
             return null;
         }
 
-        // Shorter, more reliable hops (16 to 32 blocks).
-        // A* can calculate this almost instantly, and it keeps chunks loaded.
         const dist = 16 + Math.random() * 16;
+        let bestAngle = 0;
+        let maxRepulsionScore = -1;
 
-        // Pick an angle. If this is a retry, bias it away from the failed angle.
-        const baseAngle = eCtx.attempts > 1 ? eCtx.attempts * (Math.PI / 2) : 0;
-        const angle = baseAngle + (Math.random() * Math.PI - Math.PI / 2);
+        // Sample 8 angles and pick the one furthest from our visited history
+        for (let i = 0; i < 8; i++) {
+            const testAngle = Math.random() * Math.PI * 2;
+            const tx = eCtx.bot.entity.position.x + Math.cos(testAngle) * dist;
+            const tz = eCtx.bot.entity.position.z + Math.sin(testAngle) * dist;
 
-        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(angle) * dist;
-        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(angle) * dist;
+            let minDistanceToHistory = 999999;
+            for (const pt of visitedPoints) {
+                const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
+                if (d < minDistanceToHistory) minDistanceToHistory = d;
+            }
+
+            if (visitedPoints.length === 0) minDistanceToHistory = 1;
+
+            if (minDistanceToHistory > maxRepulsionScore) {
+                maxRepulsionScore = minDistanceToHistory;
+                bestAngle = testAngle;
+            }
+        }
+
+        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(bestAngle) * dist;
+        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(bestAngle) * dist;
 
         log.info("Picked exploration vector", {
             dist: Math.round(dist),
@@ -92,7 +111,6 @@ class PickDirectionState implements FSMState {
             targetZ: Math.round(eCtx.targetZ),
             attempt: eCtx.attempts,
         });
-
         return new NavigateState();
     }
 }
@@ -106,7 +124,7 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         targetName: "explore",
         targetEntity: null,
         searchRadius: 0,
-        timeoutMs: timeouts.explore ?? 25000, // Slightly longer to allow retries
+        timeoutMs: timeouts.explore ?? 25000,
         startTime: 0,
         signal,
         targetX: 0,
@@ -114,11 +132,10 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         attempts: 0,
         stopMovement,
     };
-
-    const fsm = new StateMachineRunner(new PickDirectionState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
+    const result = await new StateMachineRunner(
+        new PickDirectionState(),
+        fsmCtx,
+    ).run();
+    if (result.status === "FAILED")
         throw new Error(result.reason || "unknown_fsm_failure");
-    }
 }

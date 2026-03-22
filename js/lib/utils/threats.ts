@@ -1,8 +1,8 @@
+// js/lib/utils/threats.ts
 import { type Bot } from "mineflayer";
 import * as config from "../config.js";
 import * as models from "../models.js";
 
-// Optimized O(1) lookup Set - much faster than array includes or generic type checks
 const HOSTILE_MOBS = new Set([
     "zombie",
     "zombie_villager",
@@ -26,52 +26,56 @@ const HOSTILE_MOBS = new Set([
     "pillager",
     "evoker",
     "vindicator",
-    "warden", // Added Warden for 1.19 safety
+    "warden",
 ]);
 
 export function getThreats(bot: Bot): models.ThreatInfo[] {
     const threats: models.ThreatInfo[] = [];
     const botPos = bot.entity.position;
 
-    // Use a for...in loop instead of Object.values() to prevent massive memory
-    // allocations every tick, which causes garbage collection lag spikes.
     for (const id in bot.entities) {
         const e = bot.entities[id];
 
-        // 1. Skip invalid/dead entities to prevent "ghost mob" tracking bugs
         if (!e || !e.isValid || e === bot.entity) continue;
 
-        // 2. Ensure it's actually a hostile mob (Checking both "mob" and "hostile" for 1.19 compatibility)
         if (
             (e.type !== "mob" && e.type !== "hostile") ||
             !HOSTILE_MOBS.has(e.name!)
         )
             continue;
 
-        // 3. Check distance (skip math if it's too far away)
-        const distance = botPos.distanceTo(e.position);
-        if (distance > 16) continue;
+        // Apply a heavy vertical discount to prevent panicking over mobs in caves
+        // when the bot is safely on the surface (and vice versa).
+        const dy = Math.abs(botPos.y - e.position.y);
+        const dx = botPos.x - e.position.x;
+        const dz = botPos.z - e.position.z;
 
-        // 4. Calculate your custom threat score
+        const horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        let effectiveDistance = horizontalDist;
+
+        if (dy > 3) {
+            effectiveDistance += dy * 2.5;
+        }
+
+        if (effectiveDistance > 16) continue;
+
         const baseThreat =
             config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
-        const threatScore = baseThreat * (10 / Math.max(distance, 1));
+        const threatScore = baseThreat * (10 / Math.max(effectiveDistance, 1));
 
         threats.push({
             id: e.id,
             name: e.name || "unknown",
-            distance: parseFloat(distance.toFixed(1)),
+            distance: parseFloat(effectiveDistance.toFixed(1)),
             threatScore: Math.round(threatScore),
             position: { x: e.position.x, y: e.position.y, z: e.position.z },
-            entity: e, // Kept the entity reference for your other handlers!
+            entity: e,
         });
     }
 
-    // Sort by highest threat score first (your original logic)
     return threats.sort((a, b) => b.threatScore! - a.threatScore!);
 }
 
-// Kept EXACTLY as you wrote it. This weighted vector math is perfect!
 export function computeSafeRetreat(
     bot: Bot,
     threats: models.ThreatInfo[],
@@ -82,7 +86,6 @@ export function computeSafeRetreat(
         totalWeight = 0;
 
     for (const threat of threats) {
-        // Use the non-null assertion (!) if TypeScript complains about threatScore being optional
         cx += threat.position.x * threat.threatScore!;
         cz += threat.position.z * threat.threatScore!;
         totalWeight += threat.threatScore!;

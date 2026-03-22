@@ -1,3 +1,4 @@
+// routine.go
 package main
 
 import (
@@ -23,8 +24,7 @@ type DefaultRoutineManager struct {
 func NewDefaultRoutineManager() *DefaultRoutineManager {
 	return &DefaultRoutineManager{
 		routines: []Routine{
-			&PanicRoutine{},
-			&CombatRoutine{},
+			&CombatRoutine{}, // Re-added the Combat Routine
 			&EatingRoutine{},
 			&SleepRoutine{},
 			&ToolingRoutine{},
@@ -58,24 +58,6 @@ func isTaskActive(action, targetName string, inFlight *Action, queue []Action) b
 
 // --- Routine Implementations ---
 
-type PanicRoutine struct{}
-
-func (p *PanicRoutine) Name() string { return "panic" }
-func (p *PanicRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	// Detect environmental damage or lava traps (Y=106 issues)
-	if state.Health < 6 && len(state.Threats) == 0 && !isTaskActive(string(ActionRetreat), "safety", inFlight, queue) {
-		return &Action{
-			ID:        fmt.Sprintf("routine-panic-%d", time.Now().UnixNano()),
-			Source:    string(SourceRoutine),
-			Action:    string(ActionRetreat),
-			Target:    Target{Type: string(TargetNone), Name: "safety"},
-			Rationale: "Emergency: Critical health with no visible threat; likely environmental hazard.",
-			Priority:  PriReflex,
-		}
-	}
-	return nil
-}
-
 type CombatRoutine struct{}
 
 func (c *CombatRoutine) Name() string { return "combat" }
@@ -83,26 +65,25 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 	if len(state.Threats) > 0 {
 		topThreat := state.Threats[0].Name
 
-		if state.Health <= 10 {
-			if !isTaskActive(string(ActionRetreat), "safety", inFlight, queue) {
-				return &Action{
-					ID:        fmt.Sprintf("routine-retreat-%d", time.Now().UnixNano()),
-					Source:    string(SourceRoutine),
-					Action:    string(ActionRetreat),
-					Target:    Target{Type: string(TargetNone), Name: "safety"},
-					Rationale: "Emergency: Fleeing from threat at low health.",
-					Priority:  PriReflex,
-				}
+		// Check if we have an axe or sword equipped/in inventory
+		hasWeapon := false
+		for _, item := range state.Inventory {
+			if strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "sword") {
+				hasWeapon = true
+				break
 			}
-		} else if topThreat != "creeper" && topThreat != "warden" {
+		}
+
+		// Engage ONLY if armed, healthy, facing exactly 1 threat, and it's not a suicide target
+		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
 			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
 				return &Action{
 					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
 					Source:    string(SourceRoutine),
 					Action:    string(ActionHunt),
 					Target:    Target{Type: string(TargetEntity), Name: topThreat},
-					Rationale: "Self-defense: Engaging threat.",
-					Priority:  PriReflex,
+					Rationale: "Tactical Engage: 1-on-1 combat advantage detected.",
+					Priority:  PriReflex, // Instantly preempts gathering/mining
 				}
 			}
 		}
@@ -163,7 +144,8 @@ func (t *ToolingRoutine) Check(state GameState, inFlight *Action, queue []Action
 		inv[item.Name] = item.Count
 	}
 
-	if inv["crafting_table"] == 0 && !isTaskActive(string(ActionCraft), "crafting_table", inFlight, queue) {
+	// --- FIX 3 (Part B): Don't craft a table if one is already nearby ---
+	if inv["crafting_table"] == 0 && !state.HasCraftingTableNearby && !isTaskActive(string(ActionCraft), "crafting_table", inFlight, queue) {
 		plankCount := 0
 		var logName string
 		for name, count := range inv {

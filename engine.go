@@ -1,3 +1,4 @@
+// engine.go
 package main
 
 import (
@@ -19,12 +20,13 @@ type Vec3 struct {
 }
 
 type GameState struct {
-	Health       float64 `json:"health"`
-	Food         float64 `json:"food"`
-	TimeOfDay    int     `json:"time_of_day"`
-	HasBedNearby bool    `json:"has_bed_nearby"`
-	Position     Vec3    `json:"position"`
-	Threats      []struct {
+	Health                 float64 `json:"health"`
+	Food                   float64 `json:"food"`
+	TimeOfDay              int     `json:"time_of_day"`
+	HasBedNearby           bool    `json:"has_bed_nearby"`
+	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"` // Added
+	Position               Vec3    `json:"position"`
+	Threats                []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
 	Inventory []struct {
@@ -58,12 +60,12 @@ type Engine struct {
 	sessionID      string
 	systemOverride string
 
-	lastReplan    time.Time
-	panicCooldown time.Time
-	lastHealth    float64
-	lastThreat    string
-	lastPos       Vec3
-	wg            sync.WaitGroup
+	lastReplan      time.Time
+	tsEmergencyLock bool // Replaces panicCooldown to prevent Split-Brain
+	lastHealth      float64
+	lastThreat      string
+	lastPos         Vec3
+	wg              sync.WaitGroup
 
 	tasksCompletedSinceReplan int
 }
@@ -201,7 +203,8 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 	}
 
-	if time.Now().Before(e.panicCooldown) {
+	// Wait for TS to complete evasion reflexes before processing tactical tasks
+	if e.tsEmergencyLock {
 		return
 	}
 
@@ -209,18 +212,24 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		e.cancelPlanning()
 	}
 
-	busy := e.inFlightTask != nil || e.queue.Len() > 0
+	// Only consider engine "busy" if executing high-priority LLM tasks.
+	// Low priority background tasks (like wandering) shouldn't block planning.
+	isExecutingTactics := false
+	if e.inFlightTask != nil && e.inFlightTask.Priority <= PriLLM {
+		isExecutingTactics = true
+	}
+
 	timeSinceReplan := time.Since(e.lastReplan)
 	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
 
-	if busy && !criticalOverride {
+	if isExecutingTactics && !criticalOverride {
 		if e.planner.GetActiveMilestone() == nil {
 			e.triggerMilestoneGeneration(ctx, ev.RawPayload)
 		}
 		return
 	}
 
-	if criticalOverride && busy {
+	if criticalOverride && isExecutingTactics {
 		e.resetExecutionState()
 		go e.exec.SendControl("noop", "critical state interrupt")
 	}
@@ -426,6 +435,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, ev.Cause,
 		)
 		e.lastReplan = time.Time{}
+		e.tsEmergencyLock = false // Reset lock on death
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
@@ -435,14 +445,19 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		})
 		e.logger.Warn("Bot died — milestone cleared", slog.String("cause", ev.Cause))
 
-	case "panic_retreat":
+	case "panic_retreat_start":
 		e.telemetry.RecordPanic()
 		e.resetExecutionState()
+		e.tsEmergencyLock = true // Hand over survival control to TS exclusively
 
-		e.panicCooldown = time.Now().Add(10 * time.Second)
 		meta.Status = string(StatusPanic)
 		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
-		e.logger.Warn("Reflex triggered by client", append(logCtx, slog.String("cause", ev.Cause))...)
+		e.logger.Warn("Emergency Lock ENGAGED", append(logCtx, slog.String("cause", ev.Cause))...)
+
+	case "panic_retreat_end":
+		e.tsEmergencyLock = false
+		e.lastReplan = time.Time{} // Force immediate tactical replan upon safety
+		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
 		if !e.matchesInFlight(ev.CommandID) {
@@ -477,7 +492,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		e.resetExecutionState()
 
-		if time.Now().Before(e.panicCooldown) {
+		if !e.tsEmergencyLock {
 			e.lastReplan = time.Now()
 		}
 

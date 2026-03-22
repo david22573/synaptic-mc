@@ -1,3 +1,4 @@
+// js/index.ts
 import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
@@ -12,6 +13,22 @@ import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 
 const { pathfinder, Movements } = pkg;
 
+// --- FIX 1: Prevent known 1.19 packet parsing glitches from spamming/crashing ---
+process.on("uncaughtException", (err: Error) => {
+    if (
+        err.name === "PartialReadError" ||
+        err.message.includes("Read error for undefined") ||
+        err.message.includes("Missing characters in string")
+    ) {
+        return; // Silently ignore to keep the event loop clean
+    }
+    log.error("Fatal uncaught exception", {
+        err: err.message,
+        stack: err.stack,
+    });
+    process.exit(1);
+});
+
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
@@ -19,6 +36,11 @@ let client: ControlPlaneClient;
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
+
+// --- FIX 2: State Cache to prevent Event Loop blocking ---
+let lastBlockSearchTime = 0;
+let cachedHasBed = false;
+let cachedHasTable = false;
 
 function stopMovement() {
     if (!bot) return;
@@ -35,6 +57,7 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -42,6 +65,7 @@ function completeTask(
         cause,
         task.startTime,
     );
+
     if (currentTask?.id === task.id) currentTask = null;
 }
 
@@ -115,6 +139,43 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 }
 
+function pushState() {
+    if (!bot?.entity || !client) return;
+
+    const now = Date.now();
+    // Only run expensive 32-block radius searches every 5 seconds (not every 2 seconds)
+    if (now - lastBlockSearchTime > 5000) {
+        cachedHasBed = !!bot.findBlock({
+            matching: (b) => b?.name.includes("bed"),
+            maxDistance: 32,
+        });
+        cachedHasTable = !!bot.findBlock({
+            matching: (b) => b?.name === "crafting_table",
+            maxDistance: 32,
+        });
+        lastBlockSearchTime = now;
+    }
+
+    client.sendState({
+        health: Math.round(bot.health),
+        food: Math.round(bot.food),
+        time_of_day: bot.time.timeOfDay,
+        position: {
+            x: Math.round(bot.entity.position.x),
+            y: Math.round(bot.entity.position.y),
+            z: Math.round(bot.entity.position.z),
+        },
+        threats: getThreats(bot)
+            .slice(0, 3)
+            .map((t) => ({ name: t.name })),
+        has_bed_nearby: cachedHasBed,
+        has_crafting_table_nearby: cachedHasTable,
+        inventory: bot.inventory
+            .items()
+            .map((i) => ({ name: i.name, count: i.count })),
+    });
+}
+
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
 
@@ -139,13 +200,29 @@ async function bootstrap() {
         stopMovement: () => stopMovement(),
     });
 
+    bot.on("error", (err: Error) => {
+        if (
+            err.name === "PartialReadError" ||
+            err.message.includes("Read error for undefined") ||
+            err.message.includes("Missing characters in string")
+        ) {
+            return; // Suppress internal Mineflayer parser errors
+        }
+        log.warn("Mineflayer bot emitted error", { err: err.message });
+    });
+
     bot.on("spawn", () => {
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allow1by1towers = true;
         movements.allowParkour = true;
         movements.allowSprinting = true;
-        movements.liquids = new Set([9, 10]);
+        // FIX: Dynamically resolve 1.19 liquid IDs instead of legacy 9/10
+        const water = bot.registry.blocksByName.water?.id;
+        const lava = bot.registry.blocksByName.lava?.id;
+        movements.liquids = new Set(
+            [water, lava].filter((id) => id !== undefined) as number[],
+        );
         movements.digCost = 1.5;
 
         const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
@@ -171,9 +248,8 @@ async function bootstrap() {
 
     bot.on("message", (msg) => {
         const text = msg.toString();
-        if (text.includes(bot.username) && !text.startsWith("<")) {
+        if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
-        }
     });
 
     bot.on("death", () => {
@@ -185,29 +261,8 @@ async function bootstrap() {
         lastDeathMessage = "unknown causes";
     });
 
-    setInterval(() => {
-        if (!bot?.entity) return;
-        client.sendState({
-            health: Math.round(bot.health),
-            food: Math.round(bot.food),
-            time_of_day: bot.time.timeOfDay,
-            position: {
-                x: Math.round(bot.entity.position.x),
-                y: Math.round(bot.entity.position.y),
-                z: Math.round(bot.entity.position.z),
-            },
-            threats: getThreats(bot)
-                .slice(0, 3)
-                .map((t) => ({ name: t.name })),
-            has_bed_nearby: !!bot.findBlock({
-                matching: (b) => b?.name.includes("bed"),
-                maxDistance: 32,
-            }),
-            inventory: bot.inventory
-                .items()
-                .map((i) => ({ name: i.name, count: i.count })),
-        });
-    }, 2000);
+    bot.on("health", pushState);
+    setInterval(pushState, 2000);
 }
 
 bootstrap().catch((err) => log.error("Fatal startup", { err }));

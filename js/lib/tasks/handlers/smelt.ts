@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/smelt.ts
 import {
     type FSMState,
     type StateContext,
@@ -26,6 +27,7 @@ interface SmeltContext extends StateContext {
 
 class CleanupState implements FSMState {
     name = "CLEANUP";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -63,16 +65,14 @@ class SmeltingState implements FSMState {
             await furnaceWindow.putFuel(sCtx.fuelType, null, 1);
             await furnaceWindow.putInput(sCtx.meatType, null, 1);
 
-            // --- SMART POLLING LOOP ---
             let itemSmelted = false;
-            const maxWaitMs = 20000; // 20 seconds max to account for heavy TPS lag
-            const pollIntervalMs = 500; // Check every half second
+            const maxWaitMs = 20000;
+            const pollIntervalMs = 500;
             let elapsedMs = 0;
 
             while (elapsedMs < maxWaitMs) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
 
-                // Check if the furnace GUI has registered an item in the output slot
                 if (furnaceWindow.outputItem()) {
                     itemSmelted = true;
                     break;
@@ -86,7 +86,8 @@ class SmeltingState implements FSMState {
                 throw new Error("FURNACE_TIMEOUT_OR_LAG");
             }
 
-            // Safely extract the item now that we know it's there
+            // Must guarantee inventory space before extracting to prevent unhandled rejections
+            await makeRoomInInventory(sCtx.bot, 1);
             await furnaceWindow.takeOutput();
         } catch (err: any) {
             sCtx.result = {
@@ -111,6 +112,7 @@ class SmeltingState implements FSMState {
 
 class ApproachFurnaceState implements FSMState {
     name = "APPROACHING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -146,6 +148,7 @@ class ApproachFurnaceState implements FSMState {
 
 class LocateFurnaceState implements FSMState {
     name = "LOCATING_FURNACE";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -171,6 +174,7 @@ class LocateFurnaceState implements FSMState {
 
 class CheckResourcesState implements FSMState {
     name = "CHECKING_RESOURCES";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -204,6 +208,7 @@ class CheckResourcesState implements FSMState {
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {

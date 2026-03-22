@@ -1,3 +1,4 @@
+// shared_types.go
 package main
 
 import "encoding/json"
@@ -6,11 +7,12 @@ import "encoding/json"
 type ClientEventType string
 
 const (
-	EventTaskCompleted ClientEventType = "task_completed"
-	EventTaskFailed    ClientEventType = "task_failed"
-	EventTaskAborted   ClientEventType = "task_aborted"
-	EventDeath         ClientEventType = "death"
-	EventPanicRetreat  ClientEventType = "panic_retreat"
+	EventTaskCompleted     ClientEventType = "task_completed"
+	EventTaskFailed        ClientEventType = "task_failed"
+	EventTaskAborted       ClientEventType = "task_aborted"
+	EventDeath             ClientEventType = "death"
+	EventPanicRetreatStart ClientEventType = "panic_retreat_start"
+	EventPanicRetreatEnd   ClientEventType = "panic_retreat_end"
 )
 
 // TaskStatus unifies execution states.

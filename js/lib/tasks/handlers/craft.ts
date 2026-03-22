@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/craft.ts
 import {
     type FSMState,
     type StateContext,
@@ -30,7 +31,6 @@ class CleanupState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
-
         if (cCtx.isPortableTable && cCtx.craftingTable) {
             await makeRoomInInventory(cCtx.bot, 1);
             const pickaxe = cCtx.bot.pathfinder.bestHarvestTool(
@@ -55,9 +55,14 @@ class CraftingState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
-
         try {
-            await cCtx.bot.craft(cCtx.recipe, 1, cCtx.craftingTable);
+            // FIX: Prevent bot.craft from hanging indefinitely when inventory is full
+            await makeRoomInInventory(cCtx.bot, 1);
+
+            const tableToUse = cCtx.recipe.requiresTable
+                ? cCtx.craftingTable
+                : null;
+            await cCtx.bot.craft(cCtx.recipe, 1, tableToUse);
         } catch (err: any) {
             cCtx.result = {
                 status: "FAILED",
@@ -76,10 +81,8 @@ class NavigateTableState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
-
         if (cCtx.recipe.requiresTable && cCtx.craftingTable) {
             const pos = cCtx.craftingTable.position;
-
             try {
                 await moveToGoal(
                     cCtx.bot,
@@ -115,7 +118,6 @@ class SetupRecipeState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
         const targetRecipeName = cCtx.targetName;
-
         const itemType = cCtx.bot.registry.itemsByName[targetRecipeName];
         if (!itemType) {
             cCtx.result = {
@@ -130,18 +132,15 @@ class SetupRecipeState implements FSMState {
         let isPortableTable = false;
 
         let recipes = cCtx.bot.recipesFor(itemType.id, null, 1, craftingTable);
-
         if (recipes.length === 0 && !craftingTable) {
             const hasTableInInv = cCtx.bot.inventory
                 .items()
                 .some((i: any) => i.name === "crafting_table");
-
             if (hasTableInInv) {
                 craftingTable = await placePortableUtility(
                     cCtx.bot,
                     "crafting_table",
                 );
-
                 if (craftingTable) {
                     isPortableTable = true;
                     recipes = cCtx.bot.recipesFor(
@@ -192,10 +191,8 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
         isPortableTable: false,
         stopMovement,
     };
-
     const fsm = new StateMachineRunner(new SetupRecipeState(), fsmCtx);
     const result = await fsm.run();
-
     if (result.status === "FAILED") {
         throw new Error(result.reason || "unknown_fsm_failure");
     }

@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/gather.ts
 import {
     type FSMState,
     type StateContext,
@@ -58,6 +59,7 @@ class NavigateState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
+
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
         gCtx.resolvedTarget = gCtx.targetBlock.name;
 
@@ -83,7 +85,6 @@ class SearchState implements FSMState {
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
-
         const candidates =
             gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
 
@@ -93,7 +94,7 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 48,
+            maxDistance: 64, // FIX: Expanded from 48 to 64 to find sparse wood
             count: 256,
         });
 
@@ -134,14 +135,13 @@ function advanceToNextCandidate(
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
     await escapeTree(bot, signal);
 
     const fsmCtx: GatherContext = {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 48,
+        searchRadius: 64, // FIX: Matches expanded findBlocks radius
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,
@@ -151,7 +151,6 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
-
     const result = await new StateMachineRunner(
         new SearchState(),
         fsmCtx,

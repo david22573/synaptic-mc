@@ -18,6 +18,7 @@ const (
 	ActionSleep          ActionType = "sleep"
 	ActionRetreat        ActionType = "retreat"
 	ActionEat            ActionType = "eat"
+	ActionInteract       ActionType = "interact"
 )
 
 // TargetType defines valid schema values for action targets.
@@ -47,6 +48,7 @@ var ValidActions = map[string]bool{
 	string(ActionSleep):          true,
 	string(ActionRetreat):        true,
 	string(ActionEat):            true,
+	string(ActionInteract):       true,
 }
 
 var ValidTargetTypes = map[string]bool{

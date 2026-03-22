@@ -1,7 +1,7 @@
-Project Context Dump (20 Mar 26 23:11 PDT)
+Project Context Dump (21 Mar 26 00:01 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 43
+Total Files: 44
 
 # Project Structure
 <file_tree>
@@ -27,6 +27,7 @@ Total Files: 43
 - js\lib\tasks\handlers\farm.ts
 - js\lib\tasks\handlers\gather.ts
 - js\lib\tasks\handlers\hunt.ts
+- js\lib\tasks\handlers\interact.ts
 - js\lib\tasks\handlers\mine.ts
 - js\lib\tasks\handlers\smelt.ts
 - js\lib\tasks\normalize.ts
@@ -108,6 +109,7 @@ const (
 	ActionSleep          ActionType = "sleep"
 	ActionRetreat        ActionType = "retreat"
 	ActionEat            ActionType = "eat"
+	ActionInteract       ActionType = "interact"
 )
 
 // TargetType defines valid schema values for action targets.
@@ -137,6 +139,7 @@ var ValidActions = map[string]bool{
 	string(ActionSleep):          true,
 	string(ActionRetreat):        true,
 	string(ActionEat):            true,
+	string(ActionInteract):       true,
 }
 
 var ValidTargetTypes = map[string]bool{
@@ -430,6 +433,7 @@ func LoadConfig(path string) (*Config, error) {
 </file>
 
 <file path="engine.go">
+// engine.go
 package main
 
 import (
@@ -451,12 +455,13 @@ type Vec3 struct {
 }
 
 type GameState struct {
-	Health       float64 `json:"health"`
-	Food         float64 `json:"food"`
-	TimeOfDay    int     `json:"time_of_day"`
-	HasBedNearby bool    `json:"has_bed_nearby"`
-	Position     Vec3    `json:"position"`
-	Threats      []struct {
+	Health                 float64 `json:"health"`
+	Food                   float64 `json:"food"`
+	TimeOfDay              int     `json:"time_of_day"`
+	HasBedNearby           bool    `json:"has_bed_nearby"`
+	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"` // Added
+	Position               Vec3    `json:"position"`
+	Threats                []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
 	Inventory []struct {
@@ -490,12 +495,12 @@ type Engine struct {
 	sessionID      string
 	systemOverride string
 
-	lastReplan    time.Time
-	panicCooldown time.Time
-	lastHealth    float64
-	lastThreat    string
-	lastPos       Vec3
-	wg            sync.WaitGroup
+	lastReplan      time.Time
+	tsEmergencyLock bool // Replaces panicCooldown to prevent Split-Brain
+	lastHealth      float64
+	lastThreat      string
+	lastPos         Vec3
+	wg              sync.WaitGroup
 
 	tasksCompletedSinceReplan int
 }
@@ -633,7 +638,8 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 	}
 
-	if time.Now().Before(e.panicCooldown) {
+	// Wait for TS to complete evasion reflexes before processing tactical tasks
+	if e.tsEmergencyLock {
 		return
 	}
 
@@ -641,18 +647,24 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		e.cancelPlanning()
 	}
 
-	busy := e.inFlightTask != nil || e.queue.Len() > 0
+	// Only consider engine "busy" if executing high-priority LLM tasks.
+	// Low priority background tasks (like wandering) shouldn't block planning.
+	isExecutingTactics := false
+	if e.inFlightTask != nil && e.inFlightTask.Priority <= PriLLM {
+		isExecutingTactics = true
+	}
+
 	timeSinceReplan := time.Since(e.lastReplan)
 	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
 
-	if busy && !criticalOverride {
+	if isExecutingTactics && !criticalOverride {
 		if e.planner.GetActiveMilestone() == nil {
 			e.triggerMilestoneGeneration(ctx, ev.RawPayload)
 		}
 		return
 	}
 
-	if criticalOverride && busy {
+	if criticalOverride && isExecutingTactics {
 		e.resetExecutionState()
 		go e.exec.SendControl("noop", "critical state interrupt")
 	}
@@ -858,6 +870,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, ev.Cause,
 		)
 		e.lastReplan = time.Time{}
+		e.tsEmergencyLock = false // Reset lock on death
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
@@ -867,14 +880,19 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		})
 		e.logger.Warn("Bot died — milestone cleared", slog.String("cause", ev.Cause))
 
-	case "panic_retreat":
+	case "panic_retreat_start":
 		e.telemetry.RecordPanic()
 		e.resetExecutionState()
+		e.tsEmergencyLock = true // Hand over survival control to TS exclusively
 
-		e.panicCooldown = time.Now().Add(10 * time.Second)
 		meta.Status = string(StatusPanic)
 		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
-		e.logger.Warn("Reflex triggered by client", append(logCtx, slog.String("cause", ev.Cause))...)
+		e.logger.Warn("Emergency Lock ENGAGED", append(logCtx, slog.String("cause", ev.Cause))...)
+
+	case "panic_retreat_end":
+		e.tsEmergencyLock = false
+		e.lastReplan = time.Time{} // Force immediate tactical replan upon safety
+		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
 		if !e.matchesInFlight(ev.CommandID) {
@@ -909,7 +927,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		e.resetExecutionState()
 
-		if time.Now().Before(e.panicCooldown) {
+		if !e.tsEmergencyLock {
 			e.lastReplan = time.Now()
 		}
 
@@ -1292,6 +1310,7 @@ func (f *FallbackBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sys
 </file>
 
 <file path="js\index.ts">
+// js/index.ts
 import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
@@ -1306,6 +1325,22 @@ import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 
 const { pathfinder, Movements } = pkg;
 
+// --- FIX 1: Prevent known 1.19 packet parsing glitches from spamming/crashing ---
+process.on("uncaughtException", (err: Error) => {
+    if (
+        err.name === "PartialReadError" ||
+        err.message.includes("Read error for undefined") ||
+        err.message.includes("Missing characters in string")
+    ) {
+        return; // Silently ignore to keep the event loop clean
+    }
+    log.error("Fatal uncaught exception", {
+        err: err.message,
+        stack: err.stack,
+    });
+    process.exit(1);
+});
+
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
@@ -1313,6 +1348,11 @@ let client: ControlPlaneClient;
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
+
+// --- FIX 2: State Cache to prevent Event Loop blocking ---
+let lastBlockSearchTime = 0;
+let cachedHasBed = false;
+let cachedHasTable = false;
 
 function stopMovement() {
     if (!bot) return;
@@ -1329,6 +1369,7 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -1336,6 +1377,7 @@ function completeTask(
         cause,
         task.startTime,
     );
+
     if (currentTask?.id === task.id) currentTask = null;
 }
 
@@ -1409,6 +1451,43 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 }
 
+function pushState() {
+    if (!bot?.entity || !client) return;
+
+    const now = Date.now();
+    // Only run expensive 32-block radius searches every 5 seconds (not every 2 seconds)
+    if (now - lastBlockSearchTime > 5000) {
+        cachedHasBed = !!bot.findBlock({
+            matching: (b) => b?.name.includes("bed"),
+            maxDistance: 32,
+        });
+        cachedHasTable = !!bot.findBlock({
+            matching: (b) => b?.name === "crafting_table",
+            maxDistance: 32,
+        });
+        lastBlockSearchTime = now;
+    }
+
+    client.sendState({
+        health: Math.round(bot.health),
+        food: Math.round(bot.food),
+        time_of_day: bot.time.timeOfDay,
+        position: {
+            x: Math.round(bot.entity.position.x),
+            y: Math.round(bot.entity.position.y),
+            z: Math.round(bot.entity.position.z),
+        },
+        threats: getThreats(bot)
+            .slice(0, 3)
+            .map((t) => ({ name: t.name })),
+        has_bed_nearby: cachedHasBed,
+        has_crafting_table_nearby: cachedHasTable,
+        inventory: bot.inventory
+            .items()
+            .map((i) => ({ name: i.name, count: i.count })),
+    });
+}
+
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
 
@@ -1433,13 +1512,29 @@ async function bootstrap() {
         stopMovement: () => stopMovement(),
     });
 
+    bot.on("error", (err: Error) => {
+        if (
+            err.name === "PartialReadError" ||
+            err.message.includes("Read error for undefined") ||
+            err.message.includes("Missing characters in string")
+        ) {
+            return; // Suppress internal Mineflayer parser errors
+        }
+        log.warn("Mineflayer bot emitted error", { err: err.message });
+    });
+
     bot.on("spawn", () => {
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allow1by1towers = true;
         movements.allowParkour = true;
         movements.allowSprinting = true;
-        movements.liquids = new Set([9, 10]);
+        // FIX: Dynamically resolve 1.19 liquid IDs instead of legacy 9/10
+        const water = bot.registry.blocksByName.water?.id;
+        const lava = bot.registry.blocksByName.lava?.id;
+        movements.liquids = new Set(
+            [water, lava].filter((id) => id !== undefined) as number[],
+        );
         movements.digCost = 1.5;
 
         const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
@@ -1465,9 +1560,8 @@ async function bootstrap() {
 
     bot.on("message", (msg) => {
         const text = msg.toString();
-        if (text.includes(bot.username) && !text.startsWith("<")) {
+        if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
-        }
     });
 
     bot.on("death", () => {
@@ -1479,29 +1573,8 @@ async function bootstrap() {
         lastDeathMessage = "unknown causes";
     });
 
-    setInterval(() => {
-        if (!bot?.entity) return;
-        client.sendState({
-            health: Math.round(bot.health),
-            food: Math.round(bot.food),
-            time_of_day: bot.time.timeOfDay,
-            position: {
-                x: Math.round(bot.entity.position.x),
-                y: Math.round(bot.entity.position.y),
-                z: Math.round(bot.entity.position.z),
-            },
-            threats: getThreats(bot)
-                .slice(0, 3)
-                .map((t) => ({ name: t.name })),
-            has_bed_nearby: !!bot.findBlock({
-                matching: (b) => b?.name.includes("bed"),
-                maxDistance: 32,
-            }),
-            inventory: bot.inventory
-                .items()
-                .map((i) => ({ name: i.name, count: i.count })),
-        });
-    }, 2000);
+    bot.on("health", pushState);
+    setInterval(pushState, 2000);
 }
 
 bootstrap().catch((err) => log.error("Fatal startup", { err }));
@@ -1681,6 +1754,7 @@ export enum ActionType {
     Sleep = "sleep",
     Retreat = "retreat",
     Eat = "eat",
+    Interact = "interact",
 }
 
 export enum ClientEventType {
@@ -1882,6 +1956,7 @@ export class ControlPlaneClient {
 </file>
 
 <file path="js\lib\systems\survival.ts">
+// js/lib/systems/survival.ts
 import type { Bot } from "mineflayer";
 import type { ControlPlaneClient } from "../network/client.js";
 import { log } from "../logger.js";
@@ -1933,25 +2008,55 @@ export class SurvivalSystem {
 
         const threats = getThreats(this.bot);
 
+        // Relaxed the filter to track ALL hostile mobs within 12 blocks,
+        // not just when the bot is at low health.
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 12 &&
                 t.threatScore > 5 &&
                 t.name !== "low_health_no_food" &&
-                t.name !== "starvation" &&
-                (this.bot.health <= 10 ||
-                    t.name === "creeper" ||
-                    t.name === "warden"),
+                t.name !== "starvation",
         );
 
         if (immediateThreats.length > 0) {
+            const topThreat = immediateThreats[0]!;
+
+            // Assess our combat viability
+            const hasWeapon = this.bot.inventory
+                .items()
+                .some(
+                    (i) => i.name.includes("axe") || i.name.includes("sword"),
+                );
+            const isOneOnOne = immediateThreats.length === 1;
+            const isUnavoidableDeath =
+                topThreat.name === "creeper" || topThreat.name === "warden";
+
+            // If the odds are good, suppress the panic reflex and let Go dispatch the hunt task
+            if (
+                hasWeapon &&
+                isOneOnOne &&
+                this.bot.health > 10 &&
+                !isUnavoidableDeath
+            ) {
+                if (this.isPanicking) {
+                    this.isPanicking = false;
+                    this.config.stopMovement();
+                    this.client.sendEvent(
+                        "panic_retreat_end",
+                        "evasion_complete",
+                        "",
+                        "engaging_in_combat",
+                        0,
+                    );
+                }
+                return;
+            }
+
+            // --- STANDARD EVASION LOGIC ---
             this.lastDangerAt = Date.now();
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
-
-                const topThreat = immediateThreats[0]!;
-                if (!topThreat) return;
 
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
@@ -1962,7 +2067,7 @@ export class SurvivalSystem {
                 this.config.onInterrupt("panic_flee");
                 this.config.stopMovement();
                 this.client.sendEvent(
-                    "panic_retreat",
+                    "panic_retreat_start",
                     "evasion",
                     "",
                     topThreat.name,
@@ -1976,6 +2081,13 @@ export class SurvivalSystem {
             this.isPanicking = false;
             log.debug("Survival goal reached; releasing reflex lock");
             this.config.stopMovement();
+            this.client.sendEvent(
+                "panic_retreat_end",
+                "evasion_complete",
+                "",
+                "safe",
+                0,
+            );
         }
     }
 
@@ -2157,6 +2269,7 @@ export async function handleBuild(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\craft.ts">
+// js/lib/tasks/handlers/craft.ts
 import {
     type FSMState,
     type StateContext,
@@ -2189,7 +2302,6 @@ class CleanupState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
-
         if (cCtx.isPortableTable && cCtx.craftingTable) {
             await makeRoomInInventory(cCtx.bot, 1);
             const pickaxe = cCtx.bot.pathfinder.bestHarvestTool(
@@ -2214,9 +2326,14 @@ class CraftingState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
-
         try {
-            await cCtx.bot.craft(cCtx.recipe, 1, cCtx.craftingTable);
+            // FIX: Prevent bot.craft from hanging indefinitely when inventory is full
+            await makeRoomInInventory(cCtx.bot, 1);
+
+            const tableToUse = cCtx.recipe.requiresTable
+                ? cCtx.craftingTable
+                : null;
+            await cCtx.bot.craft(cCtx.recipe, 1, tableToUse);
         } catch (err: any) {
             cCtx.result = {
                 status: "FAILED",
@@ -2235,10 +2352,8 @@ class NavigateTableState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
-
         if (cCtx.recipe.requiresTable && cCtx.craftingTable) {
             const pos = cCtx.craftingTable.position;
-
             try {
                 await moveToGoal(
                     cCtx.bot,
@@ -2274,7 +2389,6 @@ class SetupRecipeState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const cCtx = ctx as CraftContext;
         const targetRecipeName = cCtx.targetName;
-
         const itemType = cCtx.bot.registry.itemsByName[targetRecipeName];
         if (!itemType) {
             cCtx.result = {
@@ -2289,18 +2403,15 @@ class SetupRecipeState implements FSMState {
         let isPortableTable = false;
 
         let recipes = cCtx.bot.recipesFor(itemType.id, null, 1, craftingTable);
-
         if (recipes.length === 0 && !craftingTable) {
             const hasTableInInv = cCtx.bot.inventory
                 .items()
                 .some((i: any) => i.name === "crafting_table");
-
             if (hasTableInInv) {
                 craftingTable = await placePortableUtility(
                     cCtx.bot,
                     "crafting_table",
                 );
-
                 if (craftingTable) {
                     isPortableTable = true;
                     recipes = cCtx.bot.recipesFor(
@@ -2351,10 +2462,8 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
         isPortableTable: false,
         stopMovement,
     };
-
     const fsm = new StateMachineRunner(new SetupRecipeState(), fsmCtx);
     const result = await fsm.run();
-
     if (result.status === "FAILED") {
         throw new Error(result.reason || "unknown_fsm_failure");
     }
@@ -2363,6 +2472,7 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\explore.ts">
+// js/lib/tasks/handlers/explore.ts
 import {
     type FSMState,
     type StateContext,
@@ -2375,21 +2485,22 @@ import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
+// FIX: Retain the last 20 chunk hops to prevent backtracking
+const visitedPoints: { x: number; z: number }[] = [];
+
 interface ExploreContext extends StateContext {
     targetX: number;
     targetZ: number;
-    attempts: number; // Track how many directions we've tried
+    attempts: number;
     stopMovement: () => void;
 }
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
-
         try {
             await moveToGoal(
                 eCtx.bot,
@@ -2402,19 +2513,22 @@ class NavigateState implements FSMState {
                 },
             );
 
-            // If we actually reached the destination without throwing an error
+            // Successfully reached new area. Record it to repel future exploration.
+            visitedPoints.push({
+                x: eCtx.bot.entity.position.x,
+                z: eCtx.bot.entity.position.z,
+            });
+            if (visitedPoints.length > 20) visitedPoints.shift();
+
             eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
             return null;
         } catch (err: any) {
             const msg = String(err?.message ?? err);
-
             if (eCtx.signal.aborted || msg.includes("aborted")) {
                 eCtx.result = { status: "FAILED", reason: "aborted" };
                 return null;
             }
 
-            // If pathing failed due to terrain, DO NOT report success yet.
-            // Loop back to PickDirectionState to try a new angle!
             log.warn("Exploration path failed, picking new direction", {
                 reason: msg,
             });
@@ -2425,12 +2539,10 @@ class NavigateState implements FSMState {
 
 class PickDirectionState implements FSMState {
     name = "PICKING_DIRECTION";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
-
         eCtx.attempts++;
         if (eCtx.attempts > 4) {
             eCtx.result = {
@@ -2440,16 +2552,32 @@ class PickDirectionState implements FSMState {
             return null;
         }
 
-        // Shorter, more reliable hops (16 to 32 blocks).
-        // A* can calculate this almost instantly, and it keeps chunks loaded.
         const dist = 16 + Math.random() * 16;
+        let bestAngle = 0;
+        let maxRepulsionScore = -1;
 
-        // Pick an angle. If this is a retry, bias it away from the failed angle.
-        const baseAngle = eCtx.attempts > 1 ? eCtx.attempts * (Math.PI / 2) : 0;
-        const angle = baseAngle + (Math.random() * Math.PI - Math.PI / 2);
+        // Sample 8 angles and pick the one furthest from our visited history
+        for (let i = 0; i < 8; i++) {
+            const testAngle = Math.random() * Math.PI * 2;
+            const tx = eCtx.bot.entity.position.x + Math.cos(testAngle) * dist;
+            const tz = eCtx.bot.entity.position.z + Math.sin(testAngle) * dist;
 
-        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(angle) * dist;
-        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(angle) * dist;
+            let minDistanceToHistory = 999999;
+            for (const pt of visitedPoints) {
+                const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
+                if (d < minDistanceToHistory) minDistanceToHistory = d;
+            }
+
+            if (visitedPoints.length === 0) minDistanceToHistory = 1;
+
+            if (minDistanceToHistory > maxRepulsionScore) {
+                maxRepulsionScore = minDistanceToHistory;
+                bestAngle = testAngle;
+            }
+        }
+
+        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(bestAngle) * dist;
+        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(bestAngle) * dist;
 
         log.info("Picked exploration vector", {
             dist: Math.round(dist),
@@ -2457,7 +2585,6 @@ class PickDirectionState implements FSMState {
             targetZ: Math.round(eCtx.targetZ),
             attempt: eCtx.attempts,
         });
-
         return new NavigateState();
     }
 }
@@ -2471,7 +2598,7 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         targetName: "explore",
         targetEntity: null,
         searchRadius: 0,
-        timeoutMs: timeouts.explore ?? 25000, // Slightly longer to allow retries
+        timeoutMs: timeouts.explore ?? 25000,
         startTime: 0,
         signal,
         targetX: 0,
@@ -2479,13 +2606,12 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         attempts: 0,
         stopMovement,
     };
-
-    const fsm = new StateMachineRunner(new PickDirectionState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
+    const result = await new StateMachineRunner(
+        new PickDirectionState(),
+        fsmCtx,
+    ).run();
+    if (result.status === "FAILED")
         throw new Error(result.reason || "unknown_fsm_failure");
-    }
 }
 
 </file>
@@ -2685,6 +2811,7 @@ export async function handleFarm(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\gather.ts">
+// js/lib/tasks/handlers/gather.ts
 import {
     type FSMState,
     type StateContext,
@@ -2745,6 +2872,7 @@ class NavigateState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
+
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
         gCtx.resolvedTarget = gCtx.targetBlock.name;
 
@@ -2770,7 +2898,6 @@ class SearchState implements FSMState {
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
-
         const candidates =
             gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
 
@@ -2780,7 +2907,7 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 48,
+            maxDistance: 64, // FIX: Expanded from 48 to 64 to find sparse wood
             count: 256,
         });
 
@@ -2821,14 +2948,13 @@ function advanceToNextCandidate(
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
     await escapeTree(bot, signal);
 
     const fsmCtx: GatherContext = {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 48,
+        searchRadius: 64, // FIX: Matches expanded findBlocks radius
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,
@@ -2838,7 +2964,6 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
-
     const result = await new StateMachineRunner(
         new SearchState(),
         fsmCtx,
@@ -3036,6 +3161,79 @@ export async function handleHunt(ctx: TaskContext): Promise<void> {
 
 </file>
 
+<file path="js\lib\tasks\handlers\interact.ts">
+// js/lib/tasks/handlers/interact.ts
+import { type TaskContext } from "../registry.js";
+import { findNearestEntity } from "../primitives.js";
+import { findNearestBlockByName, moveToGoal } from "../utils.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+export async function handleInteract(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, stopMovement, timeouts } = ctx;
+    const targetName = decision.target?.name;
+
+    if (!targetName || targetName === "none") {
+        throw new Error("missing interact target");
+    }
+
+    // 1. Try to find it as an Entity (Boats, Minecarts, Villagers)
+    const entity = findNearestEntity(bot, targetName, 16);
+    if (entity) {
+        await moveToGoal(
+            bot,
+            new goals.GoalNear(
+                entity.position.x,
+                entity.position.y,
+                entity.position.z,
+                2,
+            ),
+            {
+                signal,
+                timeoutMs: timeouts.interact ?? 15000,
+                stopMovement,
+            },
+        );
+
+        if (
+            targetName.includes("boat") ||
+            targetName.includes("minecart") ||
+            targetName.includes("horse")
+        ) {
+            await bot.mount(entity);
+        } else {
+            bot.activateEntity(entity);
+        }
+        return;
+    }
+
+    // 2. Try to find it as a Block (Doors, Buttons, Levers, Beds)
+    const block = findNearestBlockByName(bot, targetName);
+    if (block) {
+        await moveToGoal(
+            bot,
+            new goals.GoalNear(
+                block.position.x,
+                block.position.y,
+                block.position.z,
+                2,
+            ),
+            {
+                signal,
+                timeoutMs: timeouts.interact ?? 15000,
+                stopMovement,
+            },
+        );
+        await bot.activateBlock(block);
+        return;
+    }
+
+    throw new Error(`NO_INTERACTABLE_FOUND: ${targetName}`);
+}
+
+</file>
+
 <file path="js\lib\tasks\handlers\mine.ts">
 import {
     type FSMState,
@@ -3201,6 +3399,7 @@ export async function handleMine(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\smelt.ts">
+// js/lib/tasks/handlers/smelt.ts
 import {
     type FSMState,
     type StateContext,
@@ -3229,6 +3428,7 @@ interface SmeltContext extends StateContext {
 
 class CleanupState implements FSMState {
     name = "CLEANUP";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3266,16 +3466,14 @@ class SmeltingState implements FSMState {
             await furnaceWindow.putFuel(sCtx.fuelType, null, 1);
             await furnaceWindow.putInput(sCtx.meatType, null, 1);
 
-            // --- SMART POLLING LOOP ---
             let itemSmelted = false;
-            const maxWaitMs = 20000; // 20 seconds max to account for heavy TPS lag
-            const pollIntervalMs = 500; // Check every half second
+            const maxWaitMs = 20000;
+            const pollIntervalMs = 500;
             let elapsedMs = 0;
 
             while (elapsedMs < maxWaitMs) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
 
-                // Check if the furnace GUI has registered an item in the output slot
                 if (furnaceWindow.outputItem()) {
                     itemSmelted = true;
                     break;
@@ -3289,7 +3487,8 @@ class SmeltingState implements FSMState {
                 throw new Error("FURNACE_TIMEOUT_OR_LAG");
             }
 
-            // Safely extract the item now that we know it's there
+            // Must guarantee inventory space before extracting to prevent unhandled rejections
+            await makeRoomInInventory(sCtx.bot, 1);
             await furnaceWindow.takeOutput();
         } catch (err: any) {
             sCtx.result = {
@@ -3314,6 +3513,7 @@ class SmeltingState implements FSMState {
 
 class ApproachFurnaceState implements FSMState {
     name = "APPROACHING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3349,6 +3549,7 @@ class ApproachFurnaceState implements FSMState {
 
 class LocateFurnaceState implements FSMState {
     name = "LOCATING_FURNACE";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3374,6 +3575,7 @@ class LocateFurnaceState implements FSMState {
 
 class CheckResourcesState implements FSMState {
     name = "CHECKING_RESOURCES";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3407,6 +3609,7 @@ class CheckResourcesState implements FSMState {
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {
@@ -3629,6 +3832,7 @@ export const TASK_REGISTRY: Record<string, TaskHandler> = {};
 </file>
 
 <file path="js\lib\tasks\task.ts">
+// js/lib/tasks/task.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
@@ -3646,6 +3850,7 @@ import { handleFarm } from "./handlers/farm.js";
 
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeDecision } from "./normalize.js";
+import { handleInteract } from "./handlers/interact.js";
 
 const { goals } = pkg;
 
@@ -3663,7 +3868,6 @@ export async function runTask(
 ): Promise<void> {
     const decision = normalizeDecision(bot, rawDecision);
 
-    // Pass ALL dependencies into the TaskContext so external handlers can use them
     const taskCtx: TaskContext = {
         bot,
         decision,
@@ -3716,11 +3920,14 @@ export async function runTask(
 
         case "sleep": {
             await escapeTree(bot, signal);
+
             const bed = bot.findBlock({
                 maxDistance: 32,
                 matching: (b: any) => b?.name.includes("bed"),
             });
+
             if (!bed) throw new Error("no bed found");
+
             await moveToGoal(
                 bot,
                 new goals.GoalNear(
@@ -3731,20 +3938,45 @@ export async function runTask(
                 ),
                 { signal, timeoutMs: 20000, stopMovement },
             );
+
             await bot.sleep(bed);
+
+            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
+            await new Promise<void>((resolve, reject) => {
+                const onWake = () => {
+                    bot.removeListener("wake", onWake);
+                    resolve();
+                };
+
+                const onAbort = () => {
+                    bot.removeListener("wake", onWake);
+                    bot.wake().catch(() => {});
+                    reject(new Error("aborted"));
+                };
+
+                bot.on("wake", onWake);
+                signal.addEventListener("abort", onAbort, { once: true });
+            });
+
             return;
         }
 
         case "retreat": {
             await escapeTree(bot, signal);
+
             const pos = computeSafeRetreat(getThreats());
             await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
                 signal,
                 timeoutMs: 15000,
                 stopMovement,
             });
+
             return;
         }
+
+        case "interact":
+            await handleInteract(taskCtx);
+            return;
 
         default:
             throw new Error(`unsupported: ${decision.action}`);
@@ -4147,11 +4379,11 @@ export function getErrorMessage(error: unknown): string {
 </file>
 
 <file path="js\lib\utils\threats.ts">
+// js/lib/utils/threats.ts
 import { type Bot } from "mineflayer";
 import * as config from "../config.js";
 import * as models from "../models.js";
 
-// Optimized O(1) lookup Set - much faster than array includes or generic type checks
 const HOSTILE_MOBS = new Set([
     "zombie",
     "zombie_villager",
@@ -4175,52 +4407,56 @@ const HOSTILE_MOBS = new Set([
     "pillager",
     "evoker",
     "vindicator",
-    "warden", // Added Warden for 1.19 safety
+    "warden",
 ]);
 
 export function getThreats(bot: Bot): models.ThreatInfo[] {
     const threats: models.ThreatInfo[] = [];
     const botPos = bot.entity.position;
 
-    // Use a for...in loop instead of Object.values() to prevent massive memory
-    // allocations every tick, which causes garbage collection lag spikes.
     for (const id in bot.entities) {
         const e = bot.entities[id];
 
-        // 1. Skip invalid/dead entities to prevent "ghost mob" tracking bugs
         if (!e || !e.isValid || e === bot.entity) continue;
 
-        // 2. Ensure it's actually a hostile mob (Checking both "mob" and "hostile" for 1.19 compatibility)
         if (
             (e.type !== "mob" && e.type !== "hostile") ||
             !HOSTILE_MOBS.has(e.name!)
         )
             continue;
 
-        // 3. Check distance (skip math if it's too far away)
-        const distance = botPos.distanceTo(e.position);
-        if (distance > 16) continue;
+        // Apply a heavy vertical discount to prevent panicking over mobs in caves
+        // when the bot is safely on the surface (and vice versa).
+        const dy = Math.abs(botPos.y - e.position.y);
+        const dx = botPos.x - e.position.x;
+        const dz = botPos.z - e.position.z;
 
-        // 4. Calculate your custom threat score
+        const horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        let effectiveDistance = horizontalDist;
+
+        if (dy > 3) {
+            effectiveDistance += dy * 2.5;
+        }
+
+        if (effectiveDistance > 16) continue;
+
         const baseThreat =
             config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
-        const threatScore = baseThreat * (10 / Math.max(distance, 1));
+        const threatScore = baseThreat * (10 / Math.max(effectiveDistance, 1));
 
         threats.push({
             id: e.id,
             name: e.name || "unknown",
-            distance: parseFloat(distance.toFixed(1)),
+            distance: parseFloat(effectiveDistance.toFixed(1)),
             threatScore: Math.round(threatScore),
             position: { x: e.position.x, y: e.position.y, z: e.position.z },
-            entity: e, // Kept the entity reference for your other handlers!
+            entity: e,
         });
     }
 
-    // Sort by highest threat score first (your original logic)
     return threats.sort((a, b) => b.threatScore! - a.threatScore!);
 }
 
-// Kept EXACTLY as you wrote it. This weighted vector math is perfect!
 export function computeSafeRetreat(
     bot: Bot,
     threats: models.ThreatInfo[],
@@ -4231,7 +4467,6 @@ export function computeSafeRetreat(
         totalWeight = 0;
 
     for (const threat of threats) {
-        // Use the non-null assertion (!) if TypeScript complains about threatScore being optional
         cx += threat.position.x * threat.threatScore!;
         cz += threat.position.z * threat.threatScore!;
         totalWeight += threat.threatScore!;
@@ -5114,6 +5349,7 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 </file>
 
 <file path="routine.go">
+// routine.go
 package main
 
 import (
@@ -5139,8 +5375,7 @@ type DefaultRoutineManager struct {
 func NewDefaultRoutineManager() *DefaultRoutineManager {
 	return &DefaultRoutineManager{
 		routines: []Routine{
-			&PanicRoutine{},
-			&CombatRoutine{},
+			&CombatRoutine{}, // Re-added the Combat Routine
 			&EatingRoutine{},
 			&SleepRoutine{},
 			&ToolingRoutine{},
@@ -5174,24 +5409,6 @@ func isTaskActive(action, targetName string, inFlight *Action, queue []Action) b
 
 // --- Routine Implementations ---
 
-type PanicRoutine struct{}
-
-func (p *PanicRoutine) Name() string { return "panic" }
-func (p *PanicRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	// Detect environmental damage or lava traps (Y=106 issues)
-	if state.Health < 6 && len(state.Threats) == 0 && !isTaskActive(string(ActionRetreat), "safety", inFlight, queue) {
-		return &Action{
-			ID:        fmt.Sprintf("routine-panic-%d", time.Now().UnixNano()),
-			Source:    string(SourceRoutine),
-			Action:    string(ActionRetreat),
-			Target:    Target{Type: string(TargetNone), Name: "safety"},
-			Rationale: "Emergency: Critical health with no visible threat; likely environmental hazard.",
-			Priority:  PriReflex,
-		}
-	}
-	return nil
-}
-
 type CombatRoutine struct{}
 
 func (c *CombatRoutine) Name() string { return "combat" }
@@ -5199,26 +5416,25 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 	if len(state.Threats) > 0 {
 		topThreat := state.Threats[0].Name
 
-		if state.Health <= 10 {
-			if !isTaskActive(string(ActionRetreat), "safety", inFlight, queue) {
-				return &Action{
-					ID:        fmt.Sprintf("routine-retreat-%d", time.Now().UnixNano()),
-					Source:    string(SourceRoutine),
-					Action:    string(ActionRetreat),
-					Target:    Target{Type: string(TargetNone), Name: "safety"},
-					Rationale: "Emergency: Fleeing from threat at low health.",
-					Priority:  PriReflex,
-				}
+		// Check if we have an axe or sword equipped/in inventory
+		hasWeapon := false
+		for _, item := range state.Inventory {
+			if strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "sword") {
+				hasWeapon = true
+				break
 			}
-		} else if topThreat != "creeper" && topThreat != "warden" {
+		}
+
+		// Engage ONLY if armed, healthy, facing exactly 1 threat, and it's not a suicide target
+		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
 			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
 				return &Action{
 					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
 					Source:    string(SourceRoutine),
 					Action:    string(ActionHunt),
 					Target:    Target{Type: string(TargetEntity), Name: topThreat},
-					Rationale: "Self-defense: Engaging threat.",
-					Priority:  PriReflex,
+					Rationale: "Tactical Engage: 1-on-1 combat advantage detected.",
+					Priority:  PriReflex, // Instantly preempts gathering/mining
 				}
 			}
 		}
@@ -5279,7 +5495,8 @@ func (t *ToolingRoutine) Check(state GameState, inFlight *Action, queue []Action
 		inv[item.Name] = item.Count
 	}
 
-	if inv["crafting_table"] == 0 && !isTaskActive(string(ActionCraft), "crafting_table", inFlight, queue) {
+	// --- FIX 3 (Part B): Don't craft a table if one is already nearby ---
+	if inv["crafting_table"] == 0 && !state.HasCraftingTableNearby && !isTaskActive(string(ActionCraft), "crafting_table", inFlight, queue) {
 		plankCount := 0
 		var logName string
 		for name, count := range inv {
@@ -5365,6 +5582,7 @@ func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action)
 </file>
 
 <file path="shared_types.go">
+// shared_types.go
 package main
 
 import "encoding/json"
@@ -5373,11 +5591,12 @@ import "encoding/json"
 type ClientEventType string
 
 const (
-	EventTaskCompleted ClientEventType = "task_completed"
-	EventTaskFailed    ClientEventType = "task_failed"
-	EventTaskAborted   ClientEventType = "task_aborted"
-	EventDeath         ClientEventType = "death"
-	EventPanicRetreat  ClientEventType = "panic_retreat"
+	EventTaskCompleted     ClientEventType = "task_completed"
+	EventTaskFailed        ClientEventType = "task_failed"
+	EventTaskAborted       ClientEventType = "task_aborted"
+	EventDeath             ClientEventType = "death"
+	EventPanicRetreatStart ClientEventType = "panic_retreat_start"
+	EventPanicRetreatEnd   ClientEventType = "panic_retreat_end"
 )
 
 // TaskStatus unifies execution states.
@@ -5761,10 +5980,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 160880,
-  "file_count": 43,
-  "estimated_tokens": 40932,
+  "total_bytes": 167917,
+  "file_count": 44,
+  "estimated_tokens": 42715,
   "mode": "full",
-  "generated_at": "2026-03-20T23:11:21.6223862-07:00"
+  "generated_at": "2026-03-21T00:01:45.4718755-07:00"
 }
 ```

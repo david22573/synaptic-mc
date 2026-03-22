@@ -1,3 +1,4 @@
+// js/lib/systems/survival.ts
 import type { Bot } from "mineflayer";
 import type { ControlPlaneClient } from "../network/client.js";
 import { log } from "../logger.js";
@@ -49,25 +50,55 @@ export class SurvivalSystem {
 
         const threats = getThreats(this.bot);
 
+        // Relaxed the filter to track ALL hostile mobs within 12 blocks,
+        // not just when the bot is at low health.
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 12 &&
                 t.threatScore > 5 &&
                 t.name !== "low_health_no_food" &&
-                t.name !== "starvation" &&
-                (this.bot.health <= 10 ||
-                    t.name === "creeper" ||
-                    t.name === "warden"),
+                t.name !== "starvation",
         );
 
         if (immediateThreats.length > 0) {
+            const topThreat = immediateThreats[0]!;
+
+            // Assess our combat viability
+            const hasWeapon = this.bot.inventory
+                .items()
+                .some(
+                    (i) => i.name.includes("axe") || i.name.includes("sword"),
+                );
+            const isOneOnOne = immediateThreats.length === 1;
+            const isUnavoidableDeath =
+                topThreat.name === "creeper" || topThreat.name === "warden";
+
+            // If the odds are good, suppress the panic reflex and let Go dispatch the hunt task
+            if (
+                hasWeapon &&
+                isOneOnOne &&
+                this.bot.health > 10 &&
+                !isUnavoidableDeath
+            ) {
+                if (this.isPanicking) {
+                    this.isPanicking = false;
+                    this.config.stopMovement();
+                    this.client.sendEvent(
+                        "panic_retreat_end",
+                        "evasion_complete",
+                        "",
+                        "engaging_in_combat",
+                        0,
+                    );
+                }
+                return;
+            }
+
+            // --- STANDARD EVASION LOGIC ---
             this.lastDangerAt = Date.now();
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
-
-                const topThreat = immediateThreats[0]!;
-                if (!topThreat) return;
 
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
@@ -78,7 +109,7 @@ export class SurvivalSystem {
                 this.config.onInterrupt("panic_flee");
                 this.config.stopMovement();
                 this.client.sendEvent(
-                    "panic_retreat",
+                    "panic_retreat_start",
                     "evasion",
                     "",
                     topThreat.name,
@@ -92,6 +123,13 @@ export class SurvivalSystem {
             this.isPanicking = false;
             log.debug("Survival goal reached; releasing reflex lock");
             this.config.stopMovement();
+            this.client.sendEvent(
+                "panic_retreat_end",
+                "evasion_complete",
+                "",
+                "safe",
+                0,
+            );
         }
     }
 

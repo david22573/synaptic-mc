@@ -1,3 +1,4 @@
+// js/lib/tasks/task.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
@@ -15,6 +16,7 @@ import { handleFarm } from "./handlers/farm.js";
 
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeDecision } from "./normalize.js";
+import { handleInteract } from "./handlers/interact.js";
 
 const { goals } = pkg;
 
@@ -32,7 +34,6 @@ export async function runTask(
 ): Promise<void> {
     const decision = normalizeDecision(bot, rawDecision);
 
-    // Pass ALL dependencies into the TaskContext so external handlers can use them
     const taskCtx: TaskContext = {
         bot,
         decision,
@@ -85,11 +86,14 @@ export async function runTask(
 
         case "sleep": {
             await escapeTree(bot, signal);
+
             const bed = bot.findBlock({
                 maxDistance: 32,
                 matching: (b: any) => b?.name.includes("bed"),
             });
+
             if (!bed) throw new Error("no bed found");
+
             await moveToGoal(
                 bot,
                 new goals.GoalNear(
@@ -100,20 +104,45 @@ export async function runTask(
                 ),
                 { signal, timeoutMs: 20000, stopMovement },
             );
+
             await bot.sleep(bed);
+
+            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
+            await new Promise<void>((resolve, reject) => {
+                const onWake = () => {
+                    bot.removeListener("wake", onWake);
+                    resolve();
+                };
+
+                const onAbort = () => {
+                    bot.removeListener("wake", onWake);
+                    bot.wake().catch(() => {});
+                    reject(new Error("aborted"));
+                };
+
+                bot.on("wake", onWake);
+                signal.addEventListener("abort", onAbort, { once: true });
+            });
+
             return;
         }
 
         case "retreat": {
             await escapeTree(bot, signal);
+
             const pos = computeSafeRetreat(getThreats());
             await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
                 signal,
                 timeoutMs: 15000,
                 stopMovement,
             });
+
             return;
         }
+
+        case "interact":
+            await handleInteract(taskCtx);
+            return;
 
         default:
             throw new Error(`unsupported: ${decision.action}`);

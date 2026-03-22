@@ -13,6 +13,7 @@ export enum ActionType {
     Sleep = "sleep",
     Retreat = "retreat",
     Eat = "eat",
+    Interact = "interact",
 }
 
 export enum ClientEventType {
