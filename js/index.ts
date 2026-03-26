@@ -199,10 +199,6 @@ function pushState() {
     lastStateSig = sig;
     lastStatePushTime = now;
 
-    const pois = getPOIs(bot);
-    const hasBed = pois.some((p) => p.name.includes("bed"));
-    const hasTable = pois.some((p) => p.name === "crafting_table");
-
     client.sendState({
         health: Math.round(bot.health),
         food: Math.round(bot.food),
@@ -215,9 +211,7 @@ function pushState() {
         threats: getThreats(bot)
             .slice(0, 3)
             .map((t) => ({ name: t.name })),
-        has_bed_nearby: hasBed,
-        has_crafting_table_nearby: hasTable,
-        pois: pois,
+        pois: getPOIs(bot),
         inventory: bot.inventory
             .items()
             .map((i) => ({ name: i.name, count: i.count })),

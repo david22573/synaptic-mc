@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -61,7 +62,6 @@ func (f *FlexBool) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Phase 7: Modified struct to accept an array of candidate arrays
 type LLMPlan struct {
 	Milestone         *MilestonePlan `json:"milestone"`
 	Objective         string         `json:"objective"`
@@ -91,7 +91,7 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 		memory:    mem,
 		telemetry: tel,
 		client: &http.Client{
-			Timeout: 45 * time.Second, // Bumped timeout slightly for heavier generation
+			Timeout: 45 * time.Second,
 		},
 	}
 }
@@ -173,9 +173,20 @@ func summarizeState(raw json.RawMessage) string {
 
 	poiStr := "none"
 	if len(state.POIs) > 0 {
+		// Sort by score descending just in case it wasn't pre-sorted
+		sort.Slice(state.POIs, func(i, j int) bool {
+			return state.POIs[i].Score > state.POIs[j].Score
+		})
+
 		var pStrs []string
-		for _, p := range state.POIs {
-			pStrs = append(pStrs, fmt.Sprintf("%s (%.0fm, vis:%.1f)", p.Name, p.Distance, p.Visibility))
+		limit := 5
+		if len(state.POIs) < limit {
+			limit = len(state.POIs)
+		}
+
+		for i := 0; i < limit; i++ {
+			p := state.POIs[i]
+			pStrs = append(pStrs, fmt.Sprintf("%s (%.1fm, score:%d, pos:%s)", p.Name, p.Distance, p.Score, p.Direction))
 		}
 		poiStr = strings.Join(pStrs, ", ")
 	}
@@ -229,7 +240,6 @@ CRITICAL MILESTONE RULES:
 
 	compactState := summarizeState(t.State)
 
-	// Phase 7: Prompt updated for candidate variant generation
 	systemPrompt := fmt.Sprintf(`%s
 
 Response format (JSON only):

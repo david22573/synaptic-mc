@@ -1,259 +1,1286 @@
-Project Context Dump (26 Mar 26 11:48 PDT)
+Project Context Dump (26 Mar 26 12:45 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 2
+Total Files: 4
 
 # Project Structure
 <file_tree>
-- llm_validator.go
-- main.go
+- engine.go
+- js\index.ts
+- js\lib\tasks\task.ts
+- js\lib\utils\perception.ts
 </file_tree>
 
 # File Contents
-<file path="llm_validator.go">
-package main
-
-import (
-	"errors"
-	"fmt"
-)
-
-type PlanValidator struct{}
-
-func NewPlanValidator() *PlanValidator {
-	return &PlanValidator{}
-}
-
-func (v *PlanValidator) ValidatePlan(plan *LLMPlan) error {
-	if plan == nil {
-		return errors.New("plan is nil")
-	}
-
-	// Truncate rather than reject if the LLM spits out too many tasks
-	if len(plan.Tasks) > 3 {
-		plan.Tasks = plan.Tasks[:3]
-	}
-
-	for i, task := range plan.Tasks {
-		if task.Action == "" {
-			return fmt.Errorf("task %d is missing an action", i)
-		}
-		if task.Target.Type == "" || task.Target.Name == "" {
-			return fmt.Errorf("task %d '%s' is missing target type or name", i, task.Action)
-		}
-		if task.Rationale == "" {
-			return fmt.Errorf("task %d '%s' is missing a rationale", i, task.Action)
-		}
-
-		// Enforce the strict explore rule
-		if task.Action == string(ActionExplore) && task.Target.Name != "none" {
-			return fmt.Errorf("explore action must have target name 'none', got '%s'", task.Target.Name)
-		}
-	}
-
-	return nil
-}
-
-</file>
-
-<file path="main.go">
+<file path="engine.go">
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
-	"net/http"
-	"os"
-	"os/signal"
+	"math"
+	"sort"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
 )
 
-const (
-	Port         = ":8080"
-	DefaultAPI   = "https://openrouter.ai/api/v1/chat/completions"
-	DefaultModel = "deepseek/deepseek-v3.2"
-	DatabasePath = "./bot_memory.db"
-)
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-		if allowedOrigin == "" || allowedOrigin == "*" {
-			return true
-		}
-		origin := r.Header.Get("Origin")
-		return origin == allowedOrigin
-	},
+type Vec3 struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	Z float64 `json:"z"`
 }
 
-func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		expectedToken := os.Getenv("API_TOKEN")
-		if expectedToken == "" {
-			// If no token is configured, allow all
-			next.ServeHTTP(w, r)
-			return
-		}
+type GameState struct {
+	Health    float64 `json:"health"`
+	Food      float64 `json:"food"`
+	TimeOfDay int     `json:"time_of_day"`
+	Position  Vec3    `json:"position"`
+	Threats   []struct {
+		Name string `json:"name"`
+	} `json:"threats"`
+	POIs      []POI           `json:"pois"`
+	Inventory []InventoryItem `json:"inventory"`
+}
 
-		token := r.Header.Get("Authorization")
-		if token == "" {
-			token = r.URL.Query().Get("token") // Fallback for WebSockets
-		}
+type StateSnapshot struct {
+	InventoryHash string
+	Health        float64
+	HasThreat     bool
+}
 
-		token = strings.TrimPrefix(token, "Bearer ")
+type Engine struct {
+	planner    Planner
+	routine    RoutineManager
+	exec       Executor
+	memory     MemoryBank
+	eventStore EventStore
+	strategy   *StrategyManager
+	learning   *LearningSystem
+	telemetry  *Telemetry
+	uiHub      *UIHub
+	logger     *slog.Logger
 
-		if token != expectedToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	eventCh chan EngineEvent
 
-		next.ServeHTTP(w, r)
+	queue        *TaskQueue
+	inFlightTask *Action
+
+	planEpoch  int
+	planning   bool
+	planCancel context.CancelFunc
+
+	sessionID       string
+	systemOverride  string
+	currentStrategy string
+
+	lastReplan      time.Time
+	lastSnapshot    StateSnapshot
+	lastState       GameState
+	tsEmergencyLock bool
+	lastHealth      float64
+	lastThreat      string
+	lastPos         Vec3
+	wg              sync.WaitGroup
+
+	tasksCompletedSinceReplan int
+}
+
+func NewEngine(
+	planner Planner,
+	routine RoutineManager,
+	exec Executor,
+	mem MemoryBank,
+	tel *Telemetry,
+	uiHub *UIHub,
+	baseLogger *slog.Logger,
+	sessionID string,
+	eventStore EventStore,
+) *Engine {
+	return &Engine{
+		planner:    planner,
+		routine:    routine,
+		exec:       exec,
+		memory:     mem,
+		eventStore: eventStore,
+		strategy:   NewStrategyManager(),
+		learning:   NewLearningSystem(),
+		telemetry:  tel,
+		uiHub:      uiHub,
+		logger:     baseLogger.With(slog.String("session_id", sessionID)),
+		eventCh:    make(chan EngineEvent, 100),
+		queue:      NewTaskQueue(),
+		planEpoch:  0,
+		lastHealth: 20.0,
+		sessionID:  sessionID,
 	}
 }
 
-func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("[!] No .env file found. Relying on system environment or defaults.")
+func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
+	e.wg.Add(1)
+	go e.loop(ctx)
+
+	for {
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+		var msg struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+
+		if err := conn.ReadJSON(&msg); err != nil {
+			e.logger.Warn("Bot disconnected or read error", slog.Any("error", err))
+			break
+		}
+
+		switch msg.Type {
+		case "state":
+			var state GameState
+			if err := json.Unmarshal(msg.Payload, &state); err == nil {
+				state.POIs = e.learning.PenalizePOIs(state.POIs)
+				e.eventCh <- EventClientState{State: state, RawPayload: msg.Payload}
+			}
+		case "event":
+			var act EventClientAction
+			if err := json.Unmarshal(msg.Payload, &act); err == nil {
+				e.eventCh <- act
+				e.uiHub.Broadcast(map[string]interface{}{"type": "event_stream", "payload": act})
+			}
+		default:
+			e.logger.Warn("Ignoring unknown message type", slog.String("type", msg.Type))
+		}
 	}
 
-	logLevel := slog.LevelInfo
-	if os.Getenv("DEBUG") == "true" {
-		logLevel = slog.LevelDebug
+	e.wg.Wait()
+	close(e.eventCh)
+	_ = e.exec.Close()
+}
+
+func (e *Engine) loop(ctx context.Context) {
+	defer e.wg.Done()
+	defer e.cancelPlanning()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-e.eventCh:
+			if !ok {
+				return
+			}
+			e.processEvent(ctx, event)
+		}
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
-	slog.SetDefault(logger)
+}
 
-	// Context with interrupt signal handling
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		logger.Error("Fatal: OPENROUTER_API_KEY environment variable is not set")
-		os.Exit(1)
+func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
+	switch ev := event.(type) {
+	case EventClientState:
+		e.handleStateUpdate(ctx, ev)
+	case EventClientAction:
+		e.handleClientAction(ctx, ev)
+	case EventPlanReady:
+		e.handlePlanReady(ctx, ev)
+	case EventPlanError:
+		e.handlePlanError(ctx, ev)
 	}
+}
 
-	apiURL := os.Getenv("LLM_API_URL")
-	if apiURL == "" {
-		apiURL = DefaultAPI
-	}
-	modelName := os.Getenv("LLM_MODEL")
-	if modelName == "" {
-		modelName = DefaultModel
-	}
+func (e *Engine) stateChangedSignificantly(old, new StateSnapshot) bool {
+	return old.InventoryHash != new.InventoryHash || math.Abs(old.Health-new.Health) > 3 || old.HasThreat != new.HasThreat
+}
 
-	memory, err := NewSQLiteMemory(DatabasePath)
-	if err != nil {
-		logger.Error("Fatal: could not initialize database", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer memory.Close()
-	logger.Info("Database initialized", slog.String("path", DatabasePath))
+func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
+	e.uiHub.Broadcast(map[string]interface{}{"type": "state_update", "payload": ev.State})
 
-	eventStore, err := NewSQLiteEventStore("./events.db")
-	if err != nil {
-		logger.Error("Fatal: could not initialize event store", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer eventStore.Close()
-	logger.Info("Event Store initialized", slog.String("path", "./events.db"))
-
-	telemetry := NewTelemetry(logger, 5.00)
-	go telemetry.StartReporting(ctx)
-
-	rawBrain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
-	fallbackBrain := NewFallbackBrain()
-	brain := NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
-
-	uiHub := NewUIHub(logger)
-	go uiHub.Run(ctx)
-
-	config, err := LoadConfig("./config.json")
-	if err != nil {
-		logger.Error("Failed to load config", slog.Any("error", err))
-		os.Exit(1)
+	e.lastState = ev.State
+	e.lastPos = ev.State.Position
+	topThreat := ""
+	if len(ev.State.Threats) > 0 {
+		topThreat = ev.State.Threats[0].Name
 	}
 
-	mux := http.NewServeMux()
+	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 5
+	criticalOverride := healthDropped && time.Since(e.lastReplan) > 15*time.Second
 
-	// Protected Endpoints
-	mux.HandleFunc("/api/config", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(config)
-	}))
+	e.lastHealth = ev.State.Health
+	e.lastThreat = topThreat
 
-	mux.HandleFunc("/ui/ws", authMiddleware(uiHub.HandleConnections))
+	for _, poi := range ev.State.POIs {
+		if poi.Name == "crafting_table" || poi.Name == "furnace" || strings.Contains(poi.Name, "bed") {
+			go e.memory.MarkWorldNode(context.Background(), poi.Name, "structure", poi.Position.X, poi.Position.Y, poi.Position.Z)
+		} else if poi.Name == "water" || poi.Name == "lava" {
+			go e.memory.MarkWorldNode(context.Background(), poi.Name, "environment", poi.Position.X, poi.Position.Y, poi.Position.Z)
+		} else if strings.Contains(poi.Name, "ore") {
+			go e.memory.MarkWorldNode(context.Background(), poi.Name, "resource", poi.Position.X, poi.Position.Y, poi.Position.Z)
+		}
+	}
 
-	// Bot WS Connection
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
+	strat := e.strategy.Evaluate(ev.State)
+	stratChanged := false
+	if strat.Goal != e.currentStrategy {
+		e.logger.Info("Strategy Shift", slog.String("old", e.currentStrategy), slog.String("new", strat.Goal))
+		e.currentStrategy = strat.Goal
+		stratChanged = true
+		e.planner.ClearMilestone()
+		go e.setSummaryAsync("Current Strategy", strat.Goal)
+	}
+
+	var currentTask *Action
+	if e.inFlightTask != nil {
+		taskCopy := *e.inFlightTask
+		currentTask = &taskCopy
+	}
+	lastFail, _ := e.memory.GetSummaryValue(ctx, e.sessionID, "Last Failure")
+
+	snapshot := DebugSnapshot{
+		StateSummary: fmt.Sprintf("H:%.1f F:%.1f P:%.0f,%.0f,%.0f T:%s", ev.State.Health, ev.State.Food, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, e.lastThreat),
+		CurrentTask:  currentTask,
+		QueueLength:  e.queue.Len(),
+		LastFailure:  lastFail,
+	}
+	e.logger.Debug("Tick Snapshot", slog.Any("snapshot", snapshot))
+
+	type kv struct {
+		Name  string
+		Count int
+	}
+	sorted := make([]kv, len(ev.State.Inventory))
+	for i, item := range ev.State.Inventory {
+		sorted[i] = kv{Name: item.Name, Count: item.Count}
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+
+	invStr := ""
+	for _, item := range sorted {
+		invStr += fmt.Sprintf("%s:%d,", item.Name, item.Count)
+	}
+
+	currentSnapshot := StateSnapshot{
+		InventoryHash: invStr,
+		Health:        ev.State.Health,
+		HasThreat:     topThreat != "",
+	}
+
+	newRoutines := e.routine.Evaluate(ev.State, e.inFlightTask, e.queue.items)
+	if len(newRoutines) > 0 {
+		e.queue.Push(newRoutines...)
+
+		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
+			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
+			go e.exec.SendControl("abort_task", "Routine interrupt: "+newRoutines[0].Rationale)
+			e.inFlightTask = nil
+			e.lastReplan = time.Time{}
+		}
+
+		if e.inFlightTask == nil {
+			e.processNextTask()
+		}
+	}
+
+	if e.tsEmergencyLock {
+		return
+	}
+
+	if e.planning {
+		if criticalOverride {
+			e.cancelPlanning()
+		} else {
 			return
 		}
-		logger.Info("Bot connected", slog.String("remote_addr", r.RemoteAddr))
-		telemetry.RecordSessionStart()
-
-		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
-
-		planner := NewLLMPlanner(brain, uiHub, memory, telemetry, logger, sessionID)
-		routine := NewDefaultRoutineManager()
-		exec := NewWSExecutor(conn)
-
-		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID, eventStore)
-		engine.Run(ctx, conn)
-
-		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
-		telemetry.RecordSessionEnd()
-	})
-
-	mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		health := map[string]interface{}{
-			"status":          "healthy",
-			"active_sessions": telemetry.ActiveSessions(),
-			"llm_avg_latency": telemetry.AvgLatency().String(),
-			"timestamp":       time.Now().UTC(),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(health)
-	})
-
-	server := &http.Server{
-		Addr:    Port,
-		Handler: mux,
 	}
 
-	// Spin up server in goroutine
+	isExecutingTactics := false
+	if e.inFlightTask != nil && e.inFlightTask.Priority <= PriLLM {
+		isExecutingTactics = true
+	}
+
+	stateChanged := e.stateChangedSignificantly(e.lastSnapshot, currentSnapshot)
+	timeSinceReplan := time.Since(e.lastReplan)
+
+	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || stratChanged || e.planner.GetActiveMilestone() == nil
+
+	if isExecutingTactics && !criticalOverride && !stratChanged {
+		if e.systemOverride == "" {
+			return
+		}
+	}
+
+	if criticalOverride && isExecutingTactics {
+		e.resetExecutionState()
+		go e.exec.SendControl("noop", "critical state interrupt")
+	}
+
+	if !needsReplan {
+		return
+	}
+
+	if timeSinceReplan < 5*time.Second && !criticalOverride && !stratChanged && e.systemOverride == "" && e.inFlightTask != nil {
+		return
+	}
+
+	e.lastSnapshot = currentSnapshot
+	epochAtStart := e.planEpoch
+
+	learnedRules := e.learning.GetRules()
+	sysOverride := fmt.Sprintf("CURRENT OVERARCHING STRATEGY: %s\n%s\nAll milestones and tasks MUST align with this strategy.\n\n%s", e.currentStrategy, learnedRules, e.systemOverride)
+	e.systemOverride = ""
+
+	updatedPayload, _ := json.Marshal(ev.State)
+
+	planCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	e.planCancel = cancel
+	e.planning = true
+	e.lastReplan = time.Now()
+
+	e.telemetry.RecordReplan()
+	traceID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
+
 	go func() {
-		logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
-		logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("Server crashed", slog.Any("error", err))
-			os.Exit(1)
+		plan, err := e.planner.GeneratePlan(planCtx, updatedPayload, e.sessionID, sysOverride)
+		if err != nil {
+			if planCtx.Err() != context.Canceled {
+				e.eventCh <- EventPlanError{Epoch: epochAtStart, Error: err}
+			}
+			return
 		}
+		e.eventCh <- EventPlanReady{Epoch: epochAtStart, TraceID: traceID, Plan: plan}
 	}()
+}
 
-	// Wait for context cancellation
-	<-ctx.Done()
-	logger.Info("Graceful shutdown initiated...")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("Server shutdown error", slog.Any("error", err))
+func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
+	if e.planCancel != nil {
+		e.planCancel = nil
 	}
-	logger.Info("Server exited.")
+	e.planning = false
+
+	if e.planEpoch != ev.Epoch {
+		e.telemetry.RecordStalePlan()
+		return
+	}
+
+	if ev.Plan != nil && bool(ev.Plan.MilestoneComplete) && len(ev.Plan.Tasks) == 0 {
+		e.lastReplan = time.Time{}
+		return
+	}
+
+	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
+		go e.exec.SendControl("noop", "No actionable tasks generated")
+		return
+	}
+
+	for i := range ev.Plan.Tasks {
+		if ev.Plan.Tasks[i].ID == "" {
+			ev.Plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
+		}
+		ev.Plan.Tasks[i].Source = string(SourceLLM)
+
+		ev.Plan.Tasks[i].Trace = TraceContext{
+			TraceID:  ev.TraceID,
+			ActionID: ev.Plan.Tasks[i].ID,
+		}
+		if ms := e.planner.GetActiveMilestone(); ms != nil {
+			ev.Plan.Tasks[i].Trace.MilestoneID = ms.ID
+		}
+	}
+
+	e.uiHub.Broadcast(map[string]interface{}{"type": "objective_update", "payload": ev.Plan.Objective})
+	go e.setSummaryAsync("Current Objective", ev.Plan.Objective)
+
+	e.queue.ClearBySource(SourceLLM)
+	e.queue.Push(ev.Plan.Tasks...)
+
+	e.eventStore.Append(ctx, e.sessionID, ev.TraceID, "TacticalPlanGenerated", map[string]interface{}{
+		"objective":  ev.Plan.Objective,
+		"task_count": len(ev.Plan.Tasks),
+		"milestone_id": func() string {
+			if len(ev.Plan.Tasks) > 0 {
+				return ev.Plan.Tasks[0].Trace.MilestoneID
+			}
+			return ""
+		}(),
+	})
+
+	e.tasksCompletedSinceReplan = 0
+	e.processNextTask()
+}
+
+func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
+	if e.planCancel != nil {
+		e.planCancel = nil
+	}
+	e.planning = false
+
+	if e.planEpoch != ev.Epoch {
+		return
+	}
+
+	e.eventStore.Append(ctx, e.sessionID, "", "TacticalPlanFailed", map[string]interface{}{
+		"error": ev.Error.Error(),
+	})
+	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
+	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
+
+	e.lastReplan = time.Now()
+}
+
+func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
+	meta := EventMeta{
+		SessionID: e.sessionID,
+		X:         e.lastPos.X,
+		Y:         e.lastPos.Y,
+		Z:         e.lastPos.Z,
+	}
+
+	e.eventStore.Append(ctx, e.sessionID, meta.TraceID, strings.ToUpper(ev.Event), map[string]interface{}{
+		"action": ev.Action,
+		"cause":  ev.Cause,
+		"status": meta.Status,
+	})
+
+	targetName := "none"
+	if e.inFlightTask != nil {
+		meta.TraceID = e.inFlightTask.Trace.TraceID
+		targetName = e.inFlightTask.Target.Name
+	}
+
+	logCtx := []any{
+		slog.String("action", ev.Action),
+		slog.String("command_id", ev.CommandID),
+		slog.Int("duration_ms", ev.Duration),
+	}
+
+	switch ev.Event {
+	case "death":
+		e.telemetry.RecordTaskStatus(StatusFailed)
+		e.resetExecutionState()
+		e.planner.ClearMilestone()
+
+		e.systemOverride = "CRITICAL: Bot just died. Inventory is RESET. Treat the current inventory as ground truth and restart basic progression: gather wood first. Do NOT assume any tools exist."
+		e.lastReplan = time.Time{}
+		e.tsEmergencyLock = false
+
+		meta.Status = string(StatusFailed)
+		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
+		go e.memory.MarkWorldNode(context.Background(), "last_death", "event", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+
+		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
+			"position": e.lastPos,
+			"cause":    ev.Cause,
+		})
+		e.logger.Warn("Bot died — milestone cleared", slog.String("cause", ev.Cause))
+
+	case "panic_retreat_start":
+		e.telemetry.RecordPanic()
+		e.resetExecutionState()
+		e.tsEmergencyLock = true
+
+		meta.Status = string(StatusPanic)
+		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
+		e.logger.Warn("Emergency Lock ENGAGED", append(logCtx, slog.String("cause", ev.Cause))...)
+
+	case "panic_retreat_end":
+		e.tsEmergencyLock = false
+		e.lastReplan = time.Time{}
+		e.logger.Info("Emergency Lock RELEASED", logCtx...)
+
+	case "task_completed":
+		if !e.matchesInFlight(ev.CommandID) {
+			return
+		}
+
+		e.learning.RecordOutcome(ev.Action, targetName, "COMPLETED", "")
+
+		e.telemetry.RecordTaskStatus(StatusCompleted)
+		meta.Status = string(StatusCompleted)
+		go e.memory.LogEvent(ev.Action, "Finished successfully", meta)
+		e.logger.Info("Task completed", logCtx...)
+		e.inFlightTask = nil
+
+		e.tasksCompletedSinceReplan++
+		e.planner.ResetStall()
+		e.processNextTask()
+
+	case "task_failed", "task_aborted":
+		if !e.matchesInFlight(ev.CommandID) {
+			return
+		}
+		statusStr := strings.ToUpper(strings.Split(ev.Event, "_")[1])
+		status := TaskStatus(statusStr)
+
+		failCause := ev.Cause
+		if failCause == "" {
+			failCause = string(CauseUnknown)
+		}
+
+		e.learning.RecordOutcome(ev.Action, targetName, string(status), failCause)
+
+		e.telemetry.RecordTaskStatus(status)
+		meta.Status = string(status)
+		go e.memory.LogEvent(ev.Action, "Task "+string(status)+": "+failCause, meta)
+		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", ev.Event), slog.String("cause", failCause))...)
+
+		if e.inFlightTask != nil && e.inFlightTask.Source == string(SourceRoutine) {
+			e.routine.RecordFailure(e.inFlightTask.Action, e.inFlightTask.Target.Name)
+		}
+
+		e.resetExecutionState()
+
+		if !e.tsEmergencyLock {
+			e.lastReplan = time.Now()
+		}
+
+		if status == "task_failed" {
+			if e.tasksCompletedSinceReplan == 0 {
+				e.planner.RecordStall()
+			}
+		}
+
+		e.tasksCompletedSinceReplan = 0
+
+		var advice string
+		switch FailureCause(failCause) {
+		case CauseNoBlocks:
+			advice = "No reachable blocks or entities found nearby. Use 'explore' first."
+		case CauseStuck:
+			advice = "Bot got physically stuck. Use 'explore' to escape the area."
+		case CausePathFailed:
+			advice = "Pathfinding failed. Target might be unreachable. Try a different target or explore."
+		case CauseTimeout:
+			advice = "Task timed out. Simplify the next step or ensure the target is closer."
+		default:
+			advice = "Adjust your plan accordingly."
+		}
+
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
+		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
+	}
+}
+
+func (e *Engine) processNextTask() {
+	if e.inFlightTask != nil || e.queue.Len() == 0 {
+		return
+	}
+
+	e.inFlightTask = e.queue.Pop()
+	task := e.inFlightTask
+
+	// The Validation Gate
+	res := ValidateAction(*task, e.lastState)
+	if !res.Valid {
+		e.logger.Warn("Validation failed", slog.String("reason", res.Reason))
+		e.systemOverride = fmt.Sprintf("Invalid action '%s': %s. %s", task.Action, res.Reason, res.FixHint)
+		e.resetExecutionState()
+		return
+	}
+
+	if task.Action == string(ActionMarkLocation) {
+		locName := task.Target.Name
+		e.wg.Add(1)
+		go func(name string, x, y, z float64, tID string) {
+			defer e.wg.Done()
+			err := e.memory.MarkWorldNode(context.Background(), name, "user_marked", x, y, z)
+			if err == nil {
+				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", name, x, y, z)
+				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: x, Y: y, Z: z, Status: "COMPLETED"})
+				e.logger.Info("World node mapped", slog.String("name", name))
+			}
+			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionMarkLocation), CommandID: task.ID}
+		}(locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, task.Trace.TraceID)
+		return
+	}
+
+	if task.Action == string(ActionRecallLocation) {
+		locName := task.Target.Name
+		e.wg.Add(1)
+		go func(name string, tID string) {
+			defer e.wg.Done()
+			node, err := e.memory.GetNode(context.Background(), name)
+			if err == nil {
+				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, node.X, node.Y, node.Z)
+				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
+				e.setSummaryAsync("Target Node: "+name, msg)
+			}
+			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
+		}(locName, task.Trace.TraceID)
+		return
+	}
+
+	if err := e.exec.Dispatch(*task); err != nil {
+		e.telemetry.RecordDispatchFailure()
+		e.logger.Error("Dispatch failed", slog.Any("error", err), slog.String("action", task.Action))
+		e.inFlightTask = nil
+		e.lastReplan = time.Time{}
+		e.systemOverride = "CRITICAL OVERRIDE: Executor dispatch failed with error: " + err.Error()
+	}
+}
+
+func (e *Engine) resetExecutionState() {
+	e.planEpoch++
+	e.queue.ClearBySource(SourceLLM)
+	e.inFlightTask = nil
+	e.lastReplan = time.Time{}
+	e.cancelPlanning()
+}
+
+func (e *Engine) matchesInFlight(commandID string) bool {
+	if e.inFlightTask == nil {
+		return false
+	}
+	return e.inFlightTask.ID == commandID
+}
+
+func (e *Engine) cancelPlanning() {
+	if e.planCancel != nil {
+		e.planCancel()
+		e.planCancel = nil
+	}
+	e.planning = false
+}
+
+func (e *Engine) setSummaryAsync(key, value string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = e.memory.SetSummary(ctx, e.sessionID, key, value)
+}
+
+</file>
+
+<file path="js\index.ts">
+import pkg from "mineflayer-pathfinder";
+import mineflayer from "mineflayer";
+import { mineflayer as viewer } from "prismarine-viewer";
+
+import * as config from "./lib/config.js";
+import { log } from "./lib/logger.js";
+import * as models from "./lib/models.js";
+import { runTask } from "./lib/tasks/task.js";
+import { ControlPlaneClient } from "./lib/network/client.js";
+import { SurvivalSystem } from "./lib/systems/survival.js";
+import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
+import { getPOIs } from "./lib/utils/perception.js";
+
+const { pathfinder, Movements } = pkg;
+
+let viewerStarted = false;
+
+const isIgnorableError = (err: Error | any) => {
+    const msg = err?.message || "";
+    const name = err?.name || "";
+    return (
+        name === "PartialReadError" ||
+        msg.includes("Read error for undefined") ||
+        msg.includes("Missing characters in string")
+    );
+};
+
+process.on("uncaughtException", (err: Error) => {
+    if (isIgnorableError(err)) return;
+    log.error("Fatal uncaught exception", {
+        err: err.message,
+        stack: err.stack,
+    });
+    process.exit(1);
+});
+
+process.on("unhandledRejection", (reason: any) => {
+    if (isIgnorableError(reason)) return;
+    log.error("Unhandled promise rejection", { reason });
+});
+
+let currentTask: models.ActiveTask | null = null;
+let taskAbortController: AbortController | null = null;
+let bot: mineflayer.Bot;
+let client: ControlPlaneClient;
+let survival: SurvivalSystem;
+let runtimeConfig: config.Config;
+let lastDeathMessage: string = "unknown causes";
+
+let lastStateSig = "";
+let lastStatePushTime = 0;
+
+function stopMovement() {
+    if (!bot) return;
+    bot.clearControlStates();
+    if (bot.pathfinder) bot.pathfinder.setGoal(null);
+}
+
+function completeTask(
+    task: models.ActiveTask | null,
+    status:
+        | "task_completed"
+        | "task_failed"
+        | "task_aborted" = "task_completed",
+    cause: string = "",
+) {
+    if (!task || !client) return;
+
+    client.sendEvent(
+        status,
+        `${task.action} ${task.target?.name || "none"}`,
+        task.id,
+        cause,
+        task.startTime,
+    );
+
+    if (currentTask?.id === task.id) currentTask = null;
+}
+
+function abortActiveTask(reason: string) {
+    if (currentTask) {
+        if (taskAbortController) taskAbortController.abort(reason);
+        completeTask(currentTask, "task_aborted", reason);
+    }
+}
+
+function normalizeFailureCause(err: any): string {
+    const msg = String(err?.message || err).toLowerCase();
+
+    if (
+        msg.includes("no path") ||
+        msg.includes("path_fail") ||
+        msg.includes("failed_to_reach") ||
+        msg.includes("pathfinder_timeout")
+    ) {
+        return "PATH_FAILED";
+    }
+    if (
+        msg.includes("timeout") ||
+        msg.includes("fsm_global_timeout") ||
+        msg.includes("furnace_timeout_or_lag")
+    ) {
+        return "TIMEOUT";
+    }
+    if (msg.includes("stuck")) {
+        return "STUCK";
+    }
+    if (
+        msg.includes("exhausted") ||
+        msg.includes("no_") ||
+        msg.includes("missing_") ||
+        msg.includes("unknown_")
+    ) {
+        return "NO_BLOCKS";
+    }
+
+    return "UNKNOWN";
+}
+
+async function executeDecision(decision: models.IncomingDecision) {
+    if (!decision?.action) return;
+
+    if (survival?.isPanickingNow()) {
+        if (decision.action === "retreat") {
+            survival.reset();
+        } else {
+            client.sendEvent(
+                "task_aborted",
+                "lock",
+                decision.id,
+                "panic",
+                Date.now(),
+            );
+            return;
+        }
+    }
+
+    abortActiveTask("preempted");
+    taskAbortController = new AbortController();
+    const signal = taskAbortController.signal;
+
+    currentTask = {
+        id: decision.id,
+        action: decision.action,
+        target: decision.target || { type: "none", name: "none" },
+        startTime: Date.now(),
+        trace: decision.trace || {
+            trace_id: "unknown",
+            action_id: decision.id,
+        },
+    };
+
+    stopMovement();
+    const activeTask = currentTask;
+
+    try {
+        const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
+        const timeoutMs = timeouts[decision.action] || 15000;
+
+        await Promise.race([
+            runTask(
+                bot,
+                decision,
+                signal,
+                timeouts,
+                () => getThreats(bot),
+                (t) => computeSafeRetreat(bot, t, 20),
+                stopMovement,
+            ),
+            new Promise((_, r) =>
+                setTimeout(() => r(new Error("timeout")), timeoutMs),
+            ),
+        ]);
+
+        if (!signal.aborted) completeTask(activeTask, "task_completed");
+    } catch (err: any) {
+        if (!signal.aborted) {
+            const normalizedCause = normalizeFailureCause(err);
+            completeTask(activeTask, "task_failed", normalizedCause);
+        }
+    } finally {
+        stopMovement();
+    }
+}
+
+function pushState() {
+    if (!bot?.entity || !client) return;
+
+    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
+        .items()
+        .map((i) => `${i.name}:${i.count}`)
+        .sort()
+        .join(",")}`;
+
+    const now = Date.now();
+
+    if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
+
+    lastStateSig = sig;
+    lastStatePushTime = now;
+
+    client.sendState({
+        health: Math.round(bot.health),
+        food: Math.round(bot.food),
+        time_of_day: bot.time.timeOfDay,
+        position: {
+            x: Math.round(bot.entity.position.x),
+            y: Math.round(bot.entity.position.y),
+            z: Math.round(bot.entity.position.z),
+        },
+        threats: getThreats(bot)
+            .slice(0, 3)
+            .map((t) => ({ name: t.name })),
+        pois: getPOIs(bot),
+        inventory: bot.inventory
+            .items()
+            .map((i) => ({ name: i.name, count: i.count })),
+    });
+}
+
+async function connectWithRetry(maxAttempts = 10, attempt = 1) {
+    if (attempt > maxAttempts) {
+        log.error("Max reconnection attempts reached. Shutting down.");
+        process.exit(1);
+    }
+
+    if (bot) {
+        try {
+            if ((bot as any).viewer) {
+                (bot as any).viewer.close();
+                viewerStarted = false;
+            }
+            bot.removeAllListeners();
+            bot.quit();
+        } catch (e) {}
+    }
+
+    log.info(`Connecting bot (Attempt ${attempt}/${maxAttempts})...`);
+
+    bot = mineflayer.createBot({
+        host: "0.0.0.0",
+        port: 25565,
+        username: "CraftBot",
+        version: false,
+    });
+
+    bot.loadPlugin(pathfinder);
+
+    if (!client) {
+        client = new ControlPlaneClient(runtimeConfig.ws_url, {
+            onCommand: (d) => void executeDecision(d),
+            onUnlock: () => abortActiveTask("unlock"),
+        });
+    }
+
+    if (!survival) {
+        survival = new SurvivalSystem(bot, client, {
+            onInterrupt: (r) => {
+                if (r === "panic_flee") abortActiveTask("survival_panic");
+            },
+            stopMovement: () => stopMovement(),
+        });
+    } else {
+        survival.bot = bot;
+    }
+
+    bot.on("error", (err: Error) => {
+        if (isIgnorableError(err)) return;
+        log.warn("Mineflayer bot emitted error", { err: err.message });
+    });
+
+    bot.on("end", (reason) => {
+        log.warn(`Bot disconnected. Reason: ${reason}`);
+        abortActiveTask("bot_disconnected");
+        survival.stop();
+
+        const backoffMs = Math.min(1000 * Math.pow(2, attempt), 30000);
+        log.info(`Retrying in ${backoffMs / 1000}s...`);
+        setTimeout(() => connectWithRetry(maxAttempts, attempt + 1), backoffMs);
+    });
+
+    bot.on("spawn", () => {
+        log.info("Bot spawned successfully.");
+        const movements = new Movements(bot);
+        movements.canDig = true;
+        movements.allow1by1towers = true;
+        movements.allowParkour = true;
+        movements.allowSprinting = true;
+
+        const water = bot.registry.blocksByName.water?.id;
+        const lava = bot.registry.blocksByName.lava?.id;
+        movements.liquids = new Set(
+            [water, lava].filter((id) => id !== undefined) as number[],
+        );
+        movements.digCost = 1.5;
+
+        const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
+        movements.scafoldingBlocks = trashBlocks
+            .map((name) => bot.registry.blocksByName[name]?.id)
+            .filter((id) => id !== undefined);
+
+        bot.pathfinder.setMovements(movements);
+        bot.pathfinder.thinkTimeout = 10000;
+
+        if (!client.isConnected()) {
+            client.connect();
+        }
+        survival.start();
+
+        if (runtimeConfig.enable_viewer) {
+            try {
+                if (viewerStarted) {
+                    log.warn("Viewer already started, skipping new instance");
+                    return;
+                }
+                viewer(bot, {
+                    port: runtimeConfig.viewer_port,
+                    firstPerson: true,
+                    viewDistance: 4,
+                });
+                viewerStarted = true;
+            } catch (err) {
+                log.warn("Could not start viewer", { err });
+            }
+        }
+    });
+
+    bot.on("message", (msg) => {
+        const text = msg.toString();
+        if (text.includes(bot.username) && !text.startsWith("<"))
+            lastDeathMessage = text;
+    });
+
+    bot.on("death", () => {
+        log.warn(
+            `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
+        );
+        abortActiveTask("bot_died");
+        client.sendEvent("death", "death", "", lastDeathMessage, 0);
+        lastDeathMessage = "unknown causes";
+    });
+
+    bot.on("health", pushState);
+
+    if ((global as any).__stateInterval)
+        clearInterval((global as any).__stateInterval);
+
+    (global as any).__stateInterval = setInterval(pushState, 2000);
+}
+
+async function bootstrap() {
+    runtimeConfig = await config.loadConfig();
+    await connectWithRetry();
+}
+
+bootstrap().catch((err) => log.error("Fatal startup", { err }));
+
+</file>
+
+<file path="js\lib\tasks\task.ts">
+// js/lib/tasks/task.ts
+import type { Bot } from "mineflayer";
+import pkg from "mineflayer-pathfinder";
+import * as models from "../models.js";
+import { type TaskContext } from "./registry.js";
+
+// Handlers
+import { handleGather } from "./handlers/gather.js";
+import { handleCraft } from "./handlers/craft.js";
+import { handleHunt } from "./handlers/hunt.js";
+import { handleBuild } from "./handlers/build.js";
+import { handleExplore } from "./handlers/explore.js";
+import { handleSmelt } from "./handlers/smelt.js";
+import { handleMine } from "./handlers/mine.js";
+import { handleFarm } from "./handlers/farm.js";
+
+import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
+import { normalizeDecision } from "./normalize.js";
+import { handleInteract } from "./handlers/interact.js";
+
+const { goals } = pkg;
+
+export async function runTask(
+    bot: Bot,
+    rawDecision: models.IncomingDecision,
+    signal: AbortSignal,
+    timeouts: Record<string, number>,
+    getThreats: () => models.ThreatInfo[],
+    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
+        x: number;
+        z: number;
+    },
+    stopMovement: () => void,
+): Promise<void> {
+    const decision = normalizeDecision(bot, rawDecision);
+
+    const taskCtx: TaskContext = {
+        bot,
+        decision,
+        signal,
+        timeouts,
+        getThreats,
+        computeSafeRetreat,
+        stopMovement,
+    };
+
+    switch (decision.action) {
+        case "hunt":
+            await handleHunt(taskCtx);
+            return;
+        case "gather":
+            await handleGather(taskCtx);
+            return;
+        case "craft":
+            await handleCraft(taskCtx);
+            return;
+        case "build":
+            await handleBuild(taskCtx);
+            return;
+        case "smelt":
+            await handleSmelt(taskCtx);
+            return;
+        case "mine":
+            await handleMine(taskCtx);
+            return;
+        case "farm":
+            await handleFarm(taskCtx);
+            return;
+        case "explore":
+            await handleExplore(taskCtx);
+            return;
+
+        case "eat": {
+            const food = bot.inventory
+                .items()
+                .find((i) => i.name === decision.target.name);
+            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
+            await bot.equip(food, "hand");
+            await bot.consume();
+            return;
+        }
+
+        case "idle":
+            await waitForMs(1500, signal);
+            return;
+
+        case "sleep": {
+            await escapeTree(bot, signal);
+
+            const bed = bot.findBlock({
+                maxDistance: 32,
+                matching: (b: any) => b?.name.includes("bed"),
+            });
+
+            if (!bed) throw new Error("no bed found");
+
+            await moveToGoal(
+                bot,
+                new goals.GoalNear(
+                    bed.position.x,
+                    bed.position.y,
+                    bed.position.z,
+                    1.5,
+                ),
+                { signal, timeoutMs: 20000, stopMovement },
+            );
+
+            await bot.sleep(bed);
+
+            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
+            await new Promise<void>((resolve, reject) => {
+                const onWake = () => {
+                    bot.removeListener("wake", onWake);
+                    resolve();
+                };
+
+                const onAbort = () => {
+                    bot.removeListener("wake", onWake);
+                    bot.wake().catch(() => {});
+                    reject(new Error("aborted"));
+                };
+
+                bot.on("wake", onWake);
+                signal.addEventListener("abort", onAbort, { once: true });
+            });
+
+            return;
+        }
+
+        case "retreat": {
+            await escapeTree(bot, signal);
+
+            const pos = computeSafeRetreat(getThreats());
+            await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
+                signal,
+                timeoutMs: 15000,
+                stopMovement,
+            });
+
+            return;
+        }
+
+        case "interact":
+            await handleInteract(taskCtx);
+            return;
+
+        default:
+            throw new Error(`unsupported: ${decision.action}`);
+    }
+}
+
+</file>
+
+<file path="js\lib\utils\perception.ts">
+import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import * as models from "../models.js";
+
+function getDirectionLabel(
+    lookDir: Vec3,
+    targetDir: Vec3,
+    dot: number,
+): string {
+    if (dot > 0.8) return "center";
+    if (dot < -0.2) return "behind";
+
+    // 2D cross product for left/right
+    const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
+    return crossY > 0 ? "left" : "right";
+}
+
+export function getPOIs(bot: Bot, radius: number = 32): any[] {
+    const pois: any[] = [];
+    if (!bot.entity) return pois;
+
+    const pos = bot.entity.position;
+    const yaw = bot.entity.yaw;
+
+    // Horizontal look vector
+    const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
+
+    // 1. Entities (Mobs, Animals, Items)
+    for (const id in bot.entities) {
+        const e = bot.entities[id];
+        if (!e || e === bot.entity || !e.isValid) continue;
+
+        const dist = pos.distanceTo(e.position);
+        if (dist > radius) continue;
+
+        const dx = e.position.x - pos.x;
+        const dz = e.position.z - pos.z;
+        const dirToEntity = new Vec3(dx, 0, dz).normalize();
+
+        const visibility = parseFloat(lookDir.dot(dirToEntity).toFixed(2));
+        const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
+
+        let type = "entity";
+        if (e.type === "mob") type = "threat";
+        else if (e.type === "animal") type = "opportunity";
+        else if (e.type === "object" || e.type === "item") type = "resource";
+
+        // Scoring: Distance heavily weighted, center FOV acts as a multiplier
+        const baseScore = 100 / Math.max(dist, 1);
+        const scoreMultiplier =
+            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
+        const score = Math.round(baseScore * scoreMultiplier);
+
+        pois.push({
+            type,
+            name: e.name || "unknown",
+            position: {
+                x: Math.round(e.position.x),
+                y: Math.round(e.position.y),
+                z: Math.round(e.position.z),
+            },
+            distance: parseFloat(dist.toFixed(1)),
+            visibility,
+            score,
+            direction,
+        });
+    }
+
+    // 2. Blocks (Filtered strictly to avoid heavy tick lag)
+    const blocks = bot.findBlocks({
+        matching: (b) => {
+            if (!b) return false;
+            return (
+                b.name.endsWith("_log") ||
+                b.name.includes("ore") ||
+                b.name === "stone" ||
+                b.name === "crafting_table" ||
+                b.name.includes("bed") ||
+                b.name === "water" ||
+                b.name === "lava"
+            );
+        },
+        maxDistance: radius,
+        count: 24,
+    });
+
+    for (const bPos of blocks) {
+        const block = bot.blockAt(bPos);
+        if (!block) continue;
+
+        const dist = pos.distanceTo(bPos);
+        const dx = bPos.x - pos.x;
+        const dz = bPos.z - pos.z;
+        const dirToBlock = new Vec3(dx, 0, dz).normalize();
+
+        const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
+        const direction = getDirectionLabel(lookDir, dirToBlock, visibility);
+
+        const baseScore = 100 / Math.max(dist, 1);
+        const scoreMultiplier =
+            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
+        const score = Math.round(baseScore * scoreMultiplier);
+
+        pois.push({
+            type: "resource",
+            name: block.name,
+            position: { x: bPos.x, y: bPos.y, z: bPos.z },
+            distance: parseFloat(dist.toFixed(1)),
+            visibility,
+            score,
+            direction,
+        });
+    }
+
+    // Sort by computed score
+    return pois.sort((a, b) => b.score - a.score).slice(0, 15);
 }
 
 </file>
@@ -262,10 +1289,10 @@ func main() {
 
 ```json
 {
-  "total_bytes": 6642,
-  "file_count": 2,
-  "estimated_tokens": 1710,
+  "total_bytes": 37273,
+  "file_count": 4,
+  "estimated_tokens": 9403,
   "mode": "full",
-  "generated_at": "2026-03-26T11:48:03.8700306-07:00"
+  "generated_at": "2026-03-26T12:45:00.9611405-07:00"
 }
 ```

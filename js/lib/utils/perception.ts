@@ -2,8 +2,21 @@ import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import * as models from "../models.js";
 
-export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
-    const pois: models.POI[] = [];
+function getDirectionLabel(
+    lookDir: Vec3,
+    targetDir: Vec3,
+    dot: number,
+): string {
+    if (dot > 0.8) return "center";
+    if (dot < -0.2) return "behind";
+
+    // 2D cross product for left/right
+    const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
+    return crossY > 0 ? "left" : "right";
+}
+
+export function getPOIs(bot: Bot, radius: number = 32): any[] {
+    const pois: any[] = [];
     if (!bot.entity) return pois;
 
     const pos = bot.entity.position;
@@ -24,16 +37,19 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
         const dz = e.position.z - pos.z;
         const dirToEntity = new Vec3(dx, 0, dz).normalize();
 
-        // Dot product: 1.0 (dead center), 0.0 (perpendicular), -1.0 (behind)
         const visibility = parseFloat(lookDir.dot(dirToEntity).toFixed(2));
+        const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
 
         let type = "entity";
         if (e.type === "mob") type = "threat";
         else if (e.type === "animal") type = "opportunity";
         else if (e.type === "object" || e.type === "item") type = "resource";
 
+        // Scoring: Distance heavily weighted, center FOV acts as a multiplier
         const baseScore = 100 / Math.max(dist, 1);
-        const score = Math.round(baseScore * (visibility > 0.5 ? 1.5 : 1.0));
+        const scoreMultiplier =
+            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
+        const score = Math.round(baseScore * scoreMultiplier);
 
         pois.push({
             type,
@@ -46,6 +62,7 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
             distance: parseFloat(dist.toFixed(1)),
             visibility,
             score,
+            direction,
         });
     }
 
@@ -75,11 +92,14 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
         const dx = bPos.x - pos.x;
         const dz = bPos.z - pos.z;
         const dirToBlock = new Vec3(dx, 0, dz).normalize();
-        const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
 
-        const score = Math.round(
-            (100 / Math.max(dist, 1)) * (visibility > 0.5 ? 1.5 : 1.0),
-        );
+        const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
+        const direction = getDirectionLabel(lookDir, dirToBlock, visibility);
+
+        const baseScore = 100 / Math.max(dist, 1);
+        const scoreMultiplier =
+            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
+        const score = Math.round(baseScore * scoreMultiplier);
 
         pois.push({
             type: "resource",
@@ -88,9 +108,10 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
             distance: parseFloat(dist.toFixed(1)),
             visibility,
             score,
+            direction,
         });
     }
 
-    // Sort by computed score (closest + most visible at the top)
+    // Sort by computed score
     return pois.sort((a, b) => b.score - a.score).slice(0, 15);
 }

@@ -20,6 +20,15 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 		inv[item.Name] += item.Count
 	}
 
+	// Scan the ranked POIs for any type of bed
+	hasBedNearby := false
+	for _, poi := range state.POIs {
+		if strings.Contains(poi.Name, "bed") {
+			hasBedNearby = true
+			break
+		}
+	}
+
 	// 1. Critical Survival Triggers
 	if state.Health < 10 || state.Food < 6 {
 		return Strategy{Goal: "SURVIVAL: Secure food immediately and retreat to safety to regenerate health.", Priority: 100, Active: true}
@@ -27,7 +36,7 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 
 	// 2. Nightfall / Shelter
 	isNight := state.TimeOfDay > 12541 && state.TimeOfDay < 23000
-	if isNight && !state.HasBedNearby {
+	if isNight && !hasBedNearby {
 		return Strategy{Goal: "SHELTER: Survive the night. Avoid open areas, dig a 3-block deep hole and cover the top, or stay near a bed.", Priority: 90, Active: true}
 	}
 

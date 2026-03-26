@@ -57,3 +57,20 @@ type WSMessage struct {
 	Trace   TraceContext    `json:"trace"`
 	Payload json.RawMessage `json:"payload"`
 }
+
+// POI represents a Point of Interest from the perception system with FOV scoring
+type POI struct {
+	Type       string  `json:"type"`
+	Name       string  `json:"name"`
+	Position   Vec3    `json:"position"`
+	Distance   float64 `json:"distance"`
+	Visibility float64 `json:"visibility"`
+	Score      int     `json:"score"`
+	Direction  string  `json:"direction"`
+}
+
+// InventoryItem represents an item stack in the bot's inventory
+type InventoryItem struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}

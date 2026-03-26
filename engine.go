@@ -21,20 +21,15 @@ type Vec3 struct {
 }
 
 type GameState struct {
-	Health                 float64 `json:"health"`
-	Food                   float64 `json:"food"`
-	TimeOfDay              int     `json:"time_of_day"`
-	HasBedNearby           bool    `json:"has_bed_nearby"`
-	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"`
-	Position               Vec3    `json:"position"`
-	Threats                []struct {
+	Health    float64 `json:"health"`
+	Food      float64 `json:"food"`
+	TimeOfDay int     `json:"time_of_day"`
+	Position  Vec3    `json:"position"`
+	Threats   []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
-	POIs      []POI `json:"pois"`
-	Inventory []struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-	} `json:"inventory"`
+	POIs      []POI           `json:"pois"`
+	Inventory []InventoryItem `json:"inventory"`
 }
 
 type StateSnapshot struct {
@@ -70,6 +65,7 @@ type Engine struct {
 
 	lastReplan      time.Time
 	lastSnapshot    StateSnapshot
+	lastState       GameState
 	tsEmergencyLock bool
 	lastHealth      float64
 	lastThreat      string
@@ -77,6 +73,7 @@ type Engine struct {
 	wg              sync.WaitGroup
 
 	tasksCompletedSinceReplan int
+	actionFailures            map[string]int // Loop protection tracking
 }
 
 func NewEngine(
@@ -91,21 +88,22 @@ func NewEngine(
 	eventStore EventStore,
 ) *Engine {
 	return &Engine{
-		planner:    planner,
-		routine:    routine,
-		exec:       exec,
-		memory:     mem,
-		eventStore: eventStore,
-		strategy:   NewStrategyManager(),
-		learning:   NewLearningSystem(),
-		telemetry:  tel,
-		uiHub:      uiHub,
-		logger:     baseLogger.With(slog.String("session_id", sessionID)),
-		eventCh:    make(chan EngineEvent, 100),
-		queue:      NewTaskQueue(),
-		planEpoch:  0,
-		lastHealth: 20.0,
-		sessionID:  sessionID,
+		planner:        planner,
+		routine:        routine,
+		exec:           exec,
+		memory:         mem,
+		eventStore:     eventStore,
+		strategy:       NewStrategyManager(),
+		learning:       NewLearningSystem(),
+		telemetry:      tel,
+		uiHub:          uiHub,
+		logger:         baseLogger.With(slog.String("session_id", sessionID)),
+		eventCh:        make(chan EngineEvent, 100),
+		queue:          NewTaskQueue(),
+		planEpoch:      0,
+		lastHealth:     20.0,
+		sessionID:      sessionID,
+		actionFailures: make(map[string]int),
 	}
 }
 
@@ -130,7 +128,6 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 		case "state":
 			var state GameState
 			if err := json.Unmarshal(msg.Payload, &state); err == nil {
-				// Phase 6.4: Penalize POIs based on learned failures before processing
 				state.POIs = e.learning.PenalizePOIs(state.POIs)
 				e.eventCh <- EventClientState{State: state, RawPayload: msg.Payload}
 			}
@@ -187,6 +184,7 @@ func (e *Engine) stateChangedSignificantly(old, new StateSnapshot) bool {
 func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	e.uiHub.Broadcast(map[string]interface{}{"type": "state_update", "payload": ev.State})
 
+	e.lastState = ev.State
 	e.lastPos = ev.State.Position
 	topThreat := ""
 	if len(ev.State.Threats) > 0 {
@@ -313,15 +311,12 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	e.lastSnapshot = currentSnapshot
-
 	epochAtStart := e.planEpoch
 
-	// Phase 6.3: Inject Learned Rules into the Planner prompt
 	learnedRules := e.learning.GetRules()
 	sysOverride := fmt.Sprintf("CURRENT OVERARCHING STRATEGY: %s\n%s\nAll milestones and tasks MUST align with this strategy.\n\n%s", e.currentStrategy, learnedRules, e.systemOverride)
 	e.systemOverride = ""
 
-	// We overwrite the raw state in the tick to ensure the planner sees the penalized POIs
 	updatedPayload, _ := json.Marshal(ev.State)
 
 	planCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
@@ -362,6 +357,15 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 
 	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
 		go e.exec.SendControl("noop", "No actionable tasks generated")
+		return
+	}
+
+	// Phase 3: The Plan Validation Gate
+	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
+	if !planRes.Valid {
+		e.logger.Warn("Plan validation failed pre-flight", slog.String("reason", planRes.Reason))
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Plan rejected. %s. %s", planRes.Reason, planRes.FixHint)
+		e.lastReplan = time.Time{} // Force immediate replan
 		return
 	}
 
@@ -485,6 +489,9 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			return
 		}
 
+		// Reset failure memory on success
+		delete(e.actionFailures, ev.Action+"_"+targetName)
+
 		e.learning.RecordOutcome(ev.Action, targetName, "COMPLETED", "")
 
 		e.telemetry.RecordTaskStatus(StatusCompleted)
@@ -548,6 +555,16 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			advice = "Adjust your plan accordingly."
 		}
 
+		// Phase 3: Loop Protection Counter
+		failureKey := ev.Action + "_" + targetName
+		e.actionFailures[failureKey]++
+
+		if e.actionFailures[failureKey] >= 3 {
+			advice = "CRITICAL: YOU HAVE FAILED THIS EXACT TASK 3 TIMES. ABORT THIS APPROACH COMPLETELY. Choose a different target or clear the area."
+			e.actionFailures[failureKey] = 0 // reset so we don't permalock
+			e.planner.ClearMilestone()       // Force higher level reset
+		}
+
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
 		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
 	}
@@ -560,6 +577,29 @@ func (e *Engine) processNextTask() {
 
 	e.inFlightTask = e.queue.Pop()
 	task := e.inFlightTask
+
+	// Phase 3: The Atomic Validation Gate with Severity
+	res := ValidateAction(*task, e.lastState)
+	if !res.Valid {
+		switch res.Severity {
+		case SeverityAdvisory:
+			e.logger.Info("Task skipped (Advisory)", slog.String("reason", res.Reason))
+			e.inFlightTask = nil
+			go e.processNextTask() // Fast forward to the next task in the queue
+			return
+		case SeverityBlocking:
+			e.logger.Warn("Task blocked", slog.String("reason", res.Reason))
+			e.systemOverride = fmt.Sprintf("Task '%s' blocked: %s. %s", task.Action, res.Reason, res.FixHint)
+			e.resetExecutionState()
+			return
+		case SeverityCritical:
+			e.logger.Error("Task critical failure", slog.String("reason", res.Reason))
+			e.systemOverride = fmt.Sprintf("CRITICAL FAILURE on '%s': %s. YOU MUST CHANGE STRATEGY. %s", task.Action, res.Reason, res.FixHint)
+			e.planner.ClearMilestone()
+			e.resetExecutionState()
+			return
+		}
+	}
 
 	if task.Action == string(ActionMarkLocation) {
 		locName := task.Target.Name
