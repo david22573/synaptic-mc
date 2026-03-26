@@ -3,6 +3,7 @@ import type { ControlPlaneClient } from "../network/client.js";
 import { log } from "../logger.js";
 import { getThreats, computeSafeRetreat } from "../utils/threats.js";
 import pkg from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
@@ -23,21 +24,25 @@ export class SurvivalSystem {
     constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
         this.bot = bot;
         this.client = client;
+
         this.config = config;
     }
 
     public start() {
         if (this.checkInterval) clearInterval(this.checkInterval);
+
         this.checkInterval = setInterval(() => this.checkSurvival(), 1000);
     }
 
     public stop() {
         if (this.checkInterval) clearInterval(this.checkInterval);
+
         this.checkInterval = null;
     }
 
     public reset() {
         this.isPanicking = false;
+
         this.lastDangerAt = 0;
         this.diggingEscape = false;
     }
@@ -56,6 +61,7 @@ export class SurvivalSystem {
 
         // Relaxed the filter to track ALL hostile mobs within 12 blocks,
         // not just when the bot is at low health.
+
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 12 &&
@@ -73,6 +79,7 @@ export class SurvivalSystem {
                 .some(
                     (i) => i.name.includes("axe") || i.name.includes("sword"),
                 );
+
             const isOneOnOne = immediateThreats.length === 1;
             const isUnavoidableDeath =
                 topThreat.name === "creeper" || topThreat.name === "warden";
@@ -86,12 +93,14 @@ export class SurvivalSystem {
             ) {
                 if (this.isPanicking) {
                     this.isPanicking = false;
+
                     this.config.stopMovement();
                     this.client.sendEvent(
                         "panic_retreat_end",
                         "evasion_complete",
                         "",
                         "engaging_in_combat",
+
                         0,
                     );
                 }
@@ -117,6 +126,7 @@ export class SurvivalSystem {
                     "evasion",
                     "",
                     topThreat.name,
+
                     0,
                 );
             }
@@ -125,6 +135,7 @@ export class SurvivalSystem {
             this.fleeTo(safePos);
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
             this.isPanicking = false;
+
             log.debug("Survival goal reached; releasing reflex lock");
             this.config.stopMovement();
             this.client.sendEvent(
@@ -152,6 +163,7 @@ export class SurvivalSystem {
                 log.warn(
                     "Panic pathfinding failed, attempting vertical dig escape",
                 );
+
                 await this.digEscape();
                 return;
             }
@@ -161,6 +173,7 @@ export class SurvivalSystem {
             log.warn(
                 "Pathfinder threw during panic, attempting vertical dig escape",
             );
+
             await this.digEscape();
         }
     }
@@ -171,25 +184,63 @@ export class SurvivalSystem {
         this.config.stopMovement();
 
         try {
-            // Try digging straight up as last resort escape
-            for (let i = 0; i < 5; i++) {
-                if (this.bot.health <= 0) break; // Stop if we died
+            // The ultimate panic button: dig a 3-deep hole straight down.
+            for (let i = 0; i < 3; i++) {
+                if (this.bot.health <= 0) break;
 
-                const above = this.bot.blockAt(
-                    this.bot.entity.position.offset(0, i + 1, 0),
-                );
-                if (above && above.name !== "air") {
-                    // Equip best tool before digging if possible
-                    const tool = this.bot.pathfinder.bestHarvestTool(above);
+                const pos = this.bot.entity.position.floored();
+                const below = this.bot.blockAt(pos.offset(0, -1, 0));
+
+                if (
+                    below &&
+                    below.name !== "air" &&
+                    below.name !== "bedrock" &&
+                    below.name !== "water" &&
+                    below.name !== "lava"
+                ) {
+                    const tool = this.bot.pathfinder.bestHarvestTool(below);
                     if (tool) await this.bot.equip(tool, "hand");
 
-                    await this.bot.dig(above);
+                    await this.bot.dig(below);
                 }
             }
 
-            // Jump up into the cleared space if we dug something
-            this.bot.setControlState("jump", true);
-            setTimeout(() => this.bot.setControlState("jump", false), 500);
+            // Try to roof ourselves in with a trash block
+            const trashBlock = this.bot.inventory
+                .items()
+                .find((i) =>
+                    [
+                        "dirt",
+                        "cobblestone",
+                        "stone",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                        "netherrack",
+                    ].includes(i.name),
+                );
+
+            if (trashBlock) {
+                await this.bot.equip(trashBlock, "hand");
+                // Grab a block at eye level to attach our roof to
+                const sideBlock = this.bot.blockAt(
+                    this.bot.entity.position.floored().offset(1, 2, 0),
+                );
+                if (sideBlock && sideBlock.name !== "air") {
+                    await this.bot
+                        .placeBlock(sideBlock, new Vec3(-1, 0, 0))
+                        .catch(() => {});
+                } else {
+                    const altAnchor = this.bot.blockAt(
+                        this.bot.entity.position.floored().offset(-1, 2, 0),
+                    );
+                    if (altAnchor && altAnchor.name !== "air") {
+                        await this.bot
+                            .placeBlock(altAnchor, new Vec3(1, 0, 0))
+                            .catch(() => {});
+                    }
+                }
+            }
         } catch (err) {
             log.warn("Vertical dig escape failed", { err });
         } finally {

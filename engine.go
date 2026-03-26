@@ -72,6 +72,7 @@ type Engine struct {
 	lastSnapshot    StateSnapshot
 	lastState       GameState
 	tsEmergencyLock bool
+	panicCooldown   time.Time // Prevents instant replan thrashing after panics
 	lastHealth      float64
 	lastThreat      string
 	lastPos         Vec3
@@ -125,7 +126,7 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 	go e.loop(runCtx)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second)) // Bumped to prevent disconnects during heavy TS operations
 
 		var msg struct {
 			Type    string          `json:"type"`
@@ -280,7 +281,13 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 	}
 
+	// 1. Hard Lock: Evading threat
 	if e.tsEmergencyLock {
+		return
+	}
+
+	// 2. Soft Lock: Debounce period to prevent immediate re-triggering of LLM planning
+	if time.Now().Before(e.panicCooldown) {
 		return
 	}
 
@@ -299,8 +306,9 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	stateChanged := e.stateChangedSignificantly(e.lastSnapshot, currentSnapshot)
 	timeSinceReplan := time.Since(e.lastReplan)
+	queueExhausted := e.inFlightTask == nil && e.queue.Len() == 0
 
-	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || stratChanged || e.planner.GetActiveMilestone() == nil
+	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || stratChanged || e.planner.GetActiveMilestone() == nil || queueExhausted
 
 	if isExecutingTactics && !criticalOverride && !stratChanged {
 		if e.systemOverride == "" {
@@ -367,6 +375,9 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	}
 
 	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
+		e.logger.Warn("LLM plan contained zero actionable tasks. Recording stall.")
+		e.planner.RecordStall()
+		e.lastReplan = time.Time{} // Force immediate replan to trigger self-healing
 		go e.exec.SendControl("noop", "No actionable tasks generated")
 		return
 	}
@@ -489,7 +500,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 	case "panic_retreat_end":
 		e.tsEmergencyLock = false
-		e.lastReplan = time.Time{}
+		e.lastReplan = time.Now()
+		e.panicCooldown = time.Now().Add(8 * time.Second) // Bumped from 4s to give the bot time to roof itself in
 		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":

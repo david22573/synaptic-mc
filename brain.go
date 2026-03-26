@@ -92,13 +92,14 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 		memory:    mem,
 		telemetry: tel,
 		client: &http.Client{
-			Timeout: 45 * time.Second,
+			Timeout: 90 * time.Second, // Bumped to handle API latency spikes
 		},
 	}
 }
 
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
+
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
@@ -108,6 +109,7 @@ NEVER start with explore.
 5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
 6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
 7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
+
 SPATIAL AWARENESS RULES:
 1. Targets in 'VISIBLE POIs' can be interacted with immediately.
 2. Targets in 'KNOWN WORLD' are out of sight. You MUST use 'recall_location' to navigate to them BEFORE you can interact with them.
@@ -260,6 +262,7 @@ Response format (JSON only):
 
 CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
 The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
+
 %s
 SUMMARY: %s
 MEMORY: %s

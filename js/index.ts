@@ -16,6 +16,7 @@ const { pathfinder, Movements } = pkg;
 let viewerStarted = false;
 const isIgnorableError = (err: Error | any) => {
     const msg = err?.message || "";
+
     const name = err?.name || "";
     return (
         name === "PartialReadError" ||
@@ -32,6 +33,7 @@ process.on("uncaughtException", (err: Error) => {
     });
     process.exit(1);
 });
+
 process.on("unhandledRejection", (reason: any) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
@@ -41,17 +43,20 @@ let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
+
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
 
 let lastStateSig = "";
 let lastStatePushTime = 0;
+
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 
 function stopMovement() {
     if (!bot) return;
+
     bot.clearControlStates();
     if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
@@ -65,6 +70,7 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -72,18 +78,21 @@ function completeTask(
         cause,
         task.startTime,
     );
+
     if (currentTask?.id === task.id) currentTask = null;
 }
 
 function abortActiveTask(reason: string) {
     if (currentTask) {
         if (taskAbortController) taskAbortController.abort(reason);
+
         completeTask(currentTask, "task_aborted", reason);
     }
 }
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
+
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -116,6 +125,7 @@ function normalizeFailureCause(err: any): string {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
             survival.reset();
@@ -132,6 +142,7 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 
     abortActiveTask("preempted");
+
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
 
@@ -145,11 +156,13 @@ async function executeDecision(decision: models.IncomingDecision) {
             action_id: decision.id,
         },
     };
+
     stopMovement();
     const activeTask = currentTask;
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
+
         const timeoutMs = timeouts[decision.action] || 15000;
 
         await Promise.race([
@@ -173,8 +186,10 @@ async function executeDecision(decision: models.IncomingDecision) {
 
         if (!signal.aborted) completeTask(activeTask, "task_completed");
     } catch (err: any) {
-        if (!signal.aborted) {
+        // Fix: Allow timeout errors to bypass the aborted check so they actually report to the engine
+        if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
+
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
@@ -184,16 +199,19 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 function pushState() {
     if (!bot?.entity || !client) return;
+
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
         .join(",")}`;
+
     const now = Date.now();
 
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
     lastStateSig = sig;
+
     lastStatePushTime = now;
 
     client.sendState({
@@ -218,6 +236,7 @@ function pushState() {
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {
         log.error("Max reconnection attempts reached. Shutting down.");
+
         process.exit(1);
     }
 
@@ -225,6 +244,7 @@ async function connectWithRetry(maxAttempts = 10) {
         try {
             if ((bot as any).viewer) {
                 (bot as any).viewer.close();
+
                 viewerStarted = false;
             }
             bot.removeAllListeners();
@@ -233,12 +253,14 @@ async function connectWithRetry(maxAttempts = 10) {
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
+
     bot = mineflayer.createBot({
         host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
-        version: false,
+        version: "1.19", // explicitly defining version fixes protodef crashes
     });
+
     bot.loadPlugin(pathfinder);
 
     if (!client) {
@@ -263,6 +285,7 @@ async function connectWithRetry(maxAttempts = 10) {
         if (isIgnorableError(err)) return;
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
+
     bot.on("end", (reason) => {
         log.warn(`Bot disconnected. Reason: ${reason}`);
         abortActiveTask("bot_disconnected");
@@ -273,6 +296,7 @@ async function connectWithRetry(maxAttempts = 10) {
         setTimeout(() => connectWithRetry(maxAttempts), backoffMs);
         reconnectAttempt++;
     });
+
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
@@ -284,6 +308,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
+
         movements.liquids = new Set(
             [water, lava].filter((id) => id !== undefined) as number[],
         );
@@ -301,10 +326,12 @@ async function connectWithRetry(maxAttempts = 10) {
             client.connect();
         }
         survival.start();
+
         if (runtimeConfig.enable_viewer) {
             try {
                 if (viewerStarted) {
                     log.warn("Viewer already started, skipping new instance");
+
                     return;
                 }
                 viewer(bot, {
@@ -312,17 +339,20 @@ async function connectWithRetry(maxAttempts = 10) {
                     firstPerson: true,
                     viewDistance: 4,
                 });
+
                 viewerStarted = true;
             } catch (err) {
                 log.warn("Could not start viewer", { err });
             }
         }
     });
+
     bot.on("message", (msg) => {
         const text = msg.toString();
         if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
     });
+
     bot.on("death", () => {
         log.warn(
             `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
@@ -331,6 +361,7 @@ async function connectWithRetry(maxAttempts = 10) {
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
     });
+
     bot.on("health", pushState);
 
     if (stateInterval) clearInterval(stateInterval);
@@ -339,6 +370,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
+
     await connectWithRetry();
 }
 
