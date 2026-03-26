@@ -26,13 +26,11 @@ type GameState struct {
 	TimeOfDay              int     `json:"time_of_day"`
 	HasBedNearby           bool    `json:"has_bed_nearby"`
 	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"`
-	NearbyWood             bool    `json:"nearby_wood"`
-	NearbyStone            bool    `json:"nearby_stone"`
-	NearbyCoal             bool    `json:"nearby_coal"`
 	Position               Vec3    `json:"position"`
 	Threats                []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
+	POIs      []POI `json:"pois"`
 	Inventory []struct {
 		Name  string `json:"name"`
 		Count int    `json:"count"`
@@ -176,9 +174,7 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 }
 
 func (e *Engine) stateChangedSignificantly(old, new StateSnapshot) bool {
-	return old.InventoryHash != new.InventoryHash ||
-		math.Abs(old.Health-new.Health) > 3 ||
-		old.HasThreat != new.HasThreat
+	return old.InventoryHash != new.InventoryHash || math.Abs(old.Health-new.Health) > 3 || old.HasThreat != new.HasThreat
 }
 
 func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
@@ -195,6 +191,21 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	e.lastHealth = ev.State.Health
 	e.lastThreat = topThreat
+
+	var currentTask *Action
+	if e.inFlightTask != nil {
+		taskCopy := *e.inFlightTask
+		currentTask = &taskCopy
+	}
+	lastFail, _ := e.memory.GetSummaryValue(ctx, e.sessionID, "Last Failure")
+
+	snapshot := DebugSnapshot{
+		StateSummary: fmt.Sprintf("H:%.1f F:%.1f P:%.0f,%.0f,%.0f T:%s", ev.State.Health, ev.State.Food, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, e.lastThreat),
+		CurrentTask:  currentTask,
+		QueueLength:  e.queue.Len(),
+		LastFailure:  lastFail,
+	}
+	e.logger.Debug("Tick Snapshot", slog.Any("snapshot", snapshot))
 
 	type kv struct {
 		Name  string
@@ -251,12 +262,13 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	stateChanged := e.stateChangedSignificantly(e.lastSnapshot, currentSnapshot)
-
 	timeSinceReplan := time.Since(e.lastReplan)
 	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || e.planner.GetActiveMilestone() == nil
 
 	if isExecutingTactics && !criticalOverride {
-		return
+		if e.systemOverride == "" {
+			return
+		}
 	}
 
 	if criticalOverride && isExecutingTactics {
@@ -268,7 +280,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		return
 	}
 
-	if timeSinceReplan < 2*time.Second && !criticalOverride && e.systemOverride == "" {
+	if timeSinceReplan < 5*time.Second && !criticalOverride && e.systemOverride == "" && e.inFlightTask != nil {
 		return
 	}
 
@@ -453,7 +465,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		failCause := ev.Cause
 		if failCause == "" {
-			failCause = "unknown reason"
+			failCause = string(CauseUnknown)
 		}
 
 		e.telemetry.RecordTaskStatus(status)
@@ -475,21 +487,21 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			if e.tasksCompletedSinceReplan == 0 {
 				e.planner.RecordStall()
 			}
-		} else if status == "task_aborted" {
-			// Do not record stall for routine interruptions
 		}
 
 		e.tasksCompletedSinceReplan = 0
 
-		failureAdvice := map[string]string{
-			"EXHAUSTED_CANDIDATES": "No blocks found nearby. Use 'explore' first.",
-			"NO_REACHABLE_BLOCKS":  "Terrain has no accessible blocks. Use 'explore'.",
-			"stuck":                "Bot is physically stuck. Use 'explore' to escape.",
-			"pathfinder_timeout":   "Pathfinding timed out. Try a different target or explore.",
-			"timeout":              "Task timed out. Simplify the next step.",
-		}
-		advice, known := failureAdvice[failCause]
-		if !known {
+		var advice string
+		switch FailureCause(failCause) {
+		case CauseNoBlocks:
+			advice = "No reachable blocks or entities found nearby. Use 'explore' first."
+		case CauseStuck:
+			advice = "Bot got physically stuck. Use 'explore' to escape the area."
+		case CausePathFailed:
+			advice = "Pathfinding failed. Target might be unreachable. Try a different target or explore."
+		case CauseTimeout:
+			advice = "Task timed out. Simplify the next step or ensure the target is closer."
+		default:
 			advice = "Adjust your plan accordingly."
 		}
 

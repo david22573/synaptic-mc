@@ -1,4 +1,3 @@
-// shared_types.go
 package main
 
 import "encoding/json"
@@ -26,11 +25,30 @@ const (
 	StatusPanic     TaskStatus = "PANIC"
 )
 
+// FailureCause standardizes reasons for task failures across TS and Go
+type FailureCause string
+
+const (
+	CauseNoBlocks   FailureCause = "NO_BLOCKS"
+	CausePathFailed FailureCause = "PATH_FAILED"
+	CauseTimeout    FailureCause = "TIMEOUT"
+	CauseStuck      FailureCause = "STUCK"
+	CauseUnknown    FailureCause = "UNKNOWN"
+)
+
 // TraceContext links Go engine decisions to TS execution logs.
 type TraceContext struct {
 	TraceID     string `json:"trace_id"`
 	ActionID    string `json:"action_id"`
 	MilestoneID string `json:"milestone_id,omitempty"`
+}
+
+// DebugSnapshot captures the engine state at a point in time for observability
+type DebugSnapshot struct {
+	StateSummary string  `json:"state_summary"`
+	CurrentTask  *Action `json:"current_task,omitempty"`
+	QueueLength  int     `json:"queue_length"`
+	LastFailure  string  `json:"last_failure"`
 }
 
 // WSMessage is updated to include trace context.

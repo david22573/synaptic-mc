@@ -102,7 +102,7 @@ CRITICAL GAME MECHANIC RULES:
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
 4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
-5. ERROR RECOVERY: Only use "explore" if a task fails with PATHING_FAILED, PATHFINDER_TIMEOUT, or EXHAUSTED_CANDIDATES.
+5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
 6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
 7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory (e.g., "rotten_flesh"). Hunting is NOT eating. Do NOT plan anything else first.
 
@@ -169,24 +169,18 @@ func summarizeState(raw json.RawMessage) string {
 		timeOfDay = "night"
 	}
 
-	nearby := []string{}
-	if state.NearbyWood {
-		nearby = append(nearby, "wood")
-	}
-	if state.NearbyStone {
-		nearby = append(nearby, "stone")
-	}
-	if state.NearbyCoal {
-		nearby = append(nearby, "coal")
-	}
-	nearbyStr := "none"
-	if len(nearby) > 0 {
-		nearbyStr = strings.Join(nearby, ", ")
+	poiStr := "none"
+	if len(state.POIs) > 0 {
+		var pStrs []string
+		for _, p := range state.POIs {
+			pStrs = append(pStrs, fmt.Sprintf("%s (%.0fm, vis:%.1f)", p.Name, p.Distance, p.Visibility))
+		}
+		poiStr = strings.Join(pStrs, ", ")
 	}
 
-	base := fmt.Sprintf("HEALTH: %.1f/20  HUNGER: %.1f/20  POS: %.0f,%.0f,%.0f  TIME: %s\nNEARBY: %s\nTHREATS: %s\nTOOLS: %s\nFOOD: %s\nMATERIALS: %s\nJUNK: %d blocks (ignored)",
+	base := fmt.Sprintf("HEALTH: %.1f/20  HUNGER: %.1f/20  POS: %.0f,%.0f,%.0f  TIME: %s\nVISIBLE POIs: %s\nTHREATS: %s\nTOOLS: %s\nFOOD: %s\nMATERIALS: %s\nJUNK: %d blocks (ignored)",
 		state.Health, state.Food, state.Position.X, state.Position.Y, state.Position.Z, timeOfDay,
-		nearbyStr, threatStr, toolStr, foodStr, matStr, junkCount)
+		poiStr, threatStr, toolStr, foodStr, matStr, junkCount)
 
 	if state.Food == 0 && len(rawFoodNames) > 0 {
 		return fmt.Sprintf(

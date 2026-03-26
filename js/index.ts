@@ -9,6 +9,7 @@ import { runTask } from "./lib/tasks/task.js";
 import { ControlPlaneClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
+import { getPOIs } from "./lib/utils/perception.js";
 
 const { pathfinder, Movements } = pkg;
 
@@ -46,12 +47,6 @@ let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
 
-let lastBlockSearchTime = 0;
-let cachedHasBed = false;
-let cachedHasTable = false;
-let cachedNearbyWood = false;
-let cachedNearbyStone = false;
-let cachedNearbyCoal = false;
 let lastStateSig = "";
 let lastStatePushTime = 0;
 
@@ -87,6 +82,39 @@ function abortActiveTask(reason: string) {
         if (taskAbortController) taskAbortController.abort(reason);
         completeTask(currentTask, "task_aborted", reason);
     }
+}
+
+function normalizeFailureCause(err: any): string {
+    const msg = String(err?.message || err).toLowerCase();
+
+    if (
+        msg.includes("no path") ||
+        msg.includes("path_fail") ||
+        msg.includes("failed_to_reach") ||
+        msg.includes("pathfinder_timeout")
+    ) {
+        return "PATH_FAILED";
+    }
+    if (
+        msg.includes("timeout") ||
+        msg.includes("fsm_global_timeout") ||
+        msg.includes("furnace_timeout_or_lag")
+    ) {
+        return "TIMEOUT";
+    }
+    if (msg.includes("stuck")) {
+        return "STUCK";
+    }
+    if (
+        msg.includes("exhausted") ||
+        msg.includes("no_") ||
+        msg.includes("missing_") ||
+        msg.includes("unknown_")
+    ) {
+        return "NO_BLOCKS";
+    }
+
+    return "UNKNOWN";
 }
 
 async function executeDecision(decision: models.IncomingDecision) {
@@ -143,10 +171,13 @@ async function executeDecision(decision: models.IncomingDecision) {
                 setTimeout(() => r(new Error("timeout")), timeoutMs),
             ),
         ]);
+
         if (!signal.aborted) completeTask(activeTask, "task_completed");
     } catch (err: any) {
-        if (!signal.aborted)
-            completeTask(activeTask, "task_failed", err.message);
+        if (!signal.aborted) {
+            const normalizedCause = normalizeFailureCause(err);
+            completeTask(activeTask, "task_failed", normalizedCause);
+        }
     } finally {
         stopMovement();
     }
@@ -155,8 +186,6 @@ async function executeDecision(decision: models.IncomingDecision) {
 function pushState() {
     if (!bot?.entity || !client) return;
 
-    // Added the Y coordinate to the signature hash.
-    // If the bot fell down a hole or climbed a tree (X/Z stayed same), the signature was swallowing the update.
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -165,36 +194,14 @@ function pushState() {
 
     const now = Date.now();
 
-    // Heartbeat bypass: Even if the signature matches perfectly, push it anyway if 5 seconds have passed.
-    // This guarantees the UI gets a fresh payload if it connects late while the bot is standing still.
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
     lastStateSig = sig;
     lastStatePushTime = now;
 
-    if (now - lastBlockSearchTime > 5000) {
-        cachedHasBed = !!bot.findBlock({
-            matching: (b) => b?.name.includes("bed"),
-            maxDistance: 32,
-        });
-        cachedHasTable = !!bot.findBlock({
-            matching: (b) => b?.name === "crafting_table",
-            maxDistance: 32,
-        });
-        cachedNearbyWood = !!bot.findBlock({
-            matching: (b) => b?.name.endsWith("_log"),
-            maxDistance: 24,
-        });
-        cachedNearbyStone = !!bot.findBlock({
-            matching: (b) => b?.name === "stone",
-            maxDistance: 12,
-        });
-        cachedNearbyCoal = !!bot.findBlock({
-            matching: (b) => b?.name === "coal_ore",
-            maxDistance: 12,
-        });
-        lastBlockSearchTime = now;
-    }
+    const pois = getPOIs(bot);
+    const hasBed = pois.some((p) => p.name.includes("bed"));
+    const hasTable = pois.some((p) => p.name === "crafting_table");
 
     client.sendState({
         health: Math.round(bot.health),
@@ -208,11 +215,9 @@ function pushState() {
         threats: getThreats(bot)
             .slice(0, 3)
             .map((t) => ({ name: t.name })),
-        has_bed_nearby: cachedHasBed,
-        has_crafting_table_nearby: cachedHasTable,
-        nearby_wood: cachedNearbyWood,
-        nearby_stone: cachedNearbyStone,
-        nearby_coal: cachedNearbyCoal,
+        has_bed_nearby: hasBed,
+        has_crafting_table_nearby: hasTable,
+        pois: pois,
         inventory: bot.inventory
             .items()
             .map((i) => ({ name: i.name, count: i.count })),
@@ -345,6 +350,7 @@ async function connectWithRetry(maxAttempts = 10, attempt = 1) {
 
     if ((global as any).__stateInterval)
         clearInterval((global as any).__stateInterval);
+
     (global as any).__stateInterval = setInterval(pushState, 2000);
 }
 

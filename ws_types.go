@@ -25,14 +25,24 @@ type EventPayload struct {
 	Duration  int    `json:"duration_ms"`
 }
 
+type POI struct {
+	Type       string  `json:"type"`
+	Name       string  `json:"name"`
+	Distance   float64 `json:"distance"`
+	Visibility float64 `json:"visibility"`
+	Score      int     `json:"score"`
+}
+
 type StatePayload struct {
-	Health       float64  `json:"health"`
-	Food         float64  `json:"food"`
-	TimeOfDay    int      `json:"time_of_day"`
-	HasBedNearby bool     `json:"has_bed_nearby"`
-	Position     Vec3     `json:"position"`
-	Threats      []Threat `json:"threats"`
-	Inventory    []Item   `json:"inventory"`
+	Health                 float64  `json:"health"`
+	Food                   float64  `json:"food"`
+	TimeOfDay              int      `json:"time_of_day"`
+	HasBedNearby           bool     `json:"has_bed_nearby"`
+	HasCraftingTableNearby bool     `json:"has_crafting_table_nearby"`
+	Position               Vec3     `json:"position"`
+	Threats                []Threat `json:"threats"`
+	POIs                   []POI    `json:"pois"`
+	Inventory              []Item   `json:"inventory"`
 }
 
 type Threat struct {

@@ -59,3 +59,12 @@ export interface ThreatInfo {
     position: { x: number; y: number; z: number };
     entity?: any;
 }
+
+export interface POI {
+    type: string;
+    name: string;
+    position: { x: number; y: number; z: number };
+    distance: number;
+    visibility: number;
+    score: number;
+}
