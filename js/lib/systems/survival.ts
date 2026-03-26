@@ -1,4 +1,3 @@
-// js/lib/systems/survival.ts
 import type { Bot } from "mineflayer";
 import type { ControlPlaneClient } from "../network/client.js";
 import { log } from "../logger.js";
@@ -13,12 +12,13 @@ export interface SurvivalConfig {
 }
 
 export class SurvivalSystem {
-    private bot: Bot;
+    public bot: Bot;
     private client: ControlPlaneClient;
     private config: SurvivalConfig;
     private checkInterval: NodeJS.Timeout | null = null;
     private isPanicking = false;
     private lastDangerAt = 0;
+    private diggingEscape = false;
 
     constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
         this.bot = bot;
@@ -39,6 +39,7 @@ export class SurvivalSystem {
     public reset() {
         this.isPanicking = false;
         this.lastDangerAt = 0;
+        this.diggingEscape = false;
     }
 
     public isPanickingNow(): boolean {
@@ -47,6 +48,9 @@ export class SurvivalSystem {
 
     private checkSurvival() {
         if (!this.bot || !this.bot.entity) return;
+
+        // Skip threat checks if we are actively executing the dig escape sequence
+        if (this.diggingEscape) return;
 
         const threats = getThreats(this.bot);
 
@@ -133,13 +137,63 @@ export class SurvivalSystem {
         }
     }
 
-    private fleeTo(safePos: { x: number; z: number }) {
+    private async fleeTo(safePos: { x: number; z: number }) {
         try {
-            this.bot.pathfinder.setGoal(
-                new goals.GoalNearXZ(safePos.x, safePos.z, 2),
+            // First attempt to pathfind normally
+            const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
+
+            // If pathfinder returns a partial path or fails immediately, trigger dig escape
+            const path = this.bot.pathfinder.getPathTo(
+                this.bot.pathfinder.movements,
+                goal,
             );
+
+            if (path.status === "noPath" || path.status === "timeout") {
+                log.warn(
+                    "Panic pathfinding failed, attempting vertical dig escape",
+                );
+                await this.digEscape();
+                return;
+            }
+
+            this.bot.pathfinder.setGoal(goal);
         } catch (e) {
-            // Ignore pathing errors during panic overrides
+            log.warn(
+                "Pathfinder threw during panic, attempting vertical dig escape",
+            );
+            await this.digEscape();
+        }
+    }
+
+    private async digEscape() {
+        if (this.diggingEscape) return;
+        this.diggingEscape = true;
+        this.config.stopMovement();
+
+        try {
+            // Try digging straight up as last resort escape
+            for (let i = 0; i < 5; i++) {
+                if (this.bot.health <= 0) break; // Stop if we died
+
+                const above = this.bot.blockAt(
+                    this.bot.entity.position.offset(0, i + 1, 0),
+                );
+                if (above && above.name !== "air") {
+                    // Equip best tool before digging if possible
+                    const tool = this.bot.pathfinder.bestHarvestTool(above);
+                    if (tool) await this.bot.equip(tool, "hand");
+
+                    await this.bot.dig(above);
+                }
+            }
+
+            // Jump up into the cleared space if we dug something
+            this.bot.setControlState("jump", true);
+            setTimeout(() => this.bot.setControlState("jump", false), 500);
+        } catch (err) {
+            log.warn("Vertical dig escape failed", { err });
+        } finally {
+            this.diggingEscape = false;
         }
     }
 }

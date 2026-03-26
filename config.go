@@ -18,24 +18,23 @@ type Config struct {
 
 var (
 	configInstance *Config
-	configOnce     sync.Once
-	configError    error
+	configMu       sync.Mutex
 )
 
 func LoadConfig(path string) (*Config, error) {
-	configOnce.Do(func() {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			configError = fmt.Errorf("failed to read config: %w", err)
-			return
-		}
+	configMu.Lock()
+	defer configMu.Unlock()
 
-		configInstance = &Config{}
-		if err := json.Unmarshal(data, configInstance); err != nil {
-			configError = fmt.Errorf("failed to parse config: %w", err)
-			configInstance = nil
-		}
-	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config: %w", err)
+	}
 
-	return configInstance, configError
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	configInstance = &cfg
+	return configInstance, nil
 }

@@ -1,13 +1,11 @@
 <script lang="ts">
-    export let name: string;
-    export let size: number = 32;
+    let { name, size = 32 } = $props<{ name: string; size?: number }>();
 
-    let hasError = false;
+    let hasError = $state(false);
 
-    // Reactively format the name and path in case the prop changes
-    $: cleanName = name.replace("minecraft:", "").toLowerCase();
-    $: formattedTitle = cleanName.replace(/_/g, " ");
-    $: imageSource = `../../public/assets/items/${cleanName}.png`;
+    let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
+    let formattedTitle = $derived(cleanName.replace(/_/g, " "));
+    let imageSource = $derived(`../../public/assets/items/${cleanName}.png`);
 
     function handleError() {
         hasError = true;
@@ -29,7 +27,7 @@
         title={formattedTitle}
         width={size}
         height={size}
-        on:error={handleError}
+        onerror={handleError}
         class="mc-icon"
     />
 {/if}

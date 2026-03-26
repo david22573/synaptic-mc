@@ -3,22 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 )
 
 type Planner interface {
-	GenerateMilestone(ctx context.Context, state json.RawMessage, sessionID string) (*MilestonePlan, error)
-	GenerateTactics(ctx context.Context, state json.RawMessage, sessionID, systemOverride string) (*LLMPlan, error)
+	GeneratePlan(ctx context.Context, state json.RawMessage, sessionID, systemOverride string) (*LLMPlan, error)
 	RecordStall() bool
 	ResetStall()
 	ClearMilestone()
 	GetActiveMilestone() *MilestonePlan
 }
 
-const maxMilestoneStalls = 5
+// Raised from 5 to 8 to give the bot more breathing room
+const maxMilestoneStalls = 8
 
 type LLMPlanner struct {
 	brain     Brain
@@ -33,75 +32,81 @@ type LLMPlanner struct {
 }
 
 func NewLLMPlanner(b Brain, uiHub *UIHub, memory MemoryBank, tel *Telemetry, baseLogger *slog.Logger, sessionID string) *LLMPlanner {
-	return &LLMPlanner{
+	p := &LLMPlanner{
 		brain:     b,
 		uiHub:     uiHub,
 		memory:    memory,
 		telemetry: tel,
 		logger:    baseLogger.With(slog.String("component", "planner"), slog.String("session_id", sessionID)),
 	}
-}
 
-func (p *LLMPlanner) GenerateMilestone(ctx context.Context, state json.RawMessage, sessionID string) (*MilestonePlan, error) {
-	p.logger.Info("Generating new milestone...")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	id, _ := memory.GetSummaryValue(ctx, "global", "active_milestone_id")
+	desc, _ := memory.GetSummaryValue(ctx, "global", "active_milestone_desc")
 
-	milestone, err := p.brain.GenerateMilestone(ctx, Tick{State: state}, sessionID)
-	if err != nil {
-		return nil, err
+	if id != "" && desc != "" {
+		p.activeMilestone = &MilestonePlan{ID: id, Description: desc}
+		p.logger.Info("Restored active milestone from global memory", slog.String("id", id))
 	}
 
-	p.telemetry.RecordMilestoneGenerated()
-
-	p.mu.Lock()
-	p.activeMilestone = milestone
-	p.milestoneStallCount = 0
-	p.mu.Unlock()
-
-	p.logger.Info("New milestone set",
-		slog.String("id", milestone.ID),
-		slog.String("description", milestone.Description),
-	)
-	p.uiHub.Broadcast(map[string]interface{}{
-		"type":    "milestone_update",
-		"payload": milestone,
-	})
-
-	go func(desc string) {
-		sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = p.memory.SetSummary(sCtx, sessionID, "Active Milestone", desc)
-	}(milestone.Description)
-
-	return milestone, nil
+	return p
 }
 
-func (p *LLMPlanner) GenerateTactics(ctx context.Context, state json.RawMessage, sessionID, systemOverride string) (*LLMPlan, error) {
+func (p *LLMPlanner) GeneratePlan(ctx context.Context, state json.RawMessage, sessionID, systemOverride string) (*LLMPlan, error) {
 	p.mu.RLock()
-	milestone := p.activeMilestone
+	currentMilestone := p.activeMilestone
 	p.mu.RUnlock()
 
-	if milestone == nil {
-		return nil, fmt.Errorf("cannot generate tactics without an active milestone")
-	}
-
-	plan, err := p.brain.EvaluatePlan(ctx, Tick{State: state}, sessionID, systemOverride, milestone)
+	plan, err := p.brain.GeneratePlan(ctx, Tick{State: state}, sessionID, systemOverride, currentMilestone)
 	if err != nil {
 		return nil, err
 	}
 
-	if plan != nil && plan.MilestoneComplete {
-		p.logger.Info("Milestone marked complete by tactical planner",
-			slog.String("milestone", milestone.Description),
+	if plan.Milestone != nil {
+		p.telemetry.RecordMilestoneGenerated()
+
+		p.mu.Lock()
+		p.activeMilestone = plan.Milestone
+		p.milestoneStallCount = 0
+		p.mu.Unlock()
+
+		p.logger.Info("New milestone set",
+			slog.String("id", plan.Milestone.ID),
+			slog.String("description", plan.Milestone.Description),
 		)
-		go p.memory.LogEvent("milestone_complete", milestone.Description,
+		p.uiHub.Broadcast(map[string]interface{}{
+			"type":    "milestone_update",
+			"payload": plan.Milestone,
+		})
+
+		go func(m *MilestonePlan) {
+			sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = p.memory.SetSummary(sCtx, sessionID, "Active Milestone", m.Description)
+			_ = p.memory.SetSummary(sCtx, "global", "active_milestone_id", m.ID)
+			_ = p.memory.SetSummary(sCtx, "global", "active_milestone_desc", m.Description)
+		}(plan.Milestone)
+	}
+
+	// Cast the FlexBool to standard bool here
+	if bool(plan.MilestoneComplete) {
+		p.logger.Info("Milestone marked complete by tactical planner")
+
+		desc := "Unknown"
+		if p.activeMilestone != nil {
+			desc = p.activeMilestone.Description
+		}
+
+		go p.memory.LogEvent("milestone_complete", desc,
 			EventMeta{SessionID: sessionID, Status: "COMPLETED"},
 		)
 
-		go func(desc string) {
+		go func(d string) {
 			sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_ = p.memory.SetSummary(sCtx, sessionID, "Last Completed Milestone", desc)
-		}(milestone.Description)
+			_ = p.memory.SetSummary(sCtx, sessionID, "Last Completed Milestone", d)
+		}(desc)
 
 		p.ClearMilestone()
 	}
@@ -121,6 +126,13 @@ func (p *LLMPlanner) RecordStall() bool {
 		)
 		p.activeMilestone = nil
 		p.milestoneStallCount = 0
+
+		go func() {
+			sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = p.memory.SetSummary(sCtx, "global", "active_milestone_id", "")
+			_ = p.memory.SetSummary(sCtx, "global", "active_milestone_desc", "")
+		}()
 		return true
 	}
 	return false
@@ -137,6 +149,13 @@ func (p *LLMPlanner) ClearMilestone() {
 	defer p.mu.Unlock()
 	p.activeMilestone = nil
 	p.milestoneStallCount = 0
+
+	go func() {
+		sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = p.memory.SetSummary(sCtx, "global", "active_milestone_id", "")
+		_ = p.memory.SetSummary(sCtx, "global", "active_milestone_desc", "")
+	}()
 }
 
 func (p *LLMPlanner) GetActiveMilestone() *MilestonePlan {

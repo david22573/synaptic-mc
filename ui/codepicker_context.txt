@@ -1,0 +1,868 @@
+Project Context Dump (25 Mar 26 23:46 PDT)
+Format: xml
+Mode: FULL (No Truncation)
+Total Files: 9
+
+# Project Structure
+<file_tree>
+- codepicker.yaml
+- index.html
+- src\App.svelte
+- src\app.css
+- src\components\ItemIcon.svelte
+- src\lib\Counter.svelte
+- src\main.ts
+- svelte.config.js
+- vite.config.ts
+</file_tree>
+
+# File Contents
+<file path="codepicker.yaml">
+environment: development
+llm:
+    model: deepseek/deepseek-v3.2
+    timeout_seconds: 3000
+    max_tokens: 8000
+    temperature: 0
+    input_cost_per_1m: 0.14
+    output_cost_per_1m: 0.28
+    budget_cap: 10
+embedding:
+    model: text-embedding-3-small
+    batch_size: 10
+    cost_per_1m: 0.02
+agent:
+    max_turns: 2000
+    use_reflexion: true
+    max_context_size: 200000
+server:
+    port: 8080
+    metrics_port: 9090
+    enable_pprof: false
+
+</file>
+
+<file path="index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ui</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+
+</file>
+
+<file path="src\App.svelte">
+<script lang="ts">
+    import { onMount, onDestroy } from "svelte";
+    import ItemIcon from "./components/ItemIcon.svelte";
+
+    type Vec3 = { x: number; y: number; z: number };
+    type Threat = { name: string };
+    type InventoryItem = { name: string; count: number };
+
+    type BotState = {
+        health: number;
+        food: number;
+        time_of_day: number;
+        has_bed_nearby: boolean;
+        position: Vec3;
+        threats: Threat[];
+        inventory: InventoryItem[];
+    };
+
+    let state: BotState = {
+        health: 20,
+        food: 20,
+        time_of_day: 0,
+        has_bed_nearby: false,
+        position: { x: 0, y: 0, z: 0 },
+        threats: [],
+        inventory: [],
+    };
+
+    let ws: WebSocket;
+    let connected = false;
+
+    onMount(() => {
+        connect();
+    });
+
+    onDestroy(() => {
+        if (ws) ws.close();
+    });
+
+    function connect() {
+        ws = new WebSocket("ws://localhost:8080/ui/ws");
+
+        ws.onopen = () => {
+            connected = true;
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === "state_update") {
+                    state = msg.payload;
+                }
+            } catch (err) {
+                console.error("Failed to parse WS message:", err);
+            }
+        };
+
+        ws.onclose = () => {
+            connected = false;
+            setTimeout(connect, 2000);
+        };
+    }
+
+    $: isNight = state.time_of_day >= 12000 && state.time_of_day <= 24000;
+    $: darkness = isNight
+        ? Math.sin(((state.time_of_day - 12000) / 12000) * Math.PI) * 0.6
+        : 0;
+
+    $: hotbarItems = Array.from(
+        { length: 9 },
+        (_, i) => state.inventory[i] || null,
+    );
+    $: sideInventory = state.inventory.slice(9);
+
+    function formatName(name: string) {
+        return name
+            .split("_")
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(" ");
+    }
+</script>
+
+<svelte:head>
+    <link
+        href="https://fonts.googleapis.com/css2?family=VT323&display=swap"
+        rel="stylesheet"
+    />
+</svelte:head>
+
+<main class="dashboard">
+    <iframe src="http://localhost:3000" title="Prismarine Viewer"></iframe>
+
+    <div
+        class="night-tint"
+        style="background-color: rgba(5, 5, 20, {darkness});"
+    ></div>
+
+    <div class="hud">
+        <div class="top-left">
+            <div class="coord-box">
+                XYZ: {Math.floor(state.position.x)}, {Math.floor(
+                    state.position.y,
+                )}, {Math.floor(state.position.z)}
+            </div>
+            <div class="status-box {connected ? 'online' : 'offline'}">
+                {connected ? "LINK ESTABLISHED" : "SEARCHING FOR SIGNAL..."}
+            </div>
+        </div>
+
+        <div class="side-inventory">
+            {#each sideInventory as item}
+                <div class="side-item">
+                    <ItemIcon name={item.name} size={24} />
+                    <span class="item-count">{item.count}</span>
+                    <span class="item-name">{formatName(item.name)}</span>
+                </div>
+            {/each}
+        </div>
+
+        <div class="bottom-center">
+            {#if state.threats && state.threats.length > 0}
+                <div class="threat-warning">
+                    HOSTILES NEARBY: {state.threats
+                        .map((t) => formatName(t.name))
+                        .join(", ")}
+                </div>
+            {/if}
+
+            <div class="stat-bars">
+                <div class="bar-wrapper">
+                    <div
+                        class="bar-fill health-fill"
+                        style="width: {(state.health / 20) * 100}%"
+                    ></div>
+                    <span class="bar-text">HP {state.health}/20</span>
+                </div>
+                <div class="bar-wrapper">
+                    <div
+                        class="bar-fill food-fill"
+                        style="width: {(state.food / 20) * 100}%"
+                    ></div>
+                    <span class="bar-text">HUNGER {state.food}/20</span>
+                </div>
+            </div>
+
+            <div class="hotbar">
+                {#each hotbarItems as item, i}
+                    <div class="hotbar-slot">
+                        <span class="slot-number">{i + 1}</span>
+                        {#if item}
+                            <div class="slot-content">
+                                <ItemIcon name={item.name} size={32} />
+                                {#if item.count > 1}
+                                    <span class="slot-count">{item.count}</span>
+                                {/if}
+                            </div>
+                        {/if}
+                    </div>
+                {/each}
+            </div>
+        </div>
+    </div>
+</main>
+
+<style>
+    :global(body) {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+    }
+
+    .dashboard {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        font-family: "VT323", monospace;
+        font-size: 20px;
+        color: white;
+        text-shadow: 2px 2px 0px #3f3f3f;
+        user-select: none;
+    }
+
+    iframe {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        border: none;
+        z-index: 1;
+    }
+
+    .night-tint {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 2;
+        transition: background-color 1s linear;
+    }
+
+    .hud {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 3;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+
+    .top-left {
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+    }
+
+    .coord-box,
+    .status-box {
+        background: rgba(0, 0, 0, 0.4);
+        display: inline-block;
+        padding: 2px 8px;
+        border: 2px solid rgba(0, 0, 0, 0.6);
+        width: fit-content;
+    }
+
+    .status-box.online {
+        color: #55ff55;
+    }
+    .status-box.offline {
+        color: #ff5555;
+    }
+
+    .side-inventory {
+        position: absolute;
+        left: 10px;
+        top: 30%;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        background: rgba(0, 0, 0, 0.2);
+        padding: 10px;
+        border-radius: 4px;
+    }
+
+    .side-item {
+        display: flex;
+        align-items: center;
+        gap: 8px; /* Adjusted gap to fit the icon tightly */
+    }
+
+    .item-count {
+        color: #ffff55;
+        min-width: 25px;
+        text-align: right;
+    }
+
+    .item-name {
+        color: #ffffff;
+    }
+
+    .bottom-center {
+        position: absolute;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .threat-warning {
+        color: #ff5555;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 4px 12px;
+        border: 2px solid #ff5555;
+        animation: blink 1s infinite;
+    }
+
+    @keyframes blink {
+        0%,
+        100% {
+            opacity: 1;
+        }
+        50% {
+            opacity: 0.5;
+        }
+    }
+
+    .stat-bars {
+        display: flex;
+        gap: 20px;
+        width: 100%;
+        justify-content: center;
+    }
+
+    .bar-wrapper {
+        position: relative;
+        width: 160px;
+        height: 20px;
+        background: rgba(0, 0, 0, 0.5);
+        border: 2px solid #222;
+        border-top-color: #555;
+        border-left-color: #555;
+    }
+
+    .bar-fill {
+        height: 100%;
+        transition: width 0.2s;
+    }
+
+    .health-fill {
+        background: #ff5555;
+        border-right: 2px solid #aa0000;
+    }
+    .food-fill {
+        background: #ffaa00;
+        border-right: 2px solid #cc6600;
+    }
+
+    .bar-text {
+        position: absolute;
+        top: -2px;
+        left: 0;
+        width: 100%;
+        text-align: center;
+        font-size: 18px;
+        text-shadow: 1px 1px 0px #000;
+    }
+
+    .hotbar {
+        display: flex;
+        background: rgba(0, 0, 0, 0.4);
+        padding: 2px;
+        border: 2px solid #222;
+        border-top-color: #555;
+        border-left-color: #555;
+    }
+
+    .hotbar-slot {
+        position: relative;
+        width: 40px;
+        height: 40px;
+        background: rgba(139, 139, 139, 0.4);
+        border: 2px solid #373737;
+        border-bottom-color: #fff;
+        border-right-color: #fff;
+        margin: 2px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .slot-number {
+        position: absolute;
+        top: 2px;
+        left: 4px;
+        font-size: 14px;
+        color: rgba(255, 255, 255, 0.5);
+        text-shadow: none;
+        z-index: 10;
+    }
+
+    .slot-content {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        position: relative;
+    }
+
+    .slot-count {
+        position: absolute;
+        bottom: -2px;
+        right: 2px;
+        font-size: 18px;
+        color: #fff;
+        text-shadow: 2px 2px 0px #000;
+        z-index: 10;
+    }
+</style>
+
+</file>
+
+<file path="src\app.css">
+/* :root {
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --border: #e5e4e7;
+  --code-bg: #f4f3ec;
+  --accent: #aa3bff;
+  --accent-bg: rgba(170, 59, 255, 0.1);
+  --accent-border: rgba(170, 59, 255, 0.5);
+  --social-bg: rgba(244, 243, 236, 0.5);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #9ca3af;
+    --text-h: #f3f4f6;
+    --bg: #16171d;
+    --border: #2e303a;
+    --code-bg: #1f2028;
+    --accent: #c084fc;
+    --accent-bg: rgba(192, 132, 252, 0.15);
+    --accent-border: rgba(192, 132, 252, 0.5);
+    --social-bg: rgba(47, 48, 58, 0.5);
+    --shadow:
+      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+  }
+
+  #social .button-icon {
+    filter: invert(1) brightness(2);
+  }
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code,
+.counter {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}
+
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
+      scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
+      scale(0.8);
+  }
+}
+
+#app {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  & > div {
+    flex: 1 1 0;
+    padding: 32px;
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+} */
+
+</file>
+
+<file path="src\components\ItemIcon.svelte">
+<script lang="ts">
+    export let name: string;
+    export let size: number = 32;
+
+    let hasError = false;
+
+    // Reactively format the name and path in case the prop changes
+    $: cleanName = name.replace("minecraft:", "").toLowerCase();
+    $: formattedTitle = cleanName.replace(/_/g, " ");
+    $: imageSource = `../../public/assets/items/${cleanName}.png`;
+
+    function handleError() {
+        hasError = true;
+    }
+</script>
+
+{#if hasError}
+    <div
+        class="fallback-icon"
+        style="width: {size}px; height: {size}px; font-size: {size * 0.4}px;"
+        title="Missing texture: {cleanName}"
+    >
+        ?
+    </div>
+{:else}
+    <img
+        src={imageSource}
+        alt={cleanName}
+        title={formattedTitle}
+        width={size}
+        height={size}
+        on:error={handleError}
+        class="mc-icon"
+    />
+{/if}
+
+<style>
+    .mc-icon {
+        image-rendering: pixelated; /* Keeps 16x16 pixel art crispy */
+        object-fit: contain;
+    }
+
+    .fallback-icon {
+        background-color: #ff00ff; /* Magenta missing texture vibe */
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        box-shadow: inset 0 0 0 2px #000000;
+        cursor: help;
+        font-family: monospace;
+    }
+</style>
+
+</file>
+
+<file path="src\lib\Counter.svelte">
+<script lang="ts">
+  let count: number = $state(0)
+  const increment = () => {
+    count += 1
+  }
+</script>
+
+<button class="counter" onclick={increment}>
+  Count is {count}
+</button>
+
+</file>
+
+<file path="src\main.ts">
+import { mount } from 'svelte'
+import './app.css'
+import App from './App.svelte'
+
+const app = mount(App, {
+  target: document.getElementById('app')!,
+})
+
+export default app
+
+</file>
+
+<file path="svelte.config.js">
+/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
+export default {}
+
+</file>
+
+<file path="vite.config.ts">
+import { defineConfig } from 'vite'
+import { svelte } from '@sveltejs/vite-plugin-svelte'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [svelte()],
+})
+
+</file>
+
+
+
+```json
+{
+  "total_bytes": 17317,
+  "file_count": 9,
+  "estimated_tokens": 4488,
+  "mode": "full",
+  "generated_at": "2026-03-25T23:46:16.0460292-07:00"
+}
+```

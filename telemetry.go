@@ -12,6 +12,7 @@ import (
 var PricingMap = map[string]struct{ Input, Output float64 }{
 	"mistralai/mistral-small-2603": {Input: 1.00, Output: 3.00},
 	"gpt-4-turbo":                  {Input: 10.00, Output: 30.00},
+	"deepseek/deepseek-v3.2":       {Input: 0.14, Output: 0.28}, // Added Deepseek
 }
 
 type Telemetry struct {
@@ -69,6 +70,7 @@ func (t *Telemetry) RecordLLMCall(model string, duration time.Duration, inTokens
 
 	prices, ok := PricingMap[model]
 	if !ok {
+		t.logger.Warn("Model pricing not found, using fallback", slog.String("model", model))
 		prices = PricingMap["mistralai/mistral-small-2603"] // default fallback
 	}
 
@@ -166,7 +168,6 @@ func (t *Telemetry) StartReporting(ctx context.Context) {
 				slog.Int("validation_failures", t.validationFailures),
 			)
 
-			// Flush execution metrics
 			t.llmInvocations, t.llmErrors, t.totalLatency = 0, 0, 0
 			t.tasksCompleted, t.tasksFailed, t.replans, t.panics = 0, 0, 0, 0
 			t.dispatchFailures, t.stalePlansDropped, t.milestonesGen, t.validationFailures = 0, 0, 0, 0

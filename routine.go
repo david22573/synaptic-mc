@@ -1,13 +1,12 @@
-// routine.go
 package main
 
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Routine defines a modular check that can inject high-priority tasks.
 type Routine interface {
 	Name() string
 	Check(state GameState, inFlight *Action, queue []Action) *Action
@@ -15,30 +14,49 @@ type Routine interface {
 
 type RoutineManager interface {
 	Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action
+	RecordFailure(action, target string)
 }
 
 type DefaultRoutineManager struct {
-	routines []Routine
+	routines     []Routine
+	failCooldown map[string]time.Time
+	mu           sync.Mutex
 }
 
 func NewDefaultRoutineManager() *DefaultRoutineManager {
 	return &DefaultRoutineManager{
 		routines: []Routine{
-			&CombatRoutine{}, // Re-added the Combat Routine
+			&CombatRoutine{},
 			&EatingRoutine{},
 			&SleepRoutine{},
-			&ToolingRoutine{},
+			&ProgressionRoutine{},
 			&CookingRoutine{},
 			&WanderRoutine{},
 		},
+		failCooldown: make(map[string]time.Time),
 	}
+}
+
+func (r *DefaultRoutineManager) RecordFailure(action, target string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failCooldown[action+":"+target] = time.Now()
+}
+
+func (r *DefaultRoutineManager) isCoolingDown(action, target string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.failCooldown[action+":"+target]
+	return ok && time.Since(t) < 30*time.Second
 }
 
 func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action {
 	var results []Action
 	for _, routine := range r.routines {
 		if task := routine.Check(state, inFlightTask, taskQueue); task != nil {
-			results = append(results, *task)
+			if !r.isCoolingDown(task.Action, task.Target.Name) {
+				results = append(results, *task)
+			}
 		}
 	}
 	return results
@@ -65,7 +83,6 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 	if len(state.Threats) > 0 {
 		topThreat := state.Threats[0].Name
 
-		// Check if we have an axe or sword equipped/in inventory
 		hasWeapon := false
 		for _, item := range state.Inventory {
 			if strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "sword") {
@@ -74,7 +91,6 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 			}
 		}
 
-		// Engage ONLY if armed, healthy, facing exactly 1 threat, and it's not a suicide target
 		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
 			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
 				return &Action{
@@ -83,7 +99,7 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 					Action:    string(ActionHunt),
 					Target:    Target{Type: string(TargetEntity), Name: topThreat},
 					Rationale: "Tactical Engage: 1-on-1 combat advantage detected.",
-					Priority:  PriReflex, // Instantly preempts gathering/mining
+					Priority:  PriReflex,
 				}
 			}
 		}
@@ -98,7 +114,7 @@ func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action)
 	if state.Food >= 16 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
 		return nil
 	}
-	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop"}
+	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop", "rotten_flesh"}
 	for _, f := range foodPriority {
 		for _, inv := range state.Inventory {
 			if inv.Name == f {
@@ -135,49 +151,85 @@ func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) 
 	return nil
 }
 
-type ToolingRoutine struct{}
+type ProgressionRoutine struct{}
 
-func (t *ToolingRoutine) Name() string { return "tooling" }
-func (t *ToolingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+func (p *ProgressionRoutine) Name() string { return "progression" }
+func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
 	inv := make(map[string]int)
+	var logName string
 	for _, item := range state.Inventory {
-		inv[item.Name] = item.Count
+		inv[item.Name] += item.Count
+		if strings.HasSuffix(item.Name, "_log") {
+			logName = item.Name
+		}
 	}
 
-	// --- FIX 3 (Part B): Don't craft a table if one is already nearby ---
-	if inv["crafting_table"] == 0 && !state.HasCraftingTableNearby && !isTaskActive(string(ActionCraft), "crafting_table", inFlight, queue) {
-		plankCount := 0
-		var logName string
-		for name, count := range inv {
-			if strings.HasSuffix(name, "_planks") {
-				plankCount += count
-			}
-			if strings.HasSuffix(name, "_log") {
-				logName = name
+	planks := 0
+	for name, count := range inv {
+		if strings.HasSuffix(name, "_planks") {
+			planks += count
+		}
+	}
+
+	isActive := func(target string) bool {
+		return isTaskActive(string(ActionCraft), target, inFlight, queue)
+	}
+
+	craft := func(target, rationale string) *Action {
+		return &Action{
+			ID:        fmt.Sprintf("routine-prog-%d", time.Now().UnixNano()),
+			Source:    string(SourceRoutine),
+			Action:    string(ActionCraft),
+			Target:    Target{Type: string(TargetRecipe), Name: target},
+			Rationale: rationale,
+			Priority:  PriRoutine,
+		}
+	}
+
+	if logName != "" && planks < 8 {
+		target := strings.Replace(logName, "_log", "_planks", 1)
+		if !isActive(target) {
+			return craft(target, "Progression: Converting logs to planks.")
+		}
+	}
+
+	if inv["crafting_table"] == 0 && !state.HasCraftingTableNearby && planks >= 4 {
+		if !isActive("crafting_table") {
+			return craft("crafting_table", "Progression: Crafting essential table.")
+		}
+	}
+
+	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
+
+	if needsTool && inv["stick"] < 2 && planks >= 1 {
+		if !isActive("stick") {
+			return craft("stick", "Progression: Crafting sticks for tools.")
+		}
+	}
+
+	if inv["stick"] >= 2 {
+		if inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3 {
+			if !isActive("iron_pickaxe") {
+				return craft("iron_pickaxe", "Progression: Upgrading to Iron Pickaxe.")
 			}
 		}
 
-		if plankCount >= 4 {
-			return &Action{
-				ID:        fmt.Sprintf("routine-craft-table-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionCraft),
-				Target:    Target{Type: string(TargetRecipe), Name: "crafting_table"},
-				Rationale: "Progression: Crafting essential table.",
-				Priority:  PriRoutine,
+		hasCraftingTable := state.HasCraftingTableNearby || inv["crafting_table"] > 0
+		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3) && hasCraftingTable {
+			if !isActive("stone_pickaxe") {
+				return craft("stone_pickaxe", "Progression: Upgrading to Stone Pickaxe.")
 			}
-		} else if logName != "" {
-			target := strings.Replace(logName, "_log", "_planks", 1)
-			return &Action{
-				ID:        fmt.Sprintf("routine-craft-planks-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionCraft),
-				Target:    Target{Type: string(TargetRecipe), Name: target},
-				Rationale: "Progression: Converting logs to planks.",
-				Priority:  PriRoutine,
+		}
+
+		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3 {
+			if !isActive("wooden_pickaxe") {
+				return craft("wooden_pickaxe", "Progression: Crafting first wooden pickaxe.")
 			}
 		}
 	}
+
 	return nil
 }
 

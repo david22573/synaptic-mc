@@ -32,52 +32,7 @@ func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger, tel *
 	}
 }
 
-func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
-	var lastErr error
-	backoff := InitialBackoff
-
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		milestone, err := r.primary.GenerateMilestone(ctx, t, sessionID)
-		if err == nil {
-			if valErr := r.validator.ValidateMilestone(milestone); valErr != nil {
-				r.telemetry.RecordValidationFailure()
-				err = fmt.Errorf("validation failed: %w", valErr)
-			} else {
-				return milestone, nil
-			}
-		}
-
-		// If the engine intentionally aborted planning (e.g., evasion reflex), drop immediately.
-		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			r.logger.Debug("Primary brain context canceled (intentional preemption)")
-			return nil, context.Canceled
-		}
-
-		lastErr = err
-		r.logger.Warn("Milestone generation failed",
-			slog.Int("attempt", attempt),
-			slog.Any("error", err),
-		)
-
-		if attempt < MaxRetries {
-			select {
-			case <-ctx.Done():
-				if errors.Is(ctx.Err(), context.Canceled) {
-					return nil, context.Canceled
-				}
-				r.logger.Warn("Context timeout in primary brain, engaging fallback milestone")
-				return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
-			case <-time.After(backoff):
-				backoff *= 2 // Exponential backoff
-			}
-		}
-	}
-
-	r.logger.Error("Primary brain exhausted retries. Engaging fallback planner.", slog.Any("final_error", lastErr))
-	return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
-}
-
-func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
+func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
 	var lastErr error
 	backoff := InitialBackoff
 
@@ -92,9 +47,10 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 			}
 		}
 
-		plan, err := r.primary.EvaluatePlan(ctx, t, sessionID, currentOverride, milestone)
+		plan, err := r.primary.GeneratePlan(ctx, t, sessionID, currentOverride, milestone)
 		if err == nil {
-			if valErr := r.validator.ValidateTactics(plan); valErr != nil {
+			// Validate the unified plan (both milestone and tasks)
+			if valErr := r.validator.ValidatePlan(plan); valErr != nil {
 				r.telemetry.RecordValidationFailure()
 				err = fmt.Errorf("validation failed: %w", valErr)
 			} else {
@@ -102,14 +58,14 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 			}
 		}
 
-		// If the engine intentionally aborted planning, drop immediately.
+		// If the engine intentionally aborted planning (e.g., evasion reflex), drop immediately.
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			r.logger.Debug("Primary brain context canceled (intentional preemption)")
 			return nil, context.Canceled
 		}
 
 		lastErr = err
-		r.logger.Warn("Tactical planning failed",
+		r.logger.Warn("Planning failed",
 			slog.Int("attempt", attempt),
 			slog.Any("error", err),
 		)
@@ -120,14 +76,14 @@ func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, sy
 				if errors.Is(ctx.Err(), context.Canceled) {
 					return nil, context.Canceled
 				}
-				r.logger.Warn("Context timeout in primary brain, engaging fallback tactics")
-				return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
+				r.logger.Warn("Context timeout in primary brain, engaging fallback planner")
+				return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone)
 			case <-time.After(backoff):
-				backoff *= 2
+				backoff *= 2 // Exponential backoff
 			}
 		}
 	}
 
-	r.logger.Error("Primary brain exhausted retries for tactics. Engaging fallback.", slog.Any("final_error", lastErr))
-	return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
+	r.logger.Error("Primary brain exhausted retries. Engaging fallback.", slog.Any("final_error", lastErr))
+	return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone)
 }

@@ -1,4 +1,3 @@
-// engine.go
 package main
 
 import (
@@ -6,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +25,10 @@ type GameState struct {
 	Food                   float64 `json:"food"`
 	TimeOfDay              int     `json:"time_of_day"`
 	HasBedNearby           bool    `json:"has_bed_nearby"`
-	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"` // Added
+	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"`
+	NearbyWood             bool    `json:"nearby_wood"`
+	NearbyStone            bool    `json:"nearby_stone"`
+	NearbyCoal             bool    `json:"nearby_coal"`
 	Position               Vec3    `json:"position"`
 	Threats                []struct {
 		Name string `json:"name"`
@@ -33,6 +37,12 @@ type GameState struct {
 		Name  string `json:"name"`
 		Count int    `json:"count"`
 	} `json:"inventory"`
+}
+
+type StateSnapshot struct {
+	InventoryHash string
+	Health        float64
+	HasThreat     bool
 }
 
 type Engine struct {
@@ -50,18 +60,16 @@ type Engine struct {
 	queue        *TaskQueue
 	inFlightTask *Action
 
-	planEpoch         int
-	planning          bool
-	planCancel        context.CancelFunc
-	milestoneEpoch    int
-	milestonePlanning bool
-	milestoneCancel   context.CancelFunc
+	planEpoch  int
+	planning   bool
+	planCancel context.CancelFunc
 
 	sessionID      string
 	systemOverride string
 
 	lastReplan      time.Time
-	tsEmergencyLock bool // Replaces panicCooldown to prevent Split-Brain
+	lastSnapshot    StateSnapshot
+	tsEmergencyLock bool
 	lastHealth      float64
 	lastThreat      string
 	lastPos         Vec3
@@ -132,15 +140,14 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 		}
 	}
 
-	close(e.eventCh)
 	e.wg.Wait()
+	close(e.eventCh)
 	_ = e.exec.Close()
 }
 
 func (e *Engine) loop(ctx context.Context) {
 	defer e.wg.Done()
 	defer e.cancelPlanning()
-	defer e.cancelMilestonePlanning()
 
 	for {
 		select {
@@ -165,11 +172,13 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 		e.handlePlanReady(ctx, ev)
 	case EventPlanError:
 		e.handlePlanError(ctx, ev)
-	case EventMilestoneReady:
-		e.handleMilestoneReady(ctx, ev)
-	case EventMilestoneError:
-		e.handleMilestoneError(ctx, ev)
 	}
+}
+
+func (e *Engine) stateChangedSignificantly(old, new StateSnapshot) bool {
+	return old.InventoryHash != new.InventoryHash ||
+		math.Abs(old.Health-new.Health) > 3 ||
+		old.HasThreat != new.HasThreat
 }
 
 func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
@@ -187,6 +196,27 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	e.lastHealth = ev.State.Health
 	e.lastThreat = topThreat
 
+	type kv struct {
+		Name  string
+		Count int
+	}
+	sorted := make([]kv, len(ev.State.Inventory))
+	for i, item := range ev.State.Inventory {
+		sorted[i] = kv{Name: item.Name, Count: item.Count}
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+
+	invStr := ""
+	for _, item := range sorted {
+		invStr += fmt.Sprintf("%s:%d,", item.Name, item.Count)
+	}
+
+	currentSnapshot := StateSnapshot{
+		InventoryHash: invStr,
+		Health:        ev.State.Health,
+		HasThreat:     topThreat != "",
+	}
+
 	newRoutines := e.routine.Evaluate(ev.State, e.inFlightTask, e.queue.items)
 	if len(newRoutines) > 0 {
 		e.queue.Push(newRoutines...)
@@ -203,29 +233,29 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 	}
 
-	// Wait for TS to complete evasion reflexes before processing tactical tasks
 	if e.tsEmergencyLock {
 		return
 	}
 
-	if e.planning && criticalOverride {
-		e.cancelPlanning()
+	if e.planning {
+		if criticalOverride {
+			e.cancelPlanning()
+		} else {
+			return
+		}
 	}
 
-	// Only consider engine "busy" if executing high-priority LLM tasks.
-	// Low priority background tasks (like wandering) shouldn't block planning.
 	isExecutingTactics := false
 	if e.inFlightTask != nil && e.inFlightTask.Priority <= PriLLM {
 		isExecutingTactics = true
 	}
 
+	stateChanged := e.stateChangedSignificantly(e.lastSnapshot, currentSnapshot)
+
 	timeSinceReplan := time.Since(e.lastReplan)
-	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
+	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || e.planner.GetActiveMilestone() == nil
 
 	if isExecutingTactics && !criticalOverride {
-		if e.planner.GetActiveMilestone() == nil {
-			e.triggerMilestoneGeneration(ctx, ev.RawPayload)
-		}
 		return
 	}
 
@@ -238,16 +268,17 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		return
 	}
 
-	if e.planner.GetActiveMilestone() == nil {
-		e.triggerMilestoneGeneration(ctx, ev.RawPayload)
+	if timeSinceReplan < 2*time.Second && !criticalOverride && e.systemOverride == "" {
 		return
 	}
+
+	e.lastSnapshot = currentSnapshot
 
 	epochAtStart := e.planEpoch
 	sysOverride := e.systemOverride
 	e.systemOverride = ""
 
-	planCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	planCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	e.planCancel = cancel
 	e.planning = true
 	e.lastReplan = time.Now()
@@ -256,7 +287,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	traceID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
 
 	go func() {
-		plan, err := e.planner.GenerateTactics(planCtx, ev.RawPayload, e.sessionID, sysOverride)
+		plan, err := e.planner.GeneratePlan(planCtx, ev.RawPayload, e.sessionID, sysOverride)
 		if err != nil {
 			if planCtx.Err() != context.Canceled {
 				e.eventCh <- EventPlanError{Epoch: epochAtStart, Error: err}
@@ -265,63 +296,6 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 		e.eventCh <- EventPlanReady{Epoch: epochAtStart, TraceID: traceID, Plan: plan}
 	}()
-}
-
-func (e *Engine) triggerMilestoneGeneration(ctx context.Context, statePayload json.RawMessage) {
-	if e.milestonePlanning {
-		return
-	}
-
-	epochAtStart := e.milestoneEpoch
-	msCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	e.milestoneCancel = cancel
-	e.milestonePlanning = true
-
-	go func() {
-		milestone, err := e.planner.GenerateMilestone(msCtx, statePayload, e.sessionID)
-		if err != nil {
-			if msCtx.Err() != context.Canceled {
-				e.eventCh <- EventMilestoneError{Epoch: epochAtStart, Error: err}
-			}
-			return
-		}
-		e.eventCh <- EventMilestoneReady{Epoch: epochAtStart, Milestone: milestone}
-	}()
-}
-
-func (e *Engine) handleMilestoneReady(ctx context.Context, ev EventMilestoneReady) {
-	if e.milestoneCancel != nil {
-		e.milestoneCancel = nil
-	}
-	e.milestonePlanning = false
-
-	if e.milestoneEpoch != ev.Epoch {
-		e.telemetry.RecordStalePlan()
-		return
-	}
-
-	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerated", map[string]interface{}{
-		"id":          ev.Milestone.ID,
-		"description": ev.Milestone.Description,
-	})
-
-	e.lastReplan = time.Time{}
-}
-
-func (e *Engine) handleMilestoneError(ctx context.Context, ev EventMilestoneError) {
-	if e.milestoneCancel != nil {
-		e.milestoneCancel = nil
-	}
-	e.milestonePlanning = false
-
-	if e.milestoneEpoch != ev.Epoch {
-		return
-	}
-
-	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerationFailed", map[string]interface{}{
-		"error": ev.Error.Error(),
-	})
-	e.logger.Error("Milestone generation failed", slog.Any("error", ev.Error))
 }
 
 func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
@@ -335,7 +309,7 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 		return
 	}
 
-	if ev.Plan != nil && ev.Plan.MilestoneComplete && len(ev.Plan.Tasks) == 0 {
+	if ev.Plan != nil && bool(ev.Plan.MilestoneComplete) && len(ev.Plan.Tasks) == 0 {
 		e.lastReplan = time.Time{}
 		return
 	}
@@ -430,12 +404,9 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.resetExecutionState()
 		e.planner.ClearMilestone()
 
-		e.systemOverride = fmt.Sprintf(
-			"CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Formulate a recovery plan immediately.",
-			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, ev.Cause,
-		)
+		e.systemOverride = "CRITICAL: Bot just died. Inventory is RESET. Treat the current inventory as ground truth and restart basic progression: gather wood first. Do NOT assume any tools exist."
 		e.lastReplan = time.Time{}
-		e.tsEmergencyLock = false // Reset lock on death
+		e.tsEmergencyLock = false
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
@@ -448,7 +419,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 	case "panic_retreat_start":
 		e.telemetry.RecordPanic()
 		e.resetExecutionState()
-		e.tsEmergencyLock = true // Hand over survival control to TS exclusively
+		e.tsEmergencyLock = true
 
 		meta.Status = string(StatusPanic)
 		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
@@ -456,7 +427,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 	case "panic_retreat_end":
 		e.tsEmergencyLock = false
-		e.lastReplan = time.Time{} // Force immediate tactical replan upon safety
+		e.lastReplan = time.Time{}
 		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
@@ -490,18 +461,39 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		go e.memory.LogEvent(ev.Action, "Task "+string(status)+": "+failCause, meta)
 		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", ev.Event), slog.String("cause", failCause))...)
 
+		if e.inFlightTask != nil && e.inFlightTask.Source == string(SourceRoutine) {
+			e.routine.RecordFailure(e.inFlightTask.Action, e.inFlightTask.Target.Name)
+		}
+
 		e.resetExecutionState()
 
 		if !e.tsEmergencyLock {
 			e.lastReplan = time.Now()
 		}
 
-		if e.tasksCompletedSinceReplan == 0 {
-			e.planner.RecordStall()
+		if status == "task_failed" {
+			if e.tasksCompletedSinceReplan == 0 {
+				e.planner.RecordStall()
+			}
+		} else if status == "task_aborted" {
+			// Do not record stall for routine interruptions
 		}
+
 		e.tasksCompletedSinceReplan = 0
 
-		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Previous task '%s' %s. Cause: %s. Adjust your plan accordingly.", ev.Action, string(status), failCause)
+		failureAdvice := map[string]string{
+			"EXHAUSTED_CANDIDATES": "No blocks found nearby. Use 'explore' first.",
+			"NO_REACHABLE_BLOCKS":  "Terrain has no accessible blocks. Use 'explore'.",
+			"stuck":                "Bot is physically stuck. Use 'explore' to escape.",
+			"pathfinder_timeout":   "Pathfinding timed out. Try a different target or explore.",
+			"timeout":              "Task timed out. Simplify the next step.",
+		}
+		advice, known := failureAdvice[failCause]
+		if !known {
+			advice = "Adjust your plan accordingly."
+		}
+
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
 		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
 	}
 }
@@ -516,7 +508,9 @@ func (e *Engine) processNextTask() {
 
 	if task.Action == string(ActionMarkLocation) {
 		locName := task.Target.Name
+		e.wg.Add(1)
 		go func(name string, x, y, z float64, tID string) {
+			defer e.wg.Done()
 			err := e.memory.MarkLocation(context.Background(), name, x, y, z)
 			if err == nil {
 				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", name, x, y, z)
@@ -530,7 +524,9 @@ func (e *Engine) processNextTask() {
 
 	if task.Action == string(ActionRecallLocation) {
 		locName := task.Target.Name
+		e.wg.Add(1)
 		go func(name string, tID string) {
+			defer e.wg.Done()
 			loc, err := e.memory.GetLocation(context.Background(), name)
 			if err == nil {
 				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, loc.X, loc.Y, loc.Z)
@@ -553,12 +549,10 @@ func (e *Engine) processNextTask() {
 
 func (e *Engine) resetExecutionState() {
 	e.planEpoch++
-	e.milestoneEpoch++
 	e.queue.ClearBySource(SourceLLM)
 	e.inFlightTask = nil
 	e.lastReplan = time.Time{}
 	e.cancelPlanning()
-	e.cancelMilestonePlanning()
 }
 
 func (e *Engine) matchesInFlight(commandID string) bool {
@@ -574,14 +568,6 @@ func (e *Engine) cancelPlanning() {
 		e.planCancel = nil
 	}
 	e.planning = false
-}
-
-func (e *Engine) cancelMilestonePlanning() {
-	if e.milestoneCancel != nil {
-		e.milestoneCancel()
-		e.milestoneCancel = nil
-	}
-	e.milestonePlanning = false
 }
 
 func (e *Engine) setSummaryAsync(key, value string) {

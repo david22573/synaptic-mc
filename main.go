@@ -8,6 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -22,7 +25,39 @@ const (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+		if allowedOrigin == "" || allowedOrigin == "*" {
+			return true
+		}
+		origin := r.Header.Get("Origin")
+		return origin == allowedOrigin
+	},
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		expectedToken := os.Getenv("API_TOKEN")
+		if expectedToken == "" {
+			// If no token is configured, allow all
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		token := r.Header.Get("Authorization")
+		if token == "" {
+			token = r.URL.Query().Get("token") // Fallback for WebSockets
+		}
+
+		token = strings.TrimPrefix(token, "Bearer ")
+
+		if token != expectedToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	}
 }
 
 func main() {
@@ -36,6 +71,10 @@ func main() {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
+
+	// Context with interrupt signal handling
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
 	if apiKey == "" {
@@ -69,14 +108,14 @@ func main() {
 	logger.Info("Event Store initialized", slog.String("path", "./events.db"))
 
 	telemetry := NewTelemetry(logger, 5.00)
-	go telemetry.StartReporting(context.Background())
+	go telemetry.StartReporting(ctx)
 
 	rawBrain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
 	fallbackBrain := NewFallbackBrain()
 	brain := NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
 
 	uiHub := NewUIHub(logger)
-	go uiHub.Run()
+	go uiHub.Run(ctx)
 
 	config, err := LoadConfig("./config.json")
 	if err != nil {
@@ -84,12 +123,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	// Protected Endpoints
+	mux.HandleFunc("/api/config", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(config)
-	})
+	}))
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ui/ws", authMiddleware(uiHub.HandleConnections))
+
+	// Bot WS Connection
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
@@ -105,19 +150,15 @@ func main() {
 		exec := NewWSExecutor(conn)
 
 		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID, eventStore)
-		engine.Run(context.Background(), conn)
+		engine.Run(ctx, conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
 		telemetry.RecordSessionEnd()
 	})
 
-	http.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	http.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
+	mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
 
-	logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
-	logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		health := map[string]interface{}{
 			"status":          "healthy",
 			"active_sessions": telemetry.ActiveSessions(),
@@ -128,8 +169,30 @@ func main() {
 		json.NewEncoder(w).Encode(health)
 	})
 
-	if err := http.ListenAndServe(Port, nil); err != nil {
-		logger.Error("Server crashed", slog.Any("error", err))
-		os.Exit(1)
+	server := &http.Server{
+		Addr:    Port,
+		Handler: mux,
 	}
+
+	// Spin up server in goroutine
+	go func() {
+		logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
+		logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("Server crashed", slog.Any("error", err))
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for context cancellation
+	<-ctx.Done()
+	logger.Info("Graceful shutdown initiated...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("Server shutdown error", slog.Any("error", err))
+	}
+	logger.Info("Server exited.")
 }

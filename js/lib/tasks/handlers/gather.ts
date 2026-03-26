@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/gather.ts
 import {
     type FSMState,
     type StateContext,
@@ -44,6 +43,26 @@ class MineState implements FSMState {
 
         try {
             await gCtx.bot.dig(freshBlock);
+
+            // Whole-tree harvesting / vein mining
+            const blockId =
+                gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
+            if (blockId) {
+                const nearby = gCtx.bot.findBlocks({
+                    matching: blockId,
+                    maxDistance: 4,
+                    count: 16,
+                });
+
+                for (const pos of nearby) {
+                    if (gCtx.signal.aborted) break;
+                    const nextBlock = gCtx.bot.blockAt(pos);
+                    if (nextBlock) {
+                        await gCtx.bot.dig(nextBlock).catch(() => {});
+                    }
+                }
+            }
+
             await waitForMs(500, gCtx.signal);
             gCtx.result = { status: "SUCCESS" };
             return null;
@@ -94,7 +113,7 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 64, // FIX: Expanded from 48 to 64 to find sparse wood
+            maxDistance: 64, // Expanded from 48 to 64 to find sparse wood
             count: 256,
         });
 
@@ -141,7 +160,7 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 64, // FIX: Matches expanded findBlocks radius
+        searchRadius: 64, // Matches expanded findBlocks radius
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,

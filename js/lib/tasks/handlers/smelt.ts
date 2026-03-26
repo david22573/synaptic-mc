@@ -21,7 +21,9 @@ interface SmeltContext extends StateContext {
     furnaceBlock: any | null;
     isPortable: boolean;
     meatType: number | null;
+    meatCount: number;
     fuelType: number | null;
+    fuelCount: number;
     stopMovement: () => void;
 }
 
@@ -61,34 +63,35 @@ class SmeltingState implements FSMState {
         let furnaceWindow: any = null;
 
         try {
-            furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
-            await furnaceWindow.putFuel(sCtx.fuelType, null, 1);
-            await furnaceWindow.putInput(sCtx.meatType, null, 1);
+            const batchSize = Math.min(sCtx.meatCount, sCtx.fuelCount, 8);
 
-            let itemSmelted = false;
-            const maxWaitMs = 20000;
+            furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
+            await furnaceWindow.putFuel(sCtx.fuelType, null, batchSize);
+            await furnaceWindow.putInput(sCtx.meatType, null, batchSize);
+
+            let itemsSmelted = 0;
+            // ~10 seconds per item in MC, give it 15s per item as buffer
+            const maxWaitMs = 15000 * batchSize;
             const pollIntervalMs = 500;
             let elapsedMs = 0;
 
-            while (elapsedMs < maxWaitMs) {
+            while (elapsedMs < maxWaitMs && itemsSmelted < batchSize) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
 
-                if (furnaceWindow.outputItem()) {
-                    itemSmelted = true;
-                    break;
+                const outItem = furnaceWindow.outputItem();
+                if (outItem) {
+                    await makeRoomInInventory(sCtx.bot, 1);
+                    await furnaceWindow.takeOutput();
+                    itemsSmelted += outItem.count;
+                } else {
+                    await waitForMs(pollIntervalMs, sCtx.signal);
+                    elapsedMs += pollIntervalMs;
                 }
-
-                await waitForMs(pollIntervalMs, sCtx.signal);
-                elapsedMs += pollIntervalMs;
             }
 
-            if (!itemSmelted) {
+            if (itemsSmelted === 0) {
                 throw new Error("FURNACE_TIMEOUT_OR_LAG");
             }
-
-            // Must guarantee inventory space before extracting to prevent unhandled rejections
-            await makeRoomInInventory(sCtx.bot, 1);
-            await furnaceWindow.takeOutput();
         } catch (err: any) {
             sCtx.result = {
                 status: "FAILED",
@@ -200,7 +203,9 @@ class CheckResourcesState implements FSMState {
         }
 
         sCtx.meatType = rawMeat.type;
+        sCtx.meatCount = rawMeat.count;
         sCtx.fuelType = fuel.type;
+        sCtx.fuelCount = fuel.count;
 
         return new LocateFurnaceState();
     }
@@ -222,7 +227,9 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         furnaceBlock: null,
         isPortable: false,
         meatType: null,
+        meatCount: 0,
         fuelType: null,
+        fuelCount: 0,
         stopMovement,
     };
 

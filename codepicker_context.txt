@@ -1,1316 +1,18 @@
-Project Context Dump (21 Mar 26 00:01 PDT)
+Project Context Dump (25 Mar 26 23:59 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 44
+Total Files: 4
 
 # Project Structure
 <file_tree>
-- Makefile
-- action_schema.go
-- brain.go
-- config.go
-- engine.go
-- event_store.go
-- events.go
-- executor.go
-- fallback_planner.go
 - js\index.ts
-- js\lib\config.ts
-- js\lib\logger.ts
-- js\lib\models.ts
-- js\lib\network\client.ts
-- js\lib\systems\survival.ts
-- js\lib\tasks\fsm.ts
-- js\lib\tasks\handlers\build.ts
-- js\lib\tasks\handlers\craft.ts
-- js\lib\tasks\handlers\explore.ts
-- js\lib\tasks\handlers\farm.ts
-- js\lib\tasks\handlers\gather.ts
-- js\lib\tasks\handlers\hunt.ts
-- js\lib\tasks\handlers\interact.ts
-- js\lib\tasks\handlers\mine.ts
-- js\lib\tasks\handlers\smelt.ts
-- js\lib\tasks\normalize.ts
-- js\lib\tasks\primitives.ts
-- js\lib\tasks\registry.ts
-- js\lib\tasks\task.ts
-- js\lib\tasks\utils.ts
-- js\lib\types.d.ts
 - js\lib\utils\errors.ts
 - js\lib\utils\threats.ts
-- llm_validator.go
-- main.go
-- memory.go
-- planner.go
-- queue.go
-- resilient_brain.go
-- routine.go
-- shared_types.go
-- telemetry.go
-- ui_hub.go
-- ws_types.go
+- ui\src\App.svelte
 </file_tree>
 
 # File Contents
-<file path="Makefile">
-.PHONY: help install run-server run-bot dev clean
-
-# Default target
-.DEFAULT_GOAL := help
-
-help: ## Show this help message
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-
-install: ## Install Go and JS dependencies
-	@echo "==> Installing JS dependencies..."
-	cd js && npm install
-	@echo "==> Tidying Go modules..."
-	go mod tidy
-
-run-server: ## Run the Go control plane directly
-	@echo "==> Starting Go WebSocket Server..."
-	go run *.go
-
-run-bot: ## Run the Mineflayer TypeScript bot directly
-	@echo "==> Starting Mineflayer Bot..."
-	cd js && npx tsx index.ts
-
-dev: ## Run both server and bot concurrently in one terminal
-	@echo "==> Starting CraftD Control Plane and Bot..."
-	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
-	go run *.go & \
-	sleep 2; \
-	cd js && npx tsx index.ts
-
-clean: ## Clean up Go cache and Node modules
-	@echo "==> Cleaning up environment..."
-	rm -rf js/node_modules
-	go clean
-</file>
-
-<file path="action_schema.go">
-package main
-
-// ActionType defines all macro actions the LLM or routines can trigger.
-type ActionType string
-
-const (
-	ActionGather         ActionType = "gather"
-	ActionCraft          ActionType = "craft"
-	ActionHunt           ActionType = "hunt"
-	ActionExplore        ActionType = "explore"
-	ActionBuild          ActionType = "build"
-	ActionSmelt          ActionType = "smelt"
-	ActionFarm           ActionType = "farm"
-	ActionMine           ActionType = "mine"
-	ActionMarkLocation   ActionType = "mark_location"
-	ActionRecallLocation ActionType = "recall_location"
-	ActionIdle           ActionType = "idle"
-	ActionSleep          ActionType = "sleep"
-	ActionRetreat        ActionType = "retreat"
-	ActionEat            ActionType = "eat"
-	ActionInteract       ActionType = "interact"
-)
-
-// TargetType defines valid schema values for action targets.
-type TargetType string
-
-const (
-	TargetBlock    TargetType = "block"
-	TargetEntity   TargetType = "entity"
-	TargetRecipe   TargetType = "recipe"
-	TargetLocation TargetType = "location"
-	TargetCategory TargetType = "category"
-	TargetNone     TargetType = "none"
-)
-
-var ValidActions = map[string]bool{
-	string(ActionGather):         true,
-	string(ActionCraft):          true,
-	string(ActionHunt):           true,
-	string(ActionExplore):        true,
-	string(ActionBuild):          true,
-	string(ActionSmelt):          true,
-	string(ActionFarm):           true,
-	string(ActionMine):           true,
-	string(ActionMarkLocation):   true,
-	string(ActionRecallLocation): true,
-	string(ActionIdle):           true,
-	string(ActionSleep):          true,
-	string(ActionRetreat):        true,
-	string(ActionEat):            true,
-	string(ActionInteract):       true,
-}
-
-var ValidTargetTypes = map[string]bool{
-	string(TargetBlock):    true,
-	string(TargetEntity):   true,
-	string(TargetRecipe):   true,
-	string(TargetLocation): true,
-	string(TargetCategory): true,
-	string(TargetNone):     true,
-}
-
-// IsValidAction checks if a raw string maps to a canonical ActionType.
-func IsValidAction(action string) bool {
-	return ValidActions[action]
-}
-
-// IsValidTargetType checks if a raw string maps to a canonical TargetType.
-func IsValidTargetType(t string) bool {
-	return ValidTargetTypes[t]
-}
-
-</file>
-
-<file path="brain.go">
-package main
-
-import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"strings"
-	"time"
-)
-
-type Priority int
-
-const (
-	PriReflex  Priority = 0
-	PriRoutine Priority = 1
-	PriLLM     Priority = 2
-)
-
-type Tick struct {
-	State json.RawMessage
-}
-
-type Target struct {
-	Type string `json:"type"`
-	Name string `json:"name"`
-}
-
-type Action struct {
-	ID        string       `json:"id,omitempty"`
-	Source    string       `json:"source,omitempty"`
-	Trace     TraceContext `json:"-"`
-	Action    string       `json:"action"`
-	Target    Target       `json:"target"`
-	Rationale string       `json:"rationale"`
-	Priority  Priority     `json:"priority"`
-}
-
-type MilestonePlan struct {
-	ID             string `json:"id"`
-	Description    string `json:"description"`
-	CompletionHint string `json:"completion_hint"`
-}
-
-type LLMPlan struct {
-	Objective         string   `json:"objective"`
-	Tasks             []Action `json:"tasks"`
-	MilestoneComplete bool     `json:"milestone_complete"`
-}
-
-type Brain interface {
-	GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error)
-	EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error)
-}
-
-type LLMBrain struct {
-	apiURL    string
-	model     string
-	apiKey    string
-	client    *http.Client
-	memory    MemoryBank
-	telemetry *Telemetry
-}
-
-func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *LLMBrain {
-	return &LLMBrain{
-		apiURL:    apiURL,
-		model:     model,
-		apiKey:    apiKey,
-		memory:    mem,
-		telemetry: tel,
-		client:    &http.Client{Timeout: 30 * time.Second},
-	}
-}
-
-const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
-Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
-
-CRITICAL GAME MECHANIC RULES:
-1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
-2. You CANNOT gather stone or coal without a wooden_pickaxe.
-3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
-5. ERROR RECOVERY: Only use "explore" if a task fails with PATHING_FAILED, PATHFINDER_TIMEOUT, or EXHAUSTED_CANDIDATES.
-6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
-
-VALID TARGET TYPES (you MUST use one of these):
-- "block"     (oak_log, stone, etc.)
-- "entity"    (zombie, cow, etc.)
-- "recipe"    (stick, wooden_pickaxe, crafting_table)
-- "location"  (only for mark/recall)
-- "category"  (food, wood)
-- "none"      (only for explore/idle/retreat/sleep)
-
-Valid macro actions: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
-
-func (b *LLMBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
-	summary, _ := b.memory.GetSummary(ctx, sessionID)
-	systemPrompt := fmt.Sprintf(`%s
-
-Generate a new high-level Milestone.
-Response format (JSON only):
-{
-  "id": "milestone-<short-slug>",
-  "description": "Clear goal",
-  "completion_hint": "Inventory/world state trigger"
-}
-
-ACTIVE CONTEXT: %s`, BaseSystemRules, summary)
-	return b.callLLMForMilestone(ctx, systemPrompt, string(t.State))
-}
-
-func (b *LLMBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
-	summary, _ := b.memory.GetSummary(ctx, sessionID)
-	history, _ := b.memory.GetRecentContext(ctx, sessionID, 6)
-	milestoneSection := "Focus on basic survival."
-	if milestone != nil {
-		milestoneSection = fmt.Sprintf("MILESTONE: %s\nCOMPLETION: %s", milestone.Description, milestone.CompletionHint)
-	}
-
-	systemPrompt := fmt.Sprintf(`%s
-
-Generate 1-3 sequential tasks for the MILESTONE.
-Response format (JSON only):
-{
-  "objective": "Sub-goal description",
-  "milestone_complete": false,
-  "tasks": [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "..." } ]
-}
-
-%s
-SUMMARY: %s
-MEMORY: %s
-OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, systemOverride)
-	return b.callLLMForPlan(ctx, systemPrompt, string(t.State))
-}
-
-func (b *LLMBrain) callLLMForMilestone(ctx context.Context, systemPrompt, userContent string) (*MilestonePlan, error) {
-	content, latency, inTok, outTok, err := b.doLLMRequest(ctx, systemPrompt, userContent)
-	b.telemetry.RecordLLMCall(b.model, latency, inTok, outTok, err)
-	if err != nil {
-		return nil, err
-	}
-	var milestone MilestonePlan
-	if err := json.Unmarshal([]byte(cleanJSON(content)), &milestone); err != nil {
-		return nil, err
-	}
-	return &milestone, nil
-}
-
-func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent string) (*LLMPlan, error) {
-	content, latency, inTok, outTok, err := b.doLLMRequest(ctx, systemPrompt, userContent)
-	b.telemetry.RecordLLMCall(b.model, latency, inTok, outTok, err)
-	if err != nil {
-		return nil, err
-	}
-	var plan LLMPlan
-	if err := json.Unmarshal([]byte(cleanJSON(content)), &plan); err != nil {
-		return nil, err
-	}
-	for i := range plan.Tasks {
-		plan.Tasks[i].Priority = PriLLM
-	}
-	return &plan, nil
-}
-
-func (b *LLMBrain) doLLMRequest(ctx context.Context, systemPrompt, userContent string) (string, time.Duration, int, int, error) {
-	payload := map[string]interface{}{
-		"model": b.model,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": userContent},
-		},
-		"response_format": map[string]string{"type": "json_object"},
-		"temperature":     0.1,
-	}
-	jsonPayload, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.apiKey)
-
-	start := time.Now()
-	resp, err := b.client.Do(req)
-	latency := time.Since(start)
-	if err != nil {
-		return "", latency, 0, 0, err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", latency, 0, 0, err
-	}
-
-	if len(result.Choices) == 0 {
-		return "", latency, 0, 0, fmt.Errorf("no choices returned")
-	}
-
-	return result.Choices[0].Message.Content, latency, result.Usage.PromptTokens, result.Usage.CompletionTokens, nil
-}
-
-func cleanJSON(raw string) string {
-	cleaned := strings.TrimSpace(raw)
-	cleaned = strings.TrimPrefix(cleaned, "```json")
-	cleaned = strings.TrimPrefix(cleaned, "```")
-	cleaned = strings.TrimSuffix(cleaned, "```")
-	return strings.TrimSpace(cleaned)
-}
-
-</file>
-
-<file path="config.go">
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"sync"
-)
-
-type Config struct {
-	WSURL         string         `json:"ws_url"`
-	ViewerPort    int            `json:"viewer_port"`
-	EnableViewer  bool           `json:"enable_viewer"`
-	DebugChat     bool           `json:"debug_chat"`
-	TaskTimeouts  map[string]int `json:"task_timeouts"`
-	ThreatWeights map[string]int `json:"threat_weights"`
-}
-
-var (
-	configInstance *Config
-	configOnce     sync.Once
-	configError    error
-)
-
-func LoadConfig(path string) (*Config, error) {
-	configOnce.Do(func() {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			configError = fmt.Errorf("failed to read config: %w", err)
-			return
-		}
-
-		configInstance = &Config{}
-		if err := json.Unmarshal(data, configInstance); err != nil {
-			configError = fmt.Errorf("failed to parse config: %w", err)
-			configInstance = nil
-		}
-	})
-
-	return configInstance, configError
-}
-
-</file>
-
-<file path="engine.go">
-// engine.go
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log/slog"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/gorilla/websocket"
-)
-
-type Vec3 struct {
-	X float64 `json:"x"`
-	Y float64 `json:"y"`
-	Z float64 `json:"z"`
-}
-
-type GameState struct {
-	Health                 float64 `json:"health"`
-	Food                   float64 `json:"food"`
-	TimeOfDay              int     `json:"time_of_day"`
-	HasBedNearby           bool    `json:"has_bed_nearby"`
-	HasCraftingTableNearby bool    `json:"has_crafting_table_nearby"` // Added
-	Position               Vec3    `json:"position"`
-	Threats                []struct {
-		Name string `json:"name"`
-	} `json:"threats"`
-	Inventory []struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-	} `json:"inventory"`
-}
-
-type Engine struct {
-	planner    Planner
-	routine    RoutineManager
-	exec       Executor
-	memory     MemoryBank
-	eventStore EventStore
-	telemetry  *Telemetry
-	uiHub      *UIHub
-	logger     *slog.Logger
-
-	eventCh chan EngineEvent
-
-	queue        *TaskQueue
-	inFlightTask *Action
-
-	planEpoch         int
-	planning          bool
-	planCancel        context.CancelFunc
-	milestoneEpoch    int
-	milestonePlanning bool
-	milestoneCancel   context.CancelFunc
-
-	sessionID      string
-	systemOverride string
-
-	lastReplan      time.Time
-	tsEmergencyLock bool // Replaces panicCooldown to prevent Split-Brain
-	lastHealth      float64
-	lastThreat      string
-	lastPos         Vec3
-	wg              sync.WaitGroup
-
-	tasksCompletedSinceReplan int
-}
-
-func NewEngine(
-	planner Planner,
-	routine RoutineManager,
-	exec Executor,
-	mem MemoryBank,
-	tel *Telemetry,
-	uiHub *UIHub,
-	baseLogger *slog.Logger,
-	sessionID string,
-	eventStore EventStore,
-) *Engine {
-	return &Engine{
-		planner:    planner,
-		routine:    routine,
-		exec:       exec,
-		memory:     mem,
-		eventStore: eventStore,
-		telemetry:  tel,
-		uiHub:      uiHub,
-		logger:     baseLogger.With(slog.String("session_id", sessionID)),
-		eventCh:    make(chan EngineEvent, 100),
-		queue:      NewTaskQueue(),
-		planEpoch:  0,
-		lastHealth: 20.0,
-		sessionID:  sessionID,
-	}
-}
-
-func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
-	e.wg.Add(1)
-	go e.loop(ctx)
-
-	for {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-		var msg struct {
-			Type    string          `json:"type"`
-			Payload json.RawMessage `json:"payload"`
-		}
-
-		if err := conn.ReadJSON(&msg); err != nil {
-			e.logger.Warn("Bot disconnected or read error", slog.Any("error", err))
-			break
-		}
-
-		switch msg.Type {
-		case "state":
-			var state GameState
-			if err := json.Unmarshal(msg.Payload, &state); err == nil {
-				e.eventCh <- EventClientState{State: state, RawPayload: msg.Payload}
-			}
-		case "event":
-			var act EventClientAction
-			if err := json.Unmarshal(msg.Payload, &act); err == nil {
-				e.eventCh <- act
-				e.uiHub.Broadcast(map[string]interface{}{"type": "event_stream", "payload": act})
-			}
-		default:
-			e.logger.Warn("Ignoring unknown message type", slog.String("type", msg.Type))
-		}
-	}
-
-	close(e.eventCh)
-	e.wg.Wait()
-	_ = e.exec.Close()
-}
-
-func (e *Engine) loop(ctx context.Context) {
-	defer e.wg.Done()
-	defer e.cancelPlanning()
-	defer e.cancelMilestonePlanning()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case event, ok := <-e.eventCh:
-			if !ok {
-				return
-			}
-			e.processEvent(ctx, event)
-		}
-	}
-}
-
-func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
-	switch ev := event.(type) {
-	case EventClientState:
-		e.handleStateUpdate(ctx, ev)
-	case EventClientAction:
-		e.handleClientAction(ctx, ev)
-	case EventPlanReady:
-		e.handlePlanReady(ctx, ev)
-	case EventPlanError:
-		e.handlePlanError(ctx, ev)
-	case EventMilestoneReady:
-		e.handleMilestoneReady(ctx, ev)
-	case EventMilestoneError:
-		e.handleMilestoneError(ctx, ev)
-	}
-}
-
-func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
-	e.uiHub.Broadcast(map[string]interface{}{"type": "state_update", "payload": ev.State})
-
-	e.lastPos = ev.State.Position
-	topThreat := ""
-	if len(ev.State.Threats) > 0 {
-		topThreat = ev.State.Threats[0].Name
-	}
-
-	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 5
-	criticalOverride := healthDropped && time.Since(e.lastReplan) > 15*time.Second
-
-	e.lastHealth = ev.State.Health
-	e.lastThreat = topThreat
-
-	newRoutines := e.routine.Evaluate(ev.State, e.inFlightTask, e.queue.items)
-	if len(newRoutines) > 0 {
-		e.queue.Push(newRoutines...)
-
-		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
-			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
-			go e.exec.SendControl("abort_task", "Routine interrupt: "+newRoutines[0].Rationale)
-			e.inFlightTask = nil
-			e.lastReplan = time.Time{}
-		}
-
-		if e.inFlightTask == nil {
-			e.processNextTask()
-		}
-	}
-
-	// Wait for TS to complete evasion reflexes before processing tactical tasks
-	if e.tsEmergencyLock {
-		return
-	}
-
-	if e.planning && criticalOverride {
-		e.cancelPlanning()
-	}
-
-	// Only consider engine "busy" if executing high-priority LLM tasks.
-	// Low priority background tasks (like wandering) shouldn't block planning.
-	isExecutingTactics := false
-	if e.inFlightTask != nil && e.inFlightTask.Priority <= PriLLM {
-		isExecutingTactics = true
-	}
-
-	timeSinceReplan := time.Since(e.lastReplan)
-	needsReplan := e.lastReplan.IsZero() || timeSinceReplan > 10*time.Second || criticalOverride || e.systemOverride != ""
-
-	if isExecutingTactics && !criticalOverride {
-		if e.planner.GetActiveMilestone() == nil {
-			e.triggerMilestoneGeneration(ctx, ev.RawPayload)
-		}
-		return
-	}
-
-	if criticalOverride && isExecutingTactics {
-		e.resetExecutionState()
-		go e.exec.SendControl("noop", "critical state interrupt")
-	}
-
-	if !needsReplan {
-		return
-	}
-
-	if e.planner.GetActiveMilestone() == nil {
-		e.triggerMilestoneGeneration(ctx, ev.RawPayload)
-		return
-	}
-
-	epochAtStart := e.planEpoch
-	sysOverride := e.systemOverride
-	e.systemOverride = ""
-
-	planCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	e.planCancel = cancel
-	e.planning = true
-	e.lastReplan = time.Now()
-
-	e.telemetry.RecordReplan()
-	traceID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
-
-	go func() {
-		plan, err := e.planner.GenerateTactics(planCtx, ev.RawPayload, e.sessionID, sysOverride)
-		if err != nil {
-			if planCtx.Err() != context.Canceled {
-				e.eventCh <- EventPlanError{Epoch: epochAtStart, Error: err}
-			}
-			return
-		}
-		e.eventCh <- EventPlanReady{Epoch: epochAtStart, TraceID: traceID, Plan: plan}
-	}()
-}
-
-func (e *Engine) triggerMilestoneGeneration(ctx context.Context, statePayload json.RawMessage) {
-	if e.milestonePlanning {
-		return
-	}
-
-	epochAtStart := e.milestoneEpoch
-	msCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	e.milestoneCancel = cancel
-	e.milestonePlanning = true
-
-	go func() {
-		milestone, err := e.planner.GenerateMilestone(msCtx, statePayload, e.sessionID)
-		if err != nil {
-			if msCtx.Err() != context.Canceled {
-				e.eventCh <- EventMilestoneError{Epoch: epochAtStart, Error: err}
-			}
-			return
-		}
-		e.eventCh <- EventMilestoneReady{Epoch: epochAtStart, Milestone: milestone}
-	}()
-}
-
-func (e *Engine) handleMilestoneReady(ctx context.Context, ev EventMilestoneReady) {
-	if e.milestoneCancel != nil {
-		e.milestoneCancel = nil
-	}
-	e.milestonePlanning = false
-
-	if e.milestoneEpoch != ev.Epoch {
-		e.telemetry.RecordStalePlan()
-		return
-	}
-
-	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerated", map[string]interface{}{
-		"id":          ev.Milestone.ID,
-		"description": ev.Milestone.Description,
-	})
-
-	e.lastReplan = time.Time{}
-}
-
-func (e *Engine) handleMilestoneError(ctx context.Context, ev EventMilestoneError) {
-	if e.milestoneCancel != nil {
-		e.milestoneCancel = nil
-	}
-	e.milestonePlanning = false
-
-	if e.milestoneEpoch != ev.Epoch {
-		return
-	}
-
-	e.eventStore.Append(ctx, e.sessionID, "", "MilestoneGenerationFailed", map[string]interface{}{
-		"error": ev.Error.Error(),
-	})
-	e.logger.Error("Milestone generation failed", slog.Any("error", ev.Error))
-}
-
-func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
-	if e.planCancel != nil {
-		e.planCancel = nil
-	}
-	e.planning = false
-
-	if e.planEpoch != ev.Epoch {
-		e.telemetry.RecordStalePlan()
-		return
-	}
-
-	if ev.Plan != nil && ev.Plan.MilestoneComplete && len(ev.Plan.Tasks) == 0 {
-		e.lastReplan = time.Time{}
-		return
-	}
-
-	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
-		go e.exec.SendControl("noop", "No actionable tasks generated")
-		return
-	}
-
-	for i := range ev.Plan.Tasks {
-		if ev.Plan.Tasks[i].ID == "" {
-			ev.Plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
-		}
-		ev.Plan.Tasks[i].Source = string(SourceLLM)
-
-		ev.Plan.Tasks[i].Trace = TraceContext{
-			TraceID:  ev.TraceID,
-			ActionID: ev.Plan.Tasks[i].ID,
-		}
-		if ms := e.planner.GetActiveMilestone(); ms != nil {
-			ev.Plan.Tasks[i].Trace.MilestoneID = ms.ID
-		}
-	}
-
-	e.uiHub.Broadcast(map[string]interface{}{"type": "objective_update", "payload": ev.Plan.Objective})
-	go e.setSummaryAsync("Current Objective", ev.Plan.Objective)
-
-	e.queue.ClearBySource(SourceLLM)
-	e.queue.Push(ev.Plan.Tasks...)
-
-	e.eventStore.Append(ctx, e.sessionID, ev.TraceID, "TacticalPlanGenerated", map[string]interface{}{
-		"objective":  ev.Plan.Objective,
-		"task_count": len(ev.Plan.Tasks),
-		"milestone_id": func() string {
-			if len(ev.Plan.Tasks) > 0 {
-				return ev.Plan.Tasks[0].Trace.MilestoneID
-			}
-			return ""
-		}(),
-	})
-
-	e.tasksCompletedSinceReplan = 0
-	e.processNextTask()
-}
-
-func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
-	if e.planCancel != nil {
-		e.planCancel = nil
-	}
-	e.planning = false
-
-	if e.planEpoch != ev.Epoch {
-		return
-	}
-
-	e.eventStore.Append(ctx, e.sessionID, "", "TacticalPlanFailed", map[string]interface{}{
-		"error": ev.Error.Error(),
-	})
-	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
-	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
-
-	e.lastReplan = time.Now()
-}
-
-func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
-	meta := EventMeta{
-		SessionID: e.sessionID,
-		X:         e.lastPos.X,
-		Y:         e.lastPos.Y,
-		Z:         e.lastPos.Z,
-	}
-
-	e.eventStore.Append(ctx, e.sessionID, meta.TraceID, strings.ToUpper(ev.Event), map[string]interface{}{
-		"action": ev.Action,
-		"cause":  ev.Cause,
-		"status": meta.Status,
-	})
-
-	if e.inFlightTask != nil {
-		meta.TraceID = e.inFlightTask.Trace.TraceID
-	}
-
-	logCtx := []any{
-		slog.String("action", ev.Action),
-		slog.String("command_id", ev.CommandID),
-		slog.Int("duration_ms", ev.Duration),
-	}
-
-	switch ev.Event {
-	case "death":
-		e.telemetry.RecordTaskStatus(StatusFailed)
-		e.resetExecutionState()
-		e.planner.ClearMilestone()
-
-		e.systemOverride = fmt.Sprintf(
-			"CRITICAL OVERRIDE: You have died at X:%.1f Y:%.1f Z:%.1f. Cause: %s. Formulate a recovery plan immediately.",
-			e.lastPos.X, e.lastPos.Y, e.lastPos.Z, ev.Cause,
-		)
-		e.lastReplan = time.Time{}
-		e.tsEmergencyLock = false // Reset lock on death
-
-		meta.Status = string(StatusFailed)
-		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
-		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
-			"position": e.lastPos,
-			"cause":    ev.Cause,
-		})
-		e.logger.Warn("Bot died — milestone cleared", slog.String("cause", ev.Cause))
-
-	case "panic_retreat_start":
-		e.telemetry.RecordPanic()
-		e.resetExecutionState()
-		e.tsEmergencyLock = true // Hand over survival control to TS exclusively
-
-		meta.Status = string(StatusPanic)
-		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
-		e.logger.Warn("Emergency Lock ENGAGED", append(logCtx, slog.String("cause", ev.Cause))...)
-
-	case "panic_retreat_end":
-		e.tsEmergencyLock = false
-		e.lastReplan = time.Time{} // Force immediate tactical replan upon safety
-		e.logger.Info("Emergency Lock RELEASED", logCtx...)
-
-	case "task_completed":
-		if !e.matchesInFlight(ev.CommandID) {
-			return
-		}
-		e.telemetry.RecordTaskStatus(StatusCompleted)
-		meta.Status = string(StatusCompleted)
-		go e.memory.LogEvent(ev.Action, "Finished successfully", meta)
-		e.logger.Info("Task completed", logCtx...)
-		e.inFlightTask = nil
-
-		e.tasksCompletedSinceReplan++
-		e.planner.ResetStall()
-		e.processNextTask()
-
-	case "task_failed", "task_aborted":
-		if !e.matchesInFlight(ev.CommandID) {
-			return
-		}
-		statusStr := strings.ToUpper(strings.Split(ev.Event, "_")[1])
-		status := TaskStatus(statusStr)
-
-		failCause := ev.Cause
-		if failCause == "" {
-			failCause = "unknown reason"
-		}
-
-		e.telemetry.RecordTaskStatus(status)
-		meta.Status = string(status)
-		go e.memory.LogEvent(ev.Action, "Task "+string(status)+": "+failCause, meta)
-		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", ev.Event), slog.String("cause", failCause))...)
-
-		e.resetExecutionState()
-
-		if !e.tsEmergencyLock {
-			e.lastReplan = time.Now()
-		}
-
-		if e.tasksCompletedSinceReplan == 0 {
-			e.planner.RecordStall()
-		}
-		e.tasksCompletedSinceReplan = 0
-
-		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Previous task '%s' %s. Cause: %s. Adjust your plan accordingly.", ev.Action, string(status), failCause)
-		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
-	}
-}
-
-func (e *Engine) processNextTask() {
-	if e.inFlightTask != nil || e.queue.Len() == 0 {
-		return
-	}
-
-	e.inFlightTask = e.queue.Pop()
-	task := e.inFlightTask
-
-	if task.Action == string(ActionMarkLocation) {
-		locName := task.Target.Name
-		go func(name string, x, y, z float64, tID string) {
-			err := e.memory.MarkLocation(context.Background(), name, x, y, z)
-			if err == nil {
-				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", name, x, y, z)
-				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: x, Y: y, Z: z, Status: "COMPLETED"})
-				e.logger.Info("Location marked in spatial memory", slog.String("name", name))
-			}
-			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionMarkLocation), CommandID: task.ID}
-		}(locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, task.Trace.TraceID)
-		return
-	}
-
-	if task.Action == string(ActionRecallLocation) {
-		locName := task.Target.Name
-		go func(name string, tID string) {
-			loc, err := e.memory.GetLocation(context.Background(), name)
-			if err == nil {
-				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, loc.X, loc.Y, loc.Z)
-				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
-				e.setSummaryAsync("Known Location: "+name, msg)
-			}
-			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
-		}(locName, task.Trace.TraceID)
-		return
-	}
-
-	if err := e.exec.Dispatch(*task); err != nil {
-		e.telemetry.RecordDispatchFailure()
-		e.logger.Error("Dispatch failed", slog.Any("error", err), slog.String("action", task.Action))
-		e.inFlightTask = nil
-		e.lastReplan = time.Time{}
-		e.systemOverride = "CRITICAL OVERRIDE: Executor dispatch failed with error: " + err.Error()
-	}
-}
-
-func (e *Engine) resetExecutionState() {
-	e.planEpoch++
-	e.milestoneEpoch++
-	e.queue.ClearBySource(SourceLLM)
-	e.inFlightTask = nil
-	e.lastReplan = time.Time{}
-	e.cancelPlanning()
-	e.cancelMilestonePlanning()
-}
-
-func (e *Engine) matchesInFlight(commandID string) bool {
-	if e.inFlightTask == nil {
-		return false
-	}
-	return e.inFlightTask.ID == commandID
-}
-
-func (e *Engine) cancelPlanning() {
-	if e.planCancel != nil {
-		e.planCancel()
-		e.planCancel = nil
-	}
-	e.planning = false
-}
-
-func (e *Engine) cancelMilestonePlanning() {
-	if e.milestoneCancel != nil {
-		e.milestoneCancel()
-		e.milestoneCancel = nil
-	}
-	e.milestonePlanning = false
-}
-
-func (e *Engine) setSummaryAsync(key, value string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = e.memory.SetSummary(ctx, e.sessionID, key, value)
-}
-
-</file>
-
-<file path="event_store.go">
-package main
-
-import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"time"
-
-	_ "modernc.org/sqlite"
-)
-
-// DomainEvent represents an immutable fact about the system at a point in time.
-type DomainEvent struct {
-	ID        int64           `json:"id"`
-	SessionID string          `json:"session_id"`
-	TraceID   string          `json:"trace_id"`
-	Type      string          `json:"type"` // e.g., "MilestoneGenerated", "TaskDispatched", "StateTick"
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
-}
-
-type EventStore interface {
-	Append(ctx context.Context, sessionID, traceID, eventType string, payload interface{}) error
-	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)
-	Close() error
-}
-
-type SQLiteEventStore struct {
-	db *sql.DB
-}
-
-func NewSQLiteEventStore(dbPath string) (*SQLiteEventStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open event store sqlite: %w", err)
-	}
-
-	schema := `
-	PRAGMA journal_mode=WAL;
-	PRAGMA synchronous=NORMAL;
-	PRAGMA busy_timeout=5000;
-
-	CREATE TABLE IF NOT EXISTS domain_events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		session_id TEXT NOT NULL,
-		trace_id TEXT NOT NULL,
-		event_type TEXT NOT NULL,
-		payload JSON NOT NULL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	CREATE INDEX IF NOT EXISTS idx_events_session ON domain_events(session_id, id ASC);
-	`
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("failed to apply event store schema: %w", err)
-	}
-
-	return &SQLiteEventStore{db: db}, nil
-}
-
-func (s *SQLiteEventStore) Append(ctx context.Context, sessionID, traceID, eventType string, payload interface{}) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event payload: %w", err)
-	}
-
-	query := `INSERT INTO domain_events (session_id, trace_id, event_type, payload) VALUES (?, ?, ?, ?)`
-	_, err = s.db.ExecContext(ctx, query, sessionID, traceID, eventType, data)
-	return err
-}
-
-func (s *SQLiteEventStore) GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, event_type, payload, created_at FROM domain_events WHERE session_id = ? ORDER BY id ASC`
-	rows, err := s.db.QueryContext(ctx, query, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var events []DomainEvent
-	for rows.Next() {
-		var e DomainEvent
-		if err := rows.Scan(&e.ID, &e.SessionID, &e.TraceID, &e.Type, &e.Payload, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-		events = append(events, e)
-	}
-	return events, nil
-}
-
-func (s *SQLiteEventStore) Close() error {
-	return s.db.Close()
-}
-
-</file>
-
-<file path="events.go">
-package main
-
-import "encoding/json"
-
-// EngineEvent is the base interface for all messages routed to the Engine's single-threaded loop.
-type EngineEvent interface {
-	isEngineEvent()
-}
-
-// EventClientState represents a telemetry tick from the TS bot.
-type EventClientState struct {
-	State      GameState
-	RawPayload json.RawMessage
-}
-
-func (e EventClientState) isEngineEvent() {}
-
-// EventClientAction represents a task lifecycle update (completed, failed, aborted).
-type EventClientAction struct {
-	Event     string `json:"event"`
-	Action    string `json:"action"`
-	CommandID string `json:"command_id"`
-	Cause     string `json:"cause"`
-	Duration  int    `json:"duration_ms"`
-}
-
-func (e EventClientAction) isEngineEvent() {}
-
-// EventPlanReady represents a successfully generated tactical plan from the LLM goroutine.
-type EventPlanReady struct {
-	Epoch   int
-	TraceID string
-	Plan    *LLMPlan
-}
-
-func (e EventPlanReady) isEngineEvent() {}
-
-// EventPlanError represents a failure in the LLM planning goroutine.
-type EventPlanError struct {
-	Epoch int
-	Error error
-}
-
-func (e EventPlanError) isEngineEvent() {}
-
-// EventMilestoneReady represents a successfully generated milestone plan.
-type EventMilestoneReady struct {
-	Epoch     int
-	Milestone *MilestonePlan
-}
-
-func (e EventMilestoneReady) isEngineEvent() {}
-
-// EventMilestoneError represents a failure in the milestone generation goroutine.
-type EventMilestoneError struct {
-	Epoch int
-	Error error
-}
-
-func (e EventMilestoneError) isEngineEvent() {}
-
-</file>
-
-<file path="executor.go">
-package main
-
-import (
-	"encoding/json"
-	"sync"
-	"time"
-
-	"github.com/gorilla/websocket"
-)
-
-type Executor interface {
-	Dispatch(action Action) error
-	SendControl(msgType, reason string) error
-	Close() error
-}
-
-type WSExecutor struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
-}
-
-func NewWSExecutor(conn *websocket.Conn) *WSExecutor {
-	return &WSExecutor{
-		conn: conn,
-	}
-}
-
-func (e *WSExecutor) Dispatch(action Action) error {
-	payload, err := json.Marshal(CommandPayload{
-		ID:        action.ID,
-		Action:    action.Action,
-		Target:    action.Target,
-		Rationale: action.Rationale,
-	})
-	if err != nil {
-		return err
-	}
-	msg := WSMessage{
-		Type:    TypeCommand,
-		Trace:   action.Trace,
-		Payload: json.RawMessage(payload),
-	}
-	return e.writeJSON(msg)
-}
-
-func (e *WSExecutor) SendControl(msgType, reason string) error {
-	payload, err := json.Marshal(map[string]string{"reason": reason})
-	if err != nil {
-		return err
-	}
-	msg := WSMessage{
-		Type:    WSMessageType(msgType),
-		Payload: json.RawMessage(payload),
-	}
-	return e.writeJSON(msg)
-}
-
-func (e *WSExecutor) Close() error {
-	return e.conn.Close()
-}
-
-func (e *WSExecutor) writeJSON(v interface{}) error {
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-	e.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return e.conn.WriteJSON(v)
-}
-
-</file>
-
-<file path="fallback_planner.go">
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-)
-
-// FallbackBrain provides deterministic, hardcoded survival plans
-// when the primary LLM is unavailable or repeatedly hallucinating.
-type FallbackBrain struct{}
-
-func NewFallbackBrain() *FallbackBrain {
-	return &FallbackBrain{}
-}
-
-func (f *FallbackBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
-	return &MilestonePlan{
-		ID:             fmt.Sprintf("fallback-milestone-%d", time.Now().Unix()),
-		Description:    "Survive and gather basic resources while AI is disconnected.",
-		CompletionHint: "Has 10 oak_logs and 10 cobblestone.",
-	}, nil
-}
-
-func (f *FallbackBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
-	// A simple, deterministic loop: if we don't have wood, get wood.
-	// We rely on the RoutineManager to handle combat and sleep reflexes.
-	return &LLMPlan{
-		Objective:         "Execute deterministic fallback survival loop",
-		MilestoneComplete: false,
-		Tasks: []Action{
-			{
-				Action:    string(ActionGather),
-				Target:    Target{Type: string(TargetBlock), Name: "wood"},
-				Rationale: "Fallback mode: Gathering generic wood to stay productive.",
-				Priority:  PriLLM,
-			},
-			{
-				Action:    string(ActionIdle),
-				Target:    Target{Type: string(TargetNone), Name: "none"},
-				Rationale: "Fallback mode: Yielding to routines.",
-				Priority:  PriLLM,
-			},
-		},
-	}, nil
-}
-
-</file>
-
 <file path="js\index.ts">
-// js/index.ts
 import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
@@ -1325,14 +27,15 @@ import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 
 const { pathfinder, Movements } = pkg;
 
-// --- FIX 1: Prevent known 1.19 packet parsing glitches from spamming/crashing ---
+let viewerStarted = false;
+
 process.on("uncaughtException", (err: Error) => {
     if (
         err.name === "PartialReadError" ||
         err.message.includes("Read error for undefined") ||
         err.message.includes("Missing characters in string")
     ) {
-        return; // Silently ignore to keep the event loop clean
+        return;
     }
     log.error("Fatal uncaught exception", {
         err: err.message,
@@ -1349,10 +52,13 @@ let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
 
-// --- FIX 2: State Cache to prevent Event Loop blocking ---
 let lastBlockSearchTime = 0;
 let cachedHasBed = false;
 let cachedHasTable = false;
+let cachedNearbyWood = false;
+let cachedNearbyStone = false;
+let cachedNearbyCoal = false;
+let lastStateSig = "";
 
 function stopMovement() {
     if (!bot) return;
@@ -1454,8 +160,15 @@ async function executeDecision(decision: models.IncomingDecision) {
 function pushState() {
     if (!bot?.entity || !client) return;
 
+    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.z)}|${bot.inventory
+        .items()
+        .map((i) => `${i.name}:${i.count}`)
+        .sort()
+        .join(",")}`;
+    if (sig === lastStateSig) return;
+    lastStateSig = sig;
+
     const now = Date.now();
-    // Only run expensive 32-block radius searches every 5 seconds (not every 2 seconds)
     if (now - lastBlockSearchTime > 5000) {
         cachedHasBed = !!bot.findBlock({
             matching: (b) => b?.name.includes("bed"),
@@ -1464,6 +177,18 @@ function pushState() {
         cachedHasTable = !!bot.findBlock({
             matching: (b) => b?.name === "crafting_table",
             maxDistance: 32,
+        });
+        cachedNearbyWood = !!bot.findBlock({
+            matching: (b) => b?.name.endsWith("_log"),
+            maxDistance: 24,
+        });
+        cachedNearbyStone = !!bot.findBlock({
+            matching: (b) => b?.name === "stone",
+            maxDistance: 12,
+        });
+        cachedNearbyCoal = !!bot.findBlock({
+            matching: (b) => b?.name === "coal_ore",
+            maxDistance: 12,
         });
         lastBlockSearchTime = now;
     }
@@ -1482,14 +207,34 @@ function pushState() {
             .map((t) => ({ name: t.name })),
         has_bed_nearby: cachedHasBed,
         has_crafting_table_nearby: cachedHasTable,
+        nearby_wood: cachedNearbyWood,
+        nearby_stone: cachedNearbyStone,
+        nearby_coal: cachedNearbyCoal,
         inventory: bot.inventory
             .items()
             .map((i) => ({ name: i.name, count: i.count })),
     });
 }
 
-async function bootstrap() {
-    runtimeConfig = await config.loadConfig();
+async function connectWithRetry(maxAttempts = 10, attempt = 1) {
+    if (attempt > maxAttempts) {
+        log.error("Max reconnection attempts reached. Shutting down.");
+        process.exit(1);
+    }
+
+    if (bot) {
+        try {
+            // Free the viewer port before killing the bot
+            if ((bot as any).viewer) {
+                (bot as any).viewer.close();
+                viewerStarted = false;
+            }
+            bot.removeAllListeners();
+            bot.quit();
+        } catch (e) {}
+    }
+
+    log.info(`Connecting bot (Attempt ${attempt}/${maxAttempts})...`);
 
     bot = mineflayer.createBot({
         host: "0.0.0.0",
@@ -1500,17 +245,23 @@ async function bootstrap() {
 
     bot.loadPlugin(pathfinder);
 
-    client = new ControlPlaneClient(runtimeConfig.ws_url, {
-        onCommand: (d) => void executeDecision(d),
-        onUnlock: () => abortActiveTask("unlock"),
-    });
+    if (!client) {
+        client = new ControlPlaneClient(runtimeConfig.ws_url, {
+            onCommand: (d) => void executeDecision(d),
+            onUnlock: () => abortActiveTask("unlock"),
+        });
+    }
 
-    survival = new SurvivalSystem(bot, client, {
-        onInterrupt: (r) => {
-            if (r === "panic_flee") abortActiveTask("survival_panic");
-        },
-        stopMovement: () => stopMovement(),
-    });
+    if (!survival) {
+        survival = new SurvivalSystem(bot, client, {
+            onInterrupt: (r) => {
+                if (r === "panic_flee") abortActiveTask("survival_panic");
+            },
+            stopMovement: () => stopMovement(),
+        });
+    } else {
+        survival.bot = bot;
+    }
 
     bot.on("error", (err: Error) => {
         if (
@@ -1518,18 +269,29 @@ async function bootstrap() {
             err.message.includes("Read error for undefined") ||
             err.message.includes("Missing characters in string")
         ) {
-            return; // Suppress internal Mineflayer parser errors
+            return;
         }
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
 
+    bot.on("end", (reason) => {
+        log.warn(`Bot disconnected. Reason: ${reason}`);
+        abortActiveTask("bot_disconnected");
+        survival.stop();
+
+        const backoffMs = Math.min(1000 * Math.pow(2, attempt), 30000);
+        log.info(`Retrying in ${backoffMs / 1000}s...`);
+        setTimeout(() => connectWithRetry(maxAttempts, attempt + 1), backoffMs);
+    });
+
     bot.on("spawn", () => {
+        log.info("Bot spawned successfully.");
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allow1by1towers = true;
         movements.allowParkour = true;
         movements.allowSprinting = true;
-        // FIX: Dynamically resolve 1.19 liquid IDs instead of legacy 9/10
+
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
         movements.liquids = new Set(
@@ -1547,13 +309,23 @@ async function bootstrap() {
 
         if (!client.isConnected()) {
             client.connect();
-            survival.start();
-            if (runtimeConfig.enable_viewer) {
+        }
+        survival.start();
+
+        if (runtimeConfig.enable_viewer) {
+            try {
+                if (viewerStarted) {
+                    log.warn("Viewer already started, skipping new instance");
+                    return;
+                }
                 viewer(bot, {
                     port: runtimeConfig.viewer_port,
                     firstPerson: true,
                     viewDistance: 4,
                 });
+                viewerStarted = true;
+            } catch (err) {
+                log.warn("Could not start viewer", { err });
             }
         }
     });
@@ -1574,2799 +346,18 @@ async function bootstrap() {
     });
 
     bot.on("health", pushState);
-    setInterval(pushState, 2000);
+
+    if ((global as any).__stateInterval)
+        clearInterval((global as any).__stateInterval);
+    (global as any).__stateInterval = setInterval(pushState, 2000);
+}
+
+async function bootstrap() {
+    runtimeConfig = await config.loadConfig();
+    await connectWithRetry();
 }
 
 bootstrap().catch((err) => log.error("Fatal startup", { err }));
-
-</file>
-
-<file path="js\lib\config.ts">
-import * as dotenv from "dotenv";
-import * as fs from "fs";
-import * as path from "path";
-
-function loadEnv(): string {
-    const candidates = [
-        path.resolve(process.cwd(), ".env"),
-        path.resolve(process.cwd(), "../.env"),
-    ];
-
-    for (const envPath of candidates) {
-        if (fs.existsSync(envPath)) {
-            dotenv.config({ path: envPath });
-            return envPath;
-        }
-    }
-
-    dotenv.config();
-    return "default-dotenv-lookup";
-}
-
-export const ENV_PATH = loadEnv();
-
-export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
-export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
-
-export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
-
-export const TASK_TIMEOUTS: Record<string, number> = {
-    gather: 30000,
-    craft: 20000,
-    hunt: 30000,
-    explore: 20000,
-    build: 20000,
-    smelt: 30000,
-    farm: 40000,
-    mine: 45000,
-    retreat: 15000,
-    sleep: 20000,
-    mark_location: 5000,
-    recall_location: 5000,
-    idle: 3000,
-};
-
-export const THREAT_WEIGHTS: Record<string, number> = {
-    warden: 1000,
-    creeper: 50,
-    skeleton: 20,
-    zombie: 10,
-    spider: 10,
-};
-
-export interface Config {
-    ws_url: string;
-    viewer_port: number;
-    enable_viewer: boolean;
-    debug_chat: boolean;
-    task_timeouts: Record<string, number>;
-    threat_weights: Record<string, number>;
-}
-
-let configCache: Config | null = null;
-
-export async function loadConfig(): Promise<Config> {
-    if (configCache) return configCache;
-
-    let timeoutId: NodeJS.Timeout | null = null;
-
-    try {
-        const controller = new AbortController();
-        timeoutId = setTimeout(() => controller.abort(), 3000);
-
-        const res = await fetch("http://127.0.0.1:8080/api/config", {
-            signal: controller.signal,
-        });
-
-        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
-
-        configCache = await res.json();
-
-        if (configCache!.task_timeouts) {
-            Object.assign(TASK_TIMEOUTS, configCache!.task_timeouts);
-        }
-        if (configCache!.threat_weights) {
-            Object.assign(THREAT_WEIGHTS, configCache!.threat_weights);
-        }
-
-        configCache!.task_timeouts = TASK_TIMEOUTS;
-        configCache!.threat_weights = THREAT_WEIGHTS;
-
-        return configCache!;
-    } catch (err) {
-        console.warn(
-            "Failed to fetch dynamic config, relying on static defaults",
-            err instanceof Error ? err.message : String(err),
-        );
-
-        configCache = {
-            ws_url: WS_URL,
-            viewer_port: VIEWER_PORT,
-            enable_viewer: ENABLE_VIEWER,
-            debug_chat: DEBUG_CHAT,
-            task_timeouts: TASK_TIMEOUTS,
-            threat_weights: THREAT_WEIGHTS,
-        };
-
-        return configCache;
-    } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-    }
-}
-
-</file>
-
-<file path="js\lib\logger.ts">
-import { type TraceContext } from "./models.js";
-
-const DEBUG = process.env.DEBUG === "true";
-
-interface LogMeta extends Record<string, unknown> {
-    trace?: TraceContext;
-}
-
-interface Logger {
-    info: (msg: string, meta?: LogMeta) => void;
-    warn: (msg: string, meta?: LogMeta) => void;
-    error: (msg: string, meta?: LogMeta) => void;
-    debug: (msg: string, meta?: LogMeta) => void;
-}
-
-function formatLog(level: string, msg: string, meta: LogMeta = {}): string {
-    const { trace, ...rest } = meta;
-    return JSON.stringify({
-        level,
-        msg,
-        trace_id: trace?.trace_id,
-        action_id: trace?.action_id,
-        milestone_id: trace?.milestone_id,
-        ...rest,
-        timestamp: new Date().toISOString(),
-    });
-}
-
-export const log: Logger = {
-    info: (msg, meta) => console.log(formatLog("INFO", msg, meta)),
-    warn: (msg, meta) => console.warn(formatLog("WARN", msg, meta)),
-    error: (msg, meta) => console.error(formatLog("ERROR", msg, meta)),
-    debug: (msg, meta) => {
-        if (!DEBUG) return;
-        console.log(formatLog("DEBUG", msg, meta));
-    },
-};
-
-</file>
-
-<file path="js\lib\models.ts">
-export enum ActionType {
-    Gather = "gather",
-    Craft = "craft",
-    Hunt = "hunt",
-    Explore = "explore",
-    Build = "build",
-    Smelt = "smelt",
-    Farm = "farm",
-    Mine = "mine",
-    MarkLocation = "mark_location",
-    RecallLocation = "recall_location",
-    Idle = "idle",
-    Sleep = "sleep",
-    Retreat = "retreat",
-    Eat = "eat",
-    Interact = "interact",
-}
-
-export enum ClientEventType {
-    TaskCompleted = "task_completed",
-    TaskFailed = "task_failed",
-    TaskAborted = "task_aborted",
-    Death = "death",
-    PanicRetreat = "panic_retreat",
-}
-
-export interface TraceContext {
-    trace_id: string;
-    action_id: string;
-    milestone_id?: string;
-}
-
-export interface DecisionTarget {
-    type: string;
-    name: string;
-}
-
-export interface IncomingDecision {
-    id: string;
-    action: ActionType;
-    target: DecisionTarget;
-    rationale?: string;
-    trace?: TraceContext;
-}
-
-export interface ActiveTask {
-    id: string;
-    action: ActionType;
-    target: DecisionTarget;
-    startTime: number;
-    trace: TraceContext;
-}
-
-export interface ThreatInfo {
-    id: number;
-    name: string;
-    distance: number;
-    threatScore: number;
-    position: { x: number; y: number; z: number };
-    entity?: any;
-}
-
-</file>
-
-<file path="js\lib\network\client.ts">
-import WebSocket from "ws";
-import { log } from "../logger.js";
-import * as models from "../models.js";
-
-export interface ControlPlaneEvents {
-    onCommand: (decision: models.IncomingDecision) => void;
-    onUnlock: () => void;
-}
-
-export class ControlPlaneClient {
-    private ws: WebSocket | null = null;
-    private readonly url: string;
-    private readonly callbacks: ControlPlaneEvents;
-    private reconnectTimer: NodeJS.Timeout | null = null;
-    private reconnectAttempts: number = 0;
-
-    constructor(url: string, callbacks: ControlPlaneEvents) {
-        this.url = url;
-        this.callbacks = callbacks;
-    }
-
-    public isConnected(): boolean {
-        return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
-    }
-
-    public connect(): void {
-        if (this.ws) {
-            // Remove listeners to prevent memory leaks and duplicate callbacks
-            this.ws.removeAllListeners();
-            // Terminate destroys the socket immediately, preventing lingering connections
-            // during aggressive reconnection loops
-            this.ws.terminate();
-            this.ws = null;
-        }
-
-        this.ws = new WebSocket(this.url);
-
-        this.ws.on("open", () => {
-            log.info("Connected to Go Control Plane", { ws_url: this.url });
-            this.reconnectAttempts = 0;
-            if (this.reconnectTimer) {
-                clearTimeout(this.reconnectTimer);
-                this.reconnectTimer = null;
-            }
-        });
-
-        this.ws.on("message", (data: Buffer) => {
-            try {
-                const msg = JSON.parse(data.toString());
-
-                if (msg.type === "command") {
-                    const decision = msg.payload as models.IncomingDecision;
-
-                    if (!decision || !decision.action) {
-                        log.error("Received malformed command payload", {
-                            payload: msg.payload,
-                        });
-                        this.callbacks.onUnlock();
-                        return;
-                    }
-
-                    decision.trace = msg.trace || {
-                        trace_id: "unknown",
-                        action_id: decision.id,
-                    };
-
-                    this.callbacks.onCommand(decision);
-                    return;
-                }
-
-                if (msg.type === "planning_error" || msg.type === "noop") {
-                    log.debug("Control plane unlocked bot", {
-                        type: msg.type,
-                        payload: msg.payload,
-                    });
-                    this.callbacks.onUnlock();
-                }
-            } catch (err) {
-                log.error("Failed to parse control-plane message", {
-                    err: err instanceof Error ? err.message : String(err),
-                });
-                this.callbacks.onUnlock();
-            }
-        });
-
-        this.ws.on("close", () => {
-            log.error("Disconnected from Control Plane. Reconnecting...");
-            this.callbacks.onUnlock();
-            this.scheduleReconnect();
-        });
-
-        this.ws.on("error", (err) => {
-            log.error("WebSocket error", {
-                err: err instanceof Error ? err.message : String(err),
-            });
-        });
-    }
-
-    private scheduleReconnect(): void {
-        if (this.reconnectTimer) return;
-        const baseDelay = 2000;
-        const maxDelay = 30000;
-        let delay = baseDelay * Math.pow(2, this.reconnectAttempts);
-        if (delay > maxDelay) delay = maxDelay;
-
-        const jitter = delay * 0.2 * (Math.random() * 2 - 1);
-        const finalDelay = Math.max(1000, delay + jitter);
-
-        log.info("Scheduling reconnect", {
-            delay_ms: Math.round(finalDelay),
-            attempt: this.reconnectAttempts + 1,
-        });
-
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectAttempts++;
-            this.reconnectTimer = null;
-            this.connect();
-        }, finalDelay);
-    }
-
-    public sendEvent(
-        event: string,
-        actionStr: string,
-        commandId = "",
-        cause = "",
-        startTime = 0,
-    ): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
-        this.ws.send(
-            JSON.stringify({
-                type: "event",
-                payload: {
-                    event,
-                    action: actionStr,
-                    command_id: commandId,
-                    cause,
-                    duration_ms,
-                },
-            }),
-        );
-    }
-
-    public sendState(state: Record<string, unknown>): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this.ws.send(JSON.stringify({ type: "state", payload: state }));
-    }
-}
-
-</file>
-
-<file path="js\lib\systems\survival.ts">
-// js/lib/systems/survival.ts
-import type { Bot } from "mineflayer";
-import type { ControlPlaneClient } from "../network/client.js";
-import { log } from "../logger.js";
-import { getThreats, computeSafeRetreat } from "../utils/threats.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-export interface SurvivalConfig {
-    onInterrupt: (reason: string) => void;
-    stopMovement: () => void;
-}
-
-export class SurvivalSystem {
-    private bot: Bot;
-    private client: ControlPlaneClient;
-    private config: SurvivalConfig;
-    private checkInterval: NodeJS.Timeout | null = null;
-    private isPanicking = false;
-    private lastDangerAt = 0;
-
-    constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
-        this.bot = bot;
-        this.client = client;
-        this.config = config;
-    }
-
-    public start() {
-        if (this.checkInterval) clearInterval(this.checkInterval);
-        this.checkInterval = setInterval(() => this.checkSurvival(), 1000);
-    }
-
-    public stop() {
-        if (this.checkInterval) clearInterval(this.checkInterval);
-        this.checkInterval = null;
-    }
-
-    public reset() {
-        this.isPanicking = false;
-        this.lastDangerAt = 0;
-    }
-
-    public isPanickingNow(): boolean {
-        return this.isPanicking;
-    }
-
-    private checkSurvival() {
-        if (!this.bot || !this.bot.entity) return;
-
-        const threats = getThreats(this.bot);
-
-        // Relaxed the filter to track ALL hostile mobs within 12 blocks,
-        // not just when the bot is at low health.
-        const immediateThreats = threats.filter(
-            (t: any) =>
-                t.distance < 12 &&
-                t.threatScore > 5 &&
-                t.name !== "low_health_no_food" &&
-                t.name !== "starvation",
-        );
-
-        if (immediateThreats.length > 0) {
-            const topThreat = immediateThreats[0]!;
-
-            // Assess our combat viability
-            const hasWeapon = this.bot.inventory
-                .items()
-                .some(
-                    (i) => i.name.includes("axe") || i.name.includes("sword"),
-                );
-            const isOneOnOne = immediateThreats.length === 1;
-            const isUnavoidableDeath =
-                topThreat.name === "creeper" || topThreat.name === "warden";
-
-            // If the odds are good, suppress the panic reflex and let Go dispatch the hunt task
-            if (
-                hasWeapon &&
-                isOneOnOne &&
-                this.bot.health > 10 &&
-                !isUnavoidableDeath
-            ) {
-                if (this.isPanicking) {
-                    this.isPanicking = false;
-                    this.config.stopMovement();
-                    this.client.sendEvent(
-                        "panic_retreat_end",
-                        "evasion_complete",
-                        "",
-                        "engaging_in_combat",
-                        0,
-                    );
-                }
-                return;
-            }
-
-            // --- STANDARD EVASION LOGIC ---
-            this.lastDangerAt = Date.now();
-
-            if (!this.isPanicking) {
-                this.isPanicking = true;
-
-                log.warn("Reflex: Critical Flee triggered", {
-                    cause: topThreat.name,
-                    health: Math.round(this.bot.health),
-                    threatCount: immediateThreats.length,
-                });
-
-                this.config.onInterrupt("panic_flee");
-                this.config.stopMovement();
-                this.client.sendEvent(
-                    "panic_retreat_start",
-                    "evasion",
-                    "",
-                    topThreat.name,
-                    0,
-                );
-            }
-
-            const safePos = computeSafeRetreat(this.bot, immediateThreats, 24);
-            this.fleeTo(safePos);
-        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
-            this.isPanicking = false;
-            log.debug("Survival goal reached; releasing reflex lock");
-            this.config.stopMovement();
-            this.client.sendEvent(
-                "panic_retreat_end",
-                "evasion_complete",
-                "",
-                "safe",
-                0,
-            );
-        }
-    }
-
-    private fleeTo(safePos: { x: number; z: number }) {
-        try {
-            this.bot.pathfinder.setGoal(
-                new goals.GoalNearXZ(safePos.x, safePos.z, 2),
-            );
-        } catch (e) {
-            // Ignore pathing errors during panic overrides
-        }
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\fsm.ts">
-import type { Bot } from "mineflayer";
-import type { Entity } from "prismarine-entity";
-import { getErrorMessage } from "../utils/errors.js";
-
-export type TaskStatus = "RUNNING" | "SUCCESS" | "FAILED";
-
-export interface TaskResult {
-    status: TaskStatus;
-    reason?: string;
-    data?: any;
-}
-
-export interface StateContext {
-    bot: Bot;
-    targetName: string;
-    targetEntity: Entity | null;
-    searchRadius: number;
-    timeoutMs: number;
-    startTime: number;
-    signal: AbortSignal;
-    result?: TaskResult;
-}
-
-export interface FSMState {
-    name: string;
-    enter(ctx: StateContext): Promise<void> | void;
-    execute(ctx: StateContext): Promise<FSMState | null>;
-}
-
-export class StateMachineRunner {
-    private currentState: FSMState | null = null;
-    private context: StateContext;
-
-    constructor(initialState: FSMState, context: StateContext) {
-        this.currentState = initialState;
-        this.context = context;
-    }
-
-    public async run(): Promise<TaskResult> {
-        this.context.startTime = Date.now();
-
-        if (this.currentState) {
-            await this.currentState.enter(this.context);
-        }
-
-        while (this.currentState !== null) {
-            if (this.context.signal.aborted) {
-                return { status: "FAILED", reason: "aborted" };
-            }
-
-            if (Date.now() - this.context.startTime > this.context.timeoutMs) {
-                return { status: "FAILED", reason: "FSM_GLOBAL_TIMEOUT" };
-            }
-
-            try {
-                const nextState = await this.currentState.execute(this.context);
-                if (nextState !== this.currentState) {
-                    if (nextState) {
-                        await nextState.enter(this.context);
-                    }
-                    this.currentState = nextState;
-                }
-            } catch (err: unknown) {
-                return {
-                    status: "FAILED",
-                    reason: `FSM_CRASH: ${getErrorMessage(err)}`,
-                };
-            }
-        }
-
-        return (
-            this.context.result || {
-                status: "FAILED",
-                reason: "UNKNOWN_TERMINATION",
-            }
-        );
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\build.ts">
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree, placePortableUtility, waitForMs } from "../utils.js";
-
-class PlaceState implements FSMState {
-    name = "PLACING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const placedBlock = await placePortableUtility(ctx.bot, ctx.targetName);
-
-        if (!placedBlock) {
-            ctx.result = {
-                status: "FAILED",
-                reason: `NO_VALID_SURFACE_FOR_${ctx.targetName.toUpperCase()}`,
-            };
-            return null;
-        }
-
-        await waitForMs(500, ctx.signal);
-        ctx.result = { status: "SUCCESS", reason: "BLOCK_PLACED" };
-        return null;
-    }
-}
-
-class CheckInventoryState implements FSMState {
-    name = "CHECKING_INVENTORY";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const item = ctx.bot.inventory
-            .items()
-            .find((i: any) => i.name === ctx.targetName);
-
-        if (!item) {
-            ctx.result = {
-                status: "FAILED",
-                reason: `MISSING_${ctx.targetName.toUpperCase()}_IN_INVENTORY`,
-            };
-            return null;
-        }
-
-        return new PlaceState();
-    }
-}
-
-export async function handleBuild(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts } = ctx;
-    await escapeTree(bot, signal);
-
-    const targetName = decision.target?.name;
-    if (!targetName || targetName === "none") {
-        throw new Error("missing build target");
-    }
-
-    const fsmCtx: StateContext = {
-        bot,
-        targetName,
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.build ?? 20000,
-        startTime: 0,
-        signal,
-    };
-
-    const fsm = new StateMachineRunner(new CheckInventoryState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\craft.ts">
-// js/lib/tasks/handlers/craft.ts
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import type { TaskContext } from "../registry.js";
-import {
-    findNearestBlockByName,
-    placePortableUtility,
-    makeRoomInInventory,
-    escapeTree,
-    waitForMs,
-    moveToGoal,
-} from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-interface CraftContext extends StateContext {
-    itemType: any;
-    recipe: any;
-    craftingTable: any;
-    isPortableTable: boolean;
-    stopMovement: () => void;
-}
-
-class CleanupState implements FSMState {
-    name = "CLEANUP";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        if (cCtx.isPortableTable && cCtx.craftingTable) {
-            await makeRoomInInventory(cCtx.bot, 1);
-            const pickaxe = cCtx.bot.pathfinder.bestHarvestTool(
-                cCtx.craftingTable,
-            );
-            if (pickaxe) await cCtx.bot.equip(pickaxe, "hand");
-
-            try {
-                await cCtx.bot.dig(cCtx.craftingTable);
-                await waitForMs(1000, cCtx.signal);
-            } catch (_err) {}
-        }
-
-        cCtx.result = { status: "SUCCESS", reason: "CRAFTING_COMPLETE" };
-        return null;
-    }
-}
-
-class CraftingState implements FSMState {
-    name = "CRAFTING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        try {
-            // FIX: Prevent bot.craft from hanging indefinitely when inventory is full
-            await makeRoomInInventory(cCtx.bot, 1);
-
-            const tableToUse = cCtx.recipe.requiresTable
-                ? cCtx.craftingTable
-                : null;
-            await cCtx.bot.craft(cCtx.recipe, 1, tableToUse);
-        } catch (err: any) {
-            cCtx.result = {
-                status: "FAILED",
-                reason: `CRAFT_ACTION_FAILED: ${err.message}`,
-            };
-            return null;
-        }
-
-        return new CleanupState();
-    }
-}
-
-class NavigateTableState implements FSMState {
-    name = "NAVIGATING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        if (cCtx.recipe.requiresTable && cCtx.craftingTable) {
-            const pos = cCtx.craftingTable.position;
-            try {
-                await moveToGoal(
-                    cCtx.bot,
-                    new goals.GoalNear(pos.x, pos.y, pos.z, 2),
-                    {
-                        signal: cCtx.signal,
-                        timeoutMs: 15000,
-                        stopMovement: cCtx.stopMovement,
-                        dynamic: false,
-                    },
-                );
-            } catch (err: any) {
-                if (err.message === "aborted") {
-                    cCtx.result = { status: "FAILED", reason: "aborted" };
-                } else {
-                    cCtx.result = {
-                        status: "FAILED",
-                        reason: "FAILED_TO_REACH_TABLE",
-                    };
-                }
-                return null;
-            }
-        }
-
-        return new CraftingState();
-    }
-}
-
-class SetupRecipeState implements FSMState {
-    name = "SETUP_RECIPE";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        const targetRecipeName = cCtx.targetName;
-        const itemType = cCtx.bot.registry.itemsByName[targetRecipeName];
-        if (!itemType) {
-            cCtx.result = {
-                status: "FAILED",
-                reason: `UNKNOWN_ITEM: ${targetRecipeName}`,
-            };
-            return null;
-        }
-        cCtx.itemType = itemType;
-
-        let craftingTable = findNearestBlockByName(cCtx.bot, "crafting_table");
-        let isPortableTable = false;
-
-        let recipes = cCtx.bot.recipesFor(itemType.id, null, 1, craftingTable);
-        if (recipes.length === 0 && !craftingTable) {
-            const hasTableInInv = cCtx.bot.inventory
-                .items()
-                .some((i: any) => i.name === "crafting_table");
-            if (hasTableInInv) {
-                craftingTable = await placePortableUtility(
-                    cCtx.bot,
-                    "crafting_table",
-                );
-                if (craftingTable) {
-                    isPortableTable = true;
-                    recipes = cCtx.bot.recipesFor(
-                        itemType.id,
-                        null,
-                        1,
-                        craftingTable,
-                    );
-                }
-            }
-        }
-
-        if (recipes.length === 0) {
-            cCtx.result = {
-                status: "FAILED",
-                reason: `MISSING_INGREDIENTS_OR_CRAFTING_TABLE_FOR_${targetRecipeName.toUpperCase()}`,
-            };
-            return null;
-        }
-
-        cCtx.recipe = recipes[0];
-        cCtx.craftingTable = craftingTable;
-        cCtx.isPortableTable = isPortableTable;
-        return new NavigateTableState();
-    }
-}
-
-export async function handleCraft(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
-
-    const targetName = decision.target?.name;
-    if (!targetName || targetName === "none") {
-        throw new Error("missing craft target");
-    }
-
-    const fsmCtx: CraftContext = {
-        bot,
-        targetName,
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.craft ?? 20000,
-        startTime: 0,
-        signal,
-        itemType: null,
-        recipe: null,
-        craftingTable: null,
-        isPortableTable: false,
-        stopMovement,
-    };
-    const fsm = new StateMachineRunner(new SetupRecipeState(), fsmCtx);
-    const result = await fsm.run();
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\explore.ts">
-// js/lib/tasks/handlers/explore.ts
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal } from "../utils.js";
-import { log } from "../../logger.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-// FIX: Retain the last 20 chunk hops to prevent backtracking
-const visitedPoints: { x: number; z: number }[] = [];
-
-interface ExploreContext extends StateContext {
-    targetX: number;
-    targetZ: number;
-    attempts: number;
-    stopMovement: () => void;
-}
-
-class NavigateState implements FSMState {
-    name = "NAVIGATING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const eCtx = ctx as ExploreContext;
-        try {
-            await moveToGoal(
-                eCtx.bot,
-                new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
-                {
-                    signal: eCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: eCtx.stopMovement,
-                    dynamic: false,
-                },
-            );
-
-            // Successfully reached new area. Record it to repel future exploration.
-            visitedPoints.push({
-                x: eCtx.bot.entity.position.x,
-                z: eCtx.bot.entity.position.z,
-            });
-            if (visitedPoints.length > 20) visitedPoints.shift();
-
-            eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
-            return null;
-        } catch (err: any) {
-            const msg = String(err?.message ?? err);
-            if (eCtx.signal.aborted || msg.includes("aborted")) {
-                eCtx.result = { status: "FAILED", reason: "aborted" };
-                return null;
-            }
-
-            log.warn("Exploration path failed, picking new direction", {
-                reason: msg,
-            });
-            return new PickDirectionState();
-        }
-    }
-}
-
-class PickDirectionState implements FSMState {
-    name = "PICKING_DIRECTION";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const eCtx = ctx as ExploreContext;
-        eCtx.attempts++;
-        if (eCtx.attempts > 4) {
-            eCtx.result = {
-                status: "FAILED",
-                reason: "SURROUNDED_BY_OBSTACLES_OR_WATER",
-            };
-            return null;
-        }
-
-        const dist = 16 + Math.random() * 16;
-        let bestAngle = 0;
-        let maxRepulsionScore = -1;
-
-        // Sample 8 angles and pick the one furthest from our visited history
-        for (let i = 0; i < 8; i++) {
-            const testAngle = Math.random() * Math.PI * 2;
-            const tx = eCtx.bot.entity.position.x + Math.cos(testAngle) * dist;
-            const tz = eCtx.bot.entity.position.z + Math.sin(testAngle) * dist;
-
-            let minDistanceToHistory = 999999;
-            for (const pt of visitedPoints) {
-                const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
-                if (d < minDistanceToHistory) minDistanceToHistory = d;
-            }
-
-            if (visitedPoints.length === 0) minDistanceToHistory = 1;
-
-            if (minDistanceToHistory > maxRepulsionScore) {
-                maxRepulsionScore = minDistanceToHistory;
-                bestAngle = testAngle;
-            }
-        }
-
-        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(bestAngle) * dist;
-        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(bestAngle) * dist;
-
-        log.info("Picked exploration vector", {
-            dist: Math.round(dist),
-            targetX: Math.round(eCtx.targetX),
-            targetZ: Math.round(eCtx.targetZ),
-            attempt: eCtx.attempts,
-        });
-        return new NavigateState();
-    }
-}
-
-export async function handleExplore(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
-
-    const fsmCtx: ExploreContext = {
-        bot,
-        targetName: "explore",
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.explore ?? 25000,
-        startTime: 0,
-        signal,
-        targetX: 0,
-        targetZ: 0,
-        attempts: 0,
-        stopMovement,
-    };
-    const result = await new StateMachineRunner(
-        new PickDirectionState(),
-        fsmCtx,
-    ).run();
-    if (result.status === "FAILED")
-        throw new Error(result.reason || "unknown_fsm_failure");
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\farm.ts">
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
-import { Vec3 } from "vec3";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-// Map crops to their fully grown metadata value and corresponding seed
-const CROP_DATA: Record<string, { matureAge: number; seedName: string }> = {
-    wheat: { matureAge: 7, seedName: "wheat_seeds" },
-    carrots: { matureAge: 7, seedName: "carrot" },
-    potatoes: { matureAge: 7, seedName: "potato" },
-    beetroots: { matureAge: 3, seedName: "beetroot_seeds" },
-};
-
-interface FarmContext extends StateContext {
-    candidatePositions: any[];
-    currentIndex: number;
-    targetBlock: any;
-    stopMovement: () => void;
-}
-
-class ReplantState implements FSMState {
-    name = "REPLANTING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const fCtx = ctx as FarmContext;
-        const cropInfo = CROP_DATA[fCtx.targetName];
-
-        // Find the farmland block directly below the crop we just broke
-        const farmlandPos = fCtx.targetBlock.position.offset(0, -1, 0);
-        const farmlandBlock = fCtx.bot.blockAt(farmlandPos);
-
-        if (farmlandBlock && farmlandBlock.name === "farmland") {
-            const seed = fCtx.bot.inventory
-                .items()
-                .find((i: any) => i.name === cropInfo!.seedName);
-            if (seed) {
-                try {
-                    await fCtx.bot.equip(seed, "hand");
-                    // Place seed on top of farmland
-                    await fCtx.bot.placeBlock(farmlandBlock, new Vec3(0, 1, 0));
-                    await waitForMs(300, fCtx.signal);
-                } catch (err) {
-                    // If replanting fails, we still succeeded at harvesting.
-                }
-            }
-        }
-
-        fCtx.result = { status: "SUCCESS", reason: "HARVESTED_AND_REPLANTED" };
-        return null;
-    }
-}
-
-class HarvestState implements FSMState {
-    name = "HARVESTING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const fCtx = ctx as FarmContext;
-        const cropBlock = fCtx.bot.blockAt(fCtx.targetBlock.position);
-
-        if (!cropBlock || cropBlock.name !== fCtx.targetName) {
-            return advanceToNextCrop(fCtx, "CROP_MISSING");
-        }
-
-        try {
-            await fCtx.bot.dig(cropBlock, true);
-            await waitForMs(400, fCtx.signal);
-            return new ReplantState();
-        } catch (err: any) {
-            return advanceToNextCrop(fCtx, `DIG_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class NavigateCropState implements FSMState {
-    name = "NAVIGATING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const fCtx = ctx as FarmContext;
-        const pos = fCtx.candidatePositions[fCtx.currentIndex];
-        fCtx.targetBlock = fCtx.bot.blockAt(pos);
-
-        try {
-            await moveToGoal(
-                fCtx.bot,
-                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
-                {
-                    signal: fCtx.signal,
-                    timeoutMs: 12000,
-                    stopMovement: fCtx.stopMovement,
-                },
-            );
-            return new HarvestState();
-        } catch (err: any) {
-            return advanceToNextCrop(fCtx, `PATH_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class SearchCropState implements FSMState {
-    name = "SEARCHING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const fCtx = ctx as FarmContext;
-        const cropInfo = CROP_DATA[fCtx.targetName];
-
-        if (!cropInfo) {
-            fCtx.result = {
-                status: "FAILED",
-                reason: `UNSUPPORTED_CROP: ${fCtx.targetName}`,
-            };
-            return null;
-        }
-
-        const blockId = fCtx.bot.registry.blocksByName[fCtx.targetName]?.id;
-        let blocks = fCtx.bot.findBlocks({
-            matching: blockId!,
-            maxDistance: 32,
-            count: 128,
-        });
-
-        const botPos = fCtx.bot.entity.position;
-
-        // Filter for ONLY fully mature crops using metadata
-        blocks = blocks.filter((pos: any) => {
-            const block = fCtx.bot.blockAt(pos);
-            return block && block.metadata === cropInfo.matureAge;
-        });
-
-        if (blocks.length === 0) {
-            fCtx.result = {
-                status: "FAILED",
-                reason: `NO_MATURE_${fCtx.targetName.toUpperCase()}_FOUND`,
-            };
-            return null;
-        }
-
-        blocks.sort(
-            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
-        );
-        fCtx.candidatePositions = blocks.slice(0, 5);
-        fCtx.currentIndex = 0;
-
-        return new NavigateCropState();
-    }
-}
-
-function advanceToNextCrop(fCtx: FarmContext, reason: string): FSMState | null {
-    fCtx.currentIndex++;
-    if (fCtx.currentIndex >= fCtx.candidatePositions.length) {
-        fCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
-        return null;
-    }
-    return new NavigateCropState();
-}
-
-export async function handleFarm(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
-
-    const fsmCtx: FarmContext = {
-        bot,
-        targetName: decision.target?.name || "",
-        targetEntity: null,
-        searchRadius: 32,
-        timeoutMs: timeouts.farm ?? 40000,
-        startTime: 0,
-        signal,
-        candidatePositions: [],
-        currentIndex: 0,
-        targetBlock: null,
-        stopMovement,
-    };
-
-    const result = await new StateMachineRunner(
-        new SearchCropState(),
-        fsmCtx,
-    ).run();
-    if (result.status === "FAILED") throw new Error(result.reason);
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\gather.ts">
-// js/lib/tasks/handlers/gather.ts
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-const LOG_TYPES = [
-    "oak_log",
-    "birch_log",
-    "spruce_log",
-    "acacia_log",
-    "jungle_log",
-    "dark_oak_log",
-    "mangrove_log",
-    "cherry_log",
-];
-
-interface GatherContext extends StateContext {
-    candidatePositions: any[];
-    currentIndex: number;
-    resolvedTarget: string;
-    targetBlock: any;
-    stopMovement: () => void;
-}
-
-class MineState implements FSMState {
-    name = "MINING";
-    async enter() {}
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const gCtx = ctx as GatherContext;
-        const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
-
-        if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
-            return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
-
-        const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
-        if (tool) await gCtx.bot.equip(tool, "hand");
-
-        try {
-            await gCtx.bot.dig(freshBlock);
-            await waitForMs(500, gCtx.signal);
-            gCtx.result = { status: "SUCCESS" };
-            return null;
-        } catch (err: any) {
-            return advanceToNextCandidate(gCtx, `DIG_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class NavigateState implements FSMState {
-    name = "NAVIGATING";
-    async enter() {}
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const gCtx = ctx as GatherContext;
-        const pos = gCtx.candidatePositions[gCtx.currentIndex];
-
-        gCtx.targetBlock = gCtx.bot.blockAt(pos);
-        gCtx.resolvedTarget = gCtx.targetBlock.name;
-
-        try {
-            await moveToGoal(
-                gCtx.bot,
-                new goals.GoalNear(pos.x, pos.y, pos.z, 1.5),
-                {
-                    signal: gCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: gCtx.stopMovement,
-                },
-            );
-            return new MineState();
-        } catch (err: any) {
-            return advanceToNextCandidate(gCtx, `PATH_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class SearchState implements FSMState {
-    name = "SEARCHING";
-    async enter() {}
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const gCtx = ctx as GatherContext;
-        const candidates =
-            gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
-
-        const ids = candidates
-            .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
-            .filter((id) => id !== undefined);
-
-        let blocks = gCtx.bot.findBlocks({
-            matching: ids,
-            maxDistance: 64, // FIX: Expanded from 48 to 64 to find sparse wood
-            count: 256,
-        });
-
-        const botPos = gCtx.bot.entity.position;
-
-        blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
-
-        if (blocks.length === 0) {
-            gCtx.result = { status: "FAILED", reason: "NO_REACHABLE_BLOCKS" };
-            return null;
-        }
-
-        blocks.sort(
-            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
-        );
-
-        gCtx.candidatePositions = blocks.slice(0, 6);
-        gCtx.currentIndex = 0;
-
-        return new NavigateState();
-    }
-}
-
-function advanceToNextCandidate(
-    gCtx: GatherContext,
-    reason: string,
-): FSMState | null {
-    gCtx.currentIndex++;
-    if (
-        gCtx.currentIndex >= gCtx.candidatePositions.length ||
-        gCtx.currentIndex > 5
-    ) {
-        gCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
-        return null;
-    }
-    return new NavigateState();
-}
-
-export async function handleGather(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
-
-    const fsmCtx: GatherContext = {
-        bot,
-        targetName: decision.target?.name,
-        targetEntity: null,
-        searchRadius: 64, // FIX: Matches expanded findBlocks radius
-        timeoutMs: timeouts.gather ?? 30000,
-        startTime: 0,
-        signal,
-        candidatePositions: [],
-        currentIndex: 0,
-        resolvedTarget: "",
-        targetBlock: null,
-        stopMovement,
-    };
-    const result = await new StateMachineRunner(
-        new SearchState(),
-        fsmCtx,
-    ).run();
-
-    if (result.status === "FAILED") throw new Error(result.reason);
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\hunt.ts">
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { gotoEntity, attackEntity, findNearestEntity } from "../primitives.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree } from "../utils.js";
-
-interface HuntContext extends StateContext {
-    stopMovement: () => void;
-}
-
-class LootState implements FSMState {
-    name = "LOOTING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const hCtx = ctx as HuntContext;
-        const droppedItems = findNearestEntity(hCtx.bot, "item", 8);
-
-        if (droppedItems) {
-            try {
-                const reached = await gotoEntity(hCtx.bot, droppedItems, 0.5, {
-                    signal: hCtx.signal,
-                    timeoutMs: 10000,
-                    stopMovement: hCtx.stopMovement,
-                });
-
-                if (!reached) {
-                    hCtx.result = {
-                        status: "FAILED",
-                        reason: "FAILED_TO_REACH_LOOT",
-                    };
-                    return null;
-                }
-            } catch (err: any) {
-                if (err.message === "aborted") {
-                    hCtx.result = { status: "FAILED", reason: "aborted" };
-                    return null;
-                }
-            }
-        }
-        hCtx.result = { status: "SUCCESS", reason: "HUNT_COMPLETE" };
-        return null;
-    }
-}
-
-class AttackState implements FSMState {
-    name = "ATTACKING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        if (!ctx.targetEntity || !ctx.targetEntity.isValid) {
-            return new LootState();
-        }
-
-        const dist = ctx.bot.entity.position.distanceTo(
-            ctx.targetEntity.position,
-        );
-
-        if (dist > 3.2) {
-            return new ApproachState();
-        }
-
-        const weapon = ctx.bot.inventory
-            .items()
-            .find((i) => i.name.includes("sword") || i.name.includes("axe"));
-
-        let cooldownMs = 650; // Default punch/sword cooldown
-
-        if (weapon) {
-            await ctx.bot.equip(weapon, "hand");
-            if (weapon.name.includes("axe")) {
-                cooldownMs = 1050; // Axes attack much slower but hit harder
-            } else if (weapon.name.includes("sword")) {
-                cooldownMs = 625;
-            }
-        }
-
-        await attackEntity(ctx.bot, ctx.targetEntity);
-        await new Promise((resolve) => setTimeout(resolve, cooldownMs));
-
-        return this;
-    }
-}
-
-class ApproachState implements FSMState {
-    name = "APPROACHING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const hCtx = ctx as HuntContext;
-
-        if (!hCtx.targetEntity || !hCtx.targetEntity.isValid) {
-            hCtx.result = {
-                status: "FAILED",
-                reason: "TARGET_LOST_OR_DESPAWNED",
-            };
-            return null;
-        }
-
-        try {
-            const reached = await gotoEntity(hCtx.bot, hCtx.targetEntity, 2, {
-                signal: hCtx.signal,
-                timeoutMs: 15000,
-                stopMovement: hCtx.stopMovement,
-            });
-
-            if (!reached) {
-                const dist = hCtx.bot.entity.position.distanceTo(
-                    hCtx.targetEntity.position,
-                );
-
-                if (dist > 32) {
-                    hCtx.result = {
-                        status: "FAILED",
-                        reason: "TARGET_RAN_TOO_FAR",
-                    };
-                    return null;
-                }
-            }
-        } catch (err: any) {
-            if (err.message === "aborted") {
-                hCtx.result = { status: "FAILED", reason: "aborted" };
-                return null;
-            }
-        }
-
-        return new AttackState();
-    }
-}
-
-export class SearchState implements FSMState {
-    name = "SEARCHING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const entity = findNearestEntity(
-            ctx.bot,
-            ctx.targetName,
-            ctx.searchRadius,
-        );
-
-        if (!entity) {
-            ctx.result = {
-                status: "FAILED",
-                reason: `NO_${ctx.targetName.toUpperCase()}_FOUND_IN_RADIUS`,
-            };
-            return null;
-        }
-        ctx.targetEntity = entity;
-        return new ApproachState();
-    }
-}
-
-export async function handleHunt(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
-
-    const targetName = decision.target?.name;
-    if (!targetName || targetName === "none") {
-        throw new Error("missing hunt target");
-    }
-
-    const fsmCtx: HuntContext = {
-        bot,
-        targetName,
-        targetEntity: null,
-        searchRadius: 32,
-        timeoutMs: timeouts.hunt ?? 30000,
-        startTime: 0,
-        signal,
-        stopMovement,
-    };
-
-    const fsm = new StateMachineRunner(new SearchState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\interact.ts">
-// js/lib/tasks/handlers/interact.ts
-import { type TaskContext } from "../registry.js";
-import { findNearestEntity } from "../primitives.js";
-import { findNearestBlockByName, moveToGoal } from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-export async function handleInteract(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, stopMovement, timeouts } = ctx;
-    const targetName = decision.target?.name;
-
-    if (!targetName || targetName === "none") {
-        throw new Error("missing interact target");
-    }
-
-    // 1. Try to find it as an Entity (Boats, Minecarts, Villagers)
-    const entity = findNearestEntity(bot, targetName, 16);
-    if (entity) {
-        await moveToGoal(
-            bot,
-            new goals.GoalNear(
-                entity.position.x,
-                entity.position.y,
-                entity.position.z,
-                2,
-            ),
-            {
-                signal,
-                timeoutMs: timeouts.interact ?? 15000,
-                stopMovement,
-            },
-        );
-
-        if (
-            targetName.includes("boat") ||
-            targetName.includes("minecart") ||
-            targetName.includes("horse")
-        ) {
-            await bot.mount(entity);
-        } else {
-            bot.activateEntity(entity);
-        }
-        return;
-    }
-
-    // 2. Try to find it as a Block (Doors, Buttons, Levers, Beds)
-    const block = findNearestBlockByName(bot, targetName);
-    if (block) {
-        await moveToGoal(
-            bot,
-            new goals.GoalNear(
-                block.position.x,
-                block.position.y,
-                block.position.z,
-                2,
-            ),
-            {
-                signal,
-                timeoutMs: timeouts.interact ?? 15000,
-                stopMovement,
-            },
-        );
-        await bot.activateBlock(block);
-        return;
-    }
-
-    throw new Error(`NO_INTERACTABLE_FOUND: ${targetName}`);
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\mine.ts">
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-interface MineContext extends StateContext {
-    candidatePositions: any[];
-    currentIndex: number;
-    targetBlock: any;
-    stopMovement: () => void;
-}
-
-class MineBlockState implements FSMState {
-    name = "BREAKING_ORE";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const mCtx = ctx as MineContext;
-        const freshBlock = mCtx.bot.blockAt(mCtx.targetBlock.position);
-
-        if (!freshBlock || freshBlock.name === "air") {
-            return advanceToNextOre(mCtx, "BLOCK_ALREADY_MINED");
-        }
-
-        const pickaxe = mCtx.bot.inventory
-            .items()
-            .find((i: any) => i.name.includes("pickaxe"));
-        if (!pickaxe) {
-            mCtx.result = { status: "FAILED", reason: "NO_PICKAXE_EQUIPPED" };
-            return null;
-        }
-
-        await mCtx.bot.equip(pickaxe, "hand");
-
-        try {
-            await mCtx.bot.dig(freshBlock, true); // true forces line-of-sight bypass
-            await waitForMs(500, mCtx.signal);
-            mCtx.result = { status: "SUCCESS" };
-            return null;
-        } catch (err: any) {
-            return advanceToNextOre(mCtx, `DIG_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class NavigateOreState implements FSMState {
-    name = "NAVIGATING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const mCtx = ctx as MineContext;
-        const pos = mCtx.candidatePositions[mCtx.currentIndex];
-        mCtx.targetBlock = mCtx.bot.blockAt(pos);
-
-        try {
-            // Use GoalGetToBlock so the bot stands *next* to the ore, not inside it
-            await moveToGoal(
-                mCtx.bot,
-                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
-                {
-                    signal: mCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: mCtx.stopMovement,
-                },
-            );
-            return new MineBlockState();
-        } catch (err: any) {
-            return advanceToNextOre(mCtx, `PATH_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class SearchOreState implements FSMState {
-    name = "SEARCHING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const mCtx = ctx as MineContext;
-        const blockId = mCtx.bot.registry.blocksByName[mCtx.targetName]?.id;
-
-        if (blockId === undefined) {
-            mCtx.result = {
-                status: "FAILED",
-                reason: `UNKNOWN_ORE: ${mCtx.targetName}`,
-            };
-            return null;
-        }
-
-        // Expanded search radius since ores can be sparse
-        let blocks = mCtx.bot.findBlocks({
-            matching: blockId,
-            maxDistance: 64,
-            count: 128,
-        });
-
-        if (blocks.length === 0) {
-            mCtx.result = {
-                status: "FAILED",
-                reason: `NO_${mCtx.targetName.toUpperCase()}_NEARBY`,
-            };
-            return null;
-        }
-
-        const botPos = mCtx.bot.entity.position;
-        blocks.sort(
-            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
-        );
-
-        mCtx.candidatePositions = blocks.slice(0, 5);
-        mCtx.currentIndex = 0;
-        return new NavigateOreState();
-    }
-}
-
-function advanceToNextOre(mCtx: MineContext, reason: string): FSMState | null {
-    mCtx.currentIndex++;
-    if (mCtx.currentIndex >= mCtx.candidatePositions.length) {
-        mCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
-        return null;
-    }
-    return new NavigateOreState();
-}
-
-export async function handleMine(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
-
-    if (!decision.target?.name || decision.target.name === "none") {
-        throw new Error("missing mine target");
-    }
-
-    const fsmCtx: MineContext = {
-        bot,
-        targetName: decision.target.name,
-        targetEntity: null,
-        searchRadius: 64,
-        timeoutMs: timeouts.mine ?? 45000,
-        startTime: 0,
-        signal,
-        candidatePositions: [],
-        currentIndex: 0,
-        targetBlock: null,
-        stopMovement,
-    };
-
-    const result = await new StateMachineRunner(
-        new SearchOreState(),
-        fsmCtx,
-    ).run();
-    if (result.status === "FAILED") throw new Error(result.reason);
-}
-
-</file>
-
-<file path="js\lib\tasks\handlers\smelt.ts">
-// js/lib/tasks/handlers/smelt.ts
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import {
-    escapeTree,
-    findNearestBlockByName,
-    placePortableUtility,
-    makeRoomInInventory,
-    waitForMs,
-    moveToGoal,
-} from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-interface SmeltContext extends StateContext {
-    furnaceBlock: any | null;
-    isPortable: boolean;
-    meatType: number | null;
-    fuelType: number | null;
-    stopMovement: () => void;
-}
-
-class CleanupState implements FSMState {
-    name = "CLEANUP";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-
-        if (sCtx.isPortable && sCtx.furnaceBlock) {
-            await makeRoomInInventory(sCtx.bot, 1);
-            const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
-                sCtx.furnaceBlock,
-            );
-            if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
-
-            try {
-                await sCtx.bot.dig(sCtx.furnaceBlock);
-                await waitForMs(1000, sCtx.signal);
-            } catch (_err) {}
-        }
-
-        sCtx.result = { status: "SUCCESS", reason: "SMELTING_COMPLETE" };
-        return null;
-    }
-}
-
-class SmeltingState implements FSMState {
-    name = "SMELTING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-        let furnaceWindow: any = null;
-
-        try {
-            furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
-            await furnaceWindow.putFuel(sCtx.fuelType, null, 1);
-            await furnaceWindow.putInput(sCtx.meatType, null, 1);
-
-            let itemSmelted = false;
-            const maxWaitMs = 20000;
-            const pollIntervalMs = 500;
-            let elapsedMs = 0;
-
-            while (elapsedMs < maxWaitMs) {
-                if (sCtx.signal.aborted) throw new Error("aborted");
-
-                if (furnaceWindow.outputItem()) {
-                    itemSmelted = true;
-                    break;
-                }
-
-                await waitForMs(pollIntervalMs, sCtx.signal);
-                elapsedMs += pollIntervalMs;
-            }
-
-            if (!itemSmelted) {
-                throw new Error("FURNACE_TIMEOUT_OR_LAG");
-            }
-
-            // Must guarantee inventory space before extracting to prevent unhandled rejections
-            await makeRoomInInventory(sCtx.bot, 1);
-            await furnaceWindow.takeOutput();
-        } catch (err: any) {
-            sCtx.result = {
-                status: "FAILED",
-                reason:
-                    err.message === "aborted"
-                        ? "aborted"
-                        : `SMELT_INTERACTION_FAILED: ${err.message}`,
-            };
-            return null;
-        } finally {
-            if (furnaceWindow) {
-                try {
-                    furnaceWindow.close();
-                } catch (_err) {}
-            }
-        }
-
-        return new CleanupState();
-    }
-}
-
-class ApproachFurnaceState implements FSMState {
-    name = "APPROACHING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-        const fPos = sCtx.furnaceBlock.position;
-
-        try {
-            await moveToGoal(
-                sCtx.bot,
-                new goals.GoalNear(fPos.x, fPos.y, fPos.z, 2),
-                {
-                    signal: sCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: sCtx.stopMovement,
-                    dynamic: false,
-                },
-            );
-        } catch (err: any) {
-            if (err.message === "aborted") {
-                sCtx.result = { status: "FAILED", reason: "aborted" };
-            } else {
-                sCtx.result = {
-                    status: "FAILED",
-                    reason: "FAILED_TO_REACH_FURNACE",
-                };
-            }
-            return null;
-        }
-
-        return new SmeltingState();
-    }
-}
-
-class LocateFurnaceState implements FSMState {
-    name = "LOCATING_FURNACE";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-        let furnace = findNearestBlockByName(sCtx.bot, "furnace");
-
-        if (!furnace) {
-            furnace = await placePortableUtility(sCtx.bot, "furnace");
-            if (!furnace) {
-                sCtx.result = {
-                    status: "FAILED",
-                    reason: "NO_FURNACE_AVAILABLE",
-                };
-                return null;
-            }
-            sCtx.isPortable = true;
-        }
-
-        sCtx.furnaceBlock = furnace;
-        return new ApproachFurnaceState();
-    }
-}
-
-class CheckResourcesState implements FSMState {
-    name = "CHECKING_RESOURCES";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-
-        const rawMeat = sCtx.bot.inventory
-            .items()
-            .find((i: any) =>
-                ["beef", "porkchop", "mutton", "chicken", "rabbit"].includes(
-                    i.name,
-                ),
-            );
-
-        const fuel = sCtx.bot.inventory
-            .items()
-            .find((i: any) =>
-                ["coal", "charcoal", "oak_planks"].includes(i.name),
-            );
-
-        if (!rawMeat || !fuel) {
-            sCtx.result = { status: "FAILED", reason: "MISSING_MEAT_OR_FUEL" };
-            return null;
-        }
-
-        sCtx.meatType = rawMeat.type;
-        sCtx.fuelType = fuel.type;
-
-        return new LocateFurnaceState();
-    }
-}
-
-export async function handleSmelt(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
-    await escapeTree(bot, signal);
-
-    const fsmCtx: SmeltContext = {
-        bot,
-        targetName: "furnace",
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.smelt ?? 30000,
-        startTime: 0,
-        signal,
-        furnaceBlock: null,
-        isPortable: false,
-        meatType: null,
-        fuelType: null,
-        stopMovement,
-    };
-
-    const fsm = new StateMachineRunner(new CheckResourcesState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\normalize.ts">
-import type { Bot } from "mineflayer";
-import * as models from "../models.js";
-import { log } from "../logger.js";
-
-const LOG_TO_PLANK_MAP: Record<string, string> = {
-    oak_log: "oak_planks",
-    birch_log: "birch_planks",
-    spruce_log: "spruce_planks",
-    jungle_log: "jungle_planks",
-    acacia_log: "acacia_planks",
-    dark_oak_log: "dark_oak_planks",
-    mangrove_log: "mangrove_planks",
-    cherry_log: "cherry_planks",
-};
-
-// Map common LLM shorthand/misspellings to strict Minecraft registry names
-const TARGET_ALIASES: Record<string, string> = {
-    // Farming Aliases
-    carrot: "carrots",
-    potato: "potatoes",
-    beetroot: "beetroots",
-    melon: "melon",
-    pumpkin: "pumpkin",
-    sugar_cane: "reeds",
-
-    // Mining Aliases
-    iron: "iron_ore",
-    gold: "gold_ore",
-    diamond: "diamond_ore",
-    coal: "coal_ore",
-    copper: "copper_ore",
-    lapis: "lapis_ore",
-    redstone: "redstone_ore",
-    emerald: "emerald_ore",
-    stone: "stone",
-    cobble: "cobblestone",
-
-    // Gathering Aliases
-    tree: "wood",
-    log: "wood",
-    timber: "wood",
-};
-
-export function normalizeDecision(
-    bot: Bot,
-    decision: models.IncomingDecision,
-): models.IncomingDecision {
-    const normalized: models.IncomingDecision = {
-        ...decision,
-        target: { ...decision.target },
-    };
-
-    const action = normalized.action;
-    const originalTargetName = (normalized.target?.name || "none")
-        .toLowerCase()
-        .trim();
-    let targetName = originalTargetName;
-
-    // 1. Apply static dictionary aliases first (fixes farm/mine targets)
-    if (TARGET_ALIASES[targetName]) {
-        targetName = TARGET_ALIASES[targetName]!;
-    }
-
-    // 2. Apply action-specific dynamic normalization
-    if (action === "craft") {
-        if (targetName === "sticks" || targetName === "stick") {
-            targetName = "stick";
-        } else if (targetName === "planks") {
-            const invItems = bot.inventory.items();
-            let foundLog = false;
-            for (const item of invItems) {
-                if (LOG_TO_PLANK_MAP[item.name]) {
-                    targetName = LOG_TO_PLANK_MAP[item.name]!;
-                    foundLog = true;
-                    break;
-                }
-            }
-            if (!foundLog) throw new Error("MISSING_LOGS_FOR_PLANKS");
-        } else if (
-            targetName === "table" ||
-            targetName === "workbench" ||
-            targetName === "crafting_table"
-        ) {
-            targetName = "crafting_table";
-        } else if (
-            targetName.includes("wooden_pickaxe") ||
-            targetName === "pickaxe"
-        ) {
-            targetName = "wooden_pickaxe";
-        } else if (targetName.includes("stone_pickaxe")) {
-            targetName = "stone_pickaxe";
-        }
-    } else if (action === "build") {
-        if (targetName === "table" || targetName === "workbench") {
-            targetName = "crafting_table";
-        }
-    } else if (action === "gather" && targetName === "wood") {
-        // Handled naturally by the gather handler
-    }
-
-    // 3. Log and apply changes if a normalization occurred
-    if (targetName !== originalTargetName) {
-        normalized.target.name = targetName;
-        log.debug("Decision normalized", {
-            original_target: originalTargetName,
-            normalized_target: targetName,
-            action,
-        });
-    }
-
-    return normalized;
-}
-
-</file>
-
-<file path="js\lib\tasks\primitives.ts">
-import type { Bot } from "mineflayer";
-import type { Entity } from "prismarine-entity";
-import pkg from "mineflayer-pathfinder";
-import { moveToGoal, type MoveOptions } from "./utils.js";
-
-const { goals } = pkg;
-
-export async function gotoEntity(
-    bot: Bot,
-    entity: Entity,
-    range: number,
-    opts: MoveOptions,
-): Promise<boolean> {
-    const goal = new goals.GoalFollow(entity, range);
-    try {
-        await moveToGoal(bot, goal, {
-            ...opts,
-            dynamic: true,
-            stuckTimeoutMs: 3000, // Chasing shouldn't stall for long
-        });
-        return true;
-    } catch (err: any) {
-        if (err.message === "aborted") {
-            throw err; // Bubble up explicit aborts immediately
-        }
-
-        // Suppress general pathing/stuck errors for entity chasing
-        bot.pathfinder.setGoal(null);
-        bot.clearControlStates();
-        return false;
-    }
-}
-
-export async function attackEntity(bot: Bot, entity: Entity): Promise<void> {
-    await bot.lookAt(entity.position.offset(0, entity.height ?? 1.5, 0), true);
-    bot.attack(entity);
-}
-
-export function findNearestEntity(
-    bot: Bot,
-    name: string,
-    radius: number,
-): Entity | null {
-    return bot.nearestEntity((entity) => {
-        return (
-            entity.name === name &&
-            bot.entity.position.distanceTo(entity.position) <= radius
-        );
-    });
-}
-
-</file>
-
-<file path="js\lib\tasks\registry.ts">
-import type { Bot } from "mineflayer";
-import type * as models from "../models.js";
-
-export interface TaskContext {
-    bot: Bot;
-    decision: models.IncomingDecision;
-    signal: AbortSignal;
-    timeouts: Record<string, number>;
-    stopMovement: () => void;
-
-    getThreats: () => any[];
-    computeSafeRetreat: (
-        threats: any[],
-        radius?: number,
-    ) => { x: number; z: number };
-}
-
-export type TaskHandler = (ctx: TaskContext) => Promise<void>;
-
-export const TASK_REGISTRY: Record<string, TaskHandler> = {};
-
-</file>
-
-<file path="js\lib\tasks\task.ts">
-// js/lib/tasks/task.ts
-import type { Bot } from "mineflayer";
-import pkg from "mineflayer-pathfinder";
-import * as models from "../models.js";
-import { type TaskContext } from "./registry.js";
-
-// Handlers
-import { handleGather } from "./handlers/gather.js";
-import { handleCraft } from "./handlers/craft.js";
-import { handleHunt } from "./handlers/hunt.js";
-import { handleBuild } from "./handlers/build.js";
-import { handleExplore } from "./handlers/explore.js";
-import { handleSmelt } from "./handlers/smelt.js";
-import { handleMine } from "./handlers/mine.js";
-import { handleFarm } from "./handlers/farm.js";
-
-import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
-import { normalizeDecision } from "./normalize.js";
-import { handleInteract } from "./handlers/interact.js";
-
-const { goals } = pkg;
-
-export async function runTask(
-    bot: Bot,
-    rawDecision: models.IncomingDecision,
-    signal: AbortSignal,
-    timeouts: Record<string, number>,
-    getThreats: () => models.ThreatInfo[],
-    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
-        x: number;
-        z: number;
-    },
-    stopMovement: () => void,
-): Promise<void> {
-    const decision = normalizeDecision(bot, rawDecision);
-
-    const taskCtx: TaskContext = {
-        bot,
-        decision,
-        signal,
-        timeouts,
-        getThreats,
-        computeSafeRetreat,
-        stopMovement,
-    };
-
-    switch (decision.action) {
-        case "hunt":
-            await handleHunt(taskCtx);
-            return;
-        case "gather":
-            await handleGather(taskCtx);
-            return;
-        case "craft":
-            await handleCraft(taskCtx);
-            return;
-        case "build":
-            await handleBuild(taskCtx);
-            return;
-        case "smelt":
-            await handleSmelt(taskCtx);
-            return;
-        case "mine":
-            await handleMine(taskCtx);
-            return;
-        case "farm":
-            await handleFarm(taskCtx);
-            return;
-        case "explore":
-            await handleExplore(taskCtx);
-            return;
-
-        case "eat": {
-            const food = bot.inventory
-                .items()
-                .find((i) => i.name === decision.target.name);
-            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
-            await bot.equip(food, "hand");
-            await bot.consume();
-            return;
-        }
-
-        case "idle":
-            await waitForMs(1500, signal);
-            return;
-
-        case "sleep": {
-            await escapeTree(bot, signal);
-
-            const bed = bot.findBlock({
-                maxDistance: 32,
-                matching: (b: any) => b?.name.includes("bed"),
-            });
-
-            if (!bed) throw new Error("no bed found");
-
-            await moveToGoal(
-                bot,
-                new goals.GoalNear(
-                    bed.position.x,
-                    bed.position.y,
-                    bed.position.z,
-                    1.5,
-                ),
-                { signal, timeoutMs: 20000, stopMovement },
-            );
-
-            await bot.sleep(bed);
-
-            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
-            await new Promise<void>((resolve, reject) => {
-                const onWake = () => {
-                    bot.removeListener("wake", onWake);
-                    resolve();
-                };
-
-                const onAbort = () => {
-                    bot.removeListener("wake", onWake);
-                    bot.wake().catch(() => {});
-                    reject(new Error("aborted"));
-                };
-
-                bot.on("wake", onWake);
-                signal.addEventListener("abort", onAbort, { once: true });
-            });
-
-            return;
-        }
-
-        case "retreat": {
-            await escapeTree(bot, signal);
-
-            const pos = computeSafeRetreat(getThreats());
-            await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
-                signal,
-                timeoutMs: 15000,
-                stopMovement,
-            });
-
-            return;
-        }
-
-        case "interact":
-            await handleInteract(taskCtx);
-            return;
-
-        default:
-            throw new Error(`unsupported: ${decision.action}`);
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\utils.ts">
-import type { Bot } from "mineflayer";
-import pkg from "mineflayer-pathfinder";
-import { Vec3 } from "vec3";
-
-const { goals } = pkg;
-
-// ==========================================
-// CONSTANTS
-// ==========================================
-
-const TREE_BLOCKS = new Set([
-    "oak_leaves",
-    "birch_leaves",
-    "spruce_leaves",
-    "jungle_leaves",
-    "acacia_leaves",
-    "dark_oak_leaves",
-    "mangrove_leaves",
-    "azalea_leaves",
-    "flowering_azalea_leaves",
-    "cherry_leaves",
-    "oak_log",
-    "birch_log",
-    "spruce_log",
-    "jungle_log",
-    "acacia_log",
-    "dark_oak_log",
-    "mangrove_log",
-]);
-
-const TRASH_ITEMS = new Set([
-    "dirt",
-    "cobblestone",
-    "gravel",
-    "rotten_flesh",
-    "spider_eye",
-    "bone",
-    "string",
-    "andesite",
-    "diorite",
-    "granite",
-    "seeds",
-    "tall_grass",
-    "grass",
-]);
-
-// ==========================================
-// MOVEMENT & POSITION HELPERS
-// ==========================================
-
-export function isOnSolidGround(bot: any): boolean {
-    if (!bot.entity.onGround) return false;
-    const pos = bot.entity.position.floored();
-    const below = bot.blockAt(pos.offset(0, -1, 0));
-    return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
-}
-
-export function isInFoliage(bot: any): boolean {
-    const pos = bot.entity.position.floored();
-    const at = bot.blockAt(pos);
-    const below = bot.blockAt(pos.offset(0, -1, 0));
-    return (
-        (at && TREE_BLOCKS.has(at.name)) ||
-        (below && TREE_BLOCKS.has(below.name))
-    );
-}
-
-export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
-    if (!isInFoliage(bot)) return;
-
-    try {
-        bot.pathfinder.setGoal(null);
-        bot.clearControlStates();
-    } catch (_err) {}
-
-    // Increased from 16 to 30 to account for massive jungle/custom canopies
-    const MAX_ATTEMPTS = 30;
-
-    for (let i = 0; i < MAX_ATTEMPTS; i++) {
-        if (signal.aborted) throw new Error("aborted");
-        if (isOnSolidGround(bot)) return;
-
-        const pos = bot.entity.position.floored();
-
-        // Check Head, Feet, and Below to clear a vertical falling shaft
-        const blocksToClear = [
-            bot.blockAt(pos.offset(0, 1, 0)), // Head (prevents suffocation lock)
-            bot.blockAt(pos), // Torso (if clipped inside a block)
-            bot.blockAt(pos.offset(0, -1, 0)), // Below (to fall down)
-        ];
-
-        let clearedSomething = false;
-
-        for (const targetBlock of blocksToClear) {
-            // If the block exists, is a tree part, and isn't air
-            if (
-                targetBlock &&
-                TREE_BLOCKS.has(targetBlock.name) &&
-                targetBlock.name !== "air"
-            ) {
-                try {
-                    // Equip the right tool (axes for logs, hands/swords for leaves)
-                    const tool = bot.pathfinder.bestHarvestTool(targetBlock);
-                    if (tool) await bot.equip(tool, "hand");
-
-                    // forceLook = true: Mineflayer sometimes fails reach-checks if the bot
-                    // is clipped inside the block. This forces the break.
-                    await bot.dig(targetBlock, true);
-                    clearedSomething = true;
-                } catch (err) {
-                    // Ignore specific dig errors, we'll try to wiggle out below
-                }
-            }
-        }
-
-        // If we are stuck on a branch edge and couldn't dig anything directly below/inside us:
-        if (!clearedSomething && !isOnSolidGround(bot)) {
-            // Do a tiny random wiggle to fall off the edge of the leaf/branch
-            const dir = Math.random() > 0.5 ? "forward" : "back";
-            bot.setControlState(dir, true);
-            await new Promise((res) => setTimeout(res, 250));
-            bot.setControlState(dir, false);
-        }
-
-        // Wait a moment for gravity to pull the bot down after breaking the block
-        await new Promise<void>((resolve) => {
-            let ticks = 0;
-            const check = () => {
-                ticks++;
-                if (isOnSolidGround(bot) || ticks > 10) {
-                    bot.removeListener("physicsTick", check);
-                    resolve();
-                }
-            };
-            bot.on("physicsTick", check);
-
-            // Fallback timeout just in case physics ticks lag
-            setTimeout(() => {
-                bot.removeListener("physicsTick", check);
-                resolve();
-            }, 1000);
-        });
-    }
-
-    if (!isOnSolidGround(bot)) {
-        throw new Error(
-            "EscapeTree - could not reach ground after 30 attempts. Likely stuck in a massive canopy.",
-        );
-    }
-}
-
-export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        const timer = setTimeout(() => {
-            cleanup();
-            resolve();
-        }, ms);
-
-        const onAbort = () => {
-            clearTimeout(timer);
-            cleanup();
-            reject(new Error("aborted"));
-        };
-
-        const cleanup = () => {
-            signal.removeEventListener("abort", onAbort);
-        };
-
-        signal.addEventListener("abort", onAbort, { once: true });
-    });
-}
-
-export interface MoveOptions {
-    signal: AbortSignal;
-    timeoutMs: number;
-    stopMovement: () => void;
-    dynamic?: boolean;
-    stuckTimeoutMs?: number;
-}
-
-export function moveToGoal(
-    bot: any,
-    goal: any,
-    opts: MoveOptions,
-): Promise<void> {
-    const {
-        signal,
-        timeoutMs,
-        stopMovement,
-        dynamic = false,
-        stuckTimeoutMs = 5000,
-    } = opts;
-
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
-            return resolve();
-        }
-
-        let settled = false;
-        let lastPos = bot.entity.position.clone();
-        let stuckTimer: NodeJS.Timeout | null = null;
-
-        const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-
-            clearTimeout(timer);
-            if (stuckTimer) clearInterval(stuckTimer);
-
-            signal.removeEventListener("abort", onAbort);
-            bot.removeListener("goal_reached", onGoalReached);
-            bot.removeListener("path_update", onPathUpdate);
-
-            if (err) {
-                reject(err);
-                return;
-            }
-            resolve();
-        };
-
-        const safeStop = () => {
-            try {
-                bot.clearControlStates();
-                stopMovement();
-            } catch (_err) {}
-        };
-
-        const onAbort = () => {
-            safeStop();
-            finish(new Error("aborted"));
-        };
-
-        const onGoalReached = () => {
-            safeStop();
-            finish();
-        };
-
-        const onPathUpdate = (results: any) => {
-            if (results.status === "noPath") {
-                setTimeout(() => {
-                    if (!settled) {
-                        safeStop();
-                        finish(new Error("no_path"));
-                    }
-                }, 3500);
-            } else if (results.status === "timeout") {
-                safeStop();
-                finish(new Error("pathfinder_timeout"));
-            }
-        };
-
-        const timer = setTimeout(() => {
-            safeStop();
-            finish(new Error("timeout"));
-        }, timeoutMs);
-
-        // Stuck detection loop with a Strike System
-        let stuckStrikes = 0;
-
-        stuckTimer = setInterval(() => {
-            const currentPos = bot.entity.position;
-            const dist = lastPos.distanceTo(currentPos);
-
-            // 0.5 blocks over 5 seconds can trigger false positives in water or dense jungles.
-            if (dist < 0.5) {
-                stuckStrikes++;
-                // Require 2 consecutive strikes (10 seconds total) before aborting
-                if (stuckStrikes >= 2) {
-                    safeStop();
-                    finish(new Error("stuck"));
-                }
-            } else {
-                // Reset strikes if the bot makes meaningful progress
-                stuckStrikes = 0;
-                lastPos = currentPos.clone();
-            }
-        }, stuckTimeoutMs);
-
-        signal.addEventListener("abort", onAbort, { once: true });
-        bot.once("goal_reached", onGoalReached);
-        bot.on("path_update", onPathUpdate);
-
-        try {
-            bot.pathfinder.setGoal(goal, dynamic);
-        } catch (err) {
-            finish(err instanceof Error ? err : new Error(String(err)));
-        }
-    });
-}
-
-export function findNearestBlockByName(bot: Bot, blockName: string): any {
-    return bot.findBlock({
-        maxDistance: 32,
-        matching: (block: any) => block?.name === blockName,
-    });
-}
-
-// ==========================================
-// INVENTORY MANAGEMENT
-// ==========================================
-
-export async function makeRoomInInventory(
-    bot: any,
-    slotsNeeded: number = 1,
-): Promise<void> {
-    if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
-
-    const inventory = bot.inventory.items();
-    const sortedItems = [...inventory].sort((a, b) => {
-        const aIsTrash = TRASH_ITEMS.has(a.name) ? -1 : 1;
-        const bIsTrash = TRASH_ITEMS.has(b.name) ? -1 : 1;
-        if (aIsTrash !== bIsTrash) return aIsTrash - bIsTrash;
-        return a.count - b.count;
-    });
-
-    let slotsFreed = 0;
-    for (const item of sortedItems) {
-        if (slotsFreed >= slotsNeeded) break;
-        try {
-            await bot.tossStack(item);
-            slotsFreed++;
-        } catch (err) {
-            // Ignore failure, try next item
-        }
-    }
-}
-
-// ==========================================
-// BLOCK PLACEMENT
-// ==========================================
-
-export async function placePortableUtility(
-    bot: any,
-    blockName: string,
-): Promise<any> {
-    const item = bot.inventory.items().find((i: any) => i.name === blockName);
-    if (!item) return null;
-
-    await bot.equip(item, "hand");
-
-    const pos = bot.entity.position.floored();
-    const candidates = [
-        bot.blockAt(pos.offset(1, -1, 0)),
-        bot.blockAt(pos.offset(-1, -1, 0)),
-        bot.blockAt(pos.offset(0, -1, 1)),
-        bot.blockAt(pos.offset(0, -1, -1)),
-    ];
-
-    for (const refBlock of candidates) {
-        if (refBlock && refBlock.name !== "air" && refBlock.name !== "water") {
-            try {
-                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                return findNearestBlockByName(bot, blockName);
-            } catch (err) {
-                // Ignore placement failure, check next adjacent block
-            }
-        }
-    }
-    return null;
-}
-
-</file>
-
-<file path="js\lib\types.d.ts">
-import { Pathfinder } from "mineflayer-pathfinder";
-
-declare module "mineflayer" {
-    interface Bot {
-        pathfinder: Pathfinder;
-    }
-}
 
 </file>
 
@@ -4494,1485 +485,400 @@ export function computeSafeRetreat(
 
 </file>
 
-<file path="llm_validator.go">
-package main
-
-import (
-	"fmt"
-	"strings"
-)
-
-// PlanValidator enforces strict schema and semantic rules on LLM outputs.
-type PlanValidator struct{}
-
-func NewPlanValidator() *PlanValidator {
-	return &PlanValidator{}
-}
-
-func (v *PlanValidator) ValidateTactics(plan *LLMPlan) error {
-	if plan == nil {
-		return fmt.Errorf("plan is nil")
-	}
-
-	if plan.Objective == "" {
-		return fmt.Errorf("plan missing objective")
-	}
-
-	if len(plan.Tasks) == 0 && !plan.MilestoneComplete {
-		return fmt.Errorf("plan has no tasks and milestone is not marked complete")
-	}
-
-	if len(plan.Tasks) > 3 {
-		return fmt.Errorf("plan exceeds maximum task limit of 3 (got %d)", len(plan.Tasks))
-	}
-
-	for i, task := range plan.Tasks {
-		if !IsValidAction(task.Action) {
-			return fmt.Errorf("task %d has invalid action: '%s'", i, task.Action)
-		}
-		if !IsValidTargetType(task.Target.Type) {
-			return fmt.Errorf("task %d has invalid target type: '%s'", i, task.Target.Type)
-		}
-		if task.Target.Type != string(TargetNone) && strings.TrimSpace(task.Target.Name) == "" {
-			return fmt.Errorf("task %d requires a target name for type '%s'", i, task.Target.Type)
-		}
-		if task.Rationale == "" {
-			return fmt.Errorf("task %d missing rationale", i)
-		}
-	}
-
-	return nil
-}
-
-func (v *PlanValidator) ValidateMilestone(m *MilestonePlan) error {
-	if m == nil {
-		return fmt.Errorf("milestone is nil")
-	}
-	if m.ID == "" {
-		return fmt.Errorf("milestone missing ID")
-	}
-	if m.Description == "" {
-		return fmt.Errorf("milestone missing description")
-	}
-	if m.CompletionHint == "" {
-		return fmt.Errorf("milestone missing completion hint")
-	}
-	return nil
-}
-
-</file>
-
-<file path="main.go">
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"log/slog"
-	"net/http"
-	"os"
-	"time"
-
-	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
-)
-
-const (
-	Port         = ":8080"
-	DefaultAPI   = "https://openrouter.ai/api/v1/chat/completions"
-	DefaultModel = "deepseek/deepseek-v3.2"
-	DatabasePath = "./bot_memory.db"
-)
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("[!] No .env file found. Relying on system environment or defaults.")
-	}
-
-	logLevel := slog.LevelInfo
-	if os.Getenv("DEBUG") == "true" {
-		logLevel = slog.LevelDebug
-	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
-	slog.SetDefault(logger)
-
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		logger.Error("Fatal: OPENROUTER_API_KEY environment variable is not set")
-		os.Exit(1)
-	}
-
-	apiURL := os.Getenv("LLM_API_URL")
-	if apiURL == "" {
-		apiURL = DefaultAPI
-	}
-	modelName := os.Getenv("LLM_MODEL")
-	if modelName == "" {
-		modelName = DefaultModel
-	}
-
-	memory, err := NewSQLiteMemory(DatabasePath)
-	if err != nil {
-		logger.Error("Fatal: could not initialize database", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer memory.Close()
-	logger.Info("Database initialized", slog.String("path", DatabasePath))
-
-	eventStore, err := NewSQLiteEventStore("./events.db")
-	if err != nil {
-		logger.Error("Fatal: could not initialize event store", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer eventStore.Close()
-	logger.Info("Event Store initialized", slog.String("path", "./events.db"))
-
-	telemetry := NewTelemetry(logger, 5.00)
-	go telemetry.StartReporting(context.Background())
-
-	rawBrain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
-	fallbackBrain := NewFallbackBrain()
-	brain := NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
-
-	uiHub := NewUIHub(logger)
-	go uiHub.Run()
-
-	config, err := LoadConfig("./config.json")
-	if err != nil {
-		logger.Error("Failed to load config", slog.Any("error", err))
-		os.Exit(1)
-	}
-
-	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(config)
-	})
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
-			return
-		}
-		logger.Info("Bot connected", slog.String("remote_addr", r.RemoteAddr))
-		telemetry.RecordSessionStart()
-
-		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
-
-		planner := NewLLMPlanner(brain, uiHub, memory, telemetry, logger, sessionID)
-		routine := NewDefaultRoutineManager()
-		exec := NewWSExecutor(conn)
-
-		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID, eventStore)
-		engine.Run(context.Background(), conn)
-
-		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
-		telemetry.RecordSessionEnd()
-	})
-
-	http.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	http.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
-
-	logger.Info("CraftD Control Plane listening", slog.String("url", "ws://localhost"+Port+"/ws"))
-	logger.Info("Observability Dashboard Feed live", slog.String("url", "ws://localhost"+Port+"/ui/ws"))
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		health := map[string]interface{}{
-			"status":          "healthy",
-			"active_sessions": telemetry.ActiveSessions(),
-			"llm_avg_latency": telemetry.AvgLatency().String(),
-			"timestamp":       time.Now().UTC(),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(health)
-	})
-
-	if err := http.ListenAndServe(Port, nil); err != nil {
-		logger.Error("Server crashed", slog.Any("error", err))
-		os.Exit(1)
-	}
-}
-
-</file>
-
-<file path="memory.go">
-package main
-
-import (
-	"context"
-	"database/sql"
-	"fmt"
-	"log"
-	"strings"
-	"sync"
-	"time"
-
-	_ "modernc.org/sqlite"
-)
-
-type EventMeta struct {
-	SessionID string
-	TraceID   string
-	Status    string
-	X, Y, Z   float64
-}
-
-type MemoryBank interface {
-	LogEvent(action, details string, meta EventMeta)
-	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
-	SetSummary(ctx context.Context, sessionID, key, value string) error
-	GetSummary(ctx context.Context, sessionID string) (string, error)
-	MarkLocation(ctx context.Context, name string, x, y, z float64) error
-	GetLocation(ctx context.Context, name string) (*Vec3, error)
-	Close() error
-}
-
-type pendingEvent struct {
-	action  string
-	details string
-	meta    EventMeta
-}
-
-type SQLiteMemory struct {
-	db        *sql.DB
-	eventChan chan pendingEvent
-	wg        sync.WaitGroup
-	cancel    context.CancelFunc
-}
-
-func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite: %w", err)
-	}
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	schema := `
-	PRAGMA journal_mode=WAL;
-	PRAGMA synchronous=NORMAL;
-	PRAGMA busy_timeout=5000;
-
-	CREATE TABLE IF NOT EXISTS events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		session_id TEXT NOT NULL,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-		action TEXT,
-		details TEXT,
-		status TEXT,
-		x REAL,
-		y REAL,
-		z REAL
-	);
-	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
-
-	CREATE TABLE IF NOT EXISTS session_summary (
-		session_id TEXT NOT NULL,
-		key TEXT NOT NULL,
-		value TEXT NOT NULL,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (session_id, key)
-	);
-
-	CREATE TABLE IF NOT EXISTS spatial_memory (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT UNIQUE,
-		x REAL,
-		y REAL,
-		z REAL
-	);
-	`
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("failed to apply schema: %w", err)
-	}
-
-	// Safe migration for Phase 3 to add trace_id to existing DBs
-	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN trace_id TEXT DEFAULT ''`)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	mem := &SQLiteMemory{
-		db:        db,
-		eventChan: make(chan pendingEvent, 1000),
-		cancel:    cancel,
-	}
-
-	mem.wg.Add(1)
-	go mem.processBatches(ctx)
-
-	return mem, nil
-}
-
-func (s *SQLiteMemory) processBatches(ctx context.Context) {
-	defer s.wg.Done()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	var batch []pendingEvent
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		tx, err := s.db.BeginTx(context.Background(), nil)
-		if err != nil {
-			log.Printf("[-] Failed to begin tx for batch: %v", err)
-			return
-		}
-
-		stmt, err := tx.Prepare(`INSERT INTO events (session_id, trace_id, action, details, status, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-		if err != nil {
-			tx.Rollback()
-			return
-		}
-		defer stmt.Close()
-
-		for _, e := range batch {
-			_, err := stmt.Exec(e.meta.SessionID, e.meta.TraceID, e.action, e.details, e.meta.Status, e.meta.X, e.meta.Y, e.meta.Z)
-			if err != nil {
-				log.Printf("[-] Failed to insert event: %v", err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			log.Printf("[-] Failed to commit event batch: %v", err)
-		}
-		batch = batch[:0]
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			flush()
-			return
-		case e := <-s.eventChan:
-			batch = append(batch, e)
-			if len(batch) >= 100 {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
-		}
-	}
-}
-
-func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
-	select {
-	case s.eventChan <- pendingEvent{action: action, details: details, meta: meta}:
-	default:
-		log.Println("[-] Event buffer full, dropping event")
-	}
-}
-
-func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
-	query := `SELECT timestamp, action, details, status, COALESCE(trace_id, '') FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
-	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-
-	var events []string
-	for rows.Next() {
-		var timestamp time.Time
-		var action, details, status, traceID string
-		if err := rows.Scan(&timestamp, &action, &details, &status, &traceID); err != nil {
-			return "", err
-		}
-
-		traceStr := ""
-		if traceID != "" {
-			traceStr = fmt.Sprintf(" [Trace: %s]", traceID)
-		}
-		events = append(events, fmt.Sprintf("[%s] %s (%s)%s: %s", timestamp.Format("15:04:05"), action, status, traceStr, details))
-	}
-
-	var contextStr strings.Builder
-	for i := len(events) - 1; i >= 0; i-- {
-		contextStr.WriteString(events[i])
-		contextStr.WriteString("\n")
-	}
-
-	return contextStr.String(), nil
-}
-
-func (s *SQLiteMemory) SetSummary(ctx context.Context, sessionID, key, value string) error {
-	query := `
-	INSERT INTO session_summary (session_id, key, value, updated_at) 
-	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(session_id, key) DO UPDATE SET 
-		value = excluded.value, 
-		updated_at = CURRENT_TIMESTAMP;`
-	_, err := s.db.ExecContext(ctx, query, sessionID, key, value)
-	return err
-}
-
-func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string, error) {
-	query := `SELECT key, value FROM session_summary WHERE session_id = ?`
-	rows, err := s.db.QueryContext(ctx, query, sessionID)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-
-	var summary strings.Builder
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			return "", err
-		}
-		summary.WriteString(fmt.Sprintf("- %s: %s\n", key, value))
-	}
-
-	if summary.Len() == 0 {
-		return "No active summary.", nil
-	}
-	return summary.String(), nil
-}
-
-func (s *SQLiteMemory) MarkLocation(ctx context.Context, name string, x, y, z float64) error {
-	query := `
-	INSERT INTO spatial_memory (name, x, y, z) 
-	VALUES (?, ?, ?, ?)
-	ON CONFLICT(name) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z;`
-	_, err := s.db.ExecContext(ctx, query, name, x, y, z)
-	return err
-}
-
-func (s *SQLiteMemory) GetLocation(ctx context.Context, name string) (*Vec3, error) {
-	query := `SELECT x, y, z FROM spatial_memory WHERE name = ?`
-	var vec Vec3
-	err := s.db.QueryRowContext(ctx, query, name).Scan(&vec.X, &vec.Y, &vec.Z)
-	if err != nil {
-		return nil, err
-	}
-	return &vec, nil
-}
-
-func (s *SQLiteMemory) Close() error {
-	s.cancel()
-	s.wg.Wait()
-	close(s.eventChan)
-	return s.db.Close()
-}
-
-</file>
-
-<file path="planner.go">
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log/slog"
-	"sync"
-	"time"
-)
-
-type Planner interface {
-	GenerateMilestone(ctx context.Context, state json.RawMessage, sessionID string) (*MilestonePlan, error)
-	GenerateTactics(ctx context.Context, state json.RawMessage, sessionID, systemOverride string) (*LLMPlan, error)
-	RecordStall() bool
-	ResetStall()
-	ClearMilestone()
-	GetActiveMilestone() *MilestonePlan
-}
-
-const maxMilestoneStalls = 5
-
-type LLMPlanner struct {
-	brain     Brain
-	logger    *slog.Logger
-	uiHub     *UIHub
-	memory    MemoryBank
-	telemetry *Telemetry
-
-	mu                  sync.RWMutex
-	activeMilestone     *MilestonePlan
-	milestoneStallCount int
-}
-
-func NewLLMPlanner(b Brain, uiHub *UIHub, memory MemoryBank, tel *Telemetry, baseLogger *slog.Logger, sessionID string) *LLMPlanner {
-	return &LLMPlanner{
-		brain:     b,
-		uiHub:     uiHub,
-		memory:    memory,
-		telemetry: tel,
-		logger:    baseLogger.With(slog.String("component", "planner"), slog.String("session_id", sessionID)),
-	}
-}
-
-func (p *LLMPlanner) GenerateMilestone(ctx context.Context, state json.RawMessage, sessionID string) (*MilestonePlan, error) {
-	p.logger.Info("Generating new milestone...")
-
-	milestone, err := p.brain.GenerateMilestone(ctx, Tick{State: state}, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	p.telemetry.RecordMilestoneGenerated()
-
-	p.mu.Lock()
-	p.activeMilestone = milestone
-	p.milestoneStallCount = 0
-	p.mu.Unlock()
-
-	p.logger.Info("New milestone set",
-		slog.String("id", milestone.ID),
-		slog.String("description", milestone.Description),
-	)
-	p.uiHub.Broadcast(map[string]interface{}{
-		"type":    "milestone_update",
-		"payload": milestone,
-	})
-
-	go func(desc string) {
-		sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = p.memory.SetSummary(sCtx, sessionID, "Active Milestone", desc)
-	}(milestone.Description)
-
-	return milestone, nil
-}
-
-func (p *LLMPlanner) GenerateTactics(ctx context.Context, state json.RawMessage, sessionID, systemOverride string) (*LLMPlan, error) {
-	p.mu.RLock()
-	milestone := p.activeMilestone
-	p.mu.RUnlock()
-
-	if milestone == nil {
-		return nil, fmt.Errorf("cannot generate tactics without an active milestone")
-	}
-
-	plan, err := p.brain.EvaluatePlan(ctx, Tick{State: state}, sessionID, systemOverride, milestone)
-	if err != nil {
-		return nil, err
-	}
-
-	if plan != nil && plan.MilestoneComplete {
-		p.logger.Info("Milestone marked complete by tactical planner",
-			slog.String("milestone", milestone.Description),
-		)
-		go p.memory.LogEvent("milestone_complete", milestone.Description,
-			EventMeta{SessionID: sessionID, Status: "COMPLETED"},
-		)
-
-		go func(desc string) {
-			sCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = p.memory.SetSummary(sCtx, sessionID, "Last Completed Milestone", desc)
-		}(milestone.Description)
-
-		p.ClearMilestone()
-	}
-
-	return plan, nil
-}
-
-func (p *LLMPlanner) RecordStall() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.milestoneStallCount++
-	if p.milestoneStallCount >= maxMilestoneStalls {
-		p.logger.Warn("Milestone stalled — clearing for regeneration",
-			slog.Int("stall_count", p.milestoneStallCount),
-			slog.String("milestone", p.milestoneDesc(p.activeMilestone)),
-		)
-		p.activeMilestone = nil
-		p.milestoneStallCount = 0
-		return true
-	}
-	return false
-}
-
-func (p *LLMPlanner) ResetStall() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.milestoneStallCount = 0
-}
-
-func (p *LLMPlanner) ClearMilestone() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.activeMilestone = nil
-	p.milestoneStallCount = 0
-}
-
-func (p *LLMPlanner) GetActiveMilestone() *MilestonePlan {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.activeMilestone
-}
-
-func (p *LLMPlanner) milestoneDesc(m *MilestonePlan) string {
-	if m == nil {
-		return "<none>"
-	}
-	return m.Description
-}
-
-</file>
-
-<file path="queue.go">
-package main
-
-import (
-	"sort"
-)
-
-type TaskSource string
-
-const (
-	SourceLLM     TaskSource = "llm"
-	SourceRoutine TaskSource = "routine"
-	SourceReflex  TaskSource = "reflex"
-)
-
-// TaskQueue manages the prioritization and lifecycle of pending actions.
-// It is NOT thread-safe by design — it must only be mutated by the Engine's event loop.
-type TaskQueue struct {
-	items []Action
-}
-
-func NewTaskQueue() *TaskQueue {
-	return &TaskQueue{
-		items: make([]Action, 0, 10),
-	}
-}
-
-// Push adds one or more tasks to the queue and re-sorts by priority.
-// Lower Priority int means higher urgency (e.g., PriRoutine = 1, PriLLM = 2).
-func (q *TaskQueue) Push(tasks ...Action) {
-	q.items = append(q.items, tasks...)
-	sort.SliceStable(q.items, func(i, j int) bool {
-		return q.items[i].Priority < q.items[j].Priority
-	})
-}
-
-// Pop removes and returns the highest priority task. Returns nil if empty.
-func (q *TaskQueue) Pop() *Action {
-	if len(q.items) == 0 {
-		return nil
-	}
-	task := q.items[0]
-	q.items = q.items[1:]
-	return &task
-}
-
-// Peek returns the highest priority task without removing it.
-func (q *TaskQueue) Peek() *Action {
-	if len(q.items) == 0 {
-		return nil
-	}
-	return &q.items[0]
-}
-
-// ClearBySource removes all tasks matching the specified source.
-func (q *TaskQueue) ClearBySource(source TaskSource) {
-	writeIndex := 0
-	for _, task := range q.items {
-		if task.Source != string(source) {
-			q.items[writeIndex] = task
-			writeIndex++
-		}
-	}
-
-	// Zero out the remaining elements to prevent memory leaks
-	for i := writeIndex; i < len(q.items); i++ {
-		q.items[i] = Action{}
-	}
-
-	// Truncate the slice
-	q.items = q.items[:writeIndex]
-}
-
-// HasRoutineTarget checks if a routine is already queued for a specific target to prevent duplicates.
-func (q *TaskQueue) HasRoutineTarget(action, targetName string) bool {
-	for _, t := range q.items {
-		if t.Source == string(SourceRoutine) && t.Action == action && t.Target.Name == targetName {
-			return true
-		}
-	}
-	return false
-}
-
-func (q *TaskQueue) Len() int {
-	return len(q.items)
-}
-
-</file>
-
-<file path="resilient_brain.go">
-package main
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"log/slog"
-	"time"
-)
-
-const (
-	MaxRetries     = 3
-	InitialBackoff = 1 * time.Second
-)
-
-// ResilientBrain wraps a primary Brain with validation, retry logic, and a fallback Brain.
-type ResilientBrain struct {
-	primary   Brain
-	fallback  Brain
-	validator *PlanValidator
-	logger    *slog.Logger
-	telemetry *Telemetry
-}
-
-func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger, tel *Telemetry) *ResilientBrain {
-	return &ResilientBrain{
-		primary:   primary,
-		fallback:  fallback,
-		validator: NewPlanValidator(),
-		logger:    logger.With(slog.String("component", "ResilientBrain")),
-		telemetry: tel,
-	}
-}
-
-func (r *ResilientBrain) GenerateMilestone(ctx context.Context, t Tick, sessionID string) (*MilestonePlan, error) {
-	var lastErr error
-	backoff := InitialBackoff
-
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		milestone, err := r.primary.GenerateMilestone(ctx, t, sessionID)
-		if err == nil {
-			if valErr := r.validator.ValidateMilestone(milestone); valErr != nil {
-				r.telemetry.RecordValidationFailure()
-				err = fmt.Errorf("validation failed: %w", valErr)
-			} else {
-				return milestone, nil
-			}
-		}
-
-		// If the engine intentionally aborted planning (e.g., evasion reflex), drop immediately.
-		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			r.logger.Debug("Primary brain context canceled (intentional preemption)")
-			return nil, context.Canceled
-		}
-
-		lastErr = err
-		r.logger.Warn("Milestone generation failed",
-			slog.Int("attempt", attempt),
-			slog.Any("error", err),
-		)
-
-		if attempt < MaxRetries {
-			select {
-			case <-ctx.Done():
-				if errors.Is(ctx.Err(), context.Canceled) {
-					return nil, context.Canceled
-				}
-				r.logger.Warn("Context timeout in primary brain, engaging fallback milestone")
-				return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
-			case <-time.After(backoff):
-				backoff *= 2 // Exponential backoff
-			}
-		}
-	}
-
-	r.logger.Error("Primary brain exhausted retries. Engaging fallback planner.", slog.Any("final_error", lastErr))
-	return r.fallback.GenerateMilestone(context.Background(), t, sessionID)
-}
-
-func (r *ResilientBrain) EvaluatePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
-	var lastErr error
-	backoff := InitialBackoff
-
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		currentOverride := systemOverride
-		if lastErr != nil && attempt > 1 {
-			correction := fmt.Sprintf("CRITICAL ERROR IN PREVIOUS OUTPUT: %v. Fix the JSON schema and semantic errors.", lastErr)
-			if currentOverride != "" {
-				currentOverride = currentOverride + "\n" + correction
-			} else {
-				currentOverride = correction
-			}
-		}
-
-		plan, err := r.primary.EvaluatePlan(ctx, t, sessionID, currentOverride, milestone)
-		if err == nil {
-			if valErr := r.validator.ValidateTactics(plan); valErr != nil {
-				r.telemetry.RecordValidationFailure()
-				err = fmt.Errorf("validation failed: %w", valErr)
-			} else {
-				return plan, nil
-			}
-		}
-
-		// If the engine intentionally aborted planning, drop immediately.
-		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			r.logger.Debug("Primary brain context canceled (intentional preemption)")
-			return nil, context.Canceled
-		}
-
-		lastErr = err
-		r.logger.Warn("Tactical planning failed",
-			slog.Int("attempt", attempt),
-			slog.Any("error", err),
-		)
-
-		if attempt < MaxRetries {
-			select {
-			case <-ctx.Done():
-				if errors.Is(ctx.Err(), context.Canceled) {
-					return nil, context.Canceled
-				}
-				r.logger.Warn("Context timeout in primary brain, engaging fallback tactics")
-				return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
-			case <-time.After(backoff):
-				backoff *= 2
-			}
-		}
-	}
-
-	r.logger.Error("Primary brain exhausted retries for tactics. Engaging fallback.", slog.Any("final_error", lastErr))
-	return r.fallback.EvaluatePlan(context.Background(), t, sessionID, systemOverride, milestone)
-}
-
-</file>
-
-<file path="routine.go">
-// routine.go
-package main
-
-import (
-	"fmt"
-	"strings"
-	"time"
-)
-
-// Routine defines a modular check that can inject high-priority tasks.
-type Routine interface {
-	Name() string
-	Check(state GameState, inFlight *Action, queue []Action) *Action
-}
-
-type RoutineManager interface {
-	Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action
-}
-
-type DefaultRoutineManager struct {
-	routines []Routine
-}
-
-func NewDefaultRoutineManager() *DefaultRoutineManager {
-	return &DefaultRoutineManager{
-		routines: []Routine{
-			&CombatRoutine{}, // Re-added the Combat Routine
-			&EatingRoutine{},
-			&SleepRoutine{},
-			&ToolingRoutine{},
-			&CookingRoutine{},
-			&WanderRoutine{},
-		},
-	}
-}
-
-func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action {
-	var results []Action
-	for _, routine := range r.routines {
-		if task := routine.Check(state, inFlightTask, taskQueue); task != nil {
-			results = append(results, *task)
-		}
-	}
-	return results
-}
-
-func isTaskActive(action, targetName string, inFlight *Action, queue []Action) bool {
-	if inFlight != nil && inFlight.Action == action && inFlight.Target.Name == targetName {
-		return true
-	}
-	for _, t := range queue {
-		if t.Action == action && t.Target.Name == targetName {
-			return true
-		}
-	}
-	return false
-}
-
-// --- Routine Implementations ---
-
-type CombatRoutine struct{}
-
-func (c *CombatRoutine) Name() string { return "combat" }
-func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if len(state.Threats) > 0 {
-		topThreat := state.Threats[0].Name
-
-		// Check if we have an axe or sword equipped/in inventory
-		hasWeapon := false
-		for _, item := range state.Inventory {
-			if strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "sword") {
-				hasWeapon = true
-				break
-			}
-		}
-
-		// Engage ONLY if armed, healthy, facing exactly 1 threat, and it's not a suicide target
-		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
-			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
-				return &Action{
-					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
-					Source:    string(SourceRoutine),
-					Action:    string(ActionHunt),
-					Target:    Target{Type: string(TargetEntity), Name: topThreat},
-					Rationale: "Tactical Engage: 1-on-1 combat advantage detected.",
-					Priority:  PriReflex, // Instantly preempts gathering/mining
-				}
-			}
-		}
-	}
-	return nil
-}
-
-type EatingRoutine struct{}
-
-func (e *EatingRoutine) Name() string { return "eating" }
-func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if state.Food >= 16 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
-		return nil
-	}
-	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop"}
-	for _, f := range foodPriority {
-		for _, inv := range state.Inventory {
-			if inv.Name == f {
-				return &Action{
-					ID:        fmt.Sprintf("routine-eat-%d", time.Now().UnixNano()),
-					Source:    string(SourceRoutine),
-					Action:    string(ActionEat),
-					Target:    Target{Type: string(TargetCategory), Name: f},
-					Rationale: "Survival: Restoring hunger to enable healing.",
-					Priority:  PriReflex,
-				}
-			}
-		}
-	}
-	return nil
-}
-
-type SleepRoutine struct{}
-
-func (s *SleepRoutine) Name() string { return "sleep" }
-func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && state.HasBedNearby {
-		if !isTaskActive(string(ActionSleep), "bed", inFlight, queue) {
-			return &Action{
-				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionSleep),
-				Target:    Target{Type: string(TargetBlock), Name: "bed"},
-				Rationale: "Routine: Sleeping to skip the night.",
-				Priority:  PriRoutine,
-			}
-		}
-	}
-	return nil
-}
-
-type ToolingRoutine struct{}
-
-func (t *ToolingRoutine) Name() string { return "tooling" }
-func (t *ToolingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	inv := make(map[string]int)
-	for _, item := range state.Inventory {
-		inv[item.Name] = item.Count
-	}
-
-	// --- FIX 3 (Part B): Don't craft a table if one is already nearby ---
-	if inv["crafting_table"] == 0 && !state.HasCraftingTableNearby && !isTaskActive(string(ActionCraft), "crafting_table", inFlight, queue) {
-		plankCount := 0
-		var logName string
-		for name, count := range inv {
-			if strings.HasSuffix(name, "_planks") {
-				plankCount += count
-			}
-			if strings.HasSuffix(name, "_log") {
-				logName = name
-			}
-		}
-
-		if plankCount >= 4 {
-			return &Action{
-				ID:        fmt.Sprintf("routine-craft-table-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionCraft),
-				Target:    Target{Type: string(TargetRecipe), Name: "crafting_table"},
-				Rationale: "Progression: Crafting essential table.",
-				Priority:  PriRoutine,
-			}
-		} else if logName != "" {
-			target := strings.Replace(logName, "_log", "_planks", 1)
-			return &Action{
-				ID:        fmt.Sprintf("routine-craft-planks-%d", time.Now().UnixNano()),
-				Source:    string(SourceRoutine),
-				Action:    string(ActionCraft),
-				Target:    Target{Type: string(TargetRecipe), Name: target},
-				Rationale: "Progression: Converting logs to planks.",
-				Priority:  PriRoutine,
-			}
-		}
-	}
-	return nil
-}
-
-type CookingRoutine struct{}
-
-func (c *CookingRoutine) Name() string { return "cooking" }
-func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	hasFurnace, hasRaw, hasFuel := false, false, false
-	for _, item := range state.Inventory {
-		if item.Name == "furnace" {
-			hasFurnace = true
-		}
-		if strings.Contains("beef porkchop mutton chicken rabbit", item.Name) {
-			hasRaw = true
-		}
-		if strings.Contains("coal charcoal oak_planks", item.Name) {
-			hasFuel = true
-		}
-	}
-
-	if hasFurnace && hasRaw && hasFuel && !isTaskActive(string(ActionSmelt), "food", inFlight, queue) {
-		return &Action{
-			ID:        fmt.Sprintf("routine-smelt-%d", time.Now().UnixNano()),
-			Source:    string(SourceRoutine),
-			Action:    string(ActionSmelt),
-			Target:    Target{Type: string(TargetCategory), Name: "food"},
-			Rationale: "Efficiency: Smelting raw food for better nutrition.",
-			Priority:  PriRoutine,
-		}
-	}
-	return nil
-}
-
-type WanderRoutine struct{}
-
-func (w *WanderRoutine) Name() string { return "wander" }
-func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if inFlight == nil && len(queue) == 0 {
-		return &Action{
-			ID:        fmt.Sprintf("routine-wander-%d", time.Now().UnixNano()),
-			Source:    string(SourceRoutine),
-			Action:    string(ActionExplore),
-			Target:    Target{Type: string(TargetNone), Name: "none"},
-			Rationale: "Idle: Exploring the area to keep chunks loaded and discover resources.",
-			Priority:  Priority(3),
-		}
-	}
-	return nil
-}
-
-</file>
-
-<file path="shared_types.go">
-// shared_types.go
-package main
-
-import "encoding/json"
-
-// ClientEventType defines all events emitted by the TS client.
-type ClientEventType string
-
-const (
-	EventTaskCompleted     ClientEventType = "task_completed"
-	EventTaskFailed        ClientEventType = "task_failed"
-	EventTaskAborted       ClientEventType = "task_aborted"
-	EventDeath             ClientEventType = "death"
-	EventPanicRetreatStart ClientEventType = "panic_retreat_start"
-	EventPanicRetreatEnd   ClientEventType = "panic_retreat_end"
-)
-
-// TaskStatus unifies execution states.
-type TaskStatus string
-
-const (
-	StatusRunning   TaskStatus = "RUNNING"
-	StatusCompleted TaskStatus = "COMPLETED"
-	StatusFailed    TaskStatus = "FAILED"
-	StatusAborted   TaskStatus = "ABORTED"
-	StatusPanic     TaskStatus = "PANIC"
-)
-
-// TraceContext links Go engine decisions to TS execution logs.
-type TraceContext struct {
-	TraceID     string `json:"trace_id"`
-	ActionID    string `json:"action_id"`
-	MilestoneID string `json:"milestone_id,omitempty"`
-}
-
-// WSMessage is updated to include trace context.
-type WSMessage struct {
-	Type    WSMessageType   `json:"type"`
-	Trace   TraceContext    `json:"trace"`
-	Payload json.RawMessage `json:"payload"`
-}
-
-</file>
-
-<file path="telemetry.go">
-package main
-
-import (
-	"context"
-	"log/slog"
-	"sync"
-	"sync/atomic"
-	"time"
-)
-
-// ModelPricing represents cost per 1M tokens (Input / Output)
-var PricingMap = map[string]struct{ Input, Output float64 }{
-	"mistralai/mistral-small-2603": {Input: 1.00, Output: 3.00},
-	"gpt-4-turbo":                  {Input: 10.00, Output: 30.00},
-}
-
-type Telemetry struct {
-	logger *slog.Logger
-	mu     sync.Mutex
-
-	llmInvocations int
-	llmErrors      int
-	totalLatency   time.Duration
-
-	inputTokens  int
-	outputTokens int
-	totalCost    float64
-
-	tasksCompleted int
-	tasksFailed    int
-	replans        int
-	panics         int
-	activeSessions int32
-
-	// Phase 3: Orchestration metrics
-	dispatchFailures   int
-	stalePlansDropped  int
-	milestonesGen      int
-	validationFailures int
-
-	costLimit float64
-}
-
-func NewTelemetry(logger *slog.Logger, costLimit float64) *Telemetry {
-	return &Telemetry{
-		logger:    logger.With(slog.String("component", "telemetry")),
-		costLimit: costLimit,
-	}
-}
-
-func (t *Telemetry) RecordSessionStart()   { atomic.AddInt32(&t.activeSessions, 1) }
-func (t *Telemetry) RecordSessionEnd()     { atomic.AddInt32(&t.activeSessions, -1) }
-func (t *Telemetry) ActiveSessions() int32 { return atomic.LoadInt32(&t.activeSessions) }
-
-func (t *Telemetry) RecordLLMCall(model string, duration time.Duration, inTokens, outTokens int, err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.llmInvocations++
-	t.totalLatency += duration
-
-	if err != nil {
-		t.llmErrors++
-		return
-	}
-
-	t.inputTokens += inTokens
-	t.outputTokens += outTokens
-
-	prices, ok := PricingMap[model]
-	if !ok {
-		prices = PricingMap["mistralai/mistral-small-2603"] // default fallback
-	}
-
-	callCost := (float64(inTokens) / 1000000.0 * prices.Input) + (float64(outTokens) / 1000000.0 * prices.Output)
-	t.totalCost += callCost
-
-	if t.totalCost > t.costLimit {
-		t.logger.Warn("GLOBAL COST LIMIT EXCEEDED",
-			slog.Float64("current_cost", t.totalCost),
-			slog.Float64("limit", t.costLimit),
-		)
-	}
-}
-
-func (t *Telemetry) HasExceededCostLimit() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.totalCost >= t.costLimit
-}
-
-func (t *Telemetry) RecordTaskStatus(status TaskStatus) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	switch status {
-	case StatusCompleted:
-		t.tasksCompleted++
-	case StatusFailed, StatusAborted:
-		t.tasksFailed++
-	}
-}
-
-func (t *Telemetry) RecordReplan() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.replans++
-}
-
-func (t *Telemetry) RecordPanic() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.panics++
-}
-
-func (t *Telemetry) RecordDispatchFailure() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.dispatchFailures++
-}
-
-func (t *Telemetry) RecordStalePlan() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.stalePlansDropped++
-}
-
-func (t *Telemetry) RecordMilestoneGenerated() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.milestonesGen++
-}
-
-func (t *Telemetry) RecordValidationFailure() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.validationFailures++
-}
-
-func (t *Telemetry) StartReporting(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			t.mu.Lock()
-			avgLatency := time.Duration(0)
-			if t.llmInvocations > 0 {
-				avgLatency = t.totalLatency / time.Duration(t.llmInvocations)
-			}
-
-			t.logger.Info("Telemetry Report",
-				slog.Int("llm_calls", t.llmInvocations),
-				slog.Int("llm_errors", t.llmErrors),
-				slog.String("llm_avg_latency", avgLatency.String()),
-				slog.Float64("total_cost_usd", t.totalCost),
-				slog.Int("tasks_completed", t.tasksCompleted),
-				slog.Int("tasks_failed", t.tasksFailed),
-				slog.Int("replans", t.replans),
-				slog.Int("panics", t.panics),
-				slog.Int("dispatch_failures", t.dispatchFailures),
-				slog.Int("stale_plans_dropped", t.stalePlansDropped),
-				slog.Int("milestones_gen", t.milestonesGen),
-				slog.Int("validation_failures", t.validationFailures),
-			)
-
-			// Flush execution metrics
-			t.llmInvocations, t.llmErrors, t.totalLatency = 0, 0, 0
-			t.tasksCompleted, t.tasksFailed, t.replans, t.panics = 0, 0, 0, 0
-			t.dispatchFailures, t.stalePlansDropped, t.milestonesGen, t.validationFailures = 0, 0, 0, 0
-			t.mu.Unlock()
-		}
-	}
-}
-
-func (t *Telemetry) AvgLatency() time.Duration {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.llmInvocations == 0 {
-		return 0
-	}
-	return t.totalLatency / time.Duration(t.llmInvocations)
-}
-
-</file>
-
-<file path="ui_hub.go">
-package main
-
-import (
-	"encoding/json"
-	"log/slog"
-	"net/http"
-	"time"
-
-	"github.com/gorilla/websocket"
-)
-
-const writeWait = 10 * time.Second
-
-type UIClient struct {
-	hub  *UIHub
-	conn *websocket.Conn
-	send chan []byte
-}
-
-type UIHub struct {
-	clients    map[*UIClient]bool
-	broadcast  chan []byte
-	register   chan *UIClient
-	unregister chan *UIClient
-	logger     *slog.Logger
-}
-
-func NewUIHub(logger *slog.Logger) *UIHub {
-	return &UIHub{
-		broadcast:  make(chan []byte, 256),
-		register:   make(chan *UIClient),
-		unregister: make(chan *UIClient),
-		clients:    make(map[*UIClient]bool),
-		logger:     logger.With(slog.String("component", "ui_hub")),
-	}
-}
-
-func (h *UIHub) Run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.clients[client] = true
-			h.logger.Info("UI Client connected", slog.Int("active_clients", len(h.clients)))
-		case client := <-h.unregister:
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				h.logger.Info("UI Client disconnected", slog.Int("active_clients", len(h.clients)))
-			}
-		case message := <-h.broadcast:
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(h.clients, client)
-				}
-			}
-		}
-	}
-}
-
-func (h *UIHub) Broadcast(msg interface{}) {
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	h.broadcast <- payload
-}
-
-func (h *UIHub) HandleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		h.logger.Error("UI Hub upgrade failed", slog.Any("error", err))
-		return
-	}
-
-	client := &UIClient{hub: h, conn: ws, send: make(chan []byte, 256)}
-	h.register <- client
-
-	go client.writePump()
-	go client.readPump()
-}
-
-func (c *UIClient) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
-	for {
-		if _, _, err := c.conn.ReadMessage(); err != nil {
-			break
-		}
-	}
-}
-
-func (c *UIClient) writePump() {
-	defer func() {
-		c.conn.Close()
-	}()
-	for message := range c.send {
-		c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			return
-		}
-	}
-	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-}
-
-</file>
-
-<file path="ws_types.go">
-package main
-
-type WSMessageType string
-
-const (
-	TypeCommand       WSMessageType = "command"
-	TypeEvent         WSMessageType = "event"
-	TypeState         WSMessageType = "state"
-	TypePlanningError WSMessageType = "planning_error"
-	TypeNoOp          WSMessageType = "noop"
-)
-
-type CommandPayload struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	Target    Target `json:"target"`
-	Rationale string `json:"rationale"`
-}
-
-type EventPayload struct {
-	Event     string `json:"event"`
-	Action    string `json:"action"`
-	CommandID string `json:"command_id"`
-	Cause     string `json:"cause"`
-	Duration  int    `json:"duration_ms"`
-}
-
-type StatePayload struct {
-	Health       float64  `json:"health"`
-	Food         float64  `json:"food"`
-	TimeOfDay    int      `json:"time_of_day"`
-	HasBedNearby bool     `json:"has_bed_nearby"`
-	Position     Vec3     `json:"position"`
-	Threats      []Threat `json:"threats"`
-	Inventory    []Item   `json:"inventory"`
-}
-
-type Threat struct {
-	Name string `json:"name"`
-}
-
-type Item struct {
-	Name  string `json:"name"`
-	Count int    `json:"count"`
-}
+<file path="ui\src\App.svelte">
+<script lang="ts">
+    import { onMount, onDestroy } from "svelte";
+    import ItemIcon from "./components/ItemIcon.svelte";
+
+    type Vec3 = { x: number; y: number; z: number };
+    type Threat = { name: string };
+    type InventoryItem = { name: string; count: number };
+
+    type BotState = {
+        health: number;
+        food: number;
+        time_of_day: number;
+        has_bed_nearby: boolean;
+        position: Vec3;
+        threats: Threat[];
+        inventory: InventoryItem[];
+    };
+
+    let botState: BotState = $state({
+        health: 20,
+        food: 20,
+        time_of_day: 0,
+        has_bed_nearby: false,
+        position: { x: 0, y: 0, z: 0 },
+        threats: [],
+        inventory: [],
+    });
+
+    let ws: WebSocket;
+    let connected = $state(false);
+
+    onMount(() => {
+        connect();
+    });
+
+    onDestroy(() => {
+        if (ws) ws.close();
+    });
+
+    function connect() {
+        ws = new WebSocket("ws://localhost:8080/ui/ws");
+
+        ws.onopen = () => {
+            connected = true;
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === "state_update") {
+                    botState = msg.payload;
+                }
+            } catch (err) {
+                console.error("Failed to parse WS message:", err);
+            }
+        };
+
+        ws.onclose = () => {
+            connected = false;
+            setTimeout(connect, 2000);
+        };
+    }
+
+    let isNight = $derived(
+        botState.time_of_day >= 12000 && botState.time_of_day <= 24000,
+    );
+    let darkness = $derived(
+        isNight
+            ? Math.sin(((botState.time_of_day - 12000) / 12000) * Math.PI) * 0.6
+            : 0,
+    );
+
+    let hotbarItems = $derived(
+        Array.from({ length: 9 }, (_, i) => botState.inventory[i] || null),
+    );
+    let sideInventory = $derived(botState.inventory.slice(9));
+
+    function formatName(name: string) {
+        return name
+            .split("_")
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(" ");
+    }
+</script>
+
+<svelte:head>
+    <link
+        href="https://fonts.googleapis.com/css2?family=VT323&display=swap"
+        rel="stylesheet"
+    />
+</svelte:head>
+
+<main class="dashboard">
+    <iframe src="http://localhost:3000" title="Prismarine Viewer"></iframe>
+
+    <div
+        class="night-tint"
+        style="background-color: rgba(5, 5, 20, {darkness});"
+    ></div>
+
+    <div class="hud">
+        <div class="top-left">
+            <div class="coord-box">
+                XYZ: {Math.floor(botState.position.x)}, {Math.floor(
+                    botState.position.y,
+                )}, {Math.floor(botState.position.z)}
+            </div>
+            <div class="status-box {connected ? 'online' : 'offline'}">
+                {connected ? "LINK ESTABLISHED" : "SEARCHING FOR SIGNAL..."}
+            </div>
+        </div>
+
+        <div class="side-inventory">
+            {#each sideInventory as item}
+                <div class="side-item">
+                    <ItemIcon name={item.name} size={24} />
+                    <span class="item-count">{item.count}</span>
+                    <span class="item-name">{formatName(item.name)}</span>
+                </div>
+            {/each}
+        </div>
+
+        <div class="bottom-center">
+            {#if botState.threats && botState.threats.length > 0}
+                <div class="threat-warning">
+                    HOSTILES NEARBY: {botState.threats
+                        .map((t) => formatName(t.name))
+                        .join(", ")}
+                </div>
+            {/if}
+
+            <div class="stat-bars">
+                <div class="bar-wrapper">
+                    <div
+                        class="bar-fill health-fill"
+                        style="width: {(botState.health / 20) * 100}%"
+                    ></div>
+                    <span class="bar-text">HP {botState.health}/20</span>
+                </div>
+                <div class="bar-wrapper">
+                    <div
+                        class="bar-fill food-fill"
+                        style="width: {(botState.food / 20) * 100}%"
+                    ></div>
+                    <span class="bar-text">HUNGER {botState.food}/20</span>
+                </div>
+            </div>
+
+            <div class="hotbar">
+                {#each hotbarItems as item, i}
+                    <div class="hotbar-slot">
+                        <span class="slot-number">{i + 1}</span>
+                        {#if item}
+                            <div class="slot-content">
+                                <ItemIcon name={item.name} size={32} />
+                                {#if item.count > 1}
+                                    <span class="slot-count">{item.count}</span>
+                                {/if}
+                            </div>
+                        {/if}
+                    </div>
+                {/each}
+            </div>
+        </div>
+    </div>
+</main>
+
+<style>
+    :global(body) {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+    }
+
+    .dashboard {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        font-family: "VT323", monospace;
+        font-size: 20px;
+        color: white;
+        text-shadow: 2px 2px 0px #3f3f3f;
+        user-select: none;
+    }
+
+    iframe {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        border: none;
+        z-index: 1;
+    }
+
+    .night-tint {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 2;
+        transition: background-color 1s linear;
+    }
+
+    .hud {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 3;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+
+    .top-left {
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+    }
+
+    .coord-box,
+    .status-box {
+        background: rgba(0, 0, 0, 0.4);
+        display: inline-block;
+        padding: 2px 8px;
+        border: 2px solid rgba(0, 0, 0, 0.6);
+        width: fit-content;
+    }
+
+    .status-box.online {
+        color: #55ff55;
+    }
+    .status-box.offline {
+        color: #ff5555;
+    }
+
+    .side-inventory {
+        position: absolute;
+        left: 10px;
+        top: 30%;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        background: rgba(0, 0, 0, 0.2);
+        padding: 10px;
+        border-radius: 4px;
+    }
+
+    .side-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .item-count {
+        color: #ffff55;
+        min-width: 25px;
+        text-align: right;
+    }
+
+    .item-name {
+        color: #ffffff;
+    }
+
+    .bottom-center {
+        position: absolute;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .threat-warning {
+        color: #ff5555;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 4px 12px;
+        border: 2px solid #ff5555;
+        animation: blink 1s infinite;
+    }
+
+    @keyframes blink {
+        0%,
+        100% {
+            opacity: 1;
+        }
+        50% {
+            opacity: 0.5;
+        }
+    }
+
+    .stat-bars {
+        display: flex;
+        gap: 20px;
+        width: 100%;
+        justify-content: center;
+    }
+
+    .bar-wrapper {
+        position: relative;
+        width: 160px;
+        height: 20px;
+        background: rgba(0, 0, 0, 0.5);
+        border: 2px solid #222;
+        border-top-color: #555;
+        border-left-color: #555;
+    }
+
+    .bar-fill {
+        height: 100%;
+        transition: width 0.2s;
+    }
+
+    .health-fill {
+        background: #ff5555;
+        border-right: 2px solid #aa0000;
+    }
+    .food-fill {
+        background: #ffaa00;
+        border-right: 2px solid #cc6600;
+    }
+
+    .bar-text {
+        position: absolute;
+        top: -2px;
+        left: 0;
+        width: 100%;
+        text-align: center;
+        font-size: 18px;
+        text-shadow: 1px 1px 0px #000;
+    }
+
+    .hotbar {
+        display: flex;
+        background: rgba(0, 0, 0, 0.4);
+        padding: 2px;
+        border: 2px solid #222;
+        border-top-color: #555;
+        border-left-color: #555;
+    }
+
+    .hotbar-slot {
+        position: relative;
+        width: 40px;
+        height: 40px;
+        background: rgba(139, 139, 139, 0.4);
+        border: 2px solid #373737;
+        border-bottom-color: #fff;
+        border-right-color: #fff;
+        margin: 2px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .slot-number {
+        position: absolute;
+        top: 2px;
+        left: 4px;
+        font-size: 14px;
+        color: rgba(255, 255, 255, 0.5);
+        text-shadow: none;
+        z-index: 10;
+    }
+
+    .slot-content {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        position: relative;
+    }
+
+    .slot-count {
+        position: absolute;
+        bottom: -2px;
+        right: 2px;
+        font-size: 18px;
+        color: #fff;
+        text-shadow: 2px 2px 0px #000;
+        z-index: 10;
+    }
+</style>
 
 </file>
 
@@ -5980,10 +886,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 167917,
-  "file_count": 44,
-  "estimated_tokens": 42715,
+  "total_bytes": 23431,
+  "file_count": 4,
+  "estimated_tokens": 5946,
   "mode": "full",
-  "generated_at": "2026-03-21T00:01:45.4718755-07:00"
+  "generated_at": "2026-03-25T23:59:45.7266965-07:00"
 }
 ```

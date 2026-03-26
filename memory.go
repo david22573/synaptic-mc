@@ -24,8 +24,10 @@ type MemoryBank interface {
 	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
+	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
 	MarkLocation(ctx context.Context, name string, x, y, z float64) error
 	GetLocation(ctx context.Context, name string) (*Vec3, error)
+	GetKnownLocations(ctx context.Context) (string, error)
 	Close() error
 }
 
@@ -90,7 +92,6 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		return nil, fmt.Errorf("failed to apply schema: %w", err)
 	}
 
-	// Safe migration for Phase 3 to add trace_id to existing DBs
 	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN trace_id TEXT DEFAULT ''`)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -160,6 +161,11 @@ func (s *SQLiteMemory) processBatches(ctx context.Context) {
 }
 
 func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
+	// Filter out noise
+	if action == "wander" || action == "idle" || action == "explore" {
+		return
+	}
+
 	select {
 	case s.eventChan <- pendingEvent{action: action, details: details, meta: meta}:
 	default:
@@ -168,26 +174,34 @@ func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
 }
 
 func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
-	query := `SELECT timestamp, action, details, status, COALESCE(trace_id, '') FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
-	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
+	query := `SELECT timestamp, action, details, status FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID, limit*2)
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
 
 	var events []string
+	var lastAction string
+
 	for rows.Next() {
 		var timestamp time.Time
-		var action, details, status, traceID string
-		if err := rows.Scan(&timestamp, &action, &details, &status, &traceID); err != nil {
+		var action, details, status string
+		// Note: We dropped fetching trace_id entirely to save tokens
+		if err := rows.Scan(&timestamp, &action, &details, &status); err != nil {
 			return "", err
 		}
 
-		traceStr := ""
-		if traceID != "" {
-			traceStr = fmt.Sprintf(" [Trace: %s]", traceID)
+		if action == lastAction {
+			continue
 		}
-		events = append(events, fmt.Sprintf("[%s] %s (%s)%s: %s", timestamp.Format("15:04:05"), action, status, traceStr, details))
+		lastAction = action
+
+		events = append(events, fmt.Sprintf("[%s] %s (%s): %s", timestamp.Format("15:04:05"), action, status, details))
+
+		if len(events) >= limit {
+			break
+		}
 	}
 
 	var contextStr strings.Builder
@@ -233,6 +247,19 @@ func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string
 	return summary.String(), nil
 }
 
+func (s *SQLiteMemory) GetSummaryValue(ctx context.Context, sessionID, key string) (string, error) {
+	query := `SELECT value FROM session_summary WHERE session_id = ? AND key = ?`
+	var value string
+	err := s.db.QueryRowContext(ctx, query, sessionID, key).Scan(&value)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return value, nil
+}
+
 func (s *SQLiteMemory) MarkLocation(ctx context.Context, name string, x, y, z float64) error {
 	query := `
 	INSERT INTO spatial_memory (name, x, y, z) 
@@ -250,6 +277,29 @@ func (s *SQLiteMemory) GetLocation(ctx context.Context, name string) (*Vec3, err
 		return nil, err
 	}
 	return &vec, nil
+}
+
+func (s *SQLiteMemory) GetKnownLocations(ctx context.Context) (string, error) {
+	query := `SELECT name, x, y, z FROM spatial_memory`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return "KNOWN LOCATIONS: none", nil
+	}
+	defer rows.Close()
+
+	var locs string
+	for rows.Next() {
+		var name string
+		var x, y, z float64
+		if err := rows.Scan(&name, &x, &y, &z); err == nil {
+			locs += fmt.Sprintf("%s X:%d,Y:%d,Z:%d ", name, int(x), int(y), int(z))
+		}
+	}
+
+	if locs == "" {
+		return "KNOWN LOCATIONS: none", nil
+	}
+	return "KNOWN LOCATIONS: " + strings.TrimSpace(locs), nil
 }
 
 func (s *SQLiteMemory) Close() error {

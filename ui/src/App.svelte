@@ -16,7 +16,7 @@
         inventory: InventoryItem[];
     };
 
-    let state: BotState = {
+    let botState: BotState = $state({
         health: 20,
         food: 20,
         time_of_day: 0,
@@ -24,10 +24,10 @@
         position: { x: 0, y: 0, z: 0 },
         threats: [],
         inventory: [],
-    };
+    });
 
     let ws: WebSocket;
-    let connected = false;
+    let connected = $state(false);
 
     onMount(() => {
         connect();
@@ -48,7 +48,7 @@
             try {
                 const msg = JSON.parse(event.data);
                 if (msg.type === "state_update") {
-                    state = msg.payload;
+                    botState = msg.payload;
                 }
             } catch (err) {
                 console.error("Failed to parse WS message:", err);
@@ -61,16 +61,19 @@
         };
     }
 
-    $: isNight = state.time_of_day >= 12000 && state.time_of_day <= 24000;
-    $: darkness = isNight
-        ? Math.sin(((state.time_of_day - 12000) / 12000) * Math.PI) * 0.6
-        : 0;
-
-    $: hotbarItems = Array.from(
-        { length: 9 },
-        (_, i) => state.inventory[i] || null,
+    let isNight = $derived(
+        botState.time_of_day >= 12000 && botState.time_of_day <= 24000,
     );
-    $: sideInventory = state.inventory.slice(9);
+    let darkness = $derived(
+        isNight
+            ? Math.sin(((botState.time_of_day - 12000) / 12000) * Math.PI) * 0.6
+            : 0,
+    );
+
+    let hotbarItems = $derived(
+        Array.from({ length: 9 }, (_, i) => botState.inventory[i] || null),
+    );
+    let sideInventory = $derived(botState.inventory.slice(9));
 
     function formatName(name: string) {
         return name
@@ -98,9 +101,9 @@
     <div class="hud">
         <div class="top-left">
             <div class="coord-box">
-                XYZ: {Math.floor(state.position.x)}, {Math.floor(
-                    state.position.y,
-                )}, {Math.floor(state.position.z)}
+                XYZ: {Math.floor(botState.position.x)}, {Math.floor(
+                    botState.position.y,
+                )}, {Math.floor(botState.position.z)}
             </div>
             <div class="status-box {connected ? 'online' : 'offline'}">
                 {connected ? "LINK ESTABLISHED" : "SEARCHING FOR SIGNAL..."}
@@ -118,9 +121,9 @@
         </div>
 
         <div class="bottom-center">
-            {#if state.threats && state.threats.length > 0}
+            {#if botState.threats && botState.threats.length > 0}
                 <div class="threat-warning">
-                    HOSTILES NEARBY: {state.threats
+                    HOSTILES NEARBY: {botState.threats
                         .map((t) => formatName(t.name))
                         .join(", ")}
                 </div>
@@ -130,16 +133,16 @@
                 <div class="bar-wrapper">
                     <div
                         class="bar-fill health-fill"
-                        style="width: {(state.health / 20) * 100}%"
+                        style="width: {(botState.health / 20) * 100}%"
                     ></div>
-                    <span class="bar-text">HP {state.health}/20</span>
+                    <span class="bar-text">HP {botState.health}/20</span>
                 </div>
                 <div class="bar-wrapper">
                     <div
                         class="bar-fill food-fill"
-                        style="width: {(state.food / 20) * 100}%"
+                        style="width: {(botState.food / 20) * 100}%"
                     ></div>
-                    <span class="bar-text">HUNGER {state.food}/20</span>
+                    <span class="bar-text">HUNGER {botState.food}/20</span>
                 </div>
             </div>
 
@@ -253,7 +256,7 @@
     .side-item {
         display: flex;
         align-items: center;
-        gap: 8px; /* Adjusted gap to fit the icon tightly */
+        gap: 8px;
     }
 
     .item-count {

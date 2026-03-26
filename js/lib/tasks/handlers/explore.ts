@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/explore.ts
 import {
     type FSMState,
     type StateContext,
@@ -11,14 +10,12 @@ import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
-// FIX: Retain the last 20 chunk hops to prevent backtracking
-const visitedPoints: { x: number; z: number }[] = [];
-
 interface ExploreContext extends StateContext {
     targetX: number;
     targetZ: number;
     attempts: number;
     stopMovement: () => void;
+    visitedPoints: { x: number; z: number }[];
 }
 
 class NavigateState implements FSMState {
@@ -40,11 +37,11 @@ class NavigateState implements FSMState {
             );
 
             // Successfully reached new area. Record it to repel future exploration.
-            visitedPoints.push({
+            eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
                 z: eCtx.bot.entity.position.z,
             });
-            if (visitedPoints.length > 20) visitedPoints.shift();
+            if (eCtx.visitedPoints.length > 20) eCtx.visitedPoints.shift();
 
             eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
             return null;
@@ -89,12 +86,12 @@ class PickDirectionState implements FSMState {
             const tz = eCtx.bot.entity.position.z + Math.sin(testAngle) * dist;
 
             let minDistanceToHistory = 999999;
-            for (const pt of visitedPoints) {
+            for (const pt of eCtx.visitedPoints) {
                 const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
                 if (d < minDistanceToHistory) minDistanceToHistory = d;
             }
 
-            if (visitedPoints.length === 0) minDistanceToHistory = 1;
+            if (eCtx.visitedPoints.length === 0) minDistanceToHistory = 1;
 
             if (minDistanceToHistory > maxRepulsionScore) {
                 maxRepulsionScore = minDistanceToHistory;
@@ -119,6 +116,12 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
+    // Bind the history array to the bot instance itself.
+    // This way it persists across multiple 'explore' task calls in the same session,
+    // but gets garbage collected naturally when the bot reconnects/re-instantiates.
+    const botRef = bot as any;
+    botRef.explorationHistory = botRef.explorationHistory || [];
+
     const fsmCtx: ExploreContext = {
         bot,
         targetName: "explore",
@@ -131,11 +134,14 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         targetZ: 0,
         attempts: 0,
         stopMovement,
+        visitedPoints: botRef.explorationHistory,
     };
+
     const result = await new StateMachineRunner(
         new PickDirectionState(),
         fsmCtx,
     ).run();
+
     if (result.status === "FAILED")
         throw new Error(result.reason || "unknown_fsm_failure");
 }

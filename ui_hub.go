@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -35,9 +36,12 @@ func NewUIHub(logger *slog.Logger) *UIHub {
 	}
 }
 
-func (h *UIHub) Run() {
+func (h *UIHub) Run(ctx context.Context) {
 	for {
 		select {
+		case <-ctx.Done():
+			h.logger.Info("UI Hub shutting down")
+			return
 		case client := <-h.register:
 			h.clients[client] = true
 			h.logger.Info("UI Client connected", slog.Int("active_clients", len(h.clients)))
