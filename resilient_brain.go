@@ -27,19 +27,24 @@ func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger, tel *
 		primary:   primary,
 		fallback:  fallback,
 		validator: NewPlanValidator(),
-		simulator: NewInternalSimulator(),
+		simulator: NewInternalSimulator(logger),
 		logger:    logger.With(slog.String("component", "ResilientBrain")),
 		telemetry: tel,
 	}
 }
 
-func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
+func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan, attempt int) (*LLMPlan, error) {
 	var lastErr error
 	backoff := InitialBackoff
 
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
+	if r.telemetry.HasExceededCostLimit() {
+		r.logger.Warn("Cost limit exceeded, routing directly to fallback planner")
+		return r.fallback.GeneratePlan(ctx, t, sessionID, systemOverride, milestone, 1)
+	}
+
+	for try := 1; try <= MaxRetries; try++ {
 		currentOverride := systemOverride
-		if lastErr != nil && attempt > 1 {
+		if lastErr != nil && try > 1 {
 			correction := fmt.Sprintf("CRITICAL ERROR IN PREVIOUS OUTPUT: %v. Fix the JSON schema and semantic errors.", lastErr)
 			if currentOverride != "" {
 				currentOverride = currentOverride + "\n" + correction
@@ -48,7 +53,7 @@ func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, sy
 			}
 		}
 
-		plan, err := r.primary.GeneratePlan(ctx, t, sessionID, currentOverride, milestone)
+		plan, err := r.primary.GeneratePlan(ctx, t, sessionID, currentOverride, milestone, try)
 		if err == nil {
 
 			// Phase 7: Run internal simulation to collapse candidates into the optimal tasks
@@ -78,18 +83,18 @@ func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, sy
 
 		lastErr = err
 		r.logger.Warn("Planning failed",
-			slog.Int("attempt", attempt),
+			slog.Int("attempt", try),
 			slog.Any("error", err),
 		)
 
-		if attempt < MaxRetries {
+		if try < MaxRetries {
 			select {
 			case <-ctx.Done():
 				if errors.Is(ctx.Err(), context.Canceled) {
 					return nil, context.Canceled
 				}
 				r.logger.Warn("Context timeout in primary brain, engaging fallback planner")
-				return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone)
+				return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone, 1)
 			case <-time.After(backoff):
 				backoff *= 2
 			}
@@ -97,5 +102,5 @@ func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, sy
 	}
 
 	r.logger.Error("Primary brain exhausted retries. Engaging fallback.", slog.Any("final_error", lastErr))
-	return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone)
+	return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone, 1)
 }

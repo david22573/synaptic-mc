@@ -33,31 +33,36 @@ const (
 	TargetNone     TargetType = "none"
 )
 
-var ValidActions = map[string]bool{
-	string(ActionGather):         true,
-	string(ActionCraft):          true,
-	string(ActionHunt):           true,
-	string(ActionExplore):        true,
-	string(ActionBuild):          true,
-	string(ActionSmelt):          true,
-	string(ActionFarm):           true,
-	string(ActionMine):           true,
-	string(ActionMarkLocation):   true,
-	string(ActionRecallLocation): true,
-	string(ActionIdle):           true,
-	string(ActionSleep):          true,
-	string(ActionRetreat):        true,
-	string(ActionEat):            true,
-	string(ActionInteract):       true,
-}
+var ValidActions map[string]bool
+var ValidTargetTypes map[string]bool
 
-var ValidTargetTypes = map[string]bool{
-	string(TargetBlock):    true,
-	string(TargetEntity):   true,
-	string(TargetRecipe):   true,
-	string(TargetLocation): true,
-	string(TargetCategory): true,
-	string(TargetNone):     true,
+func init() {
+	ValidActions = map[string]bool{
+		string(ActionGather):         true,
+		string(ActionCraft):          true,
+		string(ActionHunt):           true,
+		string(ActionExplore):        true,
+		string(ActionBuild):          true,
+		string(ActionSmelt):          true,
+		string(ActionFarm):           true,
+		string(ActionMine):           true,
+		string(ActionMarkLocation):   true,
+		string(ActionRecallLocation): true,
+		string(ActionIdle):           true,
+		string(ActionSleep):          true,
+		string(ActionRetreat):        true,
+		string(ActionEat):            true,
+		string(ActionInteract):       true,
+	}
+
+	ValidTargetTypes = map[string]bool{
+		string(TargetBlock):    true,
+		string(TargetEntity):   true,
+		string(TargetRecipe):   true,
+		string(TargetLocation): true,
+		string(TargetCategory): true,
+		string(TargetNone):     true,
+	}
 }
 
 // IsValidAction checks if a raw string maps to a canonical ActionType.

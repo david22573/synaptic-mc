@@ -21,11 +21,12 @@ type Vec3 struct {
 }
 
 type GameState struct {
-	Health    float64 `json:"health"`
-	Food      float64 `json:"food"`
-	TimeOfDay int     `json:"time_of_day"`
-	Position  Vec3    `json:"position"`
-	Threats   []struct {
+	Health       float64 `json:"health"`
+	Food         float64 `json:"food"`
+	TimeOfDay    int     `json:"time_of_day"`
+	HasBedNearby bool    `json:"has_bed_nearby"`
+	Position     Vec3    `json:"position"`
+	Threats      []struct {
 		Name string `json:"name"`
 	} `json:"threats"`
 	POIs      []POI           `json:"pois"`
@@ -37,6 +38,10 @@ type StateSnapshot struct {
 	Health        float64
 	HasThreat     bool
 }
+
+type EventProcessNext struct{}
+
+func (EventProcessNext) isEngineEvent() {}
 
 type Engine struct {
 	planner    Planner
@@ -108,8 +113,16 @@ func NewEngine(
 }
 
 func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		e.wg.Wait()
+		close(e.eventCh)
+		_ = e.exec.Close()
+	}()
+
 	e.wg.Add(1)
-	go e.loop(ctx)
+	go e.loop(runCtx)
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -141,10 +154,6 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 			e.logger.Warn("Ignoring unknown message type", slog.String("type", msg.Type))
 		}
 	}
-
-	e.wg.Wait()
-	close(e.eventCh)
-	_ = e.exec.Close()
 }
 
 func (e *Engine) loop(ctx context.Context) {
@@ -174,6 +183,8 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 		e.handlePlanReady(ctx, ev)
 	case EventPlanError:
 		e.handlePlanError(ctx, ev)
+	case EventProcessNext:
+		e.processNextTask()
 	}
 }
 
@@ -406,10 +417,7 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 }
 
 func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
-	if e.planCancel != nil {
-		e.planCancel = nil
-	}
-	e.planning = false
+	e.cancelPlanning()
 
 	if e.planEpoch != ev.Epoch {
 		return
@@ -533,7 +541,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			e.lastReplan = time.Now()
 		}
 
-		if status == "task_failed" {
+		if status == StatusFailed {
 			if e.tasksCompletedSinceReplan == 0 {
 				e.planner.RecordStall()
 			}
@@ -585,7 +593,7 @@ func (e *Engine) processNextTask() {
 		case SeverityAdvisory:
 			e.logger.Info("Task skipped (Advisory)", slog.String("reason", res.Reason))
 			e.inFlightTask = nil
-			go e.processNextTask() // Fast forward to the next task in the queue
+			go func() { e.eventCh <- EventProcessNext{} }()
 			return
 		case SeverityBlocking:
 			e.logger.Warn("Task blocked", slog.String("reason", res.Reason))

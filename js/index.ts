@@ -14,7 +14,6 @@ import { getPOIs } from "./lib/utils/perception.js";
 const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
-
 const isIgnorableError = (err: Error | any) => {
     const msg = err?.message || "";
     const name = err?.name || "";
@@ -33,7 +32,6 @@ process.on("uncaughtException", (err: Error) => {
     });
     process.exit(1);
 });
-
 process.on("unhandledRejection", (reason: any) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
@@ -49,6 +47,8 @@ let lastDeathMessage: string = "unknown causes";
 
 let lastStateSig = "";
 let lastStatePushTime = 0;
+let reconnectAttempt = 1;
+let stateInterval: NodeJS.Timeout | null = null;
 
 function stopMovement() {
     if (!bot) return;
@@ -65,7 +65,6 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -73,7 +72,6 @@ function completeTask(
         cause,
         task.startTime,
     );
-
     if (currentTask?.id === task.id) currentTask = null;
 }
 
@@ -86,7 +84,6 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -119,7 +116,6 @@ function normalizeFailureCause(err: any): string {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
-
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
             survival.reset();
@@ -149,7 +145,6 @@ async function executeDecision(decision: models.IncomingDecision) {
             action_id: decision.id,
         },
     };
-
     stopMovement();
     const activeTask = currentTask;
 
@@ -168,7 +163,11 @@ async function executeDecision(decision: models.IncomingDecision) {
                 stopMovement,
             ),
             new Promise((_, r) =>
-                setTimeout(() => r(new Error("timeout")), timeoutMs),
+                setTimeout(() => {
+                    if (taskAbortController)
+                        taskAbortController.abort("timeout");
+                    r(new Error("timeout"));
+                }, timeoutMs),
             ),
         ]);
 
@@ -185,13 +184,11 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 function pushState() {
     if (!bot?.entity || !client) return;
-
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
         .join(",")}`;
-
     const now = Date.now();
 
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
@@ -218,8 +215,8 @@ function pushState() {
     });
 }
 
-async function connectWithRetry(maxAttempts = 10, attempt = 1) {
-    if (attempt > maxAttempts) {
+async function connectWithRetry(maxAttempts = 10) {
+    if (reconnectAttempt > maxAttempts) {
         log.error("Max reconnection attempts reached. Shutting down.");
         process.exit(1);
     }
@@ -235,15 +232,13 @@ async function connectWithRetry(maxAttempts = 10, attempt = 1) {
         } catch (e) {}
     }
 
-    log.info(`Connecting bot (Attempt ${attempt}/${maxAttempts})...`);
-
+    log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
     bot = mineflayer.createBot({
         host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
         version: false,
     });
-
     bot.loadPlugin(pathfinder);
 
     if (!client) {
@@ -268,18 +263,18 @@ async function connectWithRetry(maxAttempts = 10, attempt = 1) {
         if (isIgnorableError(err)) return;
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
-
     bot.on("end", (reason) => {
         log.warn(`Bot disconnected. Reason: ${reason}`);
         abortActiveTask("bot_disconnected");
         survival.stop();
 
-        const backoffMs = Math.min(1000 * Math.pow(2, attempt), 30000);
+        const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
         log.info(`Retrying in ${backoffMs / 1000}s...`);
-        setTimeout(() => connectWithRetry(maxAttempts, attempt + 1), backoffMs);
+        setTimeout(() => connectWithRetry(maxAttempts), backoffMs);
+        reconnectAttempt++;
     });
-
     bot.on("spawn", () => {
+        reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
         const movements = new Movements(bot);
         movements.canDig = true;
@@ -306,7 +301,6 @@ async function connectWithRetry(maxAttempts = 10, attempt = 1) {
             client.connect();
         }
         survival.start();
-
         if (runtimeConfig.enable_viewer) {
             try {
                 if (viewerStarted) {
@@ -324,13 +318,11 @@ async function connectWithRetry(maxAttempts = 10, attempt = 1) {
             }
         }
     });
-
     bot.on("message", (msg) => {
         const text = msg.toString();
         if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
     });
-
     bot.on("death", () => {
         log.warn(
             `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
@@ -339,13 +331,10 @@ async function connectWithRetry(maxAttempts = 10, attempt = 1) {
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
     });
-
     bot.on("health", pushState);
 
-    if ((global as any).__stateInterval)
-        clearInterval((global as any).__stateInterval);
-
-    (global as any).__stateInterval = setInterval(pushState, 2000);
+    if (stateInterval) clearInterval(stateInterval);
+    stateInterval = setInterval(pushState, 2000);
 }
 
 async function bootstrap() {

@@ -91,7 +91,7 @@ func main() {
 		modelName = DefaultModel
 	}
 
-	memory, err := NewSQLiteMemory(DatabasePath)
+	memory, err := NewSQLiteMemory(DatabasePath, logger)
 	if err != nil {
 		logger.Error("Fatal: could not initialize database", slog.Any("error", err))
 		os.Exit(1)

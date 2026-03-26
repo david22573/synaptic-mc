@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -55,9 +55,10 @@ type SQLiteMemory struct {
 	eventChan chan pendingEvent
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
+	logger    *slog.Logger
 }
 
-func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
+func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
@@ -84,9 +85,7 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		z REAL,
 		trace_id TEXT DEFAULT ''
 	);
-
 	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
-
 	CREATE TABLE IF NOT EXISTS session_summary (
 		session_id TEXT NOT NULL,
 		key TEXT NOT NULL,
@@ -94,7 +93,6 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (session_id, key)
 	);
-
 	CREATE TABLE IF NOT EXISTS world_nodes (
 		name TEXT PRIMARY KEY,
 		type TEXT NOT NULL,
@@ -114,6 +112,7 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		db:        db,
 		eventChan: make(chan pendingEvent, 1000),
 		cancel:    cancel,
+		logger:    logger.With(slog.String("component", "SQLiteMemory")),
 	}
 
 	mem.wg.Add(1)
@@ -135,7 +134,7 @@ func (s *SQLiteMemory) processBatches(ctx context.Context) {
 		}
 		tx, err := s.db.BeginTx(context.Background(), nil)
 		if err != nil {
-			log.Printf("[-] Failed to begin tx for batch: %v", err)
+			s.logger.Error("Failed to begin tx for batch", slog.Any("error", err))
 			return
 		}
 
@@ -149,12 +148,12 @@ func (s *SQLiteMemory) processBatches(ctx context.Context) {
 		for _, e := range batch {
 			_, err := stmt.Exec(e.meta.SessionID, e.meta.TraceID, e.action, e.details, e.meta.Status, e.meta.X, e.meta.Y, e.meta.Z)
 			if err != nil {
-				log.Printf("[-] Failed to insert event: %v", err)
+				s.logger.Error("Failed to insert event", slog.Any("error", err))
 			}
 		}
 
 		if err := tx.Commit(); err != nil {
-			log.Printf("[-] Failed to commit event batch: %v", err)
+			s.logger.Error("Failed to commit event batch", slog.Any("error", err))
 		}
 		batch = batch[:0]
 	}
@@ -183,7 +182,7 @@ func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
 	select {
 	case s.eventChan <- pendingEvent{action: action, details: details, meta: meta}:
 	default:
-		log.Println("[-] Event buffer full, dropping event")
+		s.logger.Warn("Event buffer full, dropping event")
 	}
 }
 

@@ -19,6 +19,7 @@ const (
 	PriReflex  Priority = 0
 	PriRoutine Priority = 1
 	PriLLM     Priority = 2
+	PriIdle    Priority = 3
 )
 
 type Tick struct {
@@ -71,7 +72,7 @@ type LLMPlan struct {
 }
 
 type Brain interface {
-	GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan) (*LLMPlan, error)
+	GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan, attempt int) (*LLMPlan, error)
 }
 
 type LLMBrain struct {
@@ -98,15 +99,19 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
-
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per variant.
-4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
+4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log).
+NEVER start with explore.
 5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
 6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
 7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
+SPATIAL AWARENESS RULES:
+1. Targets in 'VISIBLE POIs' can be interacted with immediately.
+2. Targets in 'KNOWN WORLD' are out of sight. You MUST use 'recall_location' to navigate to them BEFORE you can interact with them.
+3. Example: [ {"action": "recall_location", "target": {"type": "location", "name": "crafting_table"}}, {"action": "interact", "target": {"type": "recipe", "name": "crafting_table"}} ]
 
 VALID TARGET TYPES (you MUST use one of these):
 - "block"     (oak_log, stone, etc.)
@@ -136,7 +141,7 @@ func summarizeState(raw json.RawMessage) string {
 		}
 		if strings.Contains(item.Name, "pickaxe") || strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "shovel") {
 			tools = append(tools, fmt.Sprintf("1x %s", item.Name))
-		} else if strings.Contains(item.Name, "beef") || strings.Contains(item.Name, "porkchop") || strings.Contains(item.Name, "apple") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "rotten_flesh") || strings.Contains(item.Name, "mutton") || strings.Contains(item.Name, "chicken") || strings.Contains(item.Name, "rabbit") {
+		} else if strings.Contains(item.Name, "beef") || strings.Contains(item.Name, "porkchop") || strings.Contains(item.Name, "apple") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "rotten_flesh") || strings.Contains(item.Name, "mutton") || strings.Contains(item.Name, "chicken") || strings.Contains(item.Name, "rabbit") || strings.Contains(item.Name, "cod") || strings.Contains(item.Name, "salmon") || strings.HasPrefix(item.Name, "cooked_") || strings.Contains(item.Name, "melon_slice") || strings.Contains(item.Name, "sweet_berries") || strings.Contains(item.Name, "cookie") || strings.Contains(item.Name, "pumpkin_pie") {
 			food = append(food, fmt.Sprintf("%dx %s", item.Count, item.Name))
 			rawFoodNames = append(rawFoodNames, item.Name)
 		} else {
@@ -173,7 +178,6 @@ func summarizeState(raw json.RawMessage) string {
 
 	poiStr := "none"
 	if len(state.POIs) > 0 {
-		// Sort by score descending just in case it wasn't pre-sorted
 		sort.Slice(state.POIs, func(i, j int) bool {
 			return state.POIs[i].Score > state.POIs[j].Score
 		})
@@ -205,7 +209,7 @@ func summarizeState(raw json.RawMessage) string {
 	return base
 }
 
-func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan) (*LLMPlan, error) {
+func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan, attempt int) (*LLMPlan, error) {
 	var summary, history, worldModel string
 	var wg sync.WaitGroup
 
@@ -254,23 +258,15 @@ Response format (JSON only):
   ]
 }
 
-CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array. The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
-
+CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
+The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
 %s
 SUMMARY: %s
 MEMORY: %s
 %s
 OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
 
-	var plan *LLMPlan
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		plan, err = b.callLLMForPlan(ctx, systemPrompt, compactState, attempt)
-		if err == nil {
-			return plan, nil
-		}
-	}
-	return nil, err
+	return b.callLLMForPlan(ctx, systemPrompt, compactState, attempt)
 }
 
 func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent string, attempt int) (*LLMPlan, error) {

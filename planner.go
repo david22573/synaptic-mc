@@ -77,11 +77,16 @@ func (p *TacticalPlanner) GeneratePlan(ctx context.Context, rawState []byte, ses
 
 	// 1. Break infinite loops on impossible milestones
 	if stalls >= MaxStalls {
-		p.logger.Warn("Max stalls reached. Forcing milestone drop to prevent thrashing.", slog.String("milestone", currentMS.ID))
-		dropOverride := fmt.Sprintf("CRITICAL: You have repeatedly failed to complete the milestone '%s'. It is currently impossible. Drop it entirely, generate a NEW milestone, and try a different approach.\n\n%s", currentMS.Description, sysOverride)
+		var msID, msDesc string
+		if currentMS != nil {
+			msID = currentMS.ID
+			msDesc = currentMS.Description
+		}
+		p.logger.Warn("Max stalls reached. Forcing milestone drop to prevent thrashing.", slog.String("milestone", msID))
+		dropOverride := fmt.Sprintf("CRITICAL: You have repeatedly failed to complete the milestone '%s'. It is currently impossible. Drop it entirely, generate a NEW milestone, and try a different approach.\n\n%s", msDesc, sysOverride)
 
 		tick := Tick{State: rawState}
-		plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, dropOverride, nil) // Pass nil to force new milestone
+		plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, dropOverride, nil, 1) // Pass nil to force new milestone
 		if err != nil {
 			return nil, err
 		}
@@ -96,7 +101,7 @@ func (p *TacticalPlanner) GeneratePlan(ctx context.Context, rawState []byte, ses
 	}
 
 	tick := Tick{State: rawState}
-	plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, contextOverride, currentMS)
+	plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, contextOverride, currentMS, 1)
 	if err != nil {
 		return nil, err
 	}

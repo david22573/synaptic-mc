@@ -2,23 +2,28 @@ package main
 
 import (
 	"encoding/json"
+	"log/slog"
 	"math"
 )
 
 type InternalSimulator struct {
 	validator *PlanValidator
+	logger    *slog.Logger
 }
 
-func NewInternalSimulator() *InternalSimulator {
+func NewInternalSimulator(logger *slog.Logger) *InternalSimulator {
 	return &InternalSimulator{
 		validator: NewPlanValidator(),
+		logger:    logger.With(slog.String("component", "InternalSimulator")),
 	}
 }
 
 // RankCandidates simulates the candidate plans, scores them based on cost/risk, and returns the optimal path.
 func (s *InternalSimulator) RankCandidates(candidates [][]Action, rawState json.RawMessage) []Action {
 	var state GameState
-	_ = json.Unmarshal(rawState, &state)
+	if err := json.Unmarshal(rawState, &state); err != nil {
+		s.logger.Error("Failed to unmarshal raw state in RankCandidates", slog.Any("error", err))
+	}
 
 	poiMap := make(map[string]POI)
 	for _, p := range state.POIs {

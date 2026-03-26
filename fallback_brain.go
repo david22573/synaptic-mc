@@ -12,7 +12,7 @@ func NewFallbackBrain() *FallbackBrain {
 	return &FallbackBrain{}
 }
 
-func (f *FallbackBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan) (*LLMPlan, error) {
+func (f *FallbackBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan, attempt int) (*LLMPlan, error) {
 	// Keep the existing milestone if we have one, otherwise spin up a generic survival one
 	milestone := currentMilestone
 	if milestone == nil {

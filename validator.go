@@ -31,13 +31,11 @@ func ValidatePlan(plan []Action, state GameState) ValidationResult {
 	for i, action := range plan {
 		res := validateActionContext(action, state, simInv)
 		if !res.Valid {
-			// Elevate everything to blocking at the plan level so it replans immediately
 			res.Severity = SeverityBlocking
 			res.Reason = fmt.Sprintf("Step %d (%s) is invalid: %s", i+1, action.Action, res.Reason)
 			return res
 		}
 
-		// Simulate state changes for the next step in the chain
 		if action.Action == "craft" {
 			simInv[action.Target.Name]++
 		} else if action.Action == "gather" || action.Action == "mine" {
@@ -70,7 +68,7 @@ func validateActionContext(a Action, s GameState, simInv map[string]int) Validat
 }
 
 func validateGather(a Action, s GameState, simInv map[string]int) ValidationResult {
-	// 1. Redundancy Check (Advisory)
+	// 1. Redundancy Check
 	if count, ok := simInv[a.Target.Name]; ok && count >= 32 {
 		return ValidationResult{
 			Valid:    false,
@@ -80,7 +78,7 @@ func validateGather(a Action, s GameState, simInv map[string]int) ValidationResu
 		}
 	}
 
-	// 2. Spatial/POI Awareness (Blocking)
+	// 2. Spatial/POI Awareness
 	targetVisible := false
 	for _, poi := range s.POIs {
 		if strings.Contains(poi.Name, a.Target.Name) || strings.Contains(a.Target.Name, poi.Name) {
@@ -89,7 +87,6 @@ func validateGather(a Action, s GameState, simInv map[string]int) ValidationResu
 		}
 	}
 
-	// Handle generic "wood" requests mapping to specific logs
 	if a.Target.Name == "wood" || strings.HasSuffix(a.Target.Name, "_log") {
 		for _, poi := range s.POIs {
 			if strings.HasSuffix(poi.Name, "_log") {
@@ -104,11 +101,11 @@ func validateGather(a Action, s GameState, simInv map[string]int) ValidationResu
 			Valid:    false,
 			Severity: SeverityBlocking,
 			Reason:   fmt.Sprintf("target '%s' is not in visual range", a.Target.Name),
-			FixHint:  "use 'explore' action to locate it first",
+			FixHint:  "use 'recall_location' if it's in the KNOWN WORLD, otherwise 'explore'",
 		}
 	}
 
-	// 3. Tool Requirements (Blocking)
+	// 3. Tool Requirements
 	if a.Target.Name == "stone" || a.Target.Name == "coal_ore" || a.Target.Name == "iron_ore" {
 		hasPick := false
 		for k, v := range simInv {
@@ -131,7 +128,6 @@ func validateGather(a Action, s GameState, simInv map[string]int) ValidationResu
 }
 
 func validateCraft(a Action, s GameState, simInv map[string]int) ValidationResult {
-	// Redundancy: Stop making multiple crafting tables or tools we already have
 	if a.Target.Name == "crafting_table" && simInv["crafting_table"] > 0 {
 		return ValidationResult{
 			Valid:    false,
@@ -165,7 +161,8 @@ func validateInteract(a Action, s GameState) ValidationResult {
 			Valid:    false,
 			Severity: SeverityBlocking,
 			Reason:   fmt.Sprintf("target '%s' is not in visual range to interact with", a.Target.Name),
-			FixHint:  "move closer or place it first",
+			// Explicitly point the LLM to its World Model memory
+			FixHint: "If it is in your KNOWN WORLD memory, use 'recall_location' to navigate to it first.",
 		}
 	}
 	return ValidationResult{Valid: true, Severity: SeverityNone}

@@ -1,17 +1,504 @@
-Project Context Dump (26 Mar 26 12:45 PDT)
+Project Context Dump (26 Mar 26 13:19 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 4
+Total Files: 13
 
 # Project Structure
 <file_tree>
+- action_schema.go
+- brain.go
+- config.go
 - engine.go
 - js\index.ts
-- js\lib\tasks\task.ts
-- js\lib\utils\perception.ts
+- memory.go
+- planner.go
+- resilient_brain.go
+- routine.go
+- simulator.go
+- strategy.go
+- telemetry.go
+- ws_types.go
 </file_tree>
 
 # File Contents
+<file path="action_schema.go">
+package main
+
+// ActionType defines all macro actions the LLM or routines can trigger.
+type ActionType string
+
+const (
+	ActionGather         ActionType = "gather"
+	ActionCraft          ActionType = "craft"
+	ActionHunt           ActionType = "hunt"
+	ActionExplore        ActionType = "explore"
+	ActionBuild          ActionType = "build"
+	ActionSmelt          ActionType = "smelt"
+	ActionFarm           ActionType = "farm"
+	ActionMine           ActionType = "mine"
+	ActionMarkLocation   ActionType = "mark_location"
+	ActionRecallLocation ActionType = "recall_location"
+	ActionIdle           ActionType = "idle"
+	ActionSleep          ActionType = "sleep"
+	ActionRetreat        ActionType = "retreat"
+	ActionEat            ActionType = "eat"
+	ActionInteract       ActionType = "interact"
+)
+
+// TargetType defines valid schema values for action targets.
+type TargetType string
+
+const (
+	TargetBlock    TargetType = "block"
+	TargetEntity   TargetType = "entity"
+	TargetRecipe   TargetType = "recipe"
+	TargetLocation TargetType = "location"
+	TargetCategory TargetType = "category"
+	TargetNone     TargetType = "none"
+)
+
+var ValidActions = map[string]bool{
+	string(ActionGather):         true,
+	string(ActionCraft):          true,
+	string(ActionHunt):           true,
+	string(ActionExplore):        true,
+	string(ActionBuild):          true,
+	string(ActionSmelt):          true,
+	string(ActionFarm):           true,
+	string(ActionMine):           true,
+	string(ActionMarkLocation):   true,
+	string(ActionRecallLocation): true,
+	string(ActionIdle):           true,
+	string(ActionSleep):          true,
+	string(ActionRetreat):        true,
+	string(ActionEat):            true,
+	string(ActionInteract):       true,
+}
+
+var ValidTargetTypes = map[string]bool{
+	string(TargetBlock):    true,
+	string(TargetEntity):   true,
+	string(TargetRecipe):   true,
+	string(TargetLocation): true,
+	string(TargetCategory): true,
+	string(TargetNone):     true,
+}
+
+// IsValidAction checks if a raw string maps to a canonical ActionType.
+func IsValidAction(action string) bool {
+	return ValidActions[action]
+}
+
+// IsValidTargetType checks if a raw string maps to a canonical TargetType.
+func IsValidTargetType(t string) bool {
+	return ValidTargetTypes[t]
+}
+
+</file>
+
+<file path="brain.go">
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Priority int
+
+const (
+	PriReflex  Priority = 0
+	PriRoutine Priority = 1
+	PriLLM     Priority = 2
+)
+
+type Tick struct {
+	State json.RawMessage
+}
+
+type Target struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
+}
+
+type Action struct {
+	ID        string       `json:"id,omitempty"`
+	Source    string       `json:"source,omitempty"`
+	Trace     TraceContext `json:"-"`
+	Action    string       `json:"action"`
+	Target    Target       `json:"target"`
+	Rationale string       `json:"rationale"`
+	Priority  Priority     `json:"priority"`
+}
+
+type MilestonePlan struct {
+	ID             string `json:"id"`
+	Description    string `json:"description"`
+	CompletionHint string `json:"completion_hint"`
+}
+
+type FlexBool bool
+
+func (f *FlexBool) UnmarshalJSON(data []byte) error {
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		*f = FlexBool(b)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*f = FlexBool(s == "true" || s == "True" || s == "1")
+		return nil
+	}
+	return nil
+}
+
+type LLMPlan struct {
+	Milestone         *MilestonePlan `json:"milestone"`
+	Objective         string         `json:"objective"`
+	CandidatePlans    [][]Action     `json:"candidate_plans"`
+	Tasks             []Action       `json:"-"` // Simulator populates this
+	MilestoneComplete FlexBool       `json:"milestone_complete"`
+}
+
+type Brain interface {
+	GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan) (*LLMPlan, error)
+}
+
+type LLMBrain struct {
+	apiURL    string
+	model     string
+	apiKey    string
+	client    *http.Client
+	memory    MemoryBank
+	telemetry *Telemetry
+}
+
+func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *LLMBrain {
+	return &LLMBrain{
+		apiURL:    apiURL,
+		model:     model,
+		apiKey:    apiKey,
+		memory:    mem,
+		telemetry: tel,
+		client: &http.Client{
+			Timeout: 45 * time.Second,
+		},
+	}
+}
+
+const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
+Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
+
+CRITICAL GAME MECHANIC RULES:
+1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
+2. You CANNOT gather stone or coal without a wooden_pickaxe.
+3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per variant.
+4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
+5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
+6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
+7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
+
+SPATIAL AWARENESS RULES:
+1. Targets in 'VISIBLE POIs' can be interacted with immediately.
+2. Targets in 'KNOWN WORLD' are out of sight. You MUST use 'recall_location' to navigate to them BEFORE you can interact with them. 
+3. Example: [ {"action": "recall_location", "target": {"type": "location", "name": "crafting_table"}}, {"action": "interact", "target": {"type": "recipe", "name": "crafting_table"}} ]
+
+VALID TARGET TYPES (you MUST use one of these):
+- "block"     (oak_log, stone, etc.)
+- "entity"    (zombie, cow, etc.)
+- "recipe"    (stick, wooden_pickaxe, crafting_table)
+- "location"  (only for mark/recall)
+- "category"  (food, wood)
+- "none"      (only for explore/idle/retreat/sleep)
+
+Valid macro actions: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
+
+func summarizeState(raw json.RawMessage) string {
+	var state GameState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return string(raw)
+	}
+
+	var junkCount int
+	var tools, food, mats, rawFoodNames []string
+
+	junkBlocks := map[string]bool{"dirt": true, "stone": true, "granite": true, "andesite": true, "diorite": true, "cobbled_deepslate": true}
+
+	for _, item := range state.Inventory {
+		if junkBlocks[item.Name] {
+			junkCount += item.Count
+			continue
+		}
+		if strings.Contains(item.Name, "pickaxe") || strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "shovel") {
+			tools = append(tools, fmt.Sprintf("1x %s", item.Name))
+		} else if strings.Contains(item.Name, "beef") || strings.Contains(item.Name, "porkchop") || strings.Contains(item.Name, "apple") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "rotten_flesh") || strings.Contains(item.Name, "mutton") || strings.Contains(item.Name, "chicken") || strings.Contains(item.Name, "rabbit") {
+			food = append(food, fmt.Sprintf("%dx %s", item.Count, item.Name))
+			rawFoodNames = append(rawFoodNames, item.Name)
+		} else {
+			mats = append(mats, fmt.Sprintf("%dx %s", item.Count, item.Name))
+		}
+	}
+
+	toolStr := "none"
+	if len(tools) > 0 {
+		toolStr = strings.Join(tools, ", ")
+	}
+	foodStr := "none"
+	if len(food) > 0 {
+		foodStr = strings.Join(food, ", ")
+	}
+	matStr := "none"
+	if len(mats) > 0 {
+		matStr = strings.Join(mats, ", ")
+	}
+
+	threatStr := "none"
+	if len(state.Threats) > 0 {
+		var tn []string
+		for _, t := range state.Threats {
+			tn = append(tn, t.Name)
+		}
+		threatStr = strings.Join(tn, ", ")
+	}
+
+	timeOfDay := "day"
+	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 {
+		timeOfDay = "night"
+	}
+
+	poiStr := "none"
+	if len(state.POIs) > 0 {
+		sort.Slice(state.POIs, func(i, j int) bool {
+			return state.POIs[i].Score > state.POIs[j].Score
+		})
+
+		var pStrs []string
+		limit := 5
+		if len(state.POIs) < limit {
+			limit = len(state.POIs)
+		}
+
+		for i := 0; i < limit; i++ {
+			p := state.POIs[i]
+			pStrs = append(pStrs, fmt.Sprintf("%s (%.1fm, score:%d, pos:%s)", p.Name, p.Distance, p.Score, p.Direction))
+		}
+		poiStr = strings.Join(pStrs, ", ")
+	}
+
+	base := fmt.Sprintf("HEALTH: %.1f/20  HUNGER: %.1f/20  POS: %.0f,%.0f,%.0f  TIME: %s\nVISIBLE POIs: %s\nTHREATS: %s\nTOOLS: %s\nFOOD: %s\nMATERIALS: %s\nJUNK: %d blocks (ignored)",
+		state.Health, state.Food, state.Position.X, state.Position.Y, state.Position.Z, timeOfDay,
+		poiStr, threatStr, toolStr, foodStr, matStr, junkCount)
+
+	if state.Food == 0 && len(rawFoodNames) > 0 {
+		return fmt.Sprintf(
+			"⚠️ CRITICAL: HUNGER=0. Food IS in inventory: %s. You MUST use action \"eat\", target type \"category\", target name \"%s\". DO NOT hunt. DO NOT gather.\n\n%s",
+			strings.Join(food, ", "), rawFoodNames[0], base,
+		)
+	}
+
+	return base
+}
+
+func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan) (*LLMPlan, error) {
+	var summary, history, worldModel string
+	var wg sync.WaitGroup
+
+	var state GameState
+	_ = json.Unmarshal(t.State, &state)
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		summary, _ = b.memory.GetSummary(ctx, sessionID)
+	}()
+	go func() {
+		defer wg.Done()
+		history, _ = b.memory.GetRecentContext(ctx, sessionID, 6)
+	}()
+	go func() {
+		defer wg.Done()
+		worldModel, _ = b.memory.GetKnownWorld(ctx, state.Position.X, state.Position.Y, state.Position.Z)
+	}()
+	wg.Wait()
+
+	milestoneSection := "No active milestone. You MUST generate a new one by populating the 'milestone' JSON object."
+	if currentMilestone != nil {
+		milestoneSection = fmt.Sprintf(`ACTIVE MILESTONE: %s
+COMPLETION HINT: %s
+
+CRITICAL MILESTONE RULES:
+1. If this milestone is NOT complete, you MUST return the EXACT same milestone object in your response and set 'milestone_complete' to false.
+2. Generate tasks that continue progress toward this active milestone.
+3. If the milestone IS complete, set 'milestone_complete' to true.`, currentMilestone.Description, currentMilestone.CompletionHint)
+	}
+
+	compactState := summarizeState(t.State)
+
+	systemPrompt := fmt.Sprintf(`%s
+
+Response format (JSON only):
+{
+  "milestone": { "id": "milestone-slug", "description": "...", "completion_hint": "..." },
+  "milestone_complete": false,
+  "objective": "Sub-goal description",
+  "candidate_plans": [
+    [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Variant 1: Closest target" } ],
+    [ { "action": "explore", "target": { "type": "none", "name": "none" }, "rationale": "Variant 2: Find better resources" } ],
+    [ { "action": "craft", "target": { "type": "recipe", "name": "stick" }, "rationale": "Variant 3: Pre-craft needed items" } ]
+  ]
+}
+
+CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array. The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
+
+%s
+SUMMARY: %s
+MEMORY: %s
+%s
+OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
+
+	var plan *LLMPlan
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		plan, err = b.callLLMForPlan(ctx, systemPrompt, compactState, attempt)
+		if err == nil {
+			return plan, nil
+		}
+	}
+	return nil, err
+}
+
+func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent string, attempt int) (*LLMPlan, error) {
+	temps := map[int]float64{1: 0.1, 2: 0.25, 3: 0.40}
+	temp, exists := temps[attempt]
+	if !exists {
+		temp = 0.50
+	}
+
+	payload := map[string]interface{}{
+		"model": b.model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userContent},
+		},
+		"response_format": map[string]string{"type": "json_object"},
+		"temperature":     temp,
+	}
+	jsonPayload, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.apiKey)
+
+	start := time.Now()
+	resp, err := b.client.Do(req)
+	latency := time.Since(start)
+	if err != nil {
+		b.telemetry.RecordLLMCall(b.model, latency, 0, 0, err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		err := fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+		b.telemetry.RecordLLMCall(b.model, latency, 0, 0, err)
+		return nil, err
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		b.telemetry.RecordLLMCall(b.model, latency, 0, 0, err)
+		return nil, err
+	}
+
+	if len(result.Choices) == 0 {
+		err := fmt.Errorf("no choices returned")
+		b.telemetry.RecordLLMCall(b.model, latency, 0, 0, err)
+		return nil, err
+	}
+
+	b.telemetry.RecordLLMCall(b.model, latency, result.Usage.PromptTokens, result.Usage.CompletionTokens, nil)
+
+	var plan LLMPlan
+	if err := json.Unmarshal([]byte(cleanJSON(result.Choices[0].Message.Content)), &plan); err != nil {
+		return nil, err
+	}
+	return &plan, nil
+}
+
+func cleanJSON(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned)
+}
+
+</file>
+
+<file path="config.go">
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"sync"
+)
+
+type Config struct {
+	WSURL         string         `json:"ws_url"`
+	ViewerPort    int            `json:"viewer_port"`
+	EnableViewer  bool           `json:"enable_viewer"`
+	DebugChat     bool           `json:"debug_chat"`
+	TaskTimeouts  map[string]int `json:"task_timeouts"`
+	ThreatWeights map[string]int `json:"threat_weights"`
+}
+
+var (
+	configInstance *Config
+	configMu       sync.Mutex
+)
+
+func LoadConfig(path string) (*Config, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	configInstance = &cfg
+	return configInstance, nil
+}
+
+</file>
+
 <file path="engine.go">
 package main
 
@@ -88,6 +575,7 @@ type Engine struct {
 	wg              sync.WaitGroup
 
 	tasksCompletedSinceReplan int
+	actionFailures            map[string]int // Loop protection tracking
 }
 
 func NewEngine(
@@ -102,21 +590,22 @@ func NewEngine(
 	eventStore EventStore,
 ) *Engine {
 	return &Engine{
-		planner:    planner,
-		routine:    routine,
-		exec:       exec,
-		memory:     mem,
-		eventStore: eventStore,
-		strategy:   NewStrategyManager(),
-		learning:   NewLearningSystem(),
-		telemetry:  tel,
-		uiHub:      uiHub,
-		logger:     baseLogger.With(slog.String("session_id", sessionID)),
-		eventCh:    make(chan EngineEvent, 100),
-		queue:      NewTaskQueue(),
-		planEpoch:  0,
-		lastHealth: 20.0,
-		sessionID:  sessionID,
+		planner:        planner,
+		routine:        routine,
+		exec:           exec,
+		memory:         mem,
+		eventStore:     eventStore,
+		strategy:       NewStrategyManager(),
+		learning:       NewLearningSystem(),
+		telemetry:      tel,
+		uiHub:          uiHub,
+		logger:         baseLogger.With(slog.String("session_id", sessionID)),
+		eventCh:        make(chan EngineEvent, 100),
+		queue:          NewTaskQueue(),
+		planEpoch:      0,
+		lastHealth:     20.0,
+		sessionID:      sessionID,
+		actionFailures: make(map[string]int),
 	}
 }
 
@@ -373,6 +862,15 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 		return
 	}
 
+	// Phase 3: The Plan Validation Gate
+	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
+	if !planRes.Valid {
+		e.logger.Warn("Plan validation failed pre-flight", slog.String("reason", planRes.Reason))
+		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Plan rejected. %s. %s", planRes.Reason, planRes.FixHint)
+		e.lastReplan = time.Time{} // Force immediate replan
+		return
+	}
+
 	for i := range ev.Plan.Tasks {
 		if ev.Plan.Tasks[i].ID == "" {
 			ev.Plan.Tasks[i].ID = fmt.Sprintf("cmd-llm-%d-%d", time.Now().UnixNano(), i)
@@ -493,6 +991,9 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			return
 		}
 
+		// Reset failure memory on success
+		delete(e.actionFailures, ev.Action+"_"+targetName)
+
 		e.learning.RecordOutcome(ev.Action, targetName, "COMPLETED", "")
 
 		e.telemetry.RecordTaskStatus(StatusCompleted)
@@ -556,6 +1057,16 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			advice = "Adjust your plan accordingly."
 		}
 
+		// Phase 3: Loop Protection Counter
+		failureKey := ev.Action + "_" + targetName
+		e.actionFailures[failureKey]++
+
+		if e.actionFailures[failureKey] >= 3 {
+			advice = "CRITICAL: YOU HAVE FAILED THIS EXACT TASK 3 TIMES. ABORT THIS APPROACH COMPLETELY. Choose a different target or clear the area."
+			e.actionFailures[failureKey] = 0 // reset so we don't permalock
+			e.planner.ClearMilestone()       // Force higher level reset
+		}
+
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
 		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
 	}
@@ -569,13 +1080,27 @@ func (e *Engine) processNextTask() {
 	e.inFlightTask = e.queue.Pop()
 	task := e.inFlightTask
 
-	// The Validation Gate
+	// Phase 3: The Atomic Validation Gate with Severity
 	res := ValidateAction(*task, e.lastState)
 	if !res.Valid {
-		e.logger.Warn("Validation failed", slog.String("reason", res.Reason))
-		e.systemOverride = fmt.Sprintf("Invalid action '%s': %s. %s", task.Action, res.Reason, res.FixHint)
-		e.resetExecutionState()
-		return
+		switch res.Severity {
+		case SeverityAdvisory:
+			e.logger.Info("Task skipped (Advisory)", slog.String("reason", res.Reason))
+			e.inFlightTask = nil
+			go e.processNextTask() // Fast forward to the next task in the queue
+			return
+		case SeverityBlocking:
+			e.logger.Warn("Task blocked", slog.String("reason", res.Reason))
+			e.systemOverride = fmt.Sprintf("Task '%s' blocked: %s. %s", task.Action, res.Reason, res.FixHint)
+			e.resetExecutionState()
+			return
+		case SeverityCritical:
+			e.logger.Error("Task critical failure", slog.String("reason", res.Reason))
+			e.systemOverride = fmt.Sprintf("CRITICAL FAILURE on '%s': %s. YOU MUST CHANGE STRATEGY. %s", task.Action, res.Reason, res.FixHint)
+			e.planner.ClearMilestone()
+			e.resetExecutionState()
+			return
+		}
 	}
 
 	if task.Action == string(ActionMarkLocation) {
@@ -1010,277 +1535,1298 @@ bootstrap().catch((err) => log.error("Fatal startup", { err }));
 
 </file>
 
-<file path="js\lib\tasks\task.ts">
-// js/lib/tasks/task.ts
-import type { Bot } from "mineflayer";
-import pkg from "mineflayer-pathfinder";
-import * as models from "../models.js";
-import { type TaskContext } from "./registry.js";
+<file path="memory.go">
+package main
 
-// Handlers
-import { handleGather } from "./handlers/gather.js";
-import { handleCraft } from "./handlers/craft.js";
-import { handleHunt } from "./handlers/hunt.js";
-import { handleBuild } from "./handlers/build.js";
-import { handleExplore } from "./handlers/explore.js";
-import { handleSmelt } from "./handlers/smelt.js";
-import { handleMine } from "./handlers/mine.js";
-import { handleFarm } from "./handlers/farm.js";
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"math"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
-import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
-import { normalizeDecision } from "./normalize.js";
-import { handleInteract } from "./handlers/interact.js";
+	_ "modernc.org/sqlite"
+)
 
-const { goals } = pkg;
+type EventMeta struct {
+	SessionID string
+	TraceID   string
+	Status    string
+	X, Y, Z   float64
+}
 
-export async function runTask(
-    bot: Bot,
-    rawDecision: models.IncomingDecision,
-    signal: AbortSignal,
-    timeouts: Record<string, number>,
-    getThreats: () => models.ThreatInfo[],
-    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
-        x: number;
-        z: number;
-    },
-    stopMovement: () => void,
-): Promise<void> {
-    const decision = normalizeDecision(bot, rawDecision);
+type WorldNode struct {
+	Name       string
+	Type       string
+	X, Y, Z    float64
+	LastSeen   time.Time
+	Confidence float64
+}
 
-    const taskCtx: TaskContext = {
-        bot,
-        decision,
-        signal,
-        timeouts,
-        getThreats,
-        computeSafeRetreat,
-        stopMovement,
-    };
+type MemoryBank interface {
+	LogEvent(action, details string, meta EventMeta)
+	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
+	SetSummary(ctx context.Context, sessionID, key, value string) error
+	GetSummary(ctx context.Context, sessionID string) (string, error)
+	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
 
-    switch (decision.action) {
-        case "hunt":
-            await handleHunt(taskCtx);
-            return;
-        case "gather":
-            await handleGather(taskCtx);
-            return;
-        case "craft":
-            await handleCraft(taskCtx);
-            return;
-        case "build":
-            await handleBuild(taskCtx);
-            return;
-        case "smelt":
-            await handleSmelt(taskCtx);
-            return;
-        case "mine":
-            await handleMine(taskCtx);
-            return;
-        case "farm":
-            await handleFarm(taskCtx);
-            return;
-        case "explore":
-            await handleExplore(taskCtx);
-            return;
+	// Phase 2: World Model Queries
+	MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error
+	GetNode(ctx context.Context, name string) (*WorldNode, error)
+	GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error)
 
-        case "eat": {
-            const food = bot.inventory
-                .items()
-                .find((i) => i.name === decision.target.name);
-            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
-            await bot.equip(food, "hand");
-            await bot.consume();
-            return;
-        }
+	Close() error
+}
 
-        case "idle":
-            await waitForMs(1500, signal);
-            return;
+type pendingEvent struct {
+	action  string
+	details string
+	meta    EventMeta
+}
 
-        case "sleep": {
-            await escapeTree(bot, signal);
+type SQLiteMemory struct {
+	db        *sql.DB
+	eventChan chan pendingEvent
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
+}
 
-            const bed = bot.findBlock({
-                maxDistance: 32,
-                matching: (b: any) => b?.name.includes("bed"),
-            });
+func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite: %w", err)
+	}
 
-            if (!bed) throw new Error("no bed found");
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
-            await moveToGoal(
-                bot,
-                new goals.GoalNear(
-                    bed.position.x,
-                    bed.position.y,
-                    bed.position.z,
-                    1.5,
-                ),
-                { signal, timeoutMs: 20000, stopMovement },
-            );
+	schema := `
+	PRAGMA journal_mode=WAL;
+	PRAGMA synchronous=NORMAL;
+	PRAGMA busy_timeout=5000;
 
-            await bot.sleep(bed);
+	CREATE TABLE IF NOT EXISTS events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		action TEXT,
+		details TEXT,
+		status TEXT,
+		x REAL,
+		y REAL,
+		z REAL,
+		trace_id TEXT DEFAULT ''
+	);
 
-            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
-            await new Promise<void>((resolve, reject) => {
-                const onWake = () => {
-                    bot.removeListener("wake", onWake);
-                    resolve();
-                };
+	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
 
-                const onAbort = () => {
-                    bot.removeListener("wake", onWake);
-                    bot.wake().catch(() => {});
-                    reject(new Error("aborted"));
-                };
+	CREATE TABLE IF NOT EXISTS session_summary (
+		session_id TEXT NOT NULL,
+		key TEXT NOT NULL,
+		value TEXT NOT NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (session_id, key)
+	);
 
-                bot.on("wake", onWake);
-                signal.addEventListener("abort", onAbort, { once: true });
-            });
+	CREATE TABLE IF NOT EXISTS world_nodes (
+		name TEXT PRIMARY KEY,
+		type TEXT NOT NULL,
+		x REAL,
+		y REAL,
+		z REAL,
+		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+		confidence REAL DEFAULT 1.0
+	);
+	`
+	if _, err := db.Exec(schema); err != nil {
+		return nil, fmt.Errorf("failed to apply schema: %w", err)
+	}
 
-            return;
-        }
+	ctx, cancel := context.WithCancel(context.Background())
+	mem := &SQLiteMemory{
+		db:        db,
+		eventChan: make(chan pendingEvent, 1000),
+		cancel:    cancel,
+	}
 
-        case "retreat": {
-            await escapeTree(bot, signal);
+	mem.wg.Add(1)
+	go mem.processBatches(ctx)
 
-            const pos = computeSafeRetreat(getThreats());
-            await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
-                signal,
-                timeoutMs: 15000,
-                stopMovement,
-            });
+	return mem, nil
+}
 
-            return;
-        }
+func (s *SQLiteMemory) processBatches(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
-        case "interact":
-            await handleInteract(taskCtx);
-            return;
+	var batch []pendingEvent
 
-        default:
-            throw new Error(`unsupported: ${decision.action}`);
-    }
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		tx, err := s.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			log.Printf("[-] Failed to begin tx for batch: %v", err)
+			return
+		}
+
+		stmt, err := tx.Prepare(`INSERT INTO events (session_id, trace_id, action, details, status, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		defer stmt.Close()
+
+		for _, e := range batch {
+			_, err := stmt.Exec(e.meta.SessionID, e.meta.TraceID, e.action, e.details, e.meta.Status, e.meta.X, e.meta.Y, e.meta.Z)
+			if err != nil {
+				log.Printf("[-] Failed to insert event: %v", err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("[-] Failed to commit event batch: %v", err)
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case e := <-s.eventChan:
+			batch = append(batch, e)
+			if len(batch) >= 100 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
+	if action == "wander" || action == "idle" || action == "explore" {
+		return
+	}
+
+	select {
+	case s.eventChan <- pendingEvent{action: action, details: details, meta: meta}:
+	default:
+		log.Println("[-] Event buffer full, dropping event")
+	}
+}
+
+func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
+	query := `SELECT timestamp, action, details, status FROM events WHERE session_id = ? ORDER BY id DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID, limit*2)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var events []string
+	var lastAction string
+
+	for rows.Next() {
+		var timestamp time.Time
+		var action, details, status string
+		if err := rows.Scan(&timestamp, &action, &details, &status); err != nil {
+			return "", err
+		}
+
+		if action == lastAction {
+			continue
+		}
+		lastAction = action
+
+		events = append(events, fmt.Sprintf("[%s] %s (%s): %s", timestamp.Format("15:04:05"), action, status, details))
+
+		if len(events) >= limit {
+			break
+		}
+	}
+
+	var contextStr strings.Builder
+	for i := len(events) - 1; i >= 0; i-- {
+		contextStr.WriteString(events[i])
+		contextStr.WriteString("\n")
+	}
+
+	return contextStr.String(), nil
+}
+
+func (s *SQLiteMemory) SetSummary(ctx context.Context, sessionID, key, value string) error {
+	query := `
+	INSERT INTO session_summary (session_id, key, value, updated_at) 
+	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(session_id, key) DO UPDATE SET 
+		value = excluded.value, 
+		updated_at = CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, sessionID, key, value)
+	return err
+}
+
+func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string, error) {
+	query := `SELECT key, value FROM session_summary WHERE session_id = ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var summary strings.Builder
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return "", err
+		}
+		summary.WriteString(fmt.Sprintf("- %s: %s\n", key, value))
+	}
+
+	if summary.Len() == 0 {
+		return "No active summary.", nil
+	}
+	return summary.String(), nil
+}
+
+func (s *SQLiteMemory) GetSummaryValue(ctx context.Context, sessionID, key string) (string, error) {
+	query := `SELECT value FROM session_summary WHERE session_id = ? AND key = ?`
+	var value string
+	err := s.db.QueryRowContext(ctx, query, sessionID, key).Scan(&value)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return value, nil
+}
+
+func (s *SQLiteMemory) MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error {
+	query := `
+	INSERT INTO world_nodes (name, type, x, y, z, last_seen, confidence) 
+	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1.0)
+	ON CONFLICT(name) DO UPDATE SET 
+		x=excluded.x, y=excluded.y, z=excluded.z, 
+		last_seen=CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, name, nodeType, x, y, z)
+	return err
+}
+
+func (s *SQLiteMemory) GetNode(ctx context.Context, name string) (*WorldNode, error) {
+	query := `SELECT name, type, x, y, z, last_seen, confidence FROM world_nodes WHERE name = ?`
+	var node WorldNode
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&node.Name, &node.Type, &node.X, &node.Y, &node.Z, &node.LastSeen, &node.Confidence)
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error) {
+	query := `SELECT name, type, x, y, z FROM world_nodes`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return "KNOWN WORLD: empty", nil
+	}
+	defer rows.Close()
+
+	type nodeDist struct {
+		Name    string
+		Type    string
+		X, Y, Z float64
+		Dist    float64
+	}
+	var nodes []nodeDist
+
+	for rows.Next() {
+		var n nodeDist
+		if err := rows.Scan(&n.Name, &n.Type, &n.X, &n.Y, &n.Z); err == nil {
+			dx, dy, dz := n.X-botX, n.Y-botY, n.Z-botZ
+			n.Dist = math.Sqrt(dx*dx + dy*dy + dz*dz)
+			nodes = append(nodes, n)
+		}
+	}
+
+	if len(nodes) == 0 {
+		return "KNOWN WORLD: empty", nil
+	}
+
+	// Sort by closest distance
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Dist < nodes[j].Dist
+	})
+
+	var out strings.Builder
+	out.WriteString("KNOWN WORLD:\n")
+
+	limit := 10
+	if len(nodes) < limit {
+		limit = len(nodes)
+	}
+
+	for i := 0; i < limit; i++ {
+		n := nodes[i]
+		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f)\n", n.Type, n.Name, n.Dist, n.X, n.Y, n.Z))
+	}
+
+	return strings.TrimSpace(out.String()), nil
+}
+
+func (s *SQLiteMemory) Close() error {
+	s.cancel()
+	s.wg.Wait()
+	close(s.eventChan)
+	return s.db.Close()
 }
 
 </file>
 
-<file path="js\lib\utils\perception.ts">
-import type { Bot } from "mineflayer";
-import { Vec3 } from "vec3";
-import * as models from "../models.js";
+<file path="planner.go">
+package main
 
-function getDirectionLabel(
-    lookDir: Vec3,
-    targetDir: Vec3,
-    dot: number,
-): string {
-    if (dot > 0.8) return "center";
-    if (dot < -0.2) return "behind";
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+)
 
-    // 2D cross product for left/right
-    const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
-    return crossY > 0 ? "left" : "right";
+const MaxStalls = 3
+
+type Planner interface {
+	GetActiveMilestone() *MilestonePlan
+	ClearMilestone()
+	RecordStall()
+	ResetStall()
+	GeneratePlan(ctx context.Context, rawState []byte, sessionID, sysOverride string) (*LLMPlan, error)
 }
 
-export function getPOIs(bot: Bot, radius: number = 32): any[] {
-    const pois: any[] = [];
-    if (!bot.entity) return pois;
+type TacticalPlanner struct {
+	brain           Brain
+	activeMilestone *MilestonePlan
+	stallCount      int
+	logger          *slog.Logger
+	mu              sync.Mutex
+}
 
-    const pos = bot.entity.position;
-    const yaw = bot.entity.yaw;
+func NewTacticalPlanner(brain Brain, logger *slog.Logger) *TacticalPlanner {
+	return &TacticalPlanner{
+		brain:  brain,
+		logger: logger.With(slog.String("component", "TacticalPlanner")),
+	}
+}
 
-    // Horizontal look vector
-    const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
+func (p *TacticalPlanner) GetActiveMilestone() *MilestonePlan {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeMilestone == nil {
+		return nil
+	}
+	// Return a copy to prevent race conditions
+	ms := *p.activeMilestone
+	return &ms
+}
 
-    // 1. Entities (Mobs, Animals, Items)
-    for (const id in bot.entities) {
-        const e = bot.entities[id];
-        if (!e || e === bot.entity || !e.isValid) continue;
+func (p *TacticalPlanner) ClearMilestone() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeMilestone != nil {
+		p.logger.Info("Clearing active milestone", slog.String("id", p.activeMilestone.ID))
+	}
+	p.activeMilestone = nil
+	p.stallCount = 0
+}
 
-        const dist = pos.distanceTo(e.position);
-        if (dist > radius) continue;
+func (p *TacticalPlanner) RecordStall() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stallCount++
+	p.logger.Warn("Milestone stalled", slog.Int("count", p.stallCount))
+}
 
-        const dx = e.position.x - pos.x;
-        const dz = e.position.z - pos.z;
-        const dirToEntity = new Vec3(dx, 0, dz).normalize();
+func (p *TacticalPlanner) ResetStall() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stallCount > 0 {
+		p.logger.Debug("Stall count reset")
+	}
+	p.stallCount = 0
+}
 
-        const visibility = parseFloat(lookDir.dot(dirToEntity).toFixed(2));
-        const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
+func (p *TacticalPlanner) GeneratePlan(ctx context.Context, rawState []byte, sessionID, sysOverride string) (*LLMPlan, error) {
+	p.mu.Lock()
+	currentMS := p.activeMilestone
+	stalls := p.stallCount
+	p.mu.Unlock()
 
-        let type = "entity";
-        if (e.type === "mob") type = "threat";
-        else if (e.type === "animal") type = "opportunity";
-        else if (e.type === "object" || e.type === "item") type = "resource";
+	// 1. Break infinite loops on impossible milestones
+	if stalls >= MaxStalls {
+		p.logger.Warn("Max stalls reached. Forcing milestone drop to prevent thrashing.", slog.String("milestone", currentMS.ID))
+		dropOverride := fmt.Sprintf("CRITICAL: You have repeatedly failed to complete the milestone '%s'. It is currently impossible. Drop it entirely, generate a NEW milestone, and try a different approach.\n\n%s", currentMS.Description, sysOverride)
 
-        // Scoring: Distance heavily weighted, center FOV acts as a multiplier
-        const baseScore = 100 / Math.max(dist, 1);
-        const scoreMultiplier =
-            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
-        const score = Math.round(baseScore * scoreMultiplier);
+		tick := Tick{State: rawState}
+		plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, dropOverride, nil) // Pass nil to force new milestone
+		if err != nil {
+			return nil, err
+		}
+		p.updateState(plan)
+		return plan, nil
+	}
 
-        pois.push({
-            type,
-            name: e.name || "unknown",
-            position: {
-                x: Math.round(e.position.x),
-                y: Math.round(e.position.y),
-                z: Math.round(e.position.z),
-            },
-            distance: parseFloat(dist.toFixed(1)),
-            visibility,
-            score,
-            direction,
-        });
-    }
+	// 2. Normal planning with partial progress tracking
+	contextOverride := sysOverride
+	if currentMS != nil && stalls > 0 {
+		contextOverride = fmt.Sprintf("You are currently trying to complete milestone '%s' but the last task failed. Evaluate the state, keep the milestone active, and generate the next tasks to recover and proceed.\n\n%s", currentMS.Description, sysOverride)
+	}
 
-    // 2. Blocks (Filtered strictly to avoid heavy tick lag)
-    const blocks = bot.findBlocks({
-        matching: (b) => {
-            if (!b) return false;
-            return (
-                b.name.endsWith("_log") ||
-                b.name.includes("ore") ||
-                b.name === "stone" ||
-                b.name === "crafting_table" ||
-                b.name.includes("bed") ||
-                b.name === "water" ||
-                b.name === "lava"
-            );
-        },
-        maxDistance: radius,
-        count: 24,
-    });
+	tick := Tick{State: rawState}
+	plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, contextOverride, currentMS)
+	if err != nil {
+		return nil, err
+	}
 
-    for (const bPos of blocks) {
-        const block = bot.blockAt(bPos);
-        if (!block) continue;
+	p.updateState(plan)
+	return plan, nil
+}
 
-        const dist = pos.distanceTo(bPos);
-        const dx = bPos.x - pos.x;
-        const dz = bPos.z - pos.z;
-        const dirToBlock = new Vec3(dx, 0, dz).normalize();
+func (p *TacticalPlanner) updateState(plan *LLMPlan) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-        const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
-        const direction = getDirectionLabel(lookDir, dirToBlock, visibility);
+	if plan == nil {
+		return
+	}
 
-        const baseScore = 100 / Math.max(dist, 1);
-        const scoreMultiplier =
-            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
-        const score = Math.round(baseScore * scoreMultiplier);
+	if bool(plan.MilestoneComplete) {
+		if p.activeMilestone != nil {
+			p.logger.Info("Milestone marked complete by LLM", slog.String("milestone", p.activeMilestone.ID))
+		}
+		p.activeMilestone = nil
+		p.stallCount = 0
+		return
+	}
 
-        pois.push({
-            type: "resource",
-            name: block.name,
-            position: { x: bPos.x, y: bPos.y, z: bPos.z },
-            distance: parseFloat(dist.toFixed(1)),
-            visibility,
-            score,
-            direction,
-        });
-    }
+	if plan.Milestone != nil && plan.Milestone.ID != "" {
+		if p.activeMilestone == nil || p.activeMilestone.ID != plan.Milestone.ID {
+			p.logger.Info("Adopting new milestone", slog.String("id", plan.Milestone.ID), slog.String("desc", plan.Milestone.Description))
+			p.activeMilestone = plan.Milestone
+			p.stallCount = 0
+		}
+	}
+}
 
-    // Sort by computed score
-    return pois.sort((a, b) => b.score - a.score).slice(0, 15);
+</file>
+
+<file path="resilient_brain.go">
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+)
+
+const (
+	MaxRetries     = 3
+	InitialBackoff = 1 * time.Second
+)
+
+type ResilientBrain struct {
+	primary   Brain
+	fallback  Brain
+	validator *PlanValidator
+	simulator *InternalSimulator
+	logger    *slog.Logger
+	telemetry *Telemetry
+}
+
+func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger, tel *Telemetry) *ResilientBrain {
+	return &ResilientBrain{
+		primary:   primary,
+		fallback:  fallback,
+		validator: NewPlanValidator(),
+		simulator: NewInternalSimulator(),
+		logger:    logger.With(slog.String("component", "ResilientBrain")),
+		telemetry: tel,
+	}
+}
+
+func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, milestone *MilestonePlan) (*LLMPlan, error) {
+	var lastErr error
+	backoff := InitialBackoff
+
+	for attempt := 1; attempt <= MaxRetries; attempt++ {
+		currentOverride := systemOverride
+		if lastErr != nil && attempt > 1 {
+			correction := fmt.Sprintf("CRITICAL ERROR IN PREVIOUS OUTPUT: %v. Fix the JSON schema and semantic errors.", lastErr)
+			if currentOverride != "" {
+				currentOverride = currentOverride + "\n" + correction
+			} else {
+				currentOverride = correction
+			}
+		}
+
+		plan, err := r.primary.GeneratePlan(ctx, t, sessionID, currentOverride, milestone)
+		if err == nil {
+
+			// Phase 7: Run internal simulation to collapse candidates into the optimal tasks
+			if len(plan.CandidatePlans) > 0 {
+				plan.Tasks = r.simulator.RankCandidates(plan.CandidatePlans, t.State)
+			}
+
+			// Ensure priorities are stamped
+			for i := range plan.Tasks {
+				plan.Tasks[i].Priority = PriLLM
+			}
+
+			// Final sanity check validation
+			if valErr := r.validator.ValidatePlan(plan, t.State); valErr != nil {
+				r.telemetry.RecordValidationFailure()
+				err = fmt.Errorf("validation failed on chosen variant: %w", valErr)
+			} else {
+				r.logger.Debug("Simulator selected optimal variant", slog.Int("steps", len(plan.Tasks)))
+				return plan, nil
+			}
+		}
+
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			r.logger.Debug("Primary brain context canceled (intentional preemption)")
+			return nil, context.Canceled
+		}
+
+		lastErr = err
+		r.logger.Warn("Planning failed",
+			slog.Int("attempt", attempt),
+			slog.Any("error", err),
+		)
+
+		if attempt < MaxRetries {
+			select {
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, context.Canceled
+				}
+				r.logger.Warn("Context timeout in primary brain, engaging fallback planner")
+				return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone)
+			case <-time.After(backoff):
+				backoff *= 2
+			}
+		}
+	}
+
+	r.logger.Error("Primary brain exhausted retries. Engaging fallback.", slog.Any("final_error", lastErr))
+	return r.fallback.GeneratePlan(context.Background(), t, sessionID, systemOverride, milestone)
+}
+
+</file>
+
+<file path="routine.go">
+package main
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Routine interface {
+	Name() string
+	Check(state GameState, inFlight *Action, queue []Action) *Action
+}
+
+type RoutineManager interface {
+	Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action
+	RecordFailure(action, target string)
+}
+
+type DefaultRoutineManager struct {
+	routines     []Routine
+	failCooldown map[string]time.Time
+	mu           sync.Mutex
+}
+
+func NewDefaultRoutineManager() *DefaultRoutineManager {
+	return &DefaultRoutineManager{
+		routines: []Routine{
+			&CombatRoutine{},
+			&EatingRoutine{},
+			&SleepRoutine{},
+			&ProgressionRoutine{},
+			&CookingRoutine{},
+			&WanderRoutine{},
+		},
+		failCooldown: make(map[string]time.Time),
+	}
+}
+
+func (r *DefaultRoutineManager) RecordFailure(action, target string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failCooldown[action+":"+target] = time.Now()
+}
+
+func (r *DefaultRoutineManager) isCoolingDown(action, target string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.failCooldown[action+":"+target]
+	return ok && time.Since(t) < 30*time.Second
+}
+
+func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action {
+	var results []Action
+	for _, routine := range r.routines {
+		if task := routine.Check(state, inFlightTask, taskQueue); task != nil {
+			if !r.isCoolingDown(task.Action, task.Target.Name) {
+				results = append(results, *task)
+			}
+		}
+	}
+	return results
+}
+
+func isTaskActive(action, targetName string, inFlight *Action, queue []Action) bool {
+	if inFlight != nil && inFlight.Action == action && inFlight.Target.Name == targetName {
+		return true
+	}
+	for _, t := range queue {
+		if t.Action == action && t.Target.Name == targetName {
+			return true
+		}
+	}
+	return false
+}
+
+// --- Routine Implementations ---
+
+type CombatRoutine struct{}
+
+func (c *CombatRoutine) Name() string { return "combat" }
+func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	if len(state.Threats) > 0 {
+		topThreat := state.Threats[0].Name
+
+		hasWeapon := false
+		for _, item := range state.Inventory {
+			if strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "sword") {
+				hasWeapon = true
+				break
+			}
+		}
+
+		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
+			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
+				return &Action{
+					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
+					Source:    string(SourceRoutine),
+					Action:    string(ActionHunt),
+					Target:    Target{Type: string(TargetEntity), Name: topThreat},
+					Rationale: "Tactical Engage: 1-on-1 combat advantage detected.",
+					Priority:  PriReflex,
+				}
+			}
+		}
+	}
+	return nil
+}
+
+type EatingRoutine struct{}
+
+func (e *EatingRoutine) Name() string { return "eating" }
+func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	if state.Food >= 16 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
+		return nil
+	}
+	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop", "rotten_flesh"}
+	for _, f := range foodPriority {
+		for _, inv := range state.Inventory {
+			if inv.Name == f {
+				return &Action{
+					ID:        fmt.Sprintf("routine-eat-%d", time.Now().UnixNano()),
+					Source:    string(SourceRoutine),
+					Action:    string(ActionEat),
+					Target:    Target{Type: string(TargetCategory), Name: f},
+					Rationale: "Survival: Restoring hunger to enable healing.",
+					Priority:  PriReflex,
+				}
+			}
+		}
+	}
+	return nil
+}
+
+type SleepRoutine struct{}
+
+func (s *SleepRoutine) Name() string { return "sleep" }
+func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	hasBedNearby := false
+	for _, poi := range state.POIs {
+		if strings.Contains(poi.Name, "bed") {
+			hasBedNearby = true
+			break
+		}
+	}
+
+	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && hasBedNearby {
+		if !isTaskActive(string(ActionSleep), "bed", inFlight, queue) {
+			return &Action{
+				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
+				Source:    string(SourceRoutine),
+				Action:    string(ActionSleep),
+				Target:    Target{Type: string(TargetBlock), Name: "bed"},
+				Rationale: "Routine: Sleeping to skip the night.",
+				Priority:  PriRoutine,
+			}
+		}
+	}
+	return nil
+}
+
+type ProgressionRoutine struct{}
+
+func (p *ProgressionRoutine) Name() string { return "progression" }
+func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	inv := make(map[string]int)
+	var logName string
+	for _, item := range state.Inventory {
+		inv[item.Name] += item.Count
+		if strings.HasSuffix(item.Name, "_log") {
+			logName = item.Name
+		}
+	}
+
+	planks := 0
+	for name, count := range inv {
+		if strings.HasSuffix(name, "_planks") {
+			planks += count
+		}
+	}
+
+	hasCraftingTableNearby := false
+	for _, poi := range state.POIs {
+		if poi.Name == "crafting_table" {
+			hasCraftingTableNearby = true
+			break
+		}
+	}
+
+	isActive := func(target string) bool {
+		return isTaskActive(string(ActionCraft), target, inFlight, queue)
+	}
+
+	craft := func(target, rationale string) *Action {
+		return &Action{
+			ID:        fmt.Sprintf("routine-prog-%d", time.Now().UnixNano()),
+			Source:    string(SourceRoutine),
+			Action:    string(ActionCraft),
+			Target:    Target{Type: string(TargetRecipe), Name: target},
+			Rationale: rationale,
+			Priority:  PriRoutine,
+		}
+	}
+
+	if logName != "" && planks < 8 {
+		target := strings.Replace(logName, "_log", "_planks", 1)
+		if !isActive(target) {
+			return craft(target, "Progression: Converting logs to planks.")
+		}
+	}
+
+	if inv["crafting_table"] == 0 && !hasCraftingTableNearby && planks >= 4 {
+		if !isActive("crafting_table") {
+			return craft("crafting_table", "Progression: Crafting essential table.")
+		}
+	}
+
+	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
+
+	if needsTool && inv["stick"] < 2 && planks >= 1 {
+		if !isActive("stick") {
+			return craft("stick", "Progression: Crafting sticks for tools.")
+		}
+	}
+
+	if inv["stick"] >= 2 {
+		if inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3 {
+			if !isActive("iron_pickaxe") {
+				return craft("iron_pickaxe", "Progression: Upgrading to Iron Pickaxe.")
+			}
+		}
+
+		hasCraftingTable := hasCraftingTableNearby || inv["crafting_table"] > 0
+		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3) && hasCraftingTable {
+			if !isActive("stone_pickaxe") {
+				return craft("stone_pickaxe", "Progression: Upgrading to Stone Pickaxe.")
+			}
+		}
+
+		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3 {
+			if !isActive("wooden_pickaxe") {
+				return craft("wooden_pickaxe", "Progression: Crafting first wooden pickaxe.")
+			}
+		}
+	}
+
+	return nil
+}
+
+type CookingRoutine struct{}
+
+func (c *CookingRoutine) Name() string { return "cooking" }
+func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	hasFurnace, hasRaw, hasFuel := false, false, false
+	for _, item := range state.Inventory {
+		if item.Name == "furnace" {
+			hasFurnace = true
+		}
+		if strings.Contains("beef porkchop mutton chicken rabbit", item.Name) {
+			hasRaw = true
+		}
+		if strings.Contains("coal charcoal oak_planks", item.Name) {
+			hasFuel = true
+		}
+	}
+
+	if hasFurnace && hasRaw && hasFuel && !isTaskActive(string(ActionSmelt), "food", inFlight, queue) {
+		return &Action{
+			ID:        fmt.Sprintf("routine-smelt-%d", time.Now().UnixNano()),
+			Source:    string(SourceRoutine),
+			Action:    string(ActionSmelt),
+			Target:    Target{Type: string(TargetCategory), Name: "food"},
+			Rationale: "Efficiency: Smelting raw food for better nutrition.",
+			Priority:  PriRoutine,
+		}
+	}
+	return nil
+}
+
+type WanderRoutine struct{}
+
+func (w *WanderRoutine) Name() string { return "wander" }
+func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+	if inFlight == nil && len(queue) == 0 {
+		return &Action{
+			ID:        fmt.Sprintf("routine-wander-%d", time.Now().UnixNano()),
+			Source:    string(SourceRoutine),
+			Action:    string(ActionExplore),
+			Target:    Target{Type: string(TargetNone), Name: "none"},
+			Rationale: "Idle: Exploring the area to keep chunks loaded and discover resources.",
+			Priority:  Priority(3),
+		}
+	}
+	return nil
+}
+
+</file>
+
+<file path="simulator.go">
+package main
+
+import (
+	"encoding/json"
+	"math"
+)
+
+type InternalSimulator struct {
+	validator *PlanValidator
+}
+
+func NewInternalSimulator() *InternalSimulator {
+	return &InternalSimulator{
+		validator: NewPlanValidator(),
+	}
+}
+
+// RankCandidates simulates the candidate plans, scores them based on cost/risk, and returns the optimal path.
+func (s *InternalSimulator) RankCandidates(candidates [][]Action, rawState json.RawMessage) []Action {
+	var state GameState
+	_ = json.Unmarshal(rawState, &state)
+
+	poiMap := make(map[string]POI)
+	for _, p := range state.POIs {
+		poiMap[p.Name] = p
+	}
+
+	var bestPlan []Action
+	bestScore := math.Inf(-1)
+
+	for _, plan := range candidates {
+		// 1. Hard Feasibility Check
+		mockPlan := &LLMPlan{Tasks: plan}
+		if err := s.validator.ValidatePlan(mockPlan, rawState); err != nil {
+			continue // Plan is impossible based on game rules, discard immediately
+		}
+
+		// 2. Cost / Benefit Heuristic
+		score := 100.0 // Base valid score
+
+		for _, task := range plan {
+			// Penalize physical distance (prefer targets that are closer)
+			if p, exists := poiMap[task.Target.Name]; exists {
+				score -= p.Distance * 0.5
+			} else if task.Action == "gather" || task.Action == "hunt" || task.Action == "mine" {
+				// Penalize interacting with things we can't currently see in the POI list
+				score -= 20.0
+			}
+
+			// Penalize complexity (longer sequences have a higher risk of failing mid-execution)
+			score -= 5.0
+
+			// Reward life-saving priorities
+			if state.Health < 10 {
+				if task.Action == "eat" {
+					score += 50.0
+				}
+				if task.Action == "retreat" {
+					score += 40.0
+				}
+			}
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestPlan = plan
+		}
+	}
+
+	// Fallback: If all plans failed validation, return the first one anyway
+	// so the validator can throw the proper localized error up the retry chain.
+	if bestPlan == nil && len(candidates) > 0 {
+		return candidates[0]
+	}
+
+	return bestPlan
+}
+
+</file>
+
+<file path="strategy.go">
+package main
+
+import "strings"
+
+type Strategy struct {
+	Goal     string
+	Priority int
+	Active   bool
+}
+
+type StrategyManager struct{}
+
+func NewStrategyManager() *StrategyManager {
+	return &StrategyManager{}
+}
+
+func (s *StrategyManager) Evaluate(state GameState) Strategy {
+	inv := make(map[string]int)
+	for _, item := range state.Inventory {
+		inv[item.Name] += item.Count
+	}
+
+	// Scan the ranked POIs for any type of bed
+	hasBedNearby := false
+	for _, poi := range state.POIs {
+		if strings.Contains(poi.Name, "bed") {
+			hasBedNearby = true
+			break
+		}
+	}
+
+	// 1. Critical Survival Triggers
+	if state.Health < 10 || state.Food < 6 {
+		return Strategy{Goal: "SURVIVAL: Secure food immediately and retreat to safety to regenerate health.", Priority: 100, Active: true}
+	}
+
+	// 2. Nightfall / Shelter
+	isNight := state.TimeOfDay > 12541 && state.TimeOfDay < 23000
+	if isNight && !hasBedNearby {
+		return Strategy{Goal: "SHELTER: Survive the night. Avoid open areas, dig a 3-block deep hole and cover the top, or stay near a bed.", Priority: 90, Active: true}
+	}
+
+	// 3. Tech Tree Heuristics
+	hasWoodenPick := inv["wooden_pickaxe"] > 0
+	hasStonePick := inv["stone_pickaxe"] > 0 || inv["iron_pickaxe"] > 0 || inv["diamond_pickaxe"] > 0
+
+	hasLog := false
+	for k, v := range inv {
+		if v > 0 && strings.HasSuffix(k, "_log") {
+			hasLog = true
+			break
+		}
+	}
+
+	if !hasWoodenPick && !hasStonePick {
+		if !hasLog && inv["oak_planks"] == 0 && inv["crafting_table"] == 0 {
+			return Strategy{Goal: "TECH TIER 1 (Wood): Gather logs. This is the absolute first step.", Priority: 80, Active: true}
+		}
+		return Strategy{Goal: "TECH TIER 1 (Tools): Use logs to craft planks, sticks, a crafting table, and finally a wooden pickaxe.", Priority: 75, Active: true}
+	}
+
+	if !hasStonePick {
+		return Strategy{Goal: "TECH TIER 2 (Stone): Use wooden pickaxe to mine at least 3 stone (cobblestone), then craft a stone pickaxe.", Priority: 70, Active: true}
+	}
+
+	if inv["furnace"] == 0 {
+		return Strategy{Goal: "TECH TIER 3 (Smelting): Mine 8 cobblestone and craft a furnace. Gather coal.", Priority: 65, Active: true}
+	}
+
+	// 4. Default Expansion
+	return Strategy{Goal: "EXPANSION: Explore the area, map new POIs, stockpile food, and locate iron ore.", Priority: 50, Active: true}
+}
+
+</file>
+
+<file path="telemetry.go">
+package main
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ModelPricing represents cost per 1M tokens (Input / Output)
+var PricingMap = map[string]struct{ Input, Output float64 }{
+	"mistralai/mistral-small-2603": {Input: 1.00, Output: 3.00},
+	"gpt-4-turbo":                  {Input: 10.00, Output: 30.00},
+	"deepseek/deepseek-v3.2":       {Input: 0.14, Output: 0.28}, // Added Deepseek
+}
+
+type Telemetry struct {
+	logger *slog.Logger
+	mu     sync.Mutex
+
+	llmInvocations int
+	llmErrors      int
+	totalLatency   time.Duration
+
+	inputTokens  int
+	outputTokens int
+	totalCost    float64
+
+	tasksCompleted int
+	tasksFailed    int
+	replans        int
+	panics         int
+	activeSessions int32
+
+	// Phase 3: Orchestration metrics
+	dispatchFailures   int
+	stalePlansDropped  int
+	milestonesGen      int
+	validationFailures int
+
+	costLimit float64
+}
+
+func NewTelemetry(logger *slog.Logger, costLimit float64) *Telemetry {
+	return &Telemetry{
+		logger:    logger.With(slog.String("component", "telemetry")),
+		costLimit: costLimit,
+	}
+}
+
+func (t *Telemetry) RecordSessionStart()   { atomic.AddInt32(&t.activeSessions, 1) }
+func (t *Telemetry) RecordSessionEnd()     { atomic.AddInt32(&t.activeSessions, -1) }
+func (t *Telemetry) ActiveSessions() int32 { return atomic.LoadInt32(&t.activeSessions) }
+
+func (t *Telemetry) RecordLLMCall(model string, duration time.Duration, inTokens, outTokens int, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.llmInvocations++
+	t.totalLatency += duration
+
+	if err != nil {
+		t.llmErrors++
+		return
+	}
+
+	t.inputTokens += inTokens
+	t.outputTokens += outTokens
+
+	prices, ok := PricingMap[model]
+	if !ok {
+		t.logger.Warn("Model pricing not found, using fallback", slog.String("model", model))
+		prices = PricingMap["mistralai/mistral-small-2603"] // default fallback
+	}
+
+	callCost := (float64(inTokens) / 1000000.0 * prices.Input) + (float64(outTokens) / 1000000.0 * prices.Output)
+	t.totalCost += callCost
+
+	if t.totalCost > t.costLimit {
+		t.logger.Warn("GLOBAL COST LIMIT EXCEEDED",
+			slog.Float64("current_cost", t.totalCost),
+			slog.Float64("limit", t.costLimit),
+		)
+	}
+}
+
+func (t *Telemetry) HasExceededCostLimit() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.totalCost >= t.costLimit
+}
+
+func (t *Telemetry) RecordTaskStatus(status TaskStatus) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch status {
+	case StatusCompleted:
+		t.tasksCompleted++
+	case StatusFailed, StatusAborted:
+		t.tasksFailed++
+	}
+}
+
+func (t *Telemetry) RecordReplan() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.replans++
+}
+
+func (t *Telemetry) RecordPanic() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.panics++
+}
+
+func (t *Telemetry) RecordDispatchFailure() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.dispatchFailures++
+}
+
+func (t *Telemetry) RecordStalePlan() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stalePlansDropped++
+}
+
+func (t *Telemetry) RecordMilestoneGenerated() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.milestonesGen++
+}
+
+func (t *Telemetry) RecordValidationFailure() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.validationFailures++
+}
+
+func (t *Telemetry) StartReporting(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.mu.Lock()
+			avgLatency := time.Duration(0)
+			if t.llmInvocations > 0 {
+				avgLatency = t.totalLatency / time.Duration(t.llmInvocations)
+			}
+
+			t.logger.Info("Telemetry Report",
+				slog.Int("llm_calls", t.llmInvocations),
+				slog.Int("llm_errors", t.llmErrors),
+				slog.String("llm_avg_latency", avgLatency.String()),
+				slog.Float64("total_cost_usd", t.totalCost),
+				slog.Int("tasks_completed", t.tasksCompleted),
+				slog.Int("tasks_failed", t.tasksFailed),
+				slog.Int("replans", t.replans),
+				slog.Int("panics", t.panics),
+				slog.Int("dispatch_failures", t.dispatchFailures),
+				slog.Int("stale_plans_dropped", t.stalePlansDropped),
+				slog.Int("milestones_gen", t.milestonesGen),
+				slog.Int("validation_failures", t.validationFailures),
+			)
+
+			t.llmInvocations, t.llmErrors, t.totalLatency = 0, 0, 0
+			t.tasksCompleted, t.tasksFailed, t.replans, t.panics = 0, 0, 0, 0
+			t.dispatchFailures, t.stalePlansDropped, t.milestonesGen, t.validationFailures = 0, 0, 0, 0
+			t.mu.Unlock()
+		}
+	}
+}
+
+func (t *Telemetry) AvgLatency() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.llmInvocations == 0 {
+		return 0
+	}
+	return t.totalLatency / time.Duration(t.llmInvocations)
+}
+
+</file>
+
+<file path="ws_types.go">
+package main
+
+type WSMessageType string
+
+const (
+	TypeCommand       WSMessageType = "command"
+	TypeEvent         WSMessageType = "event"
+	TypeState         WSMessageType = "state"
+	TypePlanningError WSMessageType = "planning_error"
+	TypeNoOp          WSMessageType = "noop"
+)
+
+type CommandPayload struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	Target    Target `json:"target"`
+	Rationale string `json:"rationale"`
+}
+
+type EventPayload struct {
+	Event     string `json:"event"`
+	Action    string `json:"action"`
+	CommandID string `json:"command_id"`
+	Cause     string `json:"cause"`
+	Duration  int    `json:"duration_ms"`
+}
+
+type StatePayload struct {
+	Health                 float64  `json:"health"`
+	Food                   float64  `json:"food"`
+	TimeOfDay              int      `json:"time_of_day"`
+	HasBedNearby           bool     `json:"has_bed_nearby"`
+	HasCraftingTableNearby bool     `json:"has_crafting_table_nearby"`
+	Position               Vec3     `json:"position"`
+	Threats                []Threat `json:"threats"`
+	POIs                   []POI    `json:"pois"`
+	Inventory              []Item   `json:"inventory"`
+}
+
+type Threat struct {
+	Name string `json:"name"`
+}
+
+type Item struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 </file>
@@ -1289,10 +2835,10 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
 
 ```json
 {
-  "total_bytes": 37273,
-  "file_count": 4,
-  "estimated_tokens": 9403,
+  "total_bytes": 80505,
+  "file_count": 13,
+  "estimated_tokens": 20315,
   "mode": "full",
-  "generated_at": "2026-03-26T12:45:00.9611405-07:00"
+  "generated_at": "2026-03-26T13:19:21.261051-07:00"
 }
 ```

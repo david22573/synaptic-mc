@@ -136,7 +136,15 @@ type SleepRoutine struct{}
 
 func (s *SleepRoutine) Name() string { return "sleep" }
 func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && state.HasBedNearby {
+	hasBedNearby := false
+	for _, poi := range state.POIs {
+		if strings.Contains(poi.Name, "bed") {
+			hasBedNearby = true
+			break
+		}
+	}
+
+	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && hasBedNearby {
 		if !isTaskActive(string(ActionSleep), "bed", inFlight, queue) {
 			return &Action{
 				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
@@ -171,6 +179,14 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 		}
 	}
 
+	hasCraftingTableNearby := false
+	for _, poi := range state.POIs {
+		if poi.Name == "crafting_table" {
+			hasCraftingTableNearby = true
+			break
+		}
+	}
+
 	isActive := func(target string) bool {
 		return isTaskActive(string(ActionCraft), target, inFlight, queue)
 	}
@@ -193,15 +209,13 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 		}
 	}
 
-	if inv["crafting_table"] == 0 && !state.HasCraftingTableNearby && planks >= 4 {
+	if inv["crafting_table"] == 0 && !hasCraftingTableNearby && planks >= 4 {
 		if !isActive("crafting_table") {
 			return craft("crafting_table", "Progression: Crafting essential table.")
 		}
 	}
 
-	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) ||
-		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) ||
-		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
+	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) || (inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) || (inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
 
 	if needsTool && inv["stick"] < 2 && planks >= 1 {
 		if !isActive("stick") {
@@ -216,7 +230,7 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 			}
 		}
 
-		hasCraftingTable := state.HasCraftingTableNearby || inv["crafting_table"] > 0
+		hasCraftingTable := hasCraftingTableNearby || inv["crafting_table"] > 0
 		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3) && hasCraftingTable {
 			if !isActive("stone_pickaxe") {
 				return craft("stone_pickaxe", "Progression: Upgrading to Stone Pickaxe.")
@@ -238,14 +252,17 @@ type CookingRoutine struct{}
 func (c *CookingRoutine) Name() string { return "cooking" }
 func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
 	hasFurnace, hasRaw, hasFuel := false, false, false
+	rawFood := map[string]bool{"beef": true, "porkchop": true, "mutton": true, "chicken": true, "rabbit": true, "cod": true, "salmon": true}
+	fuelTypes := map[string]bool{"coal": true, "charcoal": true, "oak_planks": true}
+
 	for _, item := range state.Inventory {
 		if item.Name == "furnace" {
 			hasFurnace = true
 		}
-		if strings.Contains("beef porkchop mutton chicken rabbit", item.Name) {
+		if rawFood[item.Name] {
 			hasRaw = true
 		}
-		if strings.Contains("coal charcoal oak_planks", item.Name) {
+		if fuelTypes[item.Name] {
 			hasFuel = true
 		}
 	}
@@ -274,7 +291,7 @@ func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action)
 			Action:    string(ActionExplore),
 			Target:    Target{Type: string(TargetNone), Name: "none"},
 			Rationale: "Idle: Exploring the area to keep chunks loaded and discover resources.",
-			Priority:  Priority(3),
+			Priority:  PriIdle,
 		}
 	}
 	return nil
