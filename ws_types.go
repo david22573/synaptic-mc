@@ -28,6 +28,7 @@ type EventPayload struct {
 type POI struct {
 	Type       string  `json:"type"`
 	Name       string  `json:"name"`
+	Position   Vec3    `json:"position"`
 	Distance   float64 `json:"distance"`
 	Visibility float64 `json:"visibility"`
 	Score      int     `json:"score"`

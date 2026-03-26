@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +21,26 @@ type EventMeta struct {
 	X, Y, Z   float64
 }
 
+type WorldNode struct {
+	Name       string
+	Type       string
+	X, Y, Z    float64
+	LastSeen   time.Time
+	Confidence float64
+}
+
 type MemoryBank interface {
 	LogEvent(action, details string, meta EventMeta)
 	GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
-	MarkLocation(ctx context.Context, name string, x, y, z float64) error
-	GetLocation(ctx context.Context, name string) (*Vec3, error)
-	GetKnownLocations(ctx context.Context) (string, error)
+
+	// Phase 2: World Model Queries
+	MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error
+	GetNode(ctx context.Context, name string) (*WorldNode, error)
+	GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error)
+
 	Close() error
 }
 
@@ -68,8 +81,10 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		status TEXT,
 		x REAL,
 		y REAL,
-		z REAL
+		z REAL,
+		trace_id TEXT DEFAULT ''
 	);
+
 	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
 
 	CREATE TABLE IF NOT EXISTS session_summary (
@@ -80,19 +95,19 @@ func NewSQLiteMemory(dbPath string) (*SQLiteMemory, error) {
 		PRIMARY KEY (session_id, key)
 	);
 
-	CREATE TABLE IF NOT EXISTS spatial_memory (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT UNIQUE,
+	CREATE TABLE IF NOT EXISTS world_nodes (
+		name TEXT PRIMARY KEY,
+		type TEXT NOT NULL,
 		x REAL,
 		y REAL,
-		z REAL
+		z REAL,
+		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+		confidence REAL DEFAULT 1.0
 	);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply schema: %w", err)
 	}
-
-	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN trace_id TEXT DEFAULT ''`)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	mem := &SQLiteMemory{
@@ -161,7 +176,6 @@ func (s *SQLiteMemory) processBatches(ctx context.Context) {
 }
 
 func (s *SQLiteMemory) LogEvent(action, details string, meta EventMeta) {
-	// Filter out noise
 	if action == "wander" || action == "idle" || action == "explore" {
 		return
 	}
@@ -187,7 +201,6 @@ func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, l
 	for rows.Next() {
 		var timestamp time.Time
 		var action, details, status string
-		// Note: We dropped fetching trace_id entirely to save tokens
 		if err := rows.Scan(&timestamp, &action, &details, &status); err != nil {
 			return "", err
 		}
@@ -260,46 +273,75 @@ func (s *SQLiteMemory) GetSummaryValue(ctx context.Context, sessionID, key strin
 	return value, nil
 }
 
-func (s *SQLiteMemory) MarkLocation(ctx context.Context, name string, x, y, z float64) error {
+func (s *SQLiteMemory) MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error {
 	query := `
-	INSERT INTO spatial_memory (name, x, y, z) 
-	VALUES (?, ?, ?, ?)
-	ON CONFLICT(name) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z;`
-	_, err := s.db.ExecContext(ctx, query, name, x, y, z)
+	INSERT INTO world_nodes (name, type, x, y, z, last_seen, confidence) 
+	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1.0)
+	ON CONFLICT(name) DO UPDATE SET 
+		x=excluded.x, y=excluded.y, z=excluded.z, 
+		last_seen=CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, name, nodeType, x, y, z)
 	return err
 }
 
-func (s *SQLiteMemory) GetLocation(ctx context.Context, name string) (*Vec3, error) {
-	query := `SELECT x, y, z FROM spatial_memory WHERE name = ?`
-	var vec Vec3
-	err := s.db.QueryRowContext(ctx, query, name).Scan(&vec.X, &vec.Y, &vec.Z)
+func (s *SQLiteMemory) GetNode(ctx context.Context, name string) (*WorldNode, error) {
+	query := `SELECT name, type, x, y, z, last_seen, confidence FROM world_nodes WHERE name = ?`
+	var node WorldNode
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&node.Name, &node.Type, &node.X, &node.Y, &node.Z, &node.LastSeen, &node.Confidence)
 	if err != nil {
 		return nil, err
 	}
-	return &vec, nil
+	return &node, nil
 }
 
-func (s *SQLiteMemory) GetKnownLocations(ctx context.Context) (string, error) {
-	query := `SELECT name, x, y, z FROM spatial_memory`
+func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error) {
+	query := `SELECT name, type, x, y, z FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
-		return "KNOWN LOCATIONS: none", nil
+		return "KNOWN WORLD: empty", nil
 	}
 	defer rows.Close()
 
-	var locs string
+	type nodeDist struct {
+		Name    string
+		Type    string
+		X, Y, Z float64
+		Dist    float64
+	}
+	var nodes []nodeDist
+
 	for rows.Next() {
-		var name string
-		var x, y, z float64
-		if err := rows.Scan(&name, &x, &y, &z); err == nil {
-			locs += fmt.Sprintf("%s X:%d,Y:%d,Z:%d ", name, int(x), int(y), int(z))
+		var n nodeDist
+		if err := rows.Scan(&n.Name, &n.Type, &n.X, &n.Y, &n.Z); err == nil {
+			dx, dy, dz := n.X-botX, n.Y-botY, n.Z-botZ
+			n.Dist = math.Sqrt(dx*dx + dy*dy + dz*dz)
+			nodes = append(nodes, n)
 		}
 	}
 
-	if locs == "" {
-		return "KNOWN LOCATIONS: none", nil
+	if len(nodes) == 0 {
+		return "KNOWN WORLD: empty", nil
 	}
-	return "KNOWN LOCATIONS: " + strings.TrimSpace(locs), nil
+
+	// Sort by closest distance
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Dist < nodes[j].Dist
+	})
+
+	var out strings.Builder
+	out.WriteString("KNOWN WORLD:\n")
+
+	limit := 10
+	if len(nodes) < limit {
+		limit = len(nodes)
+	}
+
+	for i := 0; i < limit; i++ {
+		n := nodes[i]
+		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f)\n", n.Type, n.Name, n.Dist, n.X, n.Y, n.Z))
+	}
+
+	return strings.TrimSpace(out.String()), nil
 }
 
 func (s *SQLiteMemory) Close() error {

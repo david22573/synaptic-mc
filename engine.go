@@ -49,6 +49,8 @@ type Engine struct {
 	exec       Executor
 	memory     MemoryBank
 	eventStore EventStore
+	strategy   *StrategyManager
+	learning   *LearningSystem
 	telemetry  *Telemetry
 	uiHub      *UIHub
 	logger     *slog.Logger
@@ -62,8 +64,9 @@ type Engine struct {
 	planning   bool
 	planCancel context.CancelFunc
 
-	sessionID      string
-	systemOverride string
+	sessionID       string
+	systemOverride  string
+	currentStrategy string
 
 	lastReplan      time.Time
 	lastSnapshot    StateSnapshot
@@ -93,6 +96,8 @@ func NewEngine(
 		exec:       exec,
 		memory:     mem,
 		eventStore: eventStore,
+		strategy:   NewStrategyManager(),
+		learning:   NewLearningSystem(),
 		telemetry:  tel,
 		uiHub:      uiHub,
 		logger:     baseLogger.With(slog.String("session_id", sessionID)),
@@ -125,6 +130,8 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 		case "state":
 			var state GameState
 			if err := json.Unmarshal(msg.Payload, &state); err == nil {
+				// Phase 6.4: Penalize POIs based on learned failures before processing
+				state.POIs = e.learning.PenalizePOIs(state.POIs)
 				e.eventCh <- EventClientState{State: state, RawPayload: msg.Payload}
 			}
 		case "event":
@@ -191,6 +198,26 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	e.lastHealth = ev.State.Health
 	e.lastThreat = topThreat
+
+	for _, poi := range ev.State.POIs {
+		if poi.Name == "crafting_table" || poi.Name == "furnace" || strings.Contains(poi.Name, "bed") {
+			go e.memory.MarkWorldNode(context.Background(), poi.Name, "structure", poi.Position.X, poi.Position.Y, poi.Position.Z)
+		} else if poi.Name == "water" || poi.Name == "lava" {
+			go e.memory.MarkWorldNode(context.Background(), poi.Name, "environment", poi.Position.X, poi.Position.Y, poi.Position.Z)
+		} else if strings.Contains(poi.Name, "ore") {
+			go e.memory.MarkWorldNode(context.Background(), poi.Name, "resource", poi.Position.X, poi.Position.Y, poi.Position.Z)
+		}
+	}
+
+	strat := e.strategy.Evaluate(ev.State)
+	stratChanged := false
+	if strat.Goal != e.currentStrategy {
+		e.logger.Info("Strategy Shift", slog.String("old", e.currentStrategy), slog.String("new", strat.Goal))
+		e.currentStrategy = strat.Goal
+		stratChanged = true
+		e.planner.ClearMilestone()
+		go e.setSummaryAsync("Current Strategy", strat.Goal)
+	}
 
 	var currentTask *Action
 	if e.inFlightTask != nil {
@@ -263,9 +290,10 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	stateChanged := e.stateChangedSignificantly(e.lastSnapshot, currentSnapshot)
 	timeSinceReplan := time.Since(e.lastReplan)
-	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || e.planner.GetActiveMilestone() == nil
 
-	if isExecutingTactics && !criticalOverride {
+	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || stratChanged || e.planner.GetActiveMilestone() == nil
+
+	if isExecutingTactics && !criticalOverride && !stratChanged {
 		if e.systemOverride == "" {
 			return
 		}
@@ -280,15 +308,21 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		return
 	}
 
-	if timeSinceReplan < 5*time.Second && !criticalOverride && e.systemOverride == "" && e.inFlightTask != nil {
+	if timeSinceReplan < 5*time.Second && !criticalOverride && !stratChanged && e.systemOverride == "" && e.inFlightTask != nil {
 		return
 	}
 
 	e.lastSnapshot = currentSnapshot
 
 	epochAtStart := e.planEpoch
-	sysOverride := e.systemOverride
+
+	// Phase 6.3: Inject Learned Rules into the Planner prompt
+	learnedRules := e.learning.GetRules()
+	sysOverride := fmt.Sprintf("CURRENT OVERARCHING STRATEGY: %s\n%s\nAll milestones and tasks MUST align with this strategy.\n\n%s", e.currentStrategy, learnedRules, e.systemOverride)
 	e.systemOverride = ""
+
+	// We overwrite the raw state in the tick to ensure the planner sees the penalized POIs
+	updatedPayload, _ := json.Marshal(ev.State)
 
 	planCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	e.planCancel = cancel
@@ -299,7 +333,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	traceID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
 
 	go func() {
-		plan, err := e.planner.GeneratePlan(planCtx, ev.RawPayload, e.sessionID, sysOverride)
+		plan, err := e.planner.GeneratePlan(planCtx, updatedPayload, e.sessionID, sysOverride)
 		if err != nil {
 			if planCtx.Err() != context.Canceled {
 				e.eventCh <- EventPlanError{Epoch: epochAtStart, Error: err}
@@ -400,8 +434,10 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		"status": meta.Status,
 	})
 
+	targetName := "none"
 	if e.inFlightTask != nil {
 		meta.TraceID = e.inFlightTask.Trace.TraceID
+		targetName = e.inFlightTask.Target.Name
 	}
 
 	logCtx := []any{
@@ -422,6 +458,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
+		go e.memory.MarkWorldNode(context.Background(), "last_death", "event", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+
 		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
 			"position": e.lastPos,
 			"cause":    ev.Cause,
@@ -446,6 +484,9 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		if !e.matchesInFlight(ev.CommandID) {
 			return
 		}
+
+		e.learning.RecordOutcome(ev.Action, targetName, "COMPLETED", "")
+
 		e.telemetry.RecordTaskStatus(StatusCompleted)
 		meta.Status = string(StatusCompleted)
 		go e.memory.LogEvent(ev.Action, "Finished successfully", meta)
@@ -467,6 +508,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		if failCause == "" {
 			failCause = string(CauseUnknown)
 		}
+
+		e.learning.RecordOutcome(ev.Action, targetName, string(status), failCause)
 
 		e.telemetry.RecordTaskStatus(status)
 		meta.Status = string(status)
@@ -523,11 +566,11 @@ func (e *Engine) processNextTask() {
 		e.wg.Add(1)
 		go func(name string, x, y, z float64, tID string) {
 			defer e.wg.Done()
-			err := e.memory.MarkLocation(context.Background(), name, x, y, z)
+			err := e.memory.MarkWorldNode(context.Background(), name, "user_marked", x, y, z)
 			if err == nil {
 				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", name, x, y, z)
-				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: x, Y: y, Z: z, Status: "COMPLETED"})
-				e.logger.Info("Location marked in spatial memory", slog.String("name", name))
+				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: x, Y: y, Z: z, Status: "COMPLETED"})
+				e.logger.Info("World node mapped", slog.String("name", name))
 			}
 			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionMarkLocation), CommandID: task.ID}
 		}(locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, task.Trace.TraceID)
@@ -539,11 +582,11 @@ func (e *Engine) processNextTask() {
 		e.wg.Add(1)
 		go func(name string, tID string) {
 			defer e.wg.Done()
-			loc, err := e.memory.GetLocation(context.Background(), name)
+			node, err := e.memory.GetNode(context.Background(), name)
 			if err == nil {
-				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, loc.X, loc.Y, loc.Z)
-				e.memory.LogEvent("spatial_memory", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
-				e.setSummaryAsync("Known Location: "+name, msg)
+				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, node.X, node.Y, node.Z)
+				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
+				e.setSummaryAsync("Target Node: "+name, msg)
 			}
 			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
 		}(locName, task.Trace.TraceID)

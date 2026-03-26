@@ -61,10 +61,12 @@ func (f *FlexBool) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Phase 7: Modified struct to accept an array of candidate arrays
 type LLMPlan struct {
 	Milestone         *MilestonePlan `json:"milestone"`
 	Objective         string         `json:"objective"`
-	Tasks             []Action       `json:"tasks"`
+	CandidatePlans    [][]Action     `json:"candidate_plans"`
+	Tasks             []Action       `json:"-"` // Simulator populates this
 	MilestoneComplete FlexBool       `json:"milestone_complete"`
 }
 
@@ -89,7 +91,7 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 		memory:    mem,
 		telemetry: tel,
 		client: &http.Client{
-			Timeout: 30 * time.Second, // Timeout to prevent hangs
+			Timeout: 45 * time.Second, // Bumped timeout slightly for heavier generation
 		},
 	}
 }
@@ -100,11 +102,11 @@ Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
-3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
+3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per variant.
 4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
 5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
 6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
-7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory (e.g., "rotten_flesh"). Hunting is NOT eating. Do NOT plan anything else first.
+7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
 
 VALID TARGET TYPES (you MUST use one of these):
 - "block"     (oak_log, stone, etc.)
@@ -193,8 +195,11 @@ func summarizeState(raw json.RawMessage) string {
 }
 
 func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOverride string, currentMilestone *MilestonePlan) (*LLMPlan, error) {
-	var summary, history, locations string
+	var summary, history, worldModel string
 	var wg sync.WaitGroup
+
+	var state GameState
+	_ = json.Unmarshal(t.State, &state)
 
 	wg.Add(3)
 	go func() {
@@ -207,17 +212,24 @@ func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOv
 	}()
 	go func() {
 		defer wg.Done()
-		locations, _ = b.memory.GetKnownLocations(ctx)
+		worldModel, _ = b.memory.GetKnownWorld(ctx, state.Position.X, state.Position.Y, state.Position.Z)
 	}()
 	wg.Wait()
 
 	milestoneSection := "No active milestone. You MUST generate a new one by populating the 'milestone' JSON object."
 	if currentMilestone != nil {
-		milestoneSection = fmt.Sprintf("ACTIVE MILESTONE: %s\nCOMPLETION HINT: %s\nIf this is complete, set milestone_complete to true. If you need a new milestone, provide it in the 'milestone' field. Otherwise, leave 'milestone' null.", currentMilestone.Description, currentMilestone.CompletionHint)
+		milestoneSection = fmt.Sprintf(`ACTIVE MILESTONE: %s
+COMPLETION HINT: %s
+
+CRITICAL MILESTONE RULES:
+1. If this milestone is NOT complete, you MUST return the EXACT same milestone object in your response and set 'milestone_complete' to false.
+2. Generate tasks that continue progress toward this active milestone.
+3. If the milestone IS complete, set 'milestone_complete' to true.`, currentMilestone.Description, currentMilestone.CompletionHint)
 	}
 
 	compactState := summarizeState(t.State)
 
+	// Phase 7: Prompt updated for candidate variant generation
 	systemPrompt := fmt.Sprintf(`%s
 
 Response format (JSON only):
@@ -225,16 +237,21 @@ Response format (JSON only):
   "milestone": { "id": "milestone-slug", "description": "...", "completion_hint": "..." },
   "milestone_complete": false,
   "objective": "Sub-goal description",
-  "tasks": [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "..." } ]
+  "candidate_plans": [
+    [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Variant 1: Closest target" } ],
+    [ { "action": "explore", "target": { "type": "none", "name": "none" }, "rationale": "Variant 2: Find better resources" } ],
+    [ { "action": "craft", "target": { "type": "recipe", "name": "stick" }, "rationale": "Variant 3: Pre-craft needed items" } ]
+  ]
 }
+
+CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array. The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
 
 %s
 SUMMARY: %s
 MEMORY: %s
 %s
-OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, locations, systemOverride)
+OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
 
-	// Built-in retry loop for handling JSON schema breaks
 	var plan *LLMPlan
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -311,9 +328,6 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 	var plan LLMPlan
 	if err := json.Unmarshal([]byte(cleanJSON(result.Choices[0].Message.Content)), &plan); err != nil {
 		return nil, err
-	}
-	for i := range plan.Tasks {
-		plan.Tasks[i].Priority = PriLLM
 	}
 	return &plan, nil
 }

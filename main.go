@@ -145,7 +145,7 @@ func main() {
 
 		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 
-		planner := NewLLMPlanner(brain, uiHub, memory, telemetry, logger, sessionID)
+		planner := NewTacticalPlanner(brain, logger)
 		routine := NewDefaultRoutineManager()
 		exec := NewWSExecutor(conn)
 
