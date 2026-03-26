@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sync"
 )
 
 type Config struct {
@@ -16,15 +15,7 @@ type Config struct {
 	ThreatWeights map[string]int `json:"threat_weights"`
 }
 
-var (
-	configInstance *Config
-	configMu       sync.Mutex
-)
-
 func LoadConfig(path string) (*Config, error) {
-	configMu.Lock()
-	defer configMu.Unlock()
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)
@@ -35,6 +26,5 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	configInstance = &cfg
-	return configInstance, nil
+	return &cfg, nil
 }

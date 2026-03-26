@@ -19,8 +19,6 @@ const TARGET_ALIASES: Record<string, string> = {
     carrot: "carrots",
     potato: "potatoes",
     beetroot: "beetroots",
-    melon: "melon",
-    pumpkin: "pumpkin",
     sugar_cane: "reeds",
 
     // Mining Aliases
@@ -32,7 +30,6 @@ const TARGET_ALIASES: Record<string, string> = {
     lapis: "lapis_ore",
     redstone: "redstone_ore",
     emerald: "emerald_ore",
-    stone: "stone",
     cobble: "cobblestone",
 
     // Gathering Aliases
