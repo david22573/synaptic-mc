@@ -55,6 +55,7 @@ export class ControlPlaneClient {
                         log.error("Received malformed command payload", {
                             payload: msg.payload,
                         });
+
                         this.callbacks.onUnlock();
                         return;
                     }
@@ -68,9 +69,14 @@ export class ControlPlaneClient {
                     return;
                 }
 
-                if (msg.type === "planning_error" || msg.type === "noop") {
+                if (
+                    msg.type === "planning_error" ||
+                    msg.type === "noop" ||
+                    msg.type === "abort_task"
+                ) {
                     log.debug("Control plane unlocked bot", {
                         type: msg.type,
+
                         payload: msg.payload,
                     });
                     this.callbacks.onUnlock();
@@ -127,12 +133,14 @@ export class ControlPlaneClient {
     ): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
+
         this.ws.send(
             JSON.stringify({
                 type: "event",
                 payload: {
                     event,
                     action: actionStr,
+
                     command_id: commandId,
                     cause,
                     duration_ms,

@@ -145,6 +145,7 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
+    const localController = taskAbortController; // Scope the controller locally to prevent background timeouts from killing new tasks
 
     currentTask = {
         id: decision.id,
@@ -159,6 +160,7 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     stopMovement();
     const activeTask = currentTask;
+    let timeoutId: NodeJS.Timeout | undefined;
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
@@ -175,13 +177,12 @@ async function executeDecision(decision: models.IncomingDecision) {
                 (t) => computeSafeRetreat(bot, t, 20),
                 stopMovement,
             ),
-            new Promise((_, r) =>
-                setTimeout(() => {
-                    if (taskAbortController)
-                        taskAbortController.abort("timeout");
+            new Promise((_, r) => {
+                timeoutId = setTimeout(() => {
+                    localController.abort("timeout");
                     r(new Error("timeout"));
-                }, timeoutMs),
-            ),
+                }, timeoutMs);
+            }),
         ]);
 
         if (!signal.aborted) completeTask(activeTask, "task_completed");
@@ -193,6 +194,7 @@ async function executeDecision(decision: models.IncomingDecision) {
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
+        if (timeoutId) clearTimeout(timeoutId); // Clear the ghost timeout!
         stopMovement();
     }
 }
@@ -258,7 +260,7 @@ async function connectWithRetry(maxAttempts = 10) {
         host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
-        version: "1.19", // explicitly defining version fixes protodef crashes
+        version: "1.19",
     });
 
     bot.loadPlugin(pathfinder);

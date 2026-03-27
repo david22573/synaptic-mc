@@ -111,7 +111,8 @@ type EatingRoutine struct{}
 
 func (e *EatingRoutine) Name() string { return "eating" }
 func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if state.Food >= 16 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
+	// 15 = 7.5 drumsticks
+	if state.Food >= 15 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
 		return nil
 	}
 	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop", "rotten_flesh"}
@@ -165,10 +166,15 @@ func (p *ProgressionRoutine) Name() string { return "progression" }
 func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
 	inv := make(map[string]int)
 	var logName string
+	hasWeapon := false
+
 	for _, item := range state.Inventory {
 		inv[item.Name] += item.Count
 		if strings.HasSuffix(item.Name, "_log") {
 			logName = item.Name
+		}
+		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
+			hasWeapon = true
 		}
 	}
 
@@ -215,14 +221,34 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 		}
 	}
 
-	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) || (inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) || (inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
+	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
 
-	if needsTool && inv["stick"] < 2 && planks >= 1 {
+	needsWeapon := !hasWeapon && ((inv["iron_ingot"] >= 2) || (inv["cobblestone"] >= 2 || inv["stone"] >= 2) || (planks >= 2))
+
+	if (needsTool || needsWeapon) && inv["stick"] < 2 && planks >= 1 {
 		if !isActive("stick") {
-			return craft("stick", "Progression: Crafting sticks for tools.")
+			return craft("stick", "Progression: Crafting sticks for tools and weapons.")
 		}
 	}
 
+	hasCraftingTable := hasCraftingTableNearby || inv["crafting_table"] > 0
+
+	// Auto-craft weapons
+	if !hasWeapon && inv["stick"] >= 1 && hasCraftingTable {
+		if inv["iron_ingot"] >= 2 && !isActive("iron_sword") {
+			return craft("iron_sword", "Armament: Crafting an iron sword for defense.")
+		}
+		if (inv["cobblestone"] >= 2 || inv["stone"] >= 2) && !isActive("stone_sword") {
+			return craft("stone_sword", "Armament: Crafting a stone sword for defense.")
+		}
+		if planks >= 2 && !isActive("wooden_sword") {
+			return craft("wooden_sword", "Armament: Crafting a wooden sword for defense.")
+		}
+	}
+
+	// Auto-craft tools
 	if inv["stick"] >= 2 {
 		if inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3 {
 			if !isActive("iron_pickaxe") {
@@ -230,7 +256,6 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 			}
 		}
 
-		hasCraftingTable := hasCraftingTableNearby || inv["crafting_table"] > 0
 		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3) && hasCraftingTable {
 			if !isActive("stone_pickaxe") {
 				return craft("stone_pickaxe", "Progression: Upgrading to Stone Pickaxe.")
