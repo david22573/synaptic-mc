@@ -1,3 +1,4 @@
+// js/lib/utils/perception.ts
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import * as models from "../models.js";
@@ -21,7 +22,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
 
     const pos = bot.entity.position;
     const yaw = bot.entity.yaw;
-
     // Horizontal look vector
     const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
 
@@ -41,9 +41,8 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
 
         let type = "entity";
-        if (e.type === "mob") type = "threat";
-        else if (e.type === "animal") type = "opportunity";
-        else if (e.type === "object" || e.type === "item") type = "resource";
+        if (e.type === "hostile") type = "threat";
+        else if (e.type === "object" || e.type === "orb") type = "resource";
 
         // Scoring: Distance heavily weighted, center FOV acts as a multiplier
         const baseScore = 100 / Math.max(dist, 1);
@@ -91,6 +90,7 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         const dist = pos.distanceTo(bPos);
         const dx = bPos.x - pos.x;
         const dz = bPos.z - pos.z;
+
         const dirToBlock = new Vec3(dx, 0, dz).normalize();
 
         const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
@@ -113,5 +113,23 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
     }
 
     // Sort by computed score
-    return pois.sort((a, b) => b.score - a.score).slice(0, 15);
+    pois.sort((a, b) => b.score - a.score);
+
+    // Filter out redundant blocks so they don't blind the LLM context
+    const seenCounts: Record<string, number> = {};
+    const diversePOIs: any[] = [];
+
+    for (const poi of pois) {
+        seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
+
+        // Cap identical resources (like water/lava/dirt) to 3
+        if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
+            continue;
+        }
+
+        diversePOIs.push(poi);
+        if (diversePOIs.length >= 15) break;
+    }
+
+    return diversePOIs;
 }

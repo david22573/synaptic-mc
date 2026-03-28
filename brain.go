@@ -92,7 +92,7 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 		memory:    mem,
 		telemetry: tel,
 		client: &http.Client{
-			Timeout: 90 * time.Second, // Bumped to handle API latency spikes
+			Timeout: 90 * time.Second,
 		},
 	}
 }
@@ -262,7 +262,6 @@ Response format (JSON only):
 
 CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
 The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
-
 %s
 SUMMARY: %s
 MEMORY: %s
@@ -292,6 +291,9 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL, bytes.NewBuffer(jsonPayload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+b.apiKey)
+
+	// FIX: Force closing the connection to avoid stale HTTP/2 streams throwing INTERNAL_ERROR
+	req.Close = true
 
 	start := time.Now()
 	resp, err := b.client.Do(req)

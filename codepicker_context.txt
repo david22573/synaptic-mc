@@ -1,4 +1,4 @@
-Project Context Dump (26 Mar 26 16:08 PDT)
+Project Context Dump (28 Mar 26 10:52 PDT)
 Format: xml
 Mode: FULL (No Truncation)
 Total Files: 49
@@ -268,13 +268,14 @@ func NewLLMBrain(apiURL, model, apiKey string, mem MemoryBank, tel *Telemetry) *
 		memory:    mem,
 		telemetry: tel,
 		client: &http.Client{
-			Timeout: 45 * time.Second,
+			Timeout: 90 * time.Second,
 		},
 	}
 }
 
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 Do NOT worry about eating, sleeping, or combat reflexes; the lower-level systems handle that automatically.
+
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
@@ -284,6 +285,7 @@ NEVER start with explore.
 5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
 6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
 7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
+
 SPATIAL AWARENESS RULES:
 1. Targets in 'VISIBLE POIs' can be interacted with immediately.
 2. Targets in 'KNOWN WORLD' are out of sight. You MUST use 'recall_location' to navigate to them BEFORE you can interact with them.
@@ -466,6 +468,9 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+b.apiKey)
 
+	// FIX: Force closing the connection to avoid stale HTTP/2 streams throwing INTERNAL_ERROR
+	req.Close = true
+
 	start := time.Now()
 	resp, err := b.client.Do(req)
 	latency := time.Since(start)
@@ -633,14 +638,14 @@ type Engine struct {
 	lastSnapshot    StateSnapshot
 	lastState       GameState
 	tsEmergencyLock bool
-	panicCooldown   time.Time // Prevents instant replan thrashing after panics
+	panicCooldown   time.Time
 	lastHealth      float64
 	lastThreat      string
 	lastPos         Vec3
 	wg              sync.WaitGroup
 
 	tasksCompletedSinceReplan int
-	actionFailures            map[string]int // Loop protection tracking
+	actionFailures            map[string]int
 }
 
 func NewEngine(
@@ -687,7 +692,7 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 	go e.loop(runCtx)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		var msg struct {
 			Type    string          `json:"type"`
@@ -832,7 +837,6 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
 			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
-			go e.exec.SendControl("abort_task", "Routine interrupt: "+newRoutines[0].Rationale)
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
@@ -842,12 +846,10 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 	}
 
-	// 1. Hard Lock: Evading threat
 	if e.tsEmergencyLock {
 		return
 	}
 
-	// 2. Soft Lock: Debounce period to prevent immediate re-triggering of LLM planning
 	if time.Now().Before(e.panicCooldown) {
 		return
 	}
@@ -938,17 +940,16 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
 		e.logger.Warn("LLM plan contained zero actionable tasks. Recording stall.")
 		e.planner.RecordStall()
-		e.lastReplan = time.Time{} // Force immediate replan to trigger self-healing
+		e.lastReplan = time.Time{}
 		go e.exec.SendControl("noop", "No actionable tasks generated")
 		return
 	}
 
-	// Phase 3: The Plan Validation Gate
 	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
 	if !planRes.Valid {
 		e.logger.Warn("Plan validation failed pre-flight", slog.String("reason", planRes.Reason))
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Plan rejected. %s. %s", planRes.Reason, planRes.FixHint)
-		e.lastReplan = time.Time{} // Force immediate replan
+		e.lastReplan = time.Time{}
 		return
 	}
 
@@ -1035,6 +1036,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.telemetry.RecordTaskStatus(StatusFailed)
 		e.resetExecutionState()
 		e.planner.ClearMilestone()
+		e.learning.Reset() // Wipe learned failure traits on respawn
 
 		e.systemOverride = "CRITICAL: Bot just died. Inventory is RESET. Treat the current inventory as ground truth and restart basic progression: gather wood first. Do NOT assume any tools exist."
 		e.lastReplan = time.Time{}
@@ -1062,7 +1064,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 	case "panic_retreat_end":
 		e.tsEmergencyLock = false
 		e.lastReplan = time.Now()
-		e.panicCooldown = time.Now().Add(4 * time.Second) // Force a 4-second breather
+		e.panicCooldown = time.Now().Add(8 * time.Second)
 		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
@@ -1070,7 +1072,6 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			return
 		}
 
-		// Reset failure memory on success
 		delete(e.actionFailures, ev.Action+"_"+targetName)
 
 		e.learning.RecordOutcome(ev.Action, targetName, "COMPLETED", "")
@@ -1136,14 +1137,13 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			advice = "Adjust your plan accordingly."
 		}
 
-		// Phase 3: Loop Protection Counter
 		failureKey := ev.Action + "_" + targetName
 		e.actionFailures[failureKey]++
 
 		if e.actionFailures[failureKey] >= 3 {
 			advice = "CRITICAL: YOU HAVE FAILED THIS EXACT TASK 3 TIMES. ABORT THIS APPROACH COMPLETELY. Choose a different target or clear the area."
-			e.actionFailures[failureKey] = 0 // reset so we don't permalock
-			e.planner.ClearMilestone()       // Force higher level reset
+			e.actionFailures[failureKey] = 0
+			e.planner.ClearMilestone()
 		}
 
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
@@ -1159,7 +1159,6 @@ func (e *Engine) processNextTask() {
 	e.inFlightTask = e.queue.Pop()
 	task := e.inFlightTask
 
-	// Phase 3: The Atomic Validation Gate with Severity
 	res := ValidateAction(*task, e.lastState)
 	if !res.Valid {
 		switch res.Severity {
@@ -1542,6 +1541,7 @@ const { pathfinder, Movements } = pkg;
 let viewerStarted = false;
 const isIgnorableError = (err: Error | any) => {
     const msg = err?.message || "";
+
     const name = err?.name || "";
     return (
         name === "PartialReadError" ||
@@ -1558,6 +1558,7 @@ process.on("uncaughtException", (err: Error) => {
     });
     process.exit(1);
 });
+
 process.on("unhandledRejection", (reason: any) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
@@ -1567,17 +1568,20 @@ let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
+
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
 
 let lastStateSig = "";
 let lastStatePushTime = 0;
+
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 
 function stopMovement() {
     if (!bot) return;
+
     bot.clearControlStates();
     if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
@@ -1591,6 +1595,7 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -1598,18 +1603,21 @@ function completeTask(
         cause,
         task.startTime,
     );
+
     if (currentTask?.id === task.id) currentTask = null;
 }
 
 function abortActiveTask(reason: string) {
     if (currentTask) {
         if (taskAbortController) taskAbortController.abort(reason);
+
         completeTask(currentTask, "task_aborted", reason);
     }
 }
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
+
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -1642,6 +1650,7 @@ function normalizeFailureCause(err: any): string {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
             survival.reset();
@@ -1658,8 +1667,10 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 
     abortActiveTask("preempted");
+
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
+    const localController = taskAbortController; // Scope the controller locally to prevent background timeouts from killing new tasks
 
     currentTask = {
         id: decision.id,
@@ -1671,11 +1682,14 @@ async function executeDecision(decision: models.IncomingDecision) {
             action_id: decision.id,
         },
     };
+
     stopMovement();
     const activeTask = currentTask;
+    let timeoutId: NodeJS.Timeout | undefined;
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
+
         const timeoutMs = timeouts[decision.action] || 15000;
 
         await Promise.race([
@@ -1688,13 +1702,12 @@ async function executeDecision(decision: models.IncomingDecision) {
                 (t) => computeSafeRetreat(bot, t, 20),
                 stopMovement,
             ),
-            new Promise((_, r) =>
-                setTimeout(() => {
-                    if (taskAbortController)
-                        taskAbortController.abort("timeout");
+            new Promise((_, r) => {
+                timeoutId = setTimeout(() => {
+                    localController.abort("timeout");
                     r(new Error("timeout"));
-                }, timeoutMs),
-            ),
+                }, timeoutMs);
+            }),
         ]);
 
         if (!signal.aborted) completeTask(activeTask, "task_completed");
@@ -1702,25 +1715,30 @@ async function executeDecision(decision: models.IncomingDecision) {
         // Fix: Allow timeout errors to bypass the aborted check so they actually report to the engine
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
+
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
+        if (timeoutId) clearTimeout(timeoutId); // Clear the ghost timeout!
         stopMovement();
     }
 }
 
 function pushState() {
     if (!bot?.entity || !client) return;
+
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
         .join(",")}`;
+
     const now = Date.now();
 
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
     lastStateSig = sig;
+
     lastStatePushTime = now;
 
     client.sendState({
@@ -1745,6 +1763,7 @@ function pushState() {
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {
         log.error("Max reconnection attempts reached. Shutting down.");
+
         process.exit(1);
     }
 
@@ -1752,6 +1771,7 @@ async function connectWithRetry(maxAttempts = 10) {
         try {
             if ((bot as any).viewer) {
                 (bot as any).viewer.close();
+
                 viewerStarted = false;
             }
             bot.removeAllListeners();
@@ -1760,12 +1780,14 @@ async function connectWithRetry(maxAttempts = 10) {
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
+
     bot = mineflayer.createBot({
         host: "0.0.0.0",
         port: 25565,
         username: "CraftBot",
-        version: false,
+        version: "1.19",
     });
+
     bot.loadPlugin(pathfinder);
 
     if (!client) {
@@ -1790,6 +1812,7 @@ async function connectWithRetry(maxAttempts = 10) {
         if (isIgnorableError(err)) return;
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
+
     bot.on("end", (reason) => {
         log.warn(`Bot disconnected. Reason: ${reason}`);
         abortActiveTask("bot_disconnected");
@@ -1800,6 +1823,7 @@ async function connectWithRetry(maxAttempts = 10) {
         setTimeout(() => connectWithRetry(maxAttempts), backoffMs);
         reconnectAttempt++;
     });
+
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
@@ -1811,6 +1835,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
+
         movements.liquids = new Set(
             [water, lava].filter((id) => id !== undefined) as number[],
         );
@@ -1828,10 +1853,12 @@ async function connectWithRetry(maxAttempts = 10) {
             client.connect();
         }
         survival.start();
+
         if (runtimeConfig.enable_viewer) {
             try {
                 if (viewerStarted) {
                     log.warn("Viewer already started, skipping new instance");
+
                     return;
                 }
                 viewer(bot, {
@@ -1839,17 +1866,20 @@ async function connectWithRetry(maxAttempts = 10) {
                     firstPerson: true,
                     viewDistance: 4,
                 });
+
                 viewerStarted = true;
             } catch (err) {
                 log.warn("Could not start viewer", { err });
             }
         }
     });
+
     bot.on("message", (msg) => {
         const text = msg.toString();
         if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
     });
+
     bot.on("death", () => {
         log.warn(
             `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
@@ -1858,6 +1888,7 @@ async function connectWithRetry(maxAttempts = 10) {
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
     });
+
     bot.on("health", pushState);
 
     if (stateInterval) clearInterval(stateInterval);
@@ -1866,6 +1897,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
+
     await connectWithRetry();
 }
 
@@ -2162,6 +2194,7 @@ export class ControlPlaneClient {
                         log.error("Received malformed command payload", {
                             payload: msg.payload,
                         });
+
                         this.callbacks.onUnlock();
                         return;
                     }
@@ -2175,9 +2208,14 @@ export class ControlPlaneClient {
                     return;
                 }
 
-                if (msg.type === "planning_error" || msg.type === "noop") {
+                if (
+                    msg.type === "planning_error" ||
+                    msg.type === "noop" ||
+                    msg.type === "abort_task"
+                ) {
                     log.debug("Control plane unlocked bot", {
                         type: msg.type,
+
                         payload: msg.payload,
                     });
                     this.callbacks.onUnlock();
@@ -2234,12 +2272,14 @@ export class ControlPlaneClient {
     ): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
+
         this.ws.send(
             JSON.stringify({
                 type: "event",
                 payload: {
                     event,
                     action: actionStr,
+
                     command_id: commandId,
                     cause,
                     duration_ms,
@@ -2262,6 +2302,7 @@ import type { ControlPlaneClient } from "../network/client.js";
 import { log } from "../logger.js";
 import { getThreats, computeSafeRetreat } from "../utils/threats.js";
 import pkg from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
@@ -2277,6 +2318,7 @@ export class SurvivalSystem {
     private checkInterval: NodeJS.Timeout | null = null;
     private isPanicking = false;
     private lastDangerAt = 0;
+    private lastFleeTime = 0;
     private diggingEscape = false;
 
     constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
@@ -2298,6 +2340,7 @@ export class SurvivalSystem {
     public reset() {
         this.isPanicking = false;
         this.lastDangerAt = 0;
+        this.lastFleeTime = 0;
         this.diggingEscape = false;
     }
 
@@ -2332,6 +2375,7 @@ export class SurvivalSystem {
                 .some(
                     (i) => i.name.includes("axe") || i.name.includes("sword"),
                 );
+
             const isOneOnOne = immediateThreats.length === 1;
             const isUnavoidableDeath =
                 topThreat.name === "creeper" || topThreat.name === "warden";
@@ -2362,13 +2406,11 @@ export class SurvivalSystem {
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
-
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
                     health: Math.round(this.bot.health),
                     threatCount: immediateThreats.length,
                 });
-
                 this.config.onInterrupt("panic_flee");
                 this.config.stopMovement();
                 this.client.sendEvent(
@@ -2380,8 +2422,19 @@ export class SurvivalSystem {
                 );
             }
 
-            const safePos = computeSafeRetreat(this.bot, immediateThreats, 24);
-            this.fleeTo(safePos);
+            // Prevent event loop thrashing by only calculating paths every 5s or if stopped
+            if (
+                !this.bot.pathfinder.isMoving() ||
+                Date.now() - this.lastFleeTime > 5000
+            ) {
+                this.lastFleeTime = Date.now();
+                const safePos = computeSafeRetreat(
+                    this.bot,
+                    immediateThreats,
+                    24,
+                );
+                this.fleeTo(safePos);
+            }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
             this.isPanicking = false;
             log.debug("Survival goal reached; releasing reflex lock");
@@ -2426,29 +2479,79 @@ export class SurvivalSystem {
 
     private async digEscape() {
         if (this.diggingEscape) return;
+
+        const inWater =
+            this.bot.blockAt(this.bot.entity.position.floored())?.name ===
+            "water";
+        if (inWater) {
+            log.warn("Refusing to vertical dig escape while submerged.");
+            return;
+        }
+
         this.diggingEscape = true;
         this.config.stopMovement();
 
         try {
-            // Try digging straight up as last resort escape
-            for (let i = 0; i < 5; i++) {
-                if (this.bot.health <= 0) break; // Stop if we died
+            // The ultimate panic button: dig a 3-deep hole straight down.
+            for (let i = 0; i < 3; i++) {
+                if (this.bot.health <= 0) break;
 
-                const above = this.bot.blockAt(
-                    this.bot.entity.position.offset(0, i + 1, 0),
-                );
-                if (above && above.name !== "air") {
-                    // Equip best tool before digging if possible
-                    const tool = this.bot.pathfinder.bestHarvestTool(above);
+                const pos = this.bot.entity.position.floored();
+                const below = this.bot.blockAt(pos.offset(0, -1, 0));
+
+                if (
+                    below &&
+                    below.name !== "air" &&
+                    below.name !== "bedrock" &&
+                    below.name !== "water" &&
+                    below.name !== "lava"
+                ) {
+                    const tool = this.bot.pathfinder.bestHarvestTool(below);
                     if (tool) await this.bot.equip(tool, "hand");
 
-                    await this.bot.dig(above);
+                    await this.bot.dig(below);
                 }
             }
 
-            // Jump up into the cleared space if we dug something
-            this.bot.setControlState("jump", true);
-            setTimeout(() => this.bot.setControlState("jump", false), 500);
+            // Try to roof ourselves in with a trash block
+            const trashBlock = this.bot.inventory
+                .items()
+                .find((i) =>
+                    [
+                        "dirt",
+                        "cobblestone",
+                        "stone",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                        "netherrack",
+                    ].includes(i.name),
+                );
+
+            if (trashBlock) {
+                await this.bot.equip(trashBlock, "hand");
+
+                // Grab a block at eye level to attach our roof to
+                const sideBlock = this.bot.blockAt(
+                    this.bot.entity.position.floored().offset(1, 2, 0),
+                );
+
+                if (sideBlock && sideBlock.name !== "air") {
+                    await this.bot
+                        .placeBlock(sideBlock, new Vec3(-1, 0, 0))
+                        .catch(() => {});
+                } else {
+                    const altAnchor = this.bot.blockAt(
+                        this.bot.entity.position.floored().offset(-1, 2, 0),
+                    );
+
+                    if (altAnchor && altAnchor.name !== "air") {
+                        await this.bot
+                            .placeBlock(altAnchor, new Vec3(1, 0, 0))
+                            .catch(() => {});
+                    }
+                }
+            }
         } catch (err) {
             log.warn("Vertical dig escape failed", { err });
         } finally {
@@ -2859,12 +2962,11 @@ class NavigateState implements FSMState {
                 new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
                 {
                     signal: eCtx.signal,
-                    timeoutMs: 15000,
+                    timeoutMs: 12000, // Reduced from 15s to fit within global limit better
                     stopMovement: eCtx.stopMovement,
                     dynamic: false,
                 },
             );
-
             // Successfully reached new area. Record it to repel future exploration.
             eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
@@ -2896,7 +2998,9 @@ class PickDirectionState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
         eCtx.attempts++;
-        if (eCtx.attempts > 4) {
+
+        // Reduced from 4 attempts to 2 to prevent hitting global 25s FSM timeout
+        if (eCtx.attempts > 2) {
             eCtx.result = {
                 status: "FAILED",
                 reason: "SURROUNDED_BY_OBSTACLES_OR_WATER",
@@ -2921,7 +3025,6 @@ class PickDirectionState implements FSMState {
             }
 
             if (eCtx.visitedPoints.length === 0) minDistanceToHistory = 1;
-
             if (minDistanceToHistory > maxRepulsionScore) {
                 maxRepulsionScore = minDistanceToHistory;
                 bestAngle = testAngle;
@@ -2946,11 +3049,8 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
     await escapeTree(bot, signal);
 
     // Bind the history array to the bot instance itself.
-    // This way it persists across multiple 'explore' task calls in the same session,
-    // but gets garbage collected naturally when the bot reconnects/re-instantiates.
     const botRef = bot as any;
     botRef.explorationHistory = botRef.explorationHistory || [];
-
     const fsmCtx: ExploreContext = {
         bot,
         targetName: "explore",
@@ -2965,12 +3065,10 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         stopMovement,
         visitedPoints: botRef.explorationHistory,
     };
-
     const result = await new StateMachineRunner(
         new PickDirectionState(),
         fsmCtx,
     ).run();
-
     if (result.status === "FAILED")
         throw new Error(result.reason || "unknown_fsm_failure");
 }
@@ -3204,6 +3302,7 @@ interface GatherContext extends StateContext {
 
 class MineState implements FSMState {
     name = "MINING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -3221,6 +3320,7 @@ class MineState implements FSMState {
             // Whole-tree harvesting / vein mining
             const blockId =
                 gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
+
             if (blockId) {
                 const nearby = gCtx.bot.findBlocks({
                     matching: blockId,
@@ -3230,6 +3330,7 @@ class MineState implements FSMState {
 
                 for (const pos of nearby) {
                     if (gCtx.signal.aborted) break;
+
                     const nextBlock = gCtx.bot.blockAt(pos);
                     if (nextBlock) {
                         await gCtx.bot.dig(nextBlock).catch(() => {});
@@ -3238,6 +3339,7 @@ class MineState implements FSMState {
             }
 
             await waitForMs(500, gCtx.signal);
+
             gCtx.result = { status: "SUCCESS" };
             return null;
         } catch (err: any) {
@@ -3248,6 +3350,7 @@ class MineState implements FSMState {
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -3266,6 +3369,7 @@ class NavigateState implements FSMState {
                     stopMovement: gCtx.stopMovement,
                 },
             );
+
             return new MineState();
         } catch (err: any) {
             return advanceToNextCandidate(gCtx, `PATH_FAIL: ${err.message}`);
@@ -3275,9 +3379,11 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
+
         const candidates =
             gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
 
@@ -3287,12 +3393,11 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 64, // Expanded from 48 to 64 to find sparse wood
-            count: 256,
+            maxDistance: 32, // Reduced from 64 to avoid blocking event loop
+            count: 64, // Reduced from 256
         });
 
         const botPos = gCtx.bot.entity.position;
-
         blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
 
         if (blocks.length === 0) {
@@ -3316,6 +3421,7 @@ function advanceToNextCandidate(
     reason: string,
 ): FSMState | null {
     gCtx.currentIndex++;
+
     if (
         gCtx.currentIndex >= gCtx.candidatePositions.length ||
         gCtx.currentIndex > 5
@@ -3328,13 +3434,14 @@ function advanceToNextCandidate(
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: GatherContext = {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 64, // Matches expanded findBlocks radius
+        searchRadius: 32, // Matches the reduced findBlocks radius
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,
@@ -3344,6 +3451,7 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
+
     const result = await new StateMachineRunner(
         new SearchState(),
         fsmCtx,
@@ -3779,7 +3887,6 @@ export async function handleMine(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\smelt.ts">
-// js/lib/tasks/handlers/smelt.ts
 import {
     type FSMState,
     type StateContext,
@@ -3810,7 +3917,6 @@ interface SmeltContext extends StateContext {
 
 class CleanupState implements FSMState {
     name = "CLEANUP";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3836,7 +3942,6 @@ class CleanupState implements FSMState {
 
 class SmeltingState implements FSMState {
     name = "SMELTING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3844,19 +3949,21 @@ class SmeltingState implements FSMState {
         let furnaceWindow: any = null;
 
         try {
-            const batchSize = Math.min(sCtx.meatCount, sCtx.fuelCount, 8);
+            // Load the furnace with everything available so we don't waste fuel
+            const inputAmount = Math.min(sCtx.meatCount, 64);
+            const fuelAmount = Math.min(sCtx.fuelCount, 64);
 
             furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
-            await furnaceWindow.putFuel(sCtx.fuelType, null, batchSize);
-            await furnaceWindow.putInput(sCtx.meatType, null, batchSize);
+            await furnaceWindow.putFuel(sCtx.fuelType, null, fuelAmount);
+            await furnaceWindow.putInput(sCtx.meatType, null, inputAmount);
 
             let itemsSmelted = 0;
-            // ~10 seconds per item in MC, give it 15s per item as buffer
-            const maxWaitMs = 15000 * batchSize;
+            // Max wait time based on how much food we put in (15s per item buffer)
+            const maxWaitMs = 15000 * inputAmount;
             const pollIntervalMs = 500;
             let elapsedMs = 0;
 
-            while (elapsedMs < maxWaitMs && itemsSmelted < batchSize) {
+            while (elapsedMs < maxWaitMs && itemsSmelted < inputAmount) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
 
                 const outItem = furnaceWindow.outputItem();
@@ -3896,7 +4003,6 @@ class SmeltingState implements FSMState {
 
 class ApproachFurnaceState implements FSMState {
     name = "APPROACHING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3932,7 +4038,6 @@ class ApproachFurnaceState implements FSMState {
 
 class LocateFurnaceState implements FSMState {
     name = "LOCATING_FURNACE";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3958,7 +4063,6 @@ class LocateFurnaceState implements FSMState {
 
 class CheckResourcesState implements FSMState {
     name = "CHECKING_RESOURCES";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3994,7 +4098,6 @@ class CheckResourcesState implements FSMState {
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {
@@ -5097,6 +5200,15 @@ func (l *LearningSystem) PenalizePOIs(pois []POI) []POI {
 	return pois
 }
 
+// Reset clears out environmental trauma so the bot doesn't permanently ban tasks after respawning
+func (l *LearningSystem) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.failures = make(map[string]int)
+	l.causes = make(map[string]string)
+	l.rules = nil
+}
+
 </file>
 
 <file path="llm_validator.go">
@@ -5195,6 +5307,11 @@ func (v *PlanValidator) ValidatePlan(plan *LLMPlan, rawState json.RawMessage) er
 			if inv[task.Target.Name] == 0 {
 				return fmt.Errorf("invalid action: cannot eat %s because it is not in your inventory", task.Target.Name)
 			}
+		}
+
+		// Simulate state change for the next tasks in this plan so multi-step logic passes
+		if task.Action == string(ActionGather) || task.Action == string(ActionMine) || task.Action == string(ActionCraft) {
+			inv[task.Target.Name] += 1
 		}
 	}
 
@@ -5444,7 +5561,6 @@ type MemoryBank interface {
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
 
-	// Phase 2: World Model Queries
 	MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error
 	GetNode(ctx context.Context, name string) (*WorldNode, error)
 	GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error)
@@ -5472,8 +5588,9 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
+	// Clamped to 1 to prevent SQLITE_BUSY write locks across concurrent goroutines
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	schema := `
@@ -5730,7 +5847,6 @@ func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float
 		return "KNOWN WORLD: empty", nil
 	}
 
-	// Sort by closest distance
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i].Dist < nodes[j].Dist
 	})
@@ -6214,7 +6330,8 @@ type EatingRoutine struct{}
 
 func (e *EatingRoutine) Name() string { return "eating" }
 func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if state.Food >= 16 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
+	// 15 = 7.5 drumsticks
+	if state.Food >= 15 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
 		return nil
 	}
 	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop", "rotten_flesh"}
@@ -6268,10 +6385,15 @@ func (p *ProgressionRoutine) Name() string { return "progression" }
 func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
 	inv := make(map[string]int)
 	var logName string
+	hasWeapon := false
+
 	for _, item := range state.Inventory {
 		inv[item.Name] += item.Count
 		if strings.HasSuffix(item.Name, "_log") {
 			logName = item.Name
+		}
+		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
+			hasWeapon = true
 		}
 	}
 
@@ -6318,14 +6440,34 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 		}
 	}
 
-	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) || (inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) || (inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
+	needsTool := (inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3)) ||
+		(inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && inv["wooden_pickaxe"] == 0 && planks >= 3)
 
-	if needsTool && inv["stick"] < 2 && planks >= 1 {
+	needsWeapon := !hasWeapon && ((inv["iron_ingot"] >= 2) || (inv["cobblestone"] >= 2 || inv["stone"] >= 2) || (planks >= 2))
+
+	if (needsTool || needsWeapon) && inv["stick"] < 2 && planks >= 1 {
 		if !isActive("stick") {
-			return craft("stick", "Progression: Crafting sticks for tools.")
+			return craft("stick", "Progression: Crafting sticks for tools and weapons.")
 		}
 	}
 
+	hasCraftingTable := hasCraftingTableNearby || inv["crafting_table"] > 0
+
+	// Auto-craft weapons
+	if !hasWeapon && inv["stick"] >= 1 && hasCraftingTable {
+		if inv["iron_ingot"] >= 2 && !isActive("iron_sword") {
+			return craft("iron_sword", "Armament: Crafting an iron sword for defense.")
+		}
+		if (inv["cobblestone"] >= 2 || inv["stone"] >= 2) && !isActive("stone_sword") {
+			return craft("stone_sword", "Armament: Crafting a stone sword for defense.")
+		}
+		if planks >= 2 && !isActive("wooden_sword") {
+			return craft("wooden_sword", "Armament: Crafting a wooden sword for defense.")
+		}
+	}
+
+	// Auto-craft tools
 	if inv["stick"] >= 2 {
 		if inv["iron_pickaxe"] == 0 && inv["iron_ingot"] >= 3 {
 			if !isActive("iron_pickaxe") {
@@ -6333,7 +6475,6 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 			}
 		}
 
-		hasCraftingTable := hasCraftingTableNearby || inv["crafting_table"] > 0
 		if inv["iron_pickaxe"] == 0 && inv["stone_pickaxe"] == 0 && (inv["cobblestone"] >= 3 || inv["stone"] >= 3) && hasCraftingTable {
 			if !isActive("stone_pickaxe") {
 				return craft("stone_pickaxe", "Progression: Upgrading to Stone Pickaxe.")
@@ -6587,8 +6728,18 @@ func NewStrategyManager() *StrategyManager {
 
 func (s *StrategyManager) Evaluate(state GameState) Strategy {
 	inv := make(map[string]int)
+	hasWeapon := false
+	readyFoodCount := 0
+
 	for _, item := range state.Inventory {
 		inv[item.Name] += item.Count
+		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
+			hasWeapon = true
+		}
+		// Count food that provides decent saturation
+		if strings.Contains(item.Name, "cooked") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "apple") {
+			readyFoodCount += item.Count
+		}
 	}
 
 	// 1. Critical Survival Triggers
@@ -6602,7 +6753,12 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 		return Strategy{Goal: "SHELTER: Survive the night. Avoid open areas, dig a 3-block deep hole and cover the top, or stay near a bed.", Priority: 90, Active: true}
 	}
 
-	// 3. Tech Tree Heuristics
+	// 3. Proactive Upkeep (The Baseline Necessities)
+	// Don't starve. If we have less than 3 good food items during the day, go hunting/farming.
+	if readyFoodCount < 3 && !isNight {
+		return Strategy{Goal: "PROVISIONING: Hunt animals or harvest crops to build a stockpile of at least 3 food items before exploring.", Priority: 85, Active: true}
+	}
+
 	hasWoodenPick := inv["wooden_pickaxe"] > 0
 	hasStonePick := inv["stone_pickaxe"] > 0 || inv["iron_pickaxe"] > 0 || inv["diamond_pickaxe"] > 0
 
@@ -6614,6 +6770,7 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 		}
 	}
 
+	// 4. Tech Tree Heuristics
 	if !hasWoodenPick && !hasStonePick {
 		if !hasLog && inv["oak_planks"] == 0 && inv["crafting_table"] == 0 {
 			return Strategy{Goal: "TECH TIER 1 (Wood): Gather logs. This is the absolute first step.", Priority: 80, Active: true}
@@ -6625,12 +6782,17 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 		return Strategy{Goal: "TECH TIER 2 (Stone): Use wooden pickaxe to mine at least 3 stone (cobblestone), then craft a stone pickaxe.", Priority: 70, Active: true}
 	}
 
+	// Ensure we are armed as soon as we hit the stone age
+	if !hasWeapon && (inv["cobblestone"] >= 2 || inv["stone"] >= 2) {
+		return Strategy{Goal: "ARMAMENT: Craft a stone sword or stone axe to defend against threats.", Priority: 68, Active: true}
+	}
+
 	if inv["furnace"] == 0 {
 		return Strategy{Goal: "TECH TIER 3 (Smelting): Mine 8 cobblestone and craft a furnace. Gather coal.", Priority: 65, Active: true}
 	}
 
-	// 4. Default Expansion
-	return Strategy{Goal: "EXPANSION: Explore the area, map new POIs, stockpile food, and locate iron ore.", Priority: 50, Active: true}
+	// 5. Default Expansion
+	return Strategy{Goal: "EXPANSION: Explore the area, map new POIs, stockpile resources, and locate iron ore.", Priority: 50, Active: true}
 }
 
 </file>
@@ -7169,10 +7331,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 204791,
+  "total_bytes": 209410,
   "file_count": 49,
-  "estimated_tokens": 52004,
+  "estimated_tokens": 53158,
   "mode": "full",
-  "generated_at": "2026-03-26T16:08:48.6150891-07:00"
+  "generated_at": "2026-03-28T10:52:40.8299924-07:00"
 }
 ```

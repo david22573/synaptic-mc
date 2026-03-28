@@ -93,3 +93,12 @@ func (l *LearningSystem) PenalizePOIs(pois []POI) []POI {
 	}
 	return pois
 }
+
+// Reset clears out environmental trauma so the bot doesn't permanently ban tasks after respawning
+func (l *LearningSystem) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.failures = make(map[string]int)
+	l.causes = make(map[string]string)
+	l.rules = nil
+}

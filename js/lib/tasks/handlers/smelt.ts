@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/smelt.ts
 import {
     type FSMState,
     type StateContext,
@@ -29,7 +28,6 @@ interface SmeltContext extends StateContext {
 
 class CleanupState implements FSMState {
     name = "CLEANUP";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -55,7 +53,6 @@ class CleanupState implements FSMState {
 
 class SmeltingState implements FSMState {
     name = "SMELTING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -63,19 +60,21 @@ class SmeltingState implements FSMState {
         let furnaceWindow: any = null;
 
         try {
-            const batchSize = Math.min(sCtx.meatCount, sCtx.fuelCount, 8);
+            // Load the furnace with everything available so we don't waste fuel
+            const inputAmount = Math.min(sCtx.meatCount, 64);
+            const fuelAmount = Math.min(sCtx.fuelCount, 64);
 
             furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
-            await furnaceWindow.putFuel(sCtx.fuelType, null, batchSize);
-            await furnaceWindow.putInput(sCtx.meatType, null, batchSize);
+            await furnaceWindow.putFuel(sCtx.fuelType, null, fuelAmount);
+            await furnaceWindow.putInput(sCtx.meatType, null, inputAmount);
 
             let itemsSmelted = 0;
-            // ~10 seconds per item in MC, give it 15s per item as buffer
-            const maxWaitMs = 15000 * batchSize;
+            // Max wait time based on how much food we put in (15s per item buffer)
+            const maxWaitMs = 15000 * inputAmount;
             const pollIntervalMs = 500;
             let elapsedMs = 0;
 
-            while (elapsedMs < maxWaitMs && itemsSmelted < batchSize) {
+            while (elapsedMs < maxWaitMs && itemsSmelted < inputAmount) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
 
                 const outItem = furnaceWindow.outputItem();
@@ -115,7 +114,6 @@ class SmeltingState implements FSMState {
 
 class ApproachFurnaceState implements FSMState {
     name = "APPROACHING";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -151,7 +149,6 @@ class ApproachFurnaceState implements FSMState {
 
 class LocateFurnaceState implements FSMState {
     name = "LOCATING_FURNACE";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -177,7 +174,6 @@ class LocateFurnaceState implements FSMState {
 
 class CheckResourcesState implements FSMState {
     name = "CHECKING_RESOURCES";
-
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -213,7 +209,6 @@ class CheckResourcesState implements FSMState {
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {

@@ -94,6 +94,11 @@ func (v *PlanValidator) ValidatePlan(plan *LLMPlan, rawState json.RawMessage) er
 				return fmt.Errorf("invalid action: cannot eat %s because it is not in your inventory", task.Target.Name)
 			}
 		}
+
+		// Simulate state change for the next tasks in this plan so multi-step logic passes
+		if task.Action == string(ActionGather) || task.Action == string(ActionMine) || task.Action == string(ActionCraft) {
+			inv[task.Target.Name] += 1
+		}
 	}
 
 	return nil

@@ -19,31 +19,29 @@ export class SurvivalSystem {
     private checkInterval: NodeJS.Timeout | null = null;
     private isPanicking = false;
     private lastDangerAt = 0;
+    private lastFleeTime = 0;
     private diggingEscape = false;
 
     constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
         this.bot = bot;
         this.client = client;
-
         this.config = config;
     }
 
     public start() {
         if (this.checkInterval) clearInterval(this.checkInterval);
-
         this.checkInterval = setInterval(() => this.checkSurvival(), 1000);
     }
 
     public stop() {
         if (this.checkInterval) clearInterval(this.checkInterval);
-
         this.checkInterval = null;
     }
 
     public reset() {
         this.isPanicking = false;
-
         this.lastDangerAt = 0;
+        this.lastFleeTime = 0;
         this.diggingEscape = false;
     }
 
@@ -61,7 +59,6 @@ export class SurvivalSystem {
 
         // Relaxed the filter to track ALL hostile mobs within 12 blocks,
         // not just when the bot is at low health.
-
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 12 &&
@@ -93,14 +90,12 @@ export class SurvivalSystem {
             ) {
                 if (this.isPanicking) {
                     this.isPanicking = false;
-
                     this.config.stopMovement();
                     this.client.sendEvent(
                         "panic_retreat_end",
                         "evasion_complete",
                         "",
                         "engaging_in_combat",
-
                         0,
                     );
                 }
@@ -112,13 +107,11 @@ export class SurvivalSystem {
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
-
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
                     health: Math.round(this.bot.health),
                     threatCount: immediateThreats.length,
                 });
-
                 this.config.onInterrupt("panic_flee");
                 this.config.stopMovement();
                 this.client.sendEvent(
@@ -126,16 +119,25 @@ export class SurvivalSystem {
                     "evasion",
                     "",
                     topThreat.name,
-
                     0,
                 );
             }
 
-            const safePos = computeSafeRetreat(this.bot, immediateThreats, 24);
-            this.fleeTo(safePos);
+            // Prevent event loop thrashing by only calculating paths every 5s or if stopped
+            if (
+                !this.bot.pathfinder.isMoving() ||
+                Date.now() - this.lastFleeTime > 5000
+            ) {
+                this.lastFleeTime = Date.now();
+                const safePos = computeSafeRetreat(
+                    this.bot,
+                    immediateThreats,
+                    24,
+                );
+                this.fleeTo(safePos);
+            }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
             this.isPanicking = false;
-
             log.debug("Survival goal reached; releasing reflex lock");
             this.config.stopMovement();
             this.client.sendEvent(
@@ -163,7 +165,6 @@ export class SurvivalSystem {
                 log.warn(
                     "Panic pathfinding failed, attempting vertical dig escape",
                 );
-
                 await this.digEscape();
                 return;
             }
@@ -173,13 +174,21 @@ export class SurvivalSystem {
             log.warn(
                 "Pathfinder threw during panic, attempting vertical dig escape",
             );
-
             await this.digEscape();
         }
     }
 
     private async digEscape() {
         if (this.diggingEscape) return;
+
+        const inWater =
+            this.bot.blockAt(this.bot.entity.position.floored())?.name ===
+            "water";
+        if (inWater) {
+            log.warn("Refusing to vertical dig escape while submerged.");
+            return;
+        }
+
         this.diggingEscape = true;
         this.config.stopMovement();
 
@@ -222,10 +231,12 @@ export class SurvivalSystem {
 
             if (trashBlock) {
                 await this.bot.equip(trashBlock, "hand");
+
                 // Grab a block at eye level to attach our roof to
                 const sideBlock = this.bot.blockAt(
                     this.bot.entity.position.floored().offset(1, 2, 0),
                 );
+
                 if (sideBlock && sideBlock.name !== "air") {
                     await this.bot
                         .placeBlock(sideBlock, new Vec3(-1, 0, 0))
@@ -234,6 +245,7 @@ export class SurvivalSystem {
                     const altAnchor = this.bot.blockAt(
                         this.bot.entity.position.floored().offset(-1, 2, 0),
                     );
+
                     if (altAnchor && altAnchor.name !== "air") {
                         await this.bot
                             .placeBlock(altAnchor, new Vec3(1, 0, 0))

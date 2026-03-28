@@ -30,6 +30,7 @@ interface GatherContext extends StateContext {
 
 class MineState implements FSMState {
     name = "MINING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -47,6 +48,7 @@ class MineState implements FSMState {
             // Whole-tree harvesting / vein mining
             const blockId =
                 gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
+
             if (blockId) {
                 const nearby = gCtx.bot.findBlocks({
                     matching: blockId,
@@ -56,6 +58,7 @@ class MineState implements FSMState {
 
                 for (const pos of nearby) {
                     if (gCtx.signal.aborted) break;
+
                     const nextBlock = gCtx.bot.blockAt(pos);
                     if (nextBlock) {
                         await gCtx.bot.dig(nextBlock).catch(() => {});
@@ -64,6 +67,7 @@ class MineState implements FSMState {
             }
 
             await waitForMs(500, gCtx.signal);
+
             gCtx.result = { status: "SUCCESS" };
             return null;
         } catch (err: any) {
@@ -74,6 +78,7 @@ class MineState implements FSMState {
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -92,6 +97,7 @@ class NavigateState implements FSMState {
                     stopMovement: gCtx.stopMovement,
                 },
             );
+
             return new MineState();
         } catch (err: any) {
             return advanceToNextCandidate(gCtx, `PATH_FAIL: ${err.message}`);
@@ -101,9 +107,11 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
+
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
+
         const candidates =
             gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
 
@@ -113,12 +121,11 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 64, // Expanded from 48 to 64 to find sparse wood
-            count: 256,
+            maxDistance: 32, // Reduced from 64 to avoid blocking event loop
+            count: 64, // Reduced from 256
         });
 
         const botPos = gCtx.bot.entity.position;
-
         blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
 
         if (blocks.length === 0) {
@@ -142,6 +149,7 @@ function advanceToNextCandidate(
     reason: string,
 ): FSMState | null {
     gCtx.currentIndex++;
+
     if (
         gCtx.currentIndex >= gCtx.candidatePositions.length ||
         gCtx.currentIndex > 5
@@ -154,13 +162,14 @@ function advanceToNextCandidate(
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: GatherContext = {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 64, // Matches expanded findBlocks radius
+        searchRadius: 32, // Matches the reduced findBlocks radius
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,
@@ -170,6 +179,7 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
+
     const result = await new StateMachineRunner(
         new SearchState(),
         fsmCtx,

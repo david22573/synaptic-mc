@@ -36,7 +36,6 @@ type MemoryBank interface {
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
 
-	// Phase 2: World Model Queries
 	MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error
 	GetNode(ctx context.Context, name string) (*WorldNode, error)
 	GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error)
@@ -64,8 +63,9 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
+	// Clamped to 1 to prevent SQLITE_BUSY write locks across concurrent goroutines
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	schema := `
@@ -322,7 +322,6 @@ func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float
 		return "KNOWN WORLD: empty", nil
 	}
 
-	// Sort by closest distance
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i].Dist < nodes[j].Dist
 	})

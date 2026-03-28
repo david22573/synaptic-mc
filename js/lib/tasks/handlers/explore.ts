@@ -30,12 +30,11 @@ class NavigateState implements FSMState {
                 new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
                 {
                     signal: eCtx.signal,
-                    timeoutMs: 15000,
+                    timeoutMs: 12000, // Reduced from 15s to fit within global limit better
                     stopMovement: eCtx.stopMovement,
                     dynamic: false,
                 },
             );
-
             // Successfully reached new area. Record it to repel future exploration.
             eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
@@ -67,7 +66,9 @@ class PickDirectionState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
         eCtx.attempts++;
-        if (eCtx.attempts > 4) {
+
+        // Reduced from 4 attempts to 2 to prevent hitting global 25s FSM timeout
+        if (eCtx.attempts > 2) {
             eCtx.result = {
                 status: "FAILED",
                 reason: "SURROUNDED_BY_OBSTACLES_OR_WATER",
@@ -92,7 +93,6 @@ class PickDirectionState implements FSMState {
             }
 
             if (eCtx.visitedPoints.length === 0) minDistanceToHistory = 1;
-
             if (minDistanceToHistory > maxRepulsionScore) {
                 maxRepulsionScore = minDistanceToHistory;
                 bestAngle = testAngle;
@@ -117,11 +117,8 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
     await escapeTree(bot, signal);
 
     // Bind the history array to the bot instance itself.
-    // This way it persists across multiple 'explore' task calls in the same session,
-    // but gets garbage collected naturally when the bot reconnects/re-instantiates.
     const botRef = bot as any;
     botRef.explorationHistory = botRef.explorationHistory || [];
-
     const fsmCtx: ExploreContext = {
         bot,
         targetName: "explore",
@@ -136,12 +133,10 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         stopMovement,
         visitedPoints: botRef.explorationHistory,
     };
-
     const result = await new StateMachineRunner(
         new PickDirectionState(),
         fsmCtx,
     ).run();
-
     if (result.status === "FAILED")
         throw new Error(result.reason || "unknown_fsm_failure");
 }

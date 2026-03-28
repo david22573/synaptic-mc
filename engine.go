@@ -72,14 +72,13 @@ type Engine struct {
 	lastSnapshot    StateSnapshot
 	lastState       GameState
 	tsEmergencyLock bool
-	panicCooldown   time.Time // Prevents instant replan thrashing after panics
 	lastHealth      float64
 	lastThreat      string
 	lastPos         Vec3
 	wg              sync.WaitGroup
 
 	tasksCompletedSinceReplan int
-	actionFailures            map[string]int // Loop protection tracking
+	actionFailures            map[string]int
 }
 
 func NewEngine(
@@ -126,7 +125,7 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 	go e.loop(runCtx)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second)) // Bumped to prevent disconnects during heavy TS operations
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		var msg struct {
 			Type    string          `json:"type"`
@@ -271,7 +270,6 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
 			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
-			go e.exec.SendControl("abort_task", "Routine interrupt: "+newRoutines[0].Rationale)
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
@@ -281,13 +279,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		}
 	}
 
-	// 1. Hard Lock: Evading threat
 	if e.tsEmergencyLock {
-		return
-	}
-
-	// 2. Soft Lock: Debounce period to prevent immediate re-triggering of LLM planning
-	if time.Now().Before(e.panicCooldown) {
 		return
 	}
 
@@ -377,17 +369,16 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	if ev.Plan == nil || len(ev.Plan.Tasks) == 0 {
 		e.logger.Warn("LLM plan contained zero actionable tasks. Recording stall.")
 		e.planner.RecordStall()
-		e.lastReplan = time.Time{} // Force immediate replan to trigger self-healing
+		e.lastReplan = time.Time{}
 		go e.exec.SendControl("noop", "No actionable tasks generated")
 		return
 	}
 
-	// Phase 3: The Plan Validation Gate
 	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
 	if !planRes.Valid {
 		e.logger.Warn("Plan validation failed pre-flight", slog.String("reason", planRes.Reason))
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Plan rejected. %s. %s", planRes.Reason, planRes.FixHint)
-		e.lastReplan = time.Time{} // Force immediate replan
+		e.lastReplan = time.Time{}
 		return
 	}
 
@@ -474,6 +465,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.telemetry.RecordTaskStatus(StatusFailed)
 		e.resetExecutionState()
 		e.planner.ClearMilestone()
+		e.learning.Reset() // Wipe learned failure traits on respawn
 
 		e.systemOverride = "CRITICAL: Bot just died. Inventory is RESET. Treat the current inventory as ground truth and restart basic progression: gather wood first. Do NOT assume any tools exist."
 		e.lastReplan = time.Time{}
@@ -500,8 +492,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 	case "panic_retreat_end":
 		e.tsEmergencyLock = false
-		e.lastReplan = time.Now()
-		e.panicCooldown = time.Now().Add(8 * time.Second) // Bumped from 4s to give the bot time to roof itself in
+		e.lastReplan = time.Time{} // Force immediate assessment after fleeing
 		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
@@ -509,7 +500,6 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			return
 		}
 
-		// Reset failure memory on success
 		delete(e.actionFailures, ev.Action+"_"+targetName)
 
 		e.learning.RecordOutcome(ev.Action, targetName, "COMPLETED", "")
@@ -575,14 +565,13 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			advice = "Adjust your plan accordingly."
 		}
 
-		// Phase 3: Loop Protection Counter
 		failureKey := ev.Action + "_" + targetName
 		e.actionFailures[failureKey]++
 
 		if e.actionFailures[failureKey] >= 3 {
 			advice = "CRITICAL: YOU HAVE FAILED THIS EXACT TASK 3 TIMES. ABORT THIS APPROACH COMPLETELY. Choose a different target or clear the area."
-			e.actionFailures[failureKey] = 0 // reset so we don't permalock
-			e.planner.ClearMilestone()       // Force higher level reset
+			e.actionFailures[failureKey] = 0
+			e.planner.ClearMilestone()
 		}
 
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
@@ -598,7 +587,6 @@ func (e *Engine) processNextTask() {
 	e.inFlightTask = e.queue.Pop()
 	task := e.inFlightTask
 
-	// Phase 3: The Atomic Validation Gate with Severity
 	res := ValidateAction(*task, e.lastState)
 	if !res.Valid {
 		switch res.Severity {
