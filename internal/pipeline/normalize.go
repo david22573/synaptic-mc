@@ -3,6 +3,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"david22573/synaptic-mc/internal/domain"
@@ -26,12 +27,18 @@ func (s *NormalizeStage) Process(ctx context.Context, state *PipelineState) erro
 		Tasks:     make([]domain.Action, 0, len(state.Plan.Tasks)),
 	}
 
-	for _, task := range state.Plan.Tasks {
+	for i, task := range state.Plan.Tasks {
 		normTask := task
+
 		// Sanitize structural strings
 		normTask.Action = strings.ToLower(strings.TrimSpace(task.Action))
 		normTask.Target.Name = strings.ToLower(strings.TrimSpace(task.Target.Name))
 		normTask.Target.Type = strings.ToLower(strings.TrimSpace(task.Target.Type))
+
+		// Imbue a deterministic ID for the TaskManager & Idempotency controller
+		if normTask.ID == "" {
+			normTask.ID = fmt.Sprintf("cmd-%s-%d", state.Trace.ActionID, i)
+		}
 
 		// Imbue the execution trace context at the boundary
 		normTask.Trace = state.Trace

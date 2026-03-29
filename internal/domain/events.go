@@ -17,12 +17,13 @@ type TraceContext struct {
 type EventType string
 
 const (
-	EventTypeStateTick   EventType = "STATE_TICK"
-	EventTypeTaskStart   EventType = "TASK_START"
-	EventTypeTaskEnd     EventType = "TASK_END"
-	EventTypePlanCreated EventType = "PLAN_CREATED"
-	EventTypePanic       EventType = "PANIC_TRIGGERED"
-	EventBotDeath        EventType = "BOT_DEATH"
+	EventTypeStateTick     EventType = "STATE_TICK"
+	EventTypeTaskStart     EventType = "TASK_START"
+	EventTypeTaskEnd       EventType = "TASK_END"
+	EventTypePlanCreated   EventType = "PLAN_CREATED"
+	EventTypePanic         EventType = "PANIC_TRIGGERED"
+	EventTypePanicResolved EventType = "PANIC_RESOLVED"
+	EventBotDeath          EventType = "BOT_DEATH"
 )
 
 // DomainEvent is the immutable record of a state transition.
@@ -35,7 +36,7 @@ type DomainEvent struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
-// EventStore is the absolute source of truth. No state mutations happen without an event.
+// EventStore is the absolute source of truth.
 type EventStore interface {
 	Append(ctx context.Context, sessionID string, trace TraceContext, eventType EventType, payload any) error
 	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)

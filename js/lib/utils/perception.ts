@@ -1,4 +1,3 @@
-// js/lib/utils/perception.ts
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import * as models from "../models.js";
@@ -11,21 +10,24 @@ function getDirectionLabel(
     if (dot > 0.8) return "center";
     if (dot < -0.2) return "behind";
 
-    // 2D cross product for left/right
     const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
     return crossY > 0 ? "left" : "right";
 }
 
+let lastPOIUpdate = 0;
+let cachedPOIs: any[] = [];
+
 export function getPOIs(bot: Bot, radius: number = 32): any[] {
+    const now = Date.now();
+    if (now - lastPOIUpdate < 1000) return cachedPOIs;
+
     const pois: any[] = [];
     if (!bot.entity) return pois;
 
     const pos = bot.entity.position;
     const yaw = bot.entity.yaw;
-    // Horizontal look vector
     const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
 
-    // 1. Entities (Mobs, Animals, Items)
     for (const id in bot.entities) {
         const e = bot.entities[id];
         if (!e || e === bot.entity || !e.isValid) continue;
@@ -44,7 +46,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         if (e.type === "hostile") type = "threat";
         else if (e.type === "object" || e.type === "orb") type = "resource";
 
-        // Scoring: Distance heavily weighted, center FOV acts as a multiplier
         const baseScore = 100 / Math.max(dist, 1);
         const scoreMultiplier =
             visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
@@ -65,7 +66,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         });
     }
 
-    // 2. Blocks (Filtered strictly to avoid heavy tick lag)
     const blocks = bot.findBlocks({
         matching: (b) => {
             if (!b) return false;
@@ -90,7 +90,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         const dist = pos.distanceTo(bPos);
         const dx = bPos.x - pos.x;
         const dz = bPos.z - pos.z;
-
         const dirToBlock = new Vec3(dx, 0, dz).normalize();
 
         const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
@@ -112,17 +111,13 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         });
     }
 
-    // Sort by computed score
     pois.sort((a, b) => b.score - a.score);
 
-    // Filter out redundant blocks so they don't blind the LLM context
     const seenCounts: Record<string, number> = {};
     const diversePOIs: any[] = [];
 
     for (const poi of pois) {
         seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
-
-        // Cap identical resources (like water/lava/dirt) to 3
         if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
             continue;
         }
@@ -131,5 +126,7 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         if (diversePOIs.length >= 15) break;
     }
 
+    lastPOIUpdate = now;
+    cachedPOIs = diversePOIs;
     return diversePOIs;
 }

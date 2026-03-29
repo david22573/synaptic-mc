@@ -19,7 +19,6 @@ const TARGET_ALIASES: Record<string, string> = {
     carrot: "carrots",
     potato: "potatoes",
     beetroot: "beetroots",
-    sugar_cane: "reeds",
 
     // Mining Aliases
     iron: "iron_ore",
@@ -67,7 +66,6 @@ export function normalizeDecision(
             targetName = "stick";
         } else if (targetName === "planks") {
             const invItems = bot.inventory.items();
-
             let foundLog = false;
             for (const item of invItems) {
                 if (LOG_TO_PLANK_MAP[item.name]) {
@@ -102,7 +100,6 @@ export function normalizeDecision(
     // 3. Log and apply changes if a normalization occurred
     if (targetName !== originalTargetName) {
         normalized.target.name = targetName;
-
         log.debug("Decision normalized", {
             original_target: originalTargetName,
             normalized_target: targetName,

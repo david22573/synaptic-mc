@@ -14,14 +14,47 @@ import { getPOIs } from "./lib/utils/perception.js";
 const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
-const isIgnorableError = (err: Error | any) => {
-    const msg = err?.message || "";
-    const name = err?.name || "";
+// More aggressive error filtering to suppress protodef spam
+const isIgnorableError = (err: Error | any): boolean => {
+    if (!err) return false;
+    const msg = String(err.message || err);
+    const name = String(err.name || "");
+    // Suppress all protodef parsing errors
     return (
         name === "PartialReadError" ||
         msg.includes("Read error for undefined") ||
-        msg.includes("Missing characters in string")
+        msg.includes("Missing characters in string") ||
+        msg.includes("protodef") ||
+        (msg.includes("size is") && msg.includes("expected size")) ||
+        // Also suppress websocket errors during reconnect
+        msg.includes("Unexpected server response")
     );
+};
+
+// Suppress console.error for ignorable errors
+const originalConsoleError = console.error;
+console.error = (...args: any[]) => {
+    const firstArg = args[0];
+    if (
+        typeof firstArg === "object" &&
+        firstArg?.err &&
+        isIgnorableError(firstArg.err)
+    ) {
+        return;
+    }
+    originalConsoleError.apply(console, args);
+};
+
+const originalConsoleWarn = console.warn;
+console.warn = (...args: any[]) => {
+    const firstArg = args[0];
+    if (
+        typeof firstArg === "string" &&
+        firstArg.includes("Read error for undefined")
+    ) {
+        return;
+    }
+    originalConsoleWarn.apply(console, args);
 };
 
 process.on("uncaughtException", (err: Error) => {
@@ -38,7 +71,6 @@ process.on("unhandledRejection", (reason: any) => {
     log.error("Unhandled promise rejection", { reason });
 });
 
-// FIX: Add proper task lock to prevent race conditions
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
@@ -50,8 +82,6 @@ let lastStateSig = "";
 let lastStatePushTime = 0;
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
-
-// FIX: Add cleanup flag to prevent double-cleanup
 let isShuttingDown = false;
 
 function stopMovement() {
@@ -69,12 +99,9 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-
-    // FIX: Prevent duplicate completion calls
     if (currentTask?.id === task.id) {
         currentTask = null;
     }
-
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -88,7 +115,6 @@ function abortActiveTask(reason: string) {
     if (currentTask && taskAbortController) {
         taskAbortController.abort(reason);
         completeTask(currentTask, "task_aborted", reason);
-        // FIX: Clear references immediately
         currentTask = null;
         taskAbortController = null;
     }
@@ -134,8 +160,6 @@ function normalizeFailureCause(err: any): string {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
-
-    // FIX: Check shutdown state
     if (isShuttingDown) {
         log.warn("Ignoring decision during shutdown", {
             action: decision.action,
@@ -158,9 +182,7 @@ async function executeDecision(decision: models.IncomingDecision) {
         }
     }
 
-    // FIX: Wait for previous task to fully abort before starting new one
     abortActiveTask("preempted");
-
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
@@ -202,12 +224,10 @@ async function executeDecision(decision: models.IncomingDecision) {
             }),
         ]);
 
-        // FIX: Only complete if not aborted
         if (!signal.aborted) {
             completeTask(activeTask, "task_completed");
         }
     } catch (err: any) {
-        // FIX: Better abort detection
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
             completeTask(activeTask, "task_failed", normalizedCause);
@@ -215,8 +235,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-
-        // FIX: Clear task references only if they're still the active ones
         if (currentTask?.id === activeTask.id) {
             currentTask = null;
         }
@@ -228,7 +246,6 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 function pushState() {
     if (!bot?.entity || !client) return;
-
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -263,7 +280,6 @@ function pushState() {
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {
         log.error("Max reconnection attempts reached. Shutting down.");
-        // FIX: Graceful shutdown
         isShuttingDown = true;
         process.exit(1);
     }
@@ -282,9 +298,8 @@ async function connectWithRetry(maxAttempts = 10) {
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
-
     bot = mineflayer.createBot({
-        host: "0.0.0.0",
+        host: "127.0.0.1",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
@@ -293,6 +308,10 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(pathfinder);
 
     if (!client) {
+        log.info("Initializing Control Plane client", {
+            ws_url: runtimeConfig.ws_url,
+            attempt: reconnectAttempt,
+        });
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (d) => void executeDecision(d),
             onUnlock: () => abortActiveTask("unlock"),
@@ -320,7 +339,6 @@ async function connectWithRetry(maxAttempts = 10) {
         abortActiveTask("bot_disconnected");
         survival.stop();
 
-        // FIX: Exponential backoff with jitter
         const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
         const jitter = Math.random() * 1000;
         const finalBackoff = backoffMs + jitter;
@@ -344,6 +362,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
+
         movements.liquids = new Set(
             [water, lava].filter((id) => id !== undefined) as number[],
         );
@@ -393,24 +412,22 @@ async function connectWithRetry(maxAttempts = 10) {
 
     bot.on("health", pushState);
 
-    // FIX: Clear existing interval before setting new one
     if (stateInterval) clearInterval(stateInterval);
     stateInterval = setInterval(pushState, 2000);
 }
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
+    log.info("Bot configuration loaded", { ws_url: runtimeConfig.ws_url });
     await connectWithRetry();
 }
 
-// FIX: Graceful shutdown on SIGINT
 process.on("SIGINT", () => {
     log.info("Received SIGINT, shutting down gracefully...");
     isShuttingDown = true;
     abortActiveTask("shutdown");
     if (bot) bot.quit();
     if (client?.isConnected()) {
-        // Give time to send final events
         setTimeout(() => process.exit(0), 1000);
     } else {
         process.exit(0);

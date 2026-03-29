@@ -20,6 +20,7 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
@@ -41,7 +42,6 @@ type Config struct {
 }
 
 func main() {
-	// Load .env file (optional - will log debug if missing)
 	if err := godotenv.Load(); err != nil {
 		slog.Debug("Could not load .env file", slog.Any("error", err))
 	}
@@ -52,13 +52,11 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	// Ensure data directory exists
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		logger.Error("Failed to create data directory", slog.String("path", cfg.DataDir), slog.Any("error", err))
 		os.Exit(1)
 	}
 
-	// Use absolute paths for SQLite databases
 	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
 	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
 
@@ -84,7 +82,8 @@ func main() {
 	})
 
 	strategyEvaluator := strategy.NewEvaluator()
-	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator)
+	policyExtractor := learning.NewPolicyExtractor(eventStore, logger)
+	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator, policyExtractor)
 	survivalPolicy := policy.NewSurvivalPolicy()
 	policyEngine := policy.NewCompositePolicy(survivalPolicy)
 	decisionEngine := decision.NewPipeline(planner, policyEngine)
@@ -92,10 +91,20 @@ func main() {
 	orch := orchestrator.New(cfg.SessionID, eventStore, decisionEngine, &noopController{}, uiHub, logger)
 
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(map[string]any{
+			"ws_url":        "ws://localhost:8080/bot/ws",
+			"viewer_port":   3000,
+			"enable_viewer": true,
+		})
+	})
+
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
 	mux.HandleFunc("/bot/ws", handleBotConnection(orch, logger))
 
-	// Resolve UI path to absolute
 	uiPath := cfg.UIPath
 	if !filepath.IsAbs(uiPath) {
 		uiPath = filepath.Join(".", uiPath)
@@ -146,7 +155,6 @@ func main() {
 }
 
 func parseConfig() Config {
-	// Define flags with environment variable defaults
 	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
 	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
 	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
@@ -241,7 +249,7 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 				}
 				orch.IngestState(ctx, state)
 
-			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic:
+			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic, domain.EventTypePanicResolved:
 				var payload any
 				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 					logger.Error("Failed to unmarshal event", slog.Any("error", err))

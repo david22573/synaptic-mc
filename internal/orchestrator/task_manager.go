@@ -30,8 +30,15 @@ func NewTaskManager(ctrl execution.Controller, logger *slog.Logger) *TaskManager
 	}
 }
 
-// Enqueue pushes a new plan to the queue. If it's a high-priority interrupt
-// (e.g., a combat reflex overriding an LLM mining task), it aborts the current task.
+// IsIdle returns true if there are no active or queued tasks
+func (m *TaskManager) IsIdle() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeTask == nil && len(m.queue) == 0
+}
+
+// Enqueue pushes a new plan to the queue.
+// If it's a high-priority interrupt it aborts the current task.
 func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -40,7 +47,8 @@ func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error
 		return nil
 	}
 
-	// Lower number = higher priority. If the new task outranks the active one, kill the active one.
+	// Lower number = higher priority.
+	// If the new task outranks the active one, kill the active one.
 	if m.activeTask != nil && tasks[0].Priority < m.activeTask.Priority {
 		m.logger.Warn("Preempting active task for higher priority action",
 			slog.String("active", m.activeTask.Action),
@@ -83,8 +91,7 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	}
 	m.activeTask = nil
 
-	// If the task failed, flush the remaining queue. The orchestrator's state loop
-	// will naturally trigger a fresh replan based on the new reality.
+	// If the task failed, flush the remaining queue.
 	if !success {
 		m.logger.Warn("Task failed, flushing remaining plan queue")
 		m.queue = make([]domain.Action, 0)

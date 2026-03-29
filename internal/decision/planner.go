@@ -1,3 +1,4 @@
+// internal/decision/planner.go
 package decision
 
 import (
@@ -14,47 +15,64 @@ type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
 }
 
-// LLMPlanner implements Planner. It merges the physical state with the strategic directive.
+type RuleExtractor interface {
+	GenerateRules(ctx context.Context, sessionID string) string
+}
+
+// LLMPlanner implements Planner.
+// It merges the physical state with the strategic directive.
 type LLMPlanner struct {
 	client    LLMClient
 	evaluator *strategy.Evaluator
+	extractor RuleExtractor
 }
 
-func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator) *LLMPlanner {
+func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor RuleExtractor) *LLMPlanner {
 	return &LLMPlanner{
 		client:    client,
 		evaluator: evaluator,
+		extractor: extractor,
 	}
 }
 
+// Enhanced System Rules to include explicit recipe knowledge
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-
+4. CRAFTING RECIPES:
+   - oak_planks: requires 1 oak_log (yields 4)
+   - stick: requires 2 oak_planks (yields 4)
+   - crafting_table: requires 4 oak_planks
+   - wooden_pickaxe: requires 3 oak_planks + 2 stick
+   - stone_pickaxe: requires 3 cobblestone + 2 stick
+5. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
 VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
-
 Response format (JSON only):
 {
   "objective": "Sub-goal description",
   "tasks": [
-    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Closest target" }
+    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Need wood for planks" }
   ]
 }`
 
 func (p *LLMPlanner) Generate(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	directive := p.evaluator.Evaluate(state)
+	learnedRules := ""
 
-	systemPrompt := fmt.Sprintf("%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
+	if p.extractor != nil {
+		learnedRules = p.extractor.GenerateRules(ctx, sessionID)
+	}
+
+	systemPrompt := fmt.Sprintf("%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
 		BaseSystemRules,
+		learnedRules,
 		directive.PrimaryGoal,
 		directive.SecondaryGoal,
 	)
 
-	// In a real system, you'd use a robust templating engine for state summarization.
-	// For brevity, we pass the raw JSON, but strip massive arrays if needed.
 	stateBytes, _ := json.Marshal(state)
 	userContent := string(stateBytes)
 

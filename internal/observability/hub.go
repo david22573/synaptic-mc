@@ -22,9 +22,7 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// FIX: Implement proper origin checking for production
-		origin := r.Header.Get("Origin")
-		return origin == "http://localhost:8080" || origin == "http://127.0.0.1:8080"
+		return true // Relaxed for local agent UI development
 	},
 }
 
@@ -32,8 +30,7 @@ type UIClient struct {
 	hub  *Hub
 	conn *websocket.Conn
 	send chan []byte
-	// FIX: Add mutex to protect send channel operations
-	mu sync.Mutex
+	mu   sync.Mutex
 }
 
 type Hub struct {
@@ -43,7 +40,6 @@ type Hub struct {
 	unregister chan *UIClient
 	logger     *slog.Logger
 
-	// FIX: Add shutdown tracking
 	mu         sync.RWMutex
 	isShutdown bool
 }
@@ -70,7 +66,6 @@ func (h *Hub) Run(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			// FIX: Send pings to all clients periodically
 			h.pingAll()
 
 		case client := <-h.register:
@@ -79,7 +74,6 @@ func (h *Hub) Run(ctx context.Context) {
 				h.clients[client] = true
 				h.logger.Info("UI Client connected", slog.Int("active_clients", len(h.clients)))
 			} else {
-				// FIX: Don't register new clients during shutdown
 				client.conn.Close()
 			}
 			h.mu.Unlock()
@@ -101,15 +95,17 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 			h.mu.RUnlock()
 
-			// FIX: Broadcast to clients without blocking the loop
 			for _, client := range clients {
 				select {
 				case client.send <- message:
 				default:
-					// FIX: Non-blocking send with client drop
 					h.logger.Warn("UI Client buffer full, scheduling drop")
 					go func(c *UIClient) {
-						h.unregister <- c
+						// Non-blocking unregister to prevent deadlocks during teardown
+						select {
+						case h.unregister <- c:
+						default:
+						}
 					}(client)
 				}
 			}
@@ -117,7 +113,6 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// FIX: New method for periodic pings
 func (h *Hub) pingAll() {
 	h.mu.RLock()
 	clients := make([]*UIClient, 0, len(h.clients))
@@ -131,14 +126,17 @@ func (h *Hub) pingAll() {
 		if err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
 			h.logger.Warn("Failed to ping client, will unregister", slog.Any("error", err))
 			go func(c *UIClient) {
-				h.unregister <- c
+				// Non-blocking unregister
+				select {
+				case h.unregister <- c:
+				default:
+				}
 			}(client)
 		}
 		client.mu.Unlock()
 	}
 }
 
-// FIX: Graceful shutdown method
 func (h *Hub) shutdown() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -154,15 +152,9 @@ func (h *Hub) shutdown() {
 		delete(h.clients, client)
 	}
 
-	// Drain channels to prevent goroutine leaks
-	close(h.register)
-	close(h.unregister)
-
-	// Give broadcast some time to drain, then close it
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		close(h.broadcast)
-	}()
+	// DO NOT close channels (register, unregister, broadcast) here.
+	// Lingering readPump/writePump goroutines will panic if they send to closed channels.
+	// Since the Hub loop is dead, we rely on GC and non-blocking sends to clean up gracefully.
 }
 
 func (h *Hub) Broadcast(msgType string, payload any) {
@@ -177,7 +169,6 @@ func (h *Hub) Broadcast(msgType string, payload any) {
 		return
 	}
 
-	// FIX: Non-blocking broadcast with drop
 	select {
 	case h.broadcast <- data:
 	default:
@@ -194,12 +185,18 @@ func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 	ws.SetReadLimit(maxMessageSize)
 	ws.SetPongHandler(func(string) error {
-		// FIX: Update read deadline on pong
 		return ws.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
 	client := &UIClient{hub: h, conn: ws, send: make(chan []byte, 256)}
-	h.register <- client
+
+	// Non-blocking register check
+	select {
+	case h.register <- client:
+	default:
+		ws.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -207,13 +204,16 @@ func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 func (c *UIClient) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		// Non-blocking unregister prevents deadlock/panic when Hub shuts down
+		select {
+		case c.hub.unregister <- c:
+		default:
+		}
 		c.conn.Close()
 	}()
 
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	for {
-		// FIX: Use proper message reading with error handling
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -221,7 +221,6 @@ func (c *UIClient) readPump() {
 			}
 			break
 		}
-		// FIX: Reset read deadline after each message
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	}
 }
@@ -238,7 +237,6 @@ func (c *UIClient) writePump() {
 		case message, ok := <-c.send:
 			c.mu.Lock()
 			if !ok {
-				// FIX: Send close message when channel is closed
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				c.mu.Unlock()
 				return
@@ -252,7 +250,6 @@ func (c *UIClient) writePump() {
 			c.mu.Unlock()
 
 		case <-ticker.C:
-			// FIX: Send periodic pings
 			c.mu.Lock()
 			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
 				c.mu.Unlock()

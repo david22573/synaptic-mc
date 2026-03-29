@@ -25,10 +25,7 @@ export class ControlPlaneClient {
 
     public connect(): void {
         if (this.ws) {
-            // Remove listeners to prevent memory leaks and duplicate callbacks
             this.ws.removeAllListeners();
-            // Terminate destroys the socket immediately, preventing lingering connections
-            // during aggressive reconnection loops
             this.ws.terminate();
             this.ws = null;
         }
@@ -76,7 +73,6 @@ export class ControlPlaneClient {
                 ) {
                     log.debug("Control plane unlocked bot", {
                         type: msg.type,
-
                         payload: msg.payload,
                     });
                     this.callbacks.onUnlock();
@@ -104,9 +100,11 @@ export class ControlPlaneClient {
 
     private scheduleReconnect(): void {
         if (this.reconnectTimer) return;
+
         const baseDelay = 2000;
         const maxDelay = 30000;
         let delay = baseDelay * Math.pow(2, this.reconnectAttempts);
+
         if (delay > maxDelay) delay = maxDelay;
 
         const jitter = delay * 0.2 * (Math.random() * 2 - 1);
@@ -134,13 +132,22 @@ export class ControlPlaneClient {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
 
+        let msgType = "TASK_END";
+        if (event === "death") msgType = "BOT_DEATH";
+        if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
+        if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
+
+        let status = event;
+        if (event === "task_completed") status = "COMPLETED";
+        if (event === "task_failed") status = "FAILED";
+        if (event === "task_aborted") status = "ABORTED";
+
         this.ws.send(
             JSON.stringify({
-                type: "event",
+                type: msgType,
                 payload: {
-                    event,
+                    status: status,
                     action: actionStr,
-
                     command_id: commandId,
                     cause,
                     duration_ms,
@@ -151,6 +158,6 @@ export class ControlPlaneClient {
 
     public sendState(state: Record<string, unknown>): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this.ws.send(JSON.stringify({ type: "state", payload: state }));
+        this.ws.send(JSON.stringify({ type: "STATE_TICK", payload: state }));
     }
 }

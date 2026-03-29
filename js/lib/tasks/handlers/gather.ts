@@ -30,7 +30,6 @@ interface GatherContext extends StateContext {
 
 class MineState implements FSMState {
     name = "MINING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -45,7 +44,6 @@ class MineState implements FSMState {
         try {
             await gCtx.bot.dig(freshBlock);
 
-            // Whole-tree harvesting / vein mining
             const blockId =
                 gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
 
@@ -58,9 +56,11 @@ class MineState implements FSMState {
 
                 for (const pos of nearby) {
                     if (gCtx.signal.aborted) break;
-
                     const nextBlock = gCtx.bot.blockAt(pos);
-                    if (nextBlock) {
+                    if (nextBlock && nextBlock.name !== "air") {
+                        const nextTool =
+                            gCtx.bot.pathfinder.bestHarvestTool(nextBlock);
+                        if (nextTool) await gCtx.bot.equip(nextTool, "hand");
                         await gCtx.bot.dig(nextBlock).catch(() => {});
                     }
                 }
@@ -78,13 +78,15 @@ class MineState implements FSMState {
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
 
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
+        if (!gCtx.targetBlock) {
+            return advanceToNextCandidate(gCtx, "BLOCK_UNLOADED");
+        }
         gCtx.resolvedTarget = gCtx.targetBlock.name;
 
         try {
@@ -107,7 +109,6 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -121,8 +122,8 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 32, // Reduced from 64 to avoid blocking event loop
-            count: 64, // Reduced from 256
+            maxDistance: 32,
+            count: 64,
         });
 
         const botPos = gCtx.bot.entity.position;
@@ -169,7 +170,7 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 32, // Matches the reduced findBlocks radius
+        searchRadius: 32,
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,

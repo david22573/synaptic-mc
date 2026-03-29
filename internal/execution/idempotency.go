@@ -7,12 +7,13 @@ import (
 )
 
 // IdempotentController wraps an Execution Controller to silently drop duplicate commands.
-// It uses a bounded LRU cache (simplified here as a map with a manual flush) to track dispatched Task IDs.
+// It uses a bounded LRU cache track dispatched Task IDs.
 type IdempotentController struct {
 	base Controller
 
 	mu       sync.Mutex
 	seen     map[string]bool
+	keys     []string
 	capacity int
 }
 
@@ -20,6 +21,7 @@ func NewIdempotentController(base Controller, capacity int) *IdempotentControlle
 	return &IdempotentController{
 		base:     base,
 		seen:     make(map[string]bool, capacity),
+		keys:     make([]string, 0, capacity),
 		capacity: capacity,
 	}
 }
@@ -31,12 +33,14 @@ func (c *IdempotentController) Dispatch(ctx context.Context, action domain.Actio
 		return nil // Silently drop, already dispatched
 	}
 
-	// Poor man's LRU clear to prevent OOM
-	if len(c.seen) >= c.capacity {
-		c.seen = make(map[string]bool, c.capacity)
+	if len(c.keys) >= c.capacity {
+		oldest := c.keys[0]
+		c.keys = c.keys[1:]
+		delete(c.seen, oldest)
 	}
 
 	c.seen[action.ID] = true
+	c.keys = append(c.keys, action.ID)
 	c.mu.Unlock()
 
 	return c.base.Dispatch(ctx, action)

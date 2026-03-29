@@ -35,9 +35,11 @@ class CleanupState implements FSMState {
 
         if (sCtx.isPortable && sCtx.furnaceBlock) {
             await makeRoomInInventory(sCtx.bot, 1);
+
             const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
                 sCtx.furnaceBlock,
             );
+
             if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
 
             try {
@@ -60,7 +62,6 @@ class SmeltingState implements FSMState {
         let furnaceWindow: any = null;
 
         try {
-            // Load the furnace with everything available so we don't waste fuel
             const inputAmount = Math.min(sCtx.meatCount, 64);
             const fuelAmount = Math.min(sCtx.fuelCount, 64);
 
@@ -69,8 +70,10 @@ class SmeltingState implements FSMState {
             await furnaceWindow.putInput(sCtx.meatType, null, inputAmount);
 
             let itemsSmelted = 0;
-            // Max wait time based on how much food we put in (15s per item buffer)
-            const maxWaitMs = 15000 * inputAmount;
+            const maxWaitMs = Math.min(
+                15000 * inputAmount,
+                sCtx.timeoutMs ?? 30000,
+            );
             const pollIntervalMs = 500;
             let elapsedMs = 0;
 
@@ -209,6 +212,7 @@ class CheckResourcesState implements FSMState {
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {

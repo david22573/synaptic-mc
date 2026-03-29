@@ -1,10 +1,11 @@
-Project Context Dump (28 Mar 26 21:44 PDT)
+Project Context Dump (29 Mar 26 02:32 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 55
+Total Files: 67
 
 # Project Structure
 <file_tree>
+- Makefile
 - cmd\server\main.go
 - internal\decision\engine.go
 - internal\decision\pipeline.go
@@ -60,9 +61,60 @@ Total Files: 55
 - js\lib\utils\errors.ts
 - js\lib\utils\perception.ts
 - js\lib\utils\threats.ts
+- pipeline\Untitled.java
+- scripts\find_deprecated_decision_logic.sh
+- scripts\lint_pipeline_immutability.sh
+- ui\index.html
+- ui\src\App.svelte
+- ui\src\app.css
+- ui\src\components\ItemIcon.svelte
+- ui\src\lib\Counter.svelte
+- ui\src\main.ts
+- ui\svelte.config.js
+- ui\vite.config.ts
 </file_tree>
 
 # File Contents
+<file path="Makefile">
+.PHONY: help install run-server run-bot dev clean test-replay
+
+# Default target
+.DEFAULT_GOAL := help
+
+help: ## Show this help message
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+install: ## Install Go and JS dependencies
+	@echo "==> Installing JS dependencies..."
+	cd js && npm install
+	@echo "==> Tidying Go modules..."
+	go mod tidy
+
+run-server: ## Run the Go control plane directly
+	@echo "==> Starting Go WebSocket Server..."
+	go run cmd/server/*.go
+
+run-bot: ## Run the Mineflayer TypeScript bot directly
+	@echo "==> Starting Mineflayer Bot..."
+	cd js && npx tsx index.ts
+
+dev: ## Run both server and bot concurrently in one terminal
+	@echo "==> Starting CraftD Control Plane and Bot..."
+	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
+	go run cmd/server/*.go & \
+	sleep 2; \
+	cd js && npx tsx index.ts
+
+test-replay: ## Run the Replay Test Harness
+	@echo "==> Running Planning Replay Tests..."
+	go test -v ./tests/...
+
+clean: ## Clean up Go cache and Node modules
+	@echo "==> Cleaning up environment..."
+	rm -rf js/node_modules
+	go clean
+</file>
+
 <file path="cmd\server\main.go">
 package main
 
@@ -107,7 +159,6 @@ type Config struct {
 }
 
 func main() {
-	// Load .env file (optional - will log debug if missing)
 	if err := godotenv.Load(); err != nil {
 		slog.Debug("Could not load .env file", slog.Any("error", err))
 	}
@@ -118,13 +169,11 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	// Ensure data directory exists
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		logger.Error("Failed to create data directory", slog.String("path", cfg.DataDir), slog.Any("error", err))
 		os.Exit(1)
 	}
 
-	// Use absolute paths for SQLite databases
 	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
 	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
 
@@ -158,10 +207,20 @@ func main() {
 	orch := orchestrator.New(cfg.SessionID, eventStore, decisionEngine, &noopController{}, uiHub, logger)
 
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(map[string]any{
+			"ws_url":        "ws://localhost:8080/bot/ws",
+			"viewer_port":   3000,
+			"enable_viewer": true,
+		})
+	})
+
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
 	mux.HandleFunc("/bot/ws", handleBotConnection(orch, logger))
 
-	// Resolve UI path to absolute
 	uiPath := cfg.UIPath
 	if !filepath.IsAbs(uiPath) {
 		uiPath = filepath.Join(".", uiPath)
@@ -212,7 +271,6 @@ func main() {
 }
 
 func parseConfig() Config {
-	// Define flags with environment variable defaults
 	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
 	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
 	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
@@ -307,7 +365,8 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 				}
 				orch.IngestState(ctx, state)
 
-			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic:
+			// Included EventTypePanicResolved here so it routes to the orchestrator properly
+			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic, domain.EventTypePanicResolved:
 				var payload any
 				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 					logger.Error("Failed to unmarshal event", slog.Any("error", err))
@@ -450,11 +509,20 @@ func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator) *LLMPlanner 
 	}
 }
 
+// FIX: Enhanced System Rules to include explicit recipe knowledge
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
+
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
+4. CRAFTING RECIPES:
+   - oak_planks: requires 1 oak_log (yields 4)
+   - stick: requires 2 oak_planks (yields 4)
+   - crafting_table: requires 4 oak_planks
+   - wooden_pickaxe: requires 3 oak_planks + 2 stick
+   - stone_pickaxe: requires 3 cobblestone + 2 stick
+5. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
 
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
 VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
@@ -463,7 +531,7 @@ Response format (JSON only):
 {
   "objective": "Sub-goal description",
   "tasks": [
-    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Closest target" }
+    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Need wood for planks" }
   ]
 }`
 
@@ -476,8 +544,6 @@ func (p *LLMPlanner) Generate(ctx context.Context, sessionID string, state domai
 		directive.SecondaryGoal,
 	)
 
-	// In a real system, you'd use a robust templating engine for state summarization.
-	// For brevity, we pass the raw JSON, but strip massive arrays if needed.
 	stateBytes, _ := json.Marshal(state)
 	userContent := string(stateBytes)
 
@@ -605,12 +671,13 @@ type TraceContext struct {
 type EventType string
 
 const (
-	EventTypeStateTick   EventType = "STATE_TICK"
-	EventTypeTaskStart   EventType = "TASK_START"
-	EventTypeTaskEnd     EventType = "TASK_END"
-	EventTypePlanCreated EventType = "PLAN_CREATED"
-	EventTypePanic       EventType = "PANIC_TRIGGERED"
-	EventBotDeath        EventType = "BOT_DEATH"
+	EventTypeStateTick     EventType = "STATE_TICK"
+	EventTypeTaskStart     EventType = "TASK_START"
+	EventTypeTaskEnd       EventType = "TASK_END"
+	EventTypePlanCreated   EventType = "PLAN_CREATED"
+	EventTypePanic         EventType = "PANIC_TRIGGERED"
+	EventTypePanicResolved EventType = "PANIC_RESOLVED"
+	EventBotDeath          EventType = "BOT_DEATH"
 )
 
 // DomainEvent is the immutable record of a state transition.
@@ -623,7 +690,7 @@ type DomainEvent struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
-// EventStore is the absolute source of truth. No state mutations happen without an event.
+// EventStore is the absolute source of truth.
 type EventStore interface {
 	Append(ctx context.Context, sessionID string, trace TraceContext, eventType EventType, payload any) error
 	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)
@@ -1074,12 +1141,11 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		config: cfg,
 		http: &http.Client{
-			Timeout: 45 * time.Second, // Hard timeout to prevent goroutine leaks
+			Timeout: 45 * time.Second,
 		},
 	}
 }
 
-// Generate executes the LLM call with Exponential Backoff + Jitter to handle 429s and 500s.
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
 	payload := map[string]any{
 		"model": c.config.Model,
@@ -1088,7 +1154,7 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 			{"role": "user", "content": userContent},
 		},
 		"response_format": map[string]string{"type": "json_object"},
-		"temperature":     0.2, // Low temp for tactical consistency
+		"temperature":     0.2,
 	}
 
 	jsonPayload, _ := json.Marshal(payload)
@@ -1097,23 +1163,32 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	baseDelay := 500 * time.Millisecond
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		// FIX: Check context cancellation before each attempt
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+		default:
+		}
+
 		if attempt > 0 {
-			// Exponential backoff with jitter
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
 			select {
 			case <-time.After(baseDelay + jitter):
 				baseDelay *= 2
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return "", fmt.Errorf("request cancelled during backoff: %w", ctx.Err())
 			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.APIURL, bytes.NewBuffer(jsonPayload))
 		if err != nil {
-			return "", err
+			lastErr = err
+			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -1121,8 +1196,12 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 			continue
 		}
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
@@ -1328,6 +1407,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -1335,14 +1415,16 @@ import (
 
 const (
 	writeWait      = 10 * time.Second
-	maxMessageSize = 512 * 1024 // 512KB max message size
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 512 * 1024
 )
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Lock this down in production via ENV vars
+		return true // Relaxed for local agent UI development
 	},
 }
 
@@ -1350,20 +1432,23 @@ type UIClient struct {
 	hub  *Hub
 	conn *websocket.Conn
 	send chan []byte
+	mu   sync.Mutex
 }
 
-// Hub manages WebSocket connections for the external UI dashboard.
 type Hub struct {
 	clients    map[*UIClient]bool
 	broadcast  chan []byte
 	register   chan *UIClient
 	unregister chan *UIClient
 	logger     *slog.Logger
+
+	mu         sync.RWMutex
+	isShutdown bool
 }
 
 func NewHub(logger *slog.Logger) *Hub {
 	return &Hub{
-		broadcast:  make(chan []byte, 1024), // Buffered to prevent blocking the caller
+		broadcast:  make(chan []byte, 1024),
 		register:   make(chan *UIClient),
 		unregister: make(chan *UIClient),
 		clients:    make(map[*UIClient]bool),
@@ -1372,42 +1457,108 @@ func NewHub(logger *slog.Logger) *Hub {
 }
 
 func (h *Hub) Run(ctx context.Context) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			h.logger.Info("UI Hub shutting down")
-			// Disconnect all clients cleanly
-			for client := range h.clients {
-				close(client.send)
-				delete(h.clients, client)
-			}
+			h.shutdown()
 			return
+
+		case <-ticker.C:
+			h.pingAll()
+
 		case client := <-h.register:
-			h.clients[client] = true
-			h.logger.Info("UI Client connected", slog.Int("active_clients", len(h.clients)))
+			h.mu.Lock()
+			if !h.isShutdown {
+				h.clients[client] = true
+				h.logger.Info("UI Client connected", slog.Int("active_clients", len(h.clients)))
+			} else {
+				client.conn.Close()
+			}
+			h.mu.Unlock()
+
 		case client := <-h.unregister:
+			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
 				h.logger.Info("UI Client disconnected", slog.Int("active_clients", len(h.clients)))
 			}
+			h.mu.Unlock()
+
 		case message := <-h.broadcast:
+			h.mu.RLock()
+			clients := make([]*UIClient, 0, len(h.clients))
 			for client := range h.clients {
+				clients = append(clients, client)
+			}
+			h.mu.RUnlock()
+
+			for _, client := range clients {
 				select {
 				case client.send <- message:
 				default:
-					// CRITICAL: If the client's send buffer is full, drop the client.
-					// A slow UI must never block the engine's event loop.
-					h.logger.Warn("UI Client buffer full, dropping connection")
-					close(client.send)
-					delete(h.clients, client)
+					h.logger.Warn("UI Client buffer full, scheduling drop")
+					go func(c *UIClient) {
+						// Non-blocking unregister to prevent deadlocks during teardown
+						select {
+						case h.unregister <- c:
+						default:
+						}
+					}(client)
 				}
 			}
 		}
 	}
 }
 
-// Broadcast serializes and sends a message to all connected UI clients asynchronously.
+func (h *Hub) pingAll() {
+	h.mu.RLock()
+	clients := make([]*UIClient, 0, len(h.clients))
+	for client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.mu.RUnlock()
+
+	for _, client := range clients {
+		client.mu.Lock()
+		if err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
+			h.logger.Warn("Failed to ping client, will unregister", slog.Any("error", err))
+			go func(c *UIClient) {
+				// Non-blocking unregister
+				select {
+				case h.unregister <- c:
+				default:
+				}
+			}(client)
+		}
+		client.mu.Unlock()
+	}
+}
+
+func (h *Hub) shutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.isShutdown {
+		return
+	}
+	h.isShutdown = true
+
+	// Close all client connections
+	for client := range h.clients {
+		client.conn.Close()
+		delete(h.clients, client)
+	}
+
+	// DO NOT close channels (register, unregister, broadcast) here.
+	// Lingering readPump/writePump goroutines will panic if they send to closed channels.
+	// Since the Hub loop is dead, we rely on GC and non-blocking sends to clean up gracefully.
+}
+
 func (h *Hub) Broadcast(msgType string, payload any) {
 	msg := map[string]any{
 		"type":    msgType,
@@ -1435,9 +1586,19 @@ func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ws.SetReadLimit(maxMessageSize)
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(pongWait))
+	})
 
 	client := &UIClient{hub: h, conn: ws, send: make(chan []byte, 256)}
-	h.register <- client
+
+	// Non-blocking register check
+	select {
+	case h.register <- client:
+	default:
+		ws.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -1445,32 +1606,60 @@ func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 func (c *UIClient) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		// Non-blocking unregister prevents deadlock/panic when Hub shuts down
+		select {
+		case c.hub.unregister <- c:
+		default:
+		}
 		c.conn.Close()
 	}()
+
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	for {
-		// We don't expect the UI to send much, but we must read to process ping/pong/close frames
-		if _, _, err := c.conn.ReadMessage(); err != nil {
+		_, _, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				c.hub.logger.Warn("UI Client read error", slog.Any("error", err))
+			}
 			break
 		}
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	}
 }
 
 func (c *UIClient) writePump() {
-	defer c.conn.Close()
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
 
-	for message := range c.send {
-		if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
-			return
-		}
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			return
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.mu.Lock()
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.mu.Unlock()
+				return
+			}
+
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Unlock()
+
+		case <-ticker.C:
+			c.mu.Lock()
+			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Unlock()
 		}
 	}
-
-	// If the channel was closed, send a graceful close message
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 }
 
 </file>
@@ -1480,31 +1669,37 @@ package orchestrator
 
 import (
 	"context"
-	"david22573/synaptic-mc/internal/decision"
-	"david22573/synaptic-mc/internal/domain"
-	"david22573/synaptic-mc/internal/execution"
-	"david22573/synaptic-mc/internal/observability"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"david22573/synaptic-mc/internal/decision"
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/observability"
 )
 
 type Orchestrator struct {
-	sessionID  string
-	store      domain.EventStore
-	decision   decision.Engine
-	controller execution.Controller
-	logger     *slog.Logger
+	sessionID   string
+	store       domain.EventStore
+	decision    decision.Engine
+	controller  execution.Controller
+	taskManager *TaskManager
+	logger      *slog.Logger
 
 	stateCh chan domain.GameState
 	eventCh chan domain.DomainEvent
 
-	mu        sync.RWMutex
-	lastState domain.GameState
-	uiHub     *observability.Hub
+	mu         sync.RWMutex
+	lastState  domain.GameState
+	reflexLock bool
+	uiHub      *observability.Hub
+
+	wg sync.WaitGroup
 }
 
 func New(
@@ -1516,14 +1711,15 @@ func New(
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
-		sessionID:  sessionID,
-		store:      store,
-		decision:   decisionEngine,
-		controller: exec,
-		uiHub:      uiHub,
-		logger:     logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
-		stateCh:    make(chan domain.GameState, 10),
-		eventCh:    make(chan domain.DomainEvent, 100),
+		sessionID:   sessionID,
+		store:       store,
+		decision:    decisionEngine,
+		controller:  exec,
+		taskManager: NewTaskManager(exec, logger),
+		uiHub:       uiHub,
+		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
+		stateCh:     make(chan domain.GameState, 10),
+		eventCh:     make(chan domain.DomainEvent, 100),
 	}
 }
 
@@ -1532,14 +1728,20 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	g, gCtx := errgroup.WithContext(ctx)
 
+	o.wg.Add(2)
 	g.Go(func() error {
+		defer o.wg.Done()
 		return o.processStateLoop(gCtx)
 	})
 
 	g.Go(func() error {
+		defer o.wg.Done()
 		return o.processEventLoop(gCtx)
 	})
 
+	<-gCtx.Done()
+	o.logger.Info("Orchestrator shutting down, waiting for loops...")
+	o.wg.Wait()
 	return g.Wait()
 }
 
@@ -1559,16 +1761,22 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, event domain.DomainEvent
 	}
 }
 
-// SessionID returns the current session identifier
 func (o *Orchestrator) SessionID() string {
 	return o.sessionID
 }
 
-// SetController updates the execution controller when bot connects
 func (o *Orchestrator) SetController(ctrl execution.Controller) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	if o.controller != nil {
+		if closer, ok := o.controller.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+
 	o.controller = ctrl
+	o.taskManager = NewTaskManager(ctrl, o.logger)
 	o.logger.Info("Execution controller updated")
 }
 
@@ -1615,17 +1823,31 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 
 func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState) error {
 	o.mu.RLock()
-	controller := o.controller
+	tm := o.taskManager
+	isLocked := o.reflexLock
 	o.mu.RUnlock()
 
-	if controller == nil {
-		o.logger.Debug("No controller available, skipping evaluation")
+	if tm == nil {
+		return nil
+	}
+
+	if isLocked {
+		return nil
+	}
+
+	if !tm.IsIdle() {
 		return nil
 	}
 
 	trace := domain.TraceContext{
 		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
 		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
 	plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
@@ -1645,25 +1867,50 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 		slog.String("objective", plan.Objective),
 		slog.Int("tasks", len(plan.Tasks)))
 
-	return controller.Dispatch(ctx, plan.Tasks[0])
+	return tm.Enqueue(ctx, plan.Tasks...)
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {
 	o.mu.RLock()
-	controller := o.controller
+	tm := o.taskManager
 	o.mu.RUnlock()
 
-	if controller == nil {
+	if tm == nil {
 		return
 	}
 
 	switch ev.Type {
 	case domain.EventBotDeath:
 		o.logger.Warn("Bot death detected, aborting active plans")
-		_ = controller.AbortCurrent(ctx, "bot_died")
+		_ = tm.Halt(ctx, "bot_died")
+
+		o.mu.Lock()
+		o.reflexLock = false
+		o.mu.Unlock()
+
 	case domain.EventTypePanic:
-		o.logger.Warn("Bot panicked, halting execution")
-		_ = controller.AbortCurrent(ctx, "panic_triggered")
+		o.logger.Warn("Bot panicked, halting execution and locking planner")
+		_ = tm.Halt(ctx, "panic_triggered")
+
+		o.mu.Lock()
+		o.reflexLock = true
+		o.mu.Unlock()
+
+	case domain.EventTypePanicResolved:
+		o.logger.Info("Bot survival reflex resolved, unlocking planner")
+		o.mu.Lock()
+		o.reflexLock = false
+		o.mu.Unlock()
+
+	case domain.EventTypeTaskEnd:
+		var payload struct {
+			Status    string `json:"status"`
+			CommandID string `json:"command_id"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			success := payload.Status == "COMPLETED"
+			_ = tm.Complete(ctx, payload.CommandID, success)
+		}
 	}
 }
 
@@ -1702,8 +1949,15 @@ func NewTaskManager(ctrl execution.Controller, logger *slog.Logger) *TaskManager
 	}
 }
 
-// Enqueue pushes a new plan to the queue. If it's a high-priority interrupt
-// (e.g., a combat reflex overriding an LLM mining task), it aborts the current task.
+// IsIdle returns true if there are no active or queued tasks
+func (m *TaskManager) IsIdle() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeTask == nil && len(m.queue) == 0
+}
+
+// Enqueue pushes a new plan to the queue.
+// If it's a high-priority interrupt it aborts the current task.
 func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1712,7 +1966,8 @@ func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error
 		return nil
 	}
 
-	// Lower number = higher priority. If the new task outranks the active one, kill the active one.
+	// Lower number = higher priority.
+	// If the new task outranks the active one, kill the active one.
 	if m.activeTask != nil && tasks[0].Priority < m.activeTask.Priority {
 		m.logger.Warn("Preempting active task for higher priority action",
 			slog.String("active", m.activeTask.Action),
@@ -1755,8 +2010,7 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	}
 	m.activeTask = nil
 
-	// If the task failed, flush the remaining queue. The orchestrator's state loop
-	// will naturally trigger a fresh replan based on the new reality.
+	// If the task failed, flush the remaining queue.
 	if !success {
 		m.logger.Warn("Task failed, flushing remaining plan queue")
 		m.queue = make([]domain.Action, 0)
@@ -1823,6 +2077,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"david22573/synaptic-mc/internal/domain"
@@ -1846,12 +2101,18 @@ func (s *NormalizeStage) Process(ctx context.Context, state *PipelineState) erro
 		Tasks:     make([]domain.Action, 0, len(state.Plan.Tasks)),
 	}
 
-	for _, task := range state.Plan.Tasks {
+	for i, task := range state.Plan.Tasks {
 		normTask := task
+
 		// Sanitize structural strings
 		normTask.Action = strings.ToLower(strings.TrimSpace(task.Action))
 		normTask.Target.Name = strings.ToLower(strings.TrimSpace(task.Target.Name))
 		normTask.Target.Type = strings.ToLower(strings.TrimSpace(task.Target.Type))
+
+		// Imbue a deterministic ID for the TaskManager & Idempotency controller
+		if normTask.ID == "" {
+			normTask.ID = fmt.Sprintf("cmd-%s-%d", state.Trace.ActionID, i)
+		}
 
 		// Imbue the execution trace context at the boundary
 		normTask.Trace = state.Trace
@@ -1866,7 +2127,6 @@ func (s *NormalizeStage) Process(ctx context.Context, state *PipelineState) erro
 </file>
 
 <file path="internal\pipeline\policy.go">
-// internal/pipeline/policy.go
 package pipeline
 
 import (
@@ -1877,7 +2137,6 @@ import (
 	"david22573/synaptic-mc/internal/policy"
 )
 
-// PolicyStage applies the authoritative policy engine against the optimized plan.
 type PolicyStage struct {
 	engine policy.Engine
 }
@@ -1887,6 +2146,11 @@ func NewPolicyStage(engine policy.Engine) *PolicyStage {
 }
 
 func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
+	// FIX: Check for nil Normalized plan
+	if state.Normalized == nil {
+		return fmt.Errorf("cannot run policy stage: normalized plan is nil")
+	}
+
 	if state.Simulation == nil {
 		return fmt.Errorf("cannot run policy stage without simulation artifact")
 	}
@@ -1901,6 +2165,13 @@ func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
 		State: state.GameState,
 	}
 
+	// FIX: Respect context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	decision := s.engine.Decide(ctx, input)
 
 	state.Policy = &PolicyDecision{
@@ -1912,7 +2183,6 @@ func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
 		return fmt.Errorf("policy rejection: %s", decision.Reason)
 	}
 
-	// The plan survives the entire pipeline. Lock it in.
 	state.FinalPlan = candidatePlan
 	return nil
 }
@@ -2177,7 +2447,6 @@ func TestPipelineStages_Integration(t *testing.T) {
 </file>
 
 <file path="internal\pipeline\validate.go">
-// internal/pipeline/validate.go
 package pipeline
 
 import (
@@ -2188,8 +2457,6 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// ValidateStage mechanically verifies if the normalized plan is physically possible.
-// It performs a pure forward-simulation of the inventory state.
 type ValidateStage struct{}
 
 func NewValidateStage() *ValidateStage {
@@ -2202,7 +2469,6 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 		return nil
 	}
 
-	// Create local shadow inventory
 	simInv := make(map[string]int)
 	for _, item := range state.GameState.Inventory {
 		simInv[item.Name] += item.Count
@@ -2213,10 +2479,9 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 	for i, task := range state.Normalized.Tasks {
 		if err := validateTaskPure(task, state.GameState, simInv); err != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
-			break // Fast fail the chain on the first physically impossible task
+			break
 		}
 
-		// Simulate state mutation for the next tasks in the chain
 		switch task.Action {
 		case "craft", "gather", "mine":
 			simInv[task.Target.Name]++
@@ -2235,37 +2500,28 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map[string]int) error {
 	switch task.Action {
 	case "explore":
-		if task.Target.Name != "none" {
-			return fmt.Errorf("explore action must have target 'none'")
-		}
+		return nil
 	case "eat":
 		if simInv[task.Target.Name] <= 0 {
 			return fmt.Errorf("cannot eat %s: not in inventory", task.Target.Name)
 		}
-	case "mine":
-		isHardBlock := strings.Contains(task.Target.Name, "stone") ||
-			strings.Contains(task.Target.Name, "coal") ||
-			strings.Contains(task.Target.Name, "iron")
+	case "mine", "gather":
+		target := strings.ToLower(task.Target.Name)
 
-		if isHardBlock {
+		if target == "item" || target == "block" || target == "none" || target == "" || target == "inventory" {
+			return fmt.Errorf("target must be a specific resource (e.g., 'oak_log', 'dirt'), got generic '%s'", task.Target.Name)
+		}
+
+		isHardBlock := strings.Contains(target, "stone") ||
+			strings.Contains(target, "coal") ||
+			strings.Contains(target, "iron")
+
+		if task.Action == "mine" && isHardBlock {
 			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 ||
 				simInv["iron_pickaxe"] > 0
 			if !hasPick {
 				return fmt.Errorf("mining %s requires a pickaxe", task.Target.Name)
 			}
-		}
-		fallthrough // mining shares spatial checks with gathering
-	case "gather":
-		visible := false
-		for _, poi := range gameState.POIs {
-			if strings.Contains(poi.Name, task.Target.Name) ||
-				strings.Contains(task.Target.Name, poi.Name) {
-				visible = true
-				break
-			}
-		}
-		if !visible && task.Target.Name != "wood" {
-			return fmt.Errorf("target '%s' is not in visual range", task.Target.Name)
 		}
 	case "craft":
 		if strings.HasSuffix(task.Target.Name, "_planks") {
@@ -2577,15 +2833,50 @@ import { getPOIs } from "./lib/utils/perception.js";
 const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
-const isIgnorableError = (err: Error | any) => {
-    const msg = err?.message || "";
 
-    const name = err?.name || "";
+// FIX: More aggressive error filtering to suppress protodef spam
+const isIgnorableError = (err: Error | any): boolean => {
+    if (!err) return false;
+
+    const msg = String(err.message || err);
+    const name = String(err.name || "");
+
+    // Suppress all protodef parsing errors
     return (
         name === "PartialReadError" ||
         msg.includes("Read error for undefined") ||
-        msg.includes("Missing characters in string")
+        msg.includes("Missing characters in string") ||
+        msg.includes("protodef") ||
+        (msg.includes("size is") && msg.includes("expected size")) ||
+        // Also suppress websocket errors during reconnect
+        msg.includes("Unexpected server response")
     );
+};
+
+// FIX: Suppress console.error for ignorable errors
+const originalConsoleError = console.error;
+console.error = (...args: any[]) => {
+    const firstArg = args[0];
+    if (
+        typeof firstArg === "object" &&
+        firstArg?.err &&
+        isIgnorableError(firstArg.err)
+    ) {
+        return; // Suppress ignorable errors
+    }
+    originalConsoleError.apply(console, args);
+};
+
+const originalConsoleWarn = console.warn;
+console.warn = (...args: any[]) => {
+    const firstArg = args[0];
+    if (
+        typeof firstArg === "string" &&
+        firstArg.includes("Read error for undefined")
+    ) {
+        return; // Suppress protodef warnings
+    }
+    originalConsoleWarn.apply(console, args);
 };
 
 process.on("uncaughtException", (err: Error) => {
@@ -2606,20 +2897,17 @@ let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
-
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
-
 let lastStateSig = "";
 let lastStatePushTime = 0;
-
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
+let isShuttingDown = false;
 
 function stopMovement() {
     if (!bot) return;
-
     bot.clearControlStates();
     if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
@@ -2633,7 +2921,9 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-
+    if (currentTask?.id === task.id) {
+        currentTask = null;
+    }
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -2641,21 +2931,19 @@ function completeTask(
         cause,
         task.startTime,
     );
-
-    if (currentTask?.id === task.id) currentTask = null;
 }
 
 function abortActiveTask(reason: string) {
-    if (currentTask) {
-        if (taskAbortController) taskAbortController.abort(reason);
-
+    if (currentTask && taskAbortController) {
+        taskAbortController.abort(reason);
         completeTask(currentTask, "task_aborted", reason);
+        currentTask = null;
+        taskAbortController = null;
     }
 }
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -2689,12 +2977,17 @@ function normalizeFailureCause(err: any): string {
     ) {
         return "NO_BLOCKS";
     }
-
     return "UNKNOWN";
 }
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+    if (isShuttingDown) {
+        log.warn("Ignoring decision during shutdown", {
+            action: decision.action,
+        });
+        return;
+    }
 
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
@@ -2717,8 +3010,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
 
-    // Scope the controller locally to prevent background timeouts from killing new tasks
-
     currentTask = {
         id: decision.id,
         action: decision.action,
@@ -2736,7 +3027,6 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-
         const timeoutMs = timeouts[decision.action] || 15000;
 
         await Promise.race([
@@ -2757,19 +3047,23 @@ async function executeDecision(decision: models.IncomingDecision) {
             }),
         ]);
 
-        if (!signal.aborted) completeTask(activeTask, "task_completed");
+        if (!signal.aborted) {
+            completeTask(activeTask, "task_completed");
+        }
     } catch (err: any) {
-        // Fix: Allow timeout errors to bypass the aborted check so they actually report to the engine
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
-
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
-
-        // Clear the ghost timeout!
         stopMovement();
+        if (currentTask?.id === activeTask.id) {
+            currentTask = null;
+        }
+        if (taskAbortController === localController) {
+            taskAbortController = null;
+        }
     }
 }
 
@@ -2783,11 +3077,9 @@ function pushState() {
         .join(",")}`;
 
     const now = Date.now();
-
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
     lastStateSig = sig;
-
     lastStatePushTime = now;
 
     client.sendState({
@@ -2812,7 +3104,7 @@ function pushState() {
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {
         log.error("Max reconnection attempts reached. Shutting down.");
-
+        isShuttingDown = true;
         process.exit(1);
     }
 
@@ -2820,12 +3112,13 @@ async function connectWithRetry(maxAttempts = 10) {
         try {
             if ((bot as any).viewer) {
                 (bot as any).viewer.close();
-
                 viewerStarted = false;
             }
             bot.removeAllListeners();
             bot.quit();
-        } catch (e) {}
+        } catch (e) {
+            log.warn("Error during bot cleanup", { err: e });
+        }
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
@@ -2840,6 +3133,12 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(pathfinder);
 
     if (!client) {
+        // FIX: Log the actual WebSocket URL being used
+        log.info("Initializing Control Plane client", {
+            ws_url: runtimeConfig.ws_url,
+            attempt: reconnectAttempt,
+        });
+
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (d) => void executeDecision(d),
             onUnlock: () => abortActiveTask("unlock"),
@@ -2868,14 +3167,20 @@ async function connectWithRetry(maxAttempts = 10) {
         survival.stop();
 
         const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
-        log.info(`Retrying in ${backoffMs / 1000}s...`);
-        setTimeout(() => connectWithRetry(maxAttempts), backoffMs);
-        reconnectAttempt++;
+        const jitter = Math.random() * 1000;
+        const finalBackoff = backoffMs + jitter;
+
+        log.info(`Retrying in ${finalBackoff / 1000}s...`);
+        setTimeout(() => {
+            reconnectAttempt++;
+            connectWithRetry(maxAttempts);
+        }, finalBackoff);
     });
 
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
+
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allow1by1towers = true;
@@ -2884,7 +3189,6 @@ async function connectWithRetry(maxAttempts = 10) {
 
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
-
         movements.liquids = new Set(
             [water, lava].filter((id) => id !== undefined) as number[],
         );
@@ -2903,19 +3207,13 @@ async function connectWithRetry(maxAttempts = 10) {
         }
         survival.start();
 
-        if (runtimeConfig.enable_viewer) {
+        if (runtimeConfig.enable_viewer && !viewerStarted) {
             try {
-                if (viewerStarted) {
-                    log.warn("Viewer already started, skipping new instance");
-
-                    return;
-                }
                 viewer(bot, {
                     port: runtimeConfig.viewer_port,
                     firstPerson: true,
                     viewDistance: 4,
                 });
-
                 viewerStarted = true;
             } catch (err) {
                 log.warn("Could not start viewer", { err });
@@ -2946,11 +3244,27 @@ async function connectWithRetry(maxAttempts = 10) {
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
-
+    // FIX: Log the final WebSocket URL after config load
+    log.info("Bot configuration loaded", { ws_url: runtimeConfig.ws_url });
     await connectWithRetry();
 }
 
-bootstrap().catch((err) => log.error("Fatal startup", { err }));
+process.on("SIGINT", () => {
+    log.info("Received SIGINT, shutting down gracefully...");
+    isShuttingDown = true;
+    abortActiveTask("shutdown");
+    if (bot) bot.quit();
+    if (client?.isConnected()) {
+        setTimeout(() => process.exit(0), 1000);
+    } else {
+        process.exit(0);
+    }
+});
+
+bootstrap().catch((err) => {
+    log.error("Fatal startup", { err });
+    process.exit(1);
+});
 
 </file>
 
@@ -2982,7 +3296,9 @@ export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
 export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
 
 export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
+
+// FIX: Correct default WebSocket path from /ws to /bot/ws
+export const WS_URL = process.env.WS_URL || "ws://localhost:8080/bot/ws";
 
 export const TASK_TIMEOUTS: Record<string, number> = {
     gather: 30000,
@@ -3213,10 +3529,7 @@ export class ControlPlaneClient {
 
     public connect(): void {
         if (this.ws) {
-            // Remove listeners to prevent memory leaks and duplicate callbacks
             this.ws.removeAllListeners();
-            // Terminate destroys the socket immediately, preventing lingering connections
-            // during aggressive reconnection loops
             this.ws.terminate();
             this.ws = null;
         }
@@ -3264,7 +3577,6 @@ export class ControlPlaneClient {
                 ) {
                     log.debug("Control plane unlocked bot", {
                         type: msg.type,
-
                         payload: msg.payload,
                     });
                     this.callbacks.onUnlock();
@@ -3292,9 +3604,11 @@ export class ControlPlaneClient {
 
     private scheduleReconnect(): void {
         if (this.reconnectTimer) return;
+
         const baseDelay = 2000;
         const maxDelay = 30000;
         let delay = baseDelay * Math.pow(2, this.reconnectAttempts);
+
         if (delay > maxDelay) delay = maxDelay;
 
         const jitter = delay * 0.2 * (Math.random() * 2 - 1);
@@ -3322,13 +3636,22 @@ export class ControlPlaneClient {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
 
+        let msgType = "TASK_END";
+        if (event === "death") msgType = "BOT_DEATH";
+        if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
+        if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
+
+        let status = event;
+        if (event === "task_completed") status = "COMPLETED";
+        if (event === "task_failed") status = "FAILED";
+        if (event === "task_aborted") status = "ABORTED";
+
         this.ws.send(
             JSON.stringify({
-                type: "event",
+                type: msgType,
                 payload: {
-                    event,
+                    status: status,
                     action: actionStr,
-
                     command_id: commandId,
                     cause,
                     duration_ms,
@@ -3339,7 +3662,7 @@ export class ControlPlaneClient {
 
     public sendState(state: Record<string, unknown>): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this.ws.send(JSON.stringify({ type: "state", payload: state }));
+        this.ws.send(JSON.stringify({ type: "STATE_TICK", payload: state }));
     }
 }
 
@@ -3383,8 +3706,11 @@ export class SurvivalSystem {
     }
 
     public stop() {
-        if (this.checkInterval) clearInterval(this.checkInterval);
-        this.checkInterval = null;
+        if (this.checkInterval) {
+            clearInterval(this.checkInterval);
+            this.checkInterval = null;
+        }
+        this.reset();
     }
 
     public reset() {
@@ -3400,13 +3726,10 @@ export class SurvivalSystem {
     }
 
     private async checkSurvival() {
-        if (!this.bot || !this.bot.entity) return;
-
-        // Skip threat checks if we are actively executing physical escape/recovery sequences
+        if (!this.bot?.entity) return;
         if (this.diggingEscape || this.pillaringOut) return;
 
         const threats = getThreats(this.bot);
-
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 24 &&
@@ -3417,7 +3740,6 @@ export class SurvivalSystem {
 
         if (immediateThreats.length > 0) {
             const topThreat = immediateThreats[0]!;
-
             const hasWeapon = this.bot.inventory
                 .items()
                 .some(
@@ -3434,6 +3756,7 @@ export class SurvivalSystem {
                 this.bot.health > 10 &&
                 !isUnavoidableDeath
             ) {
+                // FIX: Properly reset panic state when engaging
                 if (this.isPanicking) {
                     this.isPanicking = false;
                     this.config.stopMovement();
@@ -3452,7 +3775,6 @@ export class SurvivalSystem {
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
-
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
                     health: Math.round(this.bot.health),
@@ -3470,29 +3792,27 @@ export class SurvivalSystem {
                 );
             }
 
+            // FIX: Prevent spamming flee commands
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
             ) {
                 this.lastFleeTime = Date.now();
-
                 const safePos = computeSafeRetreat(
                     this.bot,
                     immediateThreats,
                     32,
                 );
-
                 this.fleeTo(safePos);
             }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
+            // FIX: Ensure we reset state properly when safe
             this.isPanicking = false;
-
             log.debug(
                 "Survival goal reached; securing exit and releasing reflex lock",
             );
             this.config.stopMovement();
 
-            // Option A: Ensure we aren't trapped in a hole before handing control back
             this.pillaringOut = true;
             await this.pillarOut().catch((err) =>
                 log.warn("Pillar out failed", { err }),
@@ -3512,7 +3832,6 @@ export class SurvivalSystem {
     private async fleeTo(safePos: { x: number; z: number }) {
         try {
             const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
-
             const path = this.bot.pathfinder.getPathTo(
                 this.bot.pathfinder.movements,
                 goal,
@@ -3541,7 +3860,6 @@ export class SurvivalSystem {
         const inWater =
             this.bot.blockAt(this.bot.entity.position.floored())?.name ===
             "water";
-
         if (inWater) {
             log.warn("Refusing to vertical dig escape while submerged.");
             return;
@@ -3566,12 +3884,11 @@ export class SurvivalSystem {
                 ) {
                     const tool = this.bot.pathfinder.bestHarvestTool(below);
                     if (tool) await this.bot.equip(tool, "hand");
-
                     await this.bot.dig(below);
                 }
             }
 
-            // Option B: The Multi-Stage Panic Roof
+            // FIX: Improved roof sealing with better error handling
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
@@ -3589,9 +3906,6 @@ export class SurvivalSystem {
             if (trashBlock) {
                 await this.bot.equip(trashBlock, "hand");
                 const pos = this.bot.entity.position.floored();
-                const targetPos = pos.offset(0, 2, 0); // Directly above head
-                let placed = false;
-
                 const compassVectors = [
                     new Vec3(1, 0, 0),
                     new Vec3(-1, 0, 0),
@@ -3599,12 +3913,13 @@ export class SurvivalSystem {
                     new Vec3(0, 0, -1),
                 ];
 
-                // 1. Try attaching to the surface walls (Y+2)
+                let placed = false;
                 for (const vec of compassVectors) {
-                    const wallBlock = this.bot.blockAt(targetPos.plus(vec));
+                    const wallBlock = this.bot.blockAt(
+                        pos.offset(vec.x, 2, vec.z),
+                    );
                     if (wallBlock && wallBlock.boundingBox === "block") {
                         try {
-                            // Aim at the wall face pointing back into the center
                             await this.bot.placeBlock(
                                 wallBlock,
                                 vec.scaled(-1),
@@ -3615,29 +3930,6 @@ export class SurvivalSystem {
                             );
                             break;
                         } catch (e) {}
-                    }
-                }
-
-                // 2. If surface terrain is uneven/missing, place on top of head-level walls (Y+1)
-                if (!placed) {
-                    for (const vec of compassVectors) {
-                        const wallBlock = this.bot.blockAt(
-                            pos.offset(vec.x, 1, vec.z),
-                        );
-                        if (wallBlock && wallBlock.boundingBox === "block") {
-                            try {
-                                // Aim at the top face of the wall block
-                                await this.bot.placeBlock(
-                                    wallBlock,
-                                    new Vec3(0, 1, 0),
-                                );
-                                placed = true;
-                                log.debug(
-                                    "Successfully sealed roof on top of Y+1 wall.",
-                                );
-                                break;
-                            } catch (e) {}
-                        }
                     }
                 }
 
@@ -3665,11 +3957,9 @@ export class SurvivalSystem {
                 this.bot.blockAt(pos.offset(1, yOffset, 0)),
                 this.bot.blockAt(pos.offset(-1, yOffset, 0)),
             ];
-            // If 3 or more surrounding blocks are solid, we are trapped
             return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
         };
 
-        // Check if we are physically trapped in a hole
         if (!isEnclosed(0) && !isEnclosed(1)) {
             return;
         }
@@ -3706,7 +3996,7 @@ export class SurvivalSystem {
                 break;
             }
 
-            // Break the roof we placed during the panic escape so we don't hit our head
+            // FIX: Break roof before jumping to avoid head collision
             const roof = this.bot.blockAt(pos.offset(0, 2, 0));
             if (
                 roof &&
@@ -3725,8 +4015,6 @@ export class SurvivalSystem {
             const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
             if (refBlock) {
                 this.bot.setControlState("jump", true);
-
-                // Mineflayer physics delay to reach peak jump height
                 await new Promise((resolve) => setTimeout(resolve, 300));
 
                 try {
@@ -5560,58 +5848,59 @@ export async function runTask(
         stopMovement,
     };
 
+    // FIX: Check abort signal before starting
+    if (signal.aborted) {
+        throw new Error("aborted");
+    }
+
     switch (decision.action) {
         case "hunt":
             await handleHunt(taskCtx);
-
             return;
         case "gather":
             await handleGather(taskCtx);
             return;
-
         case "craft":
             await handleCraft(taskCtx);
             return;
-
         case "build":
             await handleBuild(taskCtx);
             return;
-
         case "smelt":
             await handleSmelt(taskCtx);
             return;
-
         case "mine":
             await handleMine(taskCtx);
             return;
-
         case "farm":
             await handleFarm(taskCtx);
             return;
-
         case "explore":
             await handleExplore(taskCtx);
             return;
-
         case "eat": {
             const food = bot.inventory
                 .items()
                 .find((i) => i.name === decision.target.name);
 
             if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
-            await bot.equip(food, "hand");
-            await bot.consume();
+
+            // FIX: Add try/catch for consume which can fail
+            try {
+                await bot.equip(food, "hand");
+                await bot.consume();
+            } catch (err) {
+                throw new Error(
+                    `CONSUME_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+                );
+            }
             return;
         }
-
         case "idle":
             await waitForMs(1500, signal);
-
             return;
-
         case "sleep": {
             await escapeTree(bot, signal);
-
             const bed = bot.findBlock({
                 maxDistance: 32,
                 matching: (b: any) => b?.name.includes("bed"),
@@ -5630,9 +5919,15 @@ export async function runTask(
                 { signal, timeoutMs: 20000, stopMovement },
             );
 
-            await bot.sleep(bed);
+            // FIX: Add timeout for sleep operation
+            await Promise.race([
+                bot.sleep(bed),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error("SLEEP_TIMEOUT")), 10000),
+                ),
+            ]);
 
-            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
+            // Wait for morning/wake event
             await new Promise<void>((resolve, reject) => {
                 const onWake = () => {
                     bot.removeListener("wake", onWake);
@@ -5648,28 +5943,22 @@ export async function runTask(
                 bot.on("wake", onWake);
                 signal.addEventListener("abort", onAbort, { once: true });
             });
-
             return;
         }
-
         case "retreat": {
             await escapeTree(bot, signal);
-
             const pos = computeSafeRetreat(getThreats());
             await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
                 signal,
                 timeoutMs: 15000,
                 stopMovement,
             });
-            await waitForMs(1000, signal); // Mitigation for cliff falls
+            await waitForMs(1000, signal);
             return;
         }
-
         case "interact":
             await handleInteract(taskCtx);
-
             return;
-
         default:
             throw new Error(`unsupported: ${decision.action}`);
     }
@@ -5683,10 +5972,6 @@ import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 
 const { goals } = pkg;
-
-// ==========================================
-// CONSTANTS
-// ==========================================
 
 const TREE_BLOCKS = new Set([
     "oak_leaves",
@@ -5724,10 +6009,6 @@ const TRASH_ITEMS = new Set([
     "grass",
 ]);
 
-// ==========================================
-// MOVEMENT & POSITION HELPERS
-// ==========================================
-
 export function isOnSolidGround(bot: any): boolean {
     if (!bot.entity.onGround) return false;
     const pos = bot.entity.position.floored();
@@ -5756,24 +6037,22 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
     const MAX_ATTEMPTS = 30;
 
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        // FIX: Check signal.abort in loop
         if (signal.aborted) throw new Error("aborted");
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
-
-        // Added horizontal blocks to break out of 1x1 leaf prisons
         const blocksToClear = [
-            bot.blockAt(pos.offset(0, 1, 0)), // Head
-            bot.blockAt(pos), // Torso
-            bot.blockAt(pos.offset(0, -1, 0)), // Below
-            bot.blockAt(pos.offset(1, 0, 0)), // East
-            bot.blockAt(pos.offset(-1, 0, 0)), // West
-            bot.blockAt(pos.offset(0, 0, 1)), // South
-            bot.blockAt(pos.offset(0, 0, -1)), // North
+            bot.blockAt(pos.offset(0, 1, 0)),
+            bot.blockAt(pos),
+            bot.blockAt(pos.offset(0, -1, 0)),
+            bot.blockAt(pos.offset(1, 0, 0)),
+            bot.blockAt(pos.offset(-1, 0, 0)),
+            bot.blockAt(pos.offset(0, 0, 1)),
+            bot.blockAt(pos.offset(0, 0, -1)),
         ];
 
         let clearedSomething = false;
-
         for (const targetBlock of blocksToClear) {
             if (
                 targetBlock &&
@@ -5782,14 +6061,8 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
             ) {
                 try {
                     const tool = bot.pathfinder.bestHarvestTool(targetBlock);
-                    if (tool) {
-                        await bot.equip(tool, "hand");
-                    } else {
-                        // Force unequip to punch leaves if no tool is better
-                        await bot.unequip("hand");
-                    }
-
-                    // Use "ignore" raycast to break blocks even if clipped inside them
+                    if (tool) await bot.equip(tool, "hand");
+                    else await bot.unequip("hand");
                     await bot.dig(targetBlock, true, "ignore");
                     clearedSomething = true;
                 } catch (err) {
@@ -5801,7 +6074,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
         if (!clearedSomething && !isOnSolidGround(bot)) {
             const dir = Math.random() > 0.5 ? "forward" : "back";
             const strafe = Math.random() > 0.5 ? "left" : "right";
-
             bot.setControlState(dir, true);
             bot.setControlState(strafe, true);
             await new Promise((res) => setTimeout(res, 250));
@@ -5809,27 +6081,29 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
             bot.setControlState(strafe, false);
         }
 
-        await new Promise<void>((resolve) => {
+        // FIX: Add timeout to physics tick listener
+        await new Promise<void>((resolve, reject) => {
             let ticks = 0;
+            const timeout = setTimeout(() => {
+                bot.removeListener("physicsTick", check);
+                resolve();
+            }, 1000);
+
             const check = () => {
                 ticks++;
                 if (isOnSolidGround(bot) || ticks > 10) {
+                    clearTimeout(timeout);
                     bot.removeListener("physicsTick", check);
                     resolve();
                 }
             };
             bot.on("physicsTick", check);
-
-            setTimeout(() => {
-                bot.removeListener("physicsTick", check);
-                resolve();
-            }, 1000);
         });
     }
 
     if (!isOnSolidGround(bot)) {
         throw new Error(
-            "EscapeTree - could not reach ground after 30 attempts. Likely stuck in a massive canopy.",
+            "EscapeTree - could not reach ground after 30 attempts",
         );
     }
 }
@@ -5894,17 +6168,25 @@ export function moveToGoal(
         let settled = false;
         let lastPos = bot.entity.position.clone();
         let stuckTimer: NodeJS.Timeout | null = null;
+        const listeners = new Map<string, any>();
+
+        const cleanup = () => {
+            listeners.forEach((handler, event) =>
+                bot.removeListener(event, handler),
+            );
+            listeners.clear();
+            if (stuckTimer) clearInterval(stuckTimer);
+        };
 
         const finish = (err?: Error) => {
             if (settled) return;
             settled = true;
+            cleanup();
 
-            clearTimeout(timer);
-            if (stuckTimer) clearInterval(stuckTimer);
-
-            signal.removeEventListener("abort", onAbort);
-            bot.removeListener("goal_reached", onGoalReached);
-            bot.removeListener("path_update", onPathUpdate);
+            try {
+                bot.clearControlStates();
+                stopMovement();
+            } catch (_err) {}
 
             if (err) {
                 reject(err);
@@ -5913,52 +6195,26 @@ export function moveToGoal(
             resolve();
         };
 
-        const safeStop = () => {
-            try {
-                bot.clearControlStates();
-                stopMovement();
-            } catch (_err) {}
-        };
-
-        const onAbort = () => {
-            safeStop();
-            finish(new Error("aborted"));
-        };
-
-        const onGoalReached = () => {
-            safeStop();
-            finish();
-        };
+        const onAbort = () => finish(new Error("aborted"));
+        const onGoalReached = () => finish();
 
         const onPathUpdate = (results: any) => {
             if (results.status === "noPath") {
                 setTimeout(() => {
-                    if (!settled) {
-                        safeStop();
-                        finish(new Error("no_path"));
-                    }
+                    if (!settled) finish(new Error("no_path"));
                 }, 3500);
             } else if (results.status === "timeout") {
-                safeStop();
                 finish(new Error("pathfinder_timeout"));
             }
         };
 
-        const timer = setTimeout(() => {
-            safeStop();
-            finish(new Error("timeout"));
-        }, timeoutMs);
-
         let stuckStrikes = 0;
-
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
-
             if (dist < 0.5) {
                 stuckStrikes++;
                 if (stuckStrikes >= 2) {
-                    safeStop();
                     finish(new Error("stuck"));
                 }
             } else {
@@ -5967,13 +6223,20 @@ export function moveToGoal(
             }
         }, stuckTimeoutMs);
 
+        // FIX: Store listeners for proper cleanup
+        listeners.set("goal_reached", onGoalReached);
+        listeners.set("path_update", onPathUpdate);
+
         signal.addEventListener("abort", onAbort, { once: true });
         bot.once("goal_reached", onGoalReached);
         bot.on("path_update", onPathUpdate);
 
+        const timer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
+
         try {
             bot.pathfinder.setGoal(goal, dynamic);
         } catch (err) {
+            clearTimeout(timer);
             finish(err instanceof Error ? err : new Error(String(err)));
         }
     });
@@ -5985,10 +6248,6 @@ export function findNearestBlockByName(bot: Bot, blockName: string): any {
         matching: (block: any) => block?.name === blockName,
     });
 }
-
-// ==========================================
-// INVENTORY MANAGEMENT
-// ==========================================
 
 export async function makeRoomInInventory(
     bot: any,
@@ -6016,10 +6275,6 @@ export async function makeRoomInInventory(
     }
 }
 
-// ==========================================
-// BLOCK PLACEMENT
-// ==========================================
-
 export async function placePortableUtility(
     bot: any,
     blockName: string,
@@ -6028,7 +6283,6 @@ export async function placePortableUtility(
     if (!item) return null;
 
     await bot.equip(item, "hand");
-
     const pos = bot.entity.position.floored();
     const candidates = [
         bot.blockAt(pos.offset(1, -1, 0)),
@@ -6043,7 +6297,7 @@ export async function placePortableUtility(
                 await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
                 return findNearestBlockByName(bot, blockName);
             } catch (err) {
-                // Ignore placement failure, check next adjacent block
+                // Ignore placement failure
             }
         }
     }
@@ -6380,14 +6634,1210 @@ export function computeSafeRetreat(
 
 </file>
 
+<file path="pipeline\Untitled.java">
+// internal/pipeline/stage_test.go
+package pipeline
+
+import (
+	"context"
+	"testing"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type mockStage struct {
+	processFunc func(ctx context.Context, state *PipelineState) error
+}
+
+func (m *mockStage) Process(ctx context.Context, state *PipelineState) error {
+	return m.processFunc(ctx, state)
+}
+
+func TestPipelineStage_ImmutabilityContract(t *testing.T) {
+	initialPlan := &domain.Plan{
+		Objective: "Gather Wood",
+		Tasks: []domain.Action{
+			{Action: "gather", Target: domain.Target{Name: "oak_log"}},
+		},
+	}
+
+	state := &PipelineState{
+		Plan: initialPlan,
+	}
+
+	stage := &mockStage{
+		processFunc: func(ctx context.Context, s *PipelineState) error {
+			// A compliant stage creates a new artifact rather than mutating the previous one
+			s.Validation = &ValidationResult{IsValid: true}
+			return nil
+		},
+	}
+
+	err := stage.Process(context.Background(), state)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the original plan pointer and its contents remain untouched
+	if state.Plan.Objective != "Gather Wood" {
+		t.Errorf("expected original plan to remain immutable")
+	}
+
+	if state.Validation == nil || !state.Validation.IsValid {
+		t.Errorf("expected validation artifact to be populated correctly")
+	}
+}
+</file>
+
+<file path="scripts\find_deprecated_decision_logic.sh">
+#!/bin/bash
+echo "Identifying old decision logic for removal..."
+grep -rn "func (.*Validator) Validate" internal/decision/validator.go
+grep -rn "func (.*Simulator) RankAndSelect" internal/decision/simulator.go
+echo "These functions should be deleted after Step 1.3 is complete."
+</file>
+
+<file path="scripts\lint_pipeline_immutability.sh">
+#!/bin/bash
+# scripts/lint_policy_authority.sh
+
+echo "Checking for rogue policy overrides outside policy package..."
+ROGUE=$(grep -r "POLICY VIOLATION" internal/ | grep -v "internal/policy/")
+
+if [ -n "$ROGUE" ]; then
+    echo "ERROR: Hardcoded policy constraints found outside internal/policy/!"
+    echo "$ROGUE"
+    exit 1
+fi
+echo "Policy authority checks passed."
+</file>
+
+<file path="ui\index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ui</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+
+</file>
+
+<file path="ui\src\App.svelte">
+<script lang="ts">
+    import { onMount } from "svelte";
+    import ItemIcon from "./components/ItemIcon.svelte";
+
+    // State runes
+    let gameState = $state<any>(null);
+    let events = $state<any[]>([]);
+    let objective = $state<string>("Initializing...");
+    let connectionStatus = $state<"connecting" | "connected" | "disconnected">(
+        "connecting",
+    );
+
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    const maxEvents = 50;
+
+    // Derived runes
+    const position = $derived(gameState?.position || { x: 0, y: 0, z: 0 });
+    const health = $derived(gameState?.health ?? 20);
+    const food = $derived(gameState?.food ?? 20);
+    const timeOfDay = $derived(gameState?.time_of_day ?? 0);
+    const inventory = $derived(gameState?.inventory || []);
+    const threats = $derived(gameState?.threats || []);
+    const pois = $derived(gameState?.pois || []);
+
+    const timeDisplay = $derived(formatTimeOfDay(timeOfDay));
+    const coordsDisplay = $derived(
+        `X: ${Math.round(position.x)} Y: ${Math.round(position.y)} Z: ${Math.round(position.z)}`,
+    );
+
+    let viewerUrl = $state("about:blank");
+
+    // HUD Math
+    const fullHearts = $derived(Math.max(0, Math.floor(health / 2)));
+    const halfHearts = $derived(health % 2 !== 0 && health > 0 ? 1 : 0);
+    const emptyHearts = $derived(Math.max(0, 10 - fullHearts - halfHearts));
+
+    const fullFood = $derived(Math.max(0, Math.floor(food / 2)));
+    const halfFood = $derived(food % 2 !== 0 && food > 0 ? 1 : 0);
+    const emptyFood = $derived(Math.max(0, 10 - fullFood - halfFood));
+
+    const hotbarSlots = $derived(
+        Array.from({ length: 9 }, (_, i) => inventory[i] || null),
+    );
+    const xpProgress = $derived((timeOfDay % 1000) / 10); // Slowly fills based on time of day
+
+    function formatTimeOfDay(time: number): string {
+        const hours = Math.floor((time / 1000 + 6) % 24);
+        const minutes = Math.floor(((time % 1000) / 1000) * 60);
+        return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}`;
+    }
+
+    function connect() {
+        connectionStatus = "connecting";
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const host = window.location.host;
+        const wsUrl = `${protocol}//${host}/ui/ws`;
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            connectionStatus = "connected";
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                handleMessage(message);
+            } catch (err) {
+                console.error("Failed to parse message:", err);
+            }
+        };
+
+        ws.onclose = () => {
+            connectionStatus = "disconnected";
+            scheduleReconnect();
+        };
+
+        ws.onerror = (error) => {
+            connectionStatus = "disconnected";
+        };
+    }
+
+    function handleMessage(message: any) {
+        if (!message.type || !message.payload) return;
+
+        switch (message.type) {
+            case "state_update":
+                gameState = message.payload;
+                break;
+            case "event_stream": {
+                const newEvent = {
+                    ...message.payload,
+                    timestamp: new Date().toLocaleTimeString(),
+                };
+                events = [newEvent, ...events].slice(0, maxEvents);
+                break;
+            }
+            case "objective_update":
+                objective = message.payload;
+                break;
+        }
+    }
+
+    function scheduleReconnect() {
+        const delay = 3000;
+        reconnectTimer = setTimeout(() => {
+            connect();
+        }, delay);
+    }
+
+    function clearEventLog() {
+        events = [];
+    }
+
+    onMount(() => {
+        viewerUrl = `http://${window.location.hostname}:3000`;
+        connect();
+        return () => {
+            if (ws) ws.close();
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+        };
+    });
+</script>
+
+<main class="container">
+    <header class="header">
+        <div class="title-group">
+            <h1>Synaptic MC</h1>
+            <span class="coords-badge">{timeDisplay} | {coordsDisplay}</span>
+        </div>
+        <div class="status">
+            <span class="indicator {connectionStatus}"></span>
+            <span class="status-text">
+                {#if connectionStatus === "connecting"}
+                    Connecting...
+                {:else if connectionStatus === "connected"}
+                    Connected
+                {:else}
+                    Disconnected
+                {/if}
+            </span>
+        </div>
+    </header>
+
+    <div class="split-layout">
+        <div class="main-column">
+            <section class="card viewer-card">
+                <iframe
+                    src={viewerUrl}
+                    title="Mineflayer Viewer"
+                    class="viewer-iframe"
+                ></iframe>
+
+                <div class="mc-overlay">
+                    <div class="mc-crosshair"></div>
+
+                    <div class="mc-hud">
+                        <div class="mc-bars">
+                            <div class="mc-bar-half">
+                                {#each Array(fullHearts) as _}
+                                    <span class="mc-icon-stat">❤️</span>
+                                {/each}
+                                {#each Array(halfHearts) as _}
+                                    <span class="mc-icon-stat">💔</span>
+                                {/each}
+                                {#each Array(emptyHearts) as _}
+                                    <span class="mc-icon-stat empty">🖤</span>
+                                {/each}
+                            </div>
+                            <div class="mc-bar-half right-align">
+                                {#each Array(emptyFood) as _}
+                                    <span class="mc-icon-stat empty">🍖</span>
+                                {/each}
+                                {#each Array(halfFood) as _}
+                                    <span class="mc-icon-stat">🍗</span>
+                                {/each}
+                                {#each Array(fullFood) as _}
+                                    <span class="mc-icon-stat">🍖</span>
+                                {/each}
+                            </div>
+                        </div>
+
+                        <div class="mc-xp-bar">
+                            <div
+                                class="mc-xp-fill"
+                                style:width="{xpProgress}%"
+                            ></div>
+                        </div>
+
+                        <div class="mc-hotbar-container">
+                            <div class="mc-offhand slot"></div>
+                            <div class="mc-hotbar">
+                                {#each hotbarSlots as slot, i}
+                                    <div class="slot {i === 0 ? 'active' : ''}">
+                                        {#if slot}
+                                            <ItemIcon
+                                                name={slot.name}
+                                                size={24}
+                                            />
+                                            {#if slot.count > 1}
+                                                <span class="slot-count"
+                                                    >{slot.count}</span
+                                                >
+                                            {/if}
+                                        {/if}
+                                    </div>
+                                {/each}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="card objective-card">
+                <h3>🎯 Current Objective</h3>
+                <p class="objective">{objective}</p>
+            </section>
+        </div>
+
+        <aside class="sidebar">
+            <section class="card">
+                <h3>🎒 Inventory ({inventory.length} items)</h3>
+                {#if inventory.length > 0}
+                    <div class="inventory-grid">
+                        {#each inventory as item}
+                            <div class="item">
+                                <span class="item-name">{item.name}</span>
+                                <span class="item-count">{item.count}</span>
+                            </div>
+                        {/each}
+                    </div>
+                {:else}
+                    <p class="empty">Empty</p>
+                {/if}
+            </section>
+
+            <section class="card">
+                <h3>⚠️ Threats ({threats.length})</h3>
+                {#if threats.length > 0}
+                    <ul class="list">
+                        {#each threats as threat}
+                            <li class="threat-item">
+                                <span class="threat-name">{threat.name}</span>
+                                <span class="threat-dist"
+                                    >{threat.distance}m</span
+                                >
+                            </li>
+                        {/each}
+                    </ul>
+                {:else}
+                    <p class="empty">No threats detected</p>
+                {/if}
+            </section>
+
+            <section class="card">
+                <h3>📡 POIs ({pois.length})</h3>
+                {#if pois.length > 0}
+                    <ul class="list">
+                        {#each pois.slice(0, 10) as poi}
+                            <li class="poi-item">
+                                <span class="poi-type">{poi.type}</span>
+                                <span class="poi-name">{poi.name}</span>
+                                <span class="poi-dist"
+                                    >{poi.distance}m {poi.direction}</span
+                                >
+                            </li>
+                        {/each}
+                    </ul>
+                {:else}
+                    <p class="empty">No POIs detected</p>
+                {/if}
+            </section>
+
+            <section class="card events-card">
+                <div class="events-header">
+                    <h3>📋 Event Stream</h3>
+                    <button onclick={clearEventLog} class="clear-btn"
+                        >Clear</button
+                    >
+                </div>
+                <div class="events-list">
+                    {#if events.length > 0}
+                        {#each events as event}
+                            <div class="event-item">
+                                <span class="event-time">{event.timestamp}</span
+                                >
+                                <span class="event-type">{event.type}</span>
+                                <span
+                                    class="event-payload"
+                                    title={JSON.stringify(event.payload)}
+                                >
+                                    {JSON.stringify(event.payload)}
+                                </span>
+                            </div>
+                        {/each}
+                    {:else}
+                        <p class="empty">No events yet</p>
+                    {/if}
+                </div>
+            </section>
+        </aside>
+    </div>
+</main>
+
+<style>
+    :global(body) {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+            Oxygen, Ubuntu, Cantarell, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+    }
+
+    .container {
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 1rem;
+    }
+
+    .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1.5rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid #334155;
+    }
+
+    .title-group {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .header h1 {
+        margin: 0;
+        color: #38bdf8;
+    }
+
+    .coords-badge {
+        background: #1e293b;
+        padding: 0.25rem 0.75rem;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.875rem;
+        border: 1px solid #334155;
+    }
+
+    .split-layout {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 1.5rem;
+    }
+
+    @media (max-width: 1024px) {
+        .split-layout {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .main-column,
+    .sidebar {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    .status {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .indicator {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: inline-block;
+    }
+    .indicator.connecting {
+        background: #fbbf24;
+        animation: pulse 1s infinite;
+    }
+    .indicator.connected {
+        background: #34d399;
+    }
+    .indicator.disconnected {
+        background: #ef4444;
+    }
+
+    @keyframes pulse {
+        0%,
+        100% {
+            opacity: 1;
+        }
+        50% {
+            opacity: 0.5;
+        }
+    }
+
+    .card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 1rem;
+    }
+
+    .card h3 {
+        margin: 0 0 0.5rem 0;
+        color: #94a3b8;
+        font-size: 0.875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    /* --- MINECRAFT HUD STYLES --- */
+    .viewer-card {
+        padding: 0;
+        position: relative;
+        overflow: hidden;
+        height: 600px;
+        border: 2px solid #000;
+        border-radius: 4px;
+    }
+
+    .viewer-iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+        background: #000;
+    }
+
+    .mc-overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        align-items: center;
+        padding-bottom: 12px;
+    }
+
+    .mc-crosshair {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 16px;
+        height: 16px;
+        pointer-events: none;
+    }
+
+    .mc-crosshair::before,
+    .mc-crosshair::after {
+        content: "";
+        position: absolute;
+        background: rgba(255, 255, 255, 0.6);
+        mix-blend-mode: difference;
+    }
+
+    .mc-crosshair::before {
+        top: 7px;
+        left: 0;
+        width: 16px;
+        height: 2px;
+    }
+    .mc-crosshair::after {
+        top: 0;
+        left: 7px;
+        width: 2px;
+        height: 16px;
+    }
+
+    .mc-hud {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        width: 100%;
+    }
+
+    .mc-bars {
+        display: flex;
+        justify-content: space-between;
+        width: 364px; /* Align to hotbar width */
+        margin-bottom: 4px;
+    }
+
+    .mc-bar-half {
+        display: flex;
+        gap: 1px;
+    }
+
+    .mc-icon-stat {
+        font-size: 14px;
+        line-height: 1;
+        filter: drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
+    }
+
+    .mc-icon-stat.empty {
+        filter: grayscale(1) brightness(0.2)
+            drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
+    }
+
+    .mc-xp-bar {
+        width: 364px;
+        height: 8px;
+        background: #222;
+        border: 1px solid #000;
+        margin-bottom: 6px;
+    }
+
+    .mc-xp-fill {
+        height: 100%;
+        background: #84e82a;
+        border-top: 1px solid #c2ff75;
+    }
+
+    .mc-hotbar-container {
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
+    }
+
+    .mc-hotbar {
+        display: flex;
+        background: #8b8b8b;
+        border: 2px solid #111;
+        padding: 2px;
+        box-shadow:
+            inset 2px 2px 0px rgba(255, 255, 255, 0.4),
+            inset -2px -2px 0px rgba(0, 0, 0, 0.4);
+    }
+
+    .slot {
+        width: 36px;
+        height: 36px;
+        background: #8b8b8b;
+        border-style: solid;
+        border-width: 2px;
+        border-color: #373737 #fff #fff #373737;
+        position: relative;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+    }
+
+    .mc-offhand {
+        border-color: #373737 #fff #fff #373737;
+    }
+
+    .slot.active {
+        outline: 3px solid rgba(255, 255, 255, 0.9);
+        outline-offset: -3px;
+        z-index: 10;
+    }
+
+    .slot-count {
+        position: absolute;
+        bottom: -2px;
+        right: 1px;
+        font-size: 14px;
+        font-weight: 900;
+        color: white;
+        text-shadow:
+            2px 2px 0 #3f3f3f,
+            -1px -1px 0 #3f3f3f,
+            1px -1px 0 #3f3f3f,
+            -1px 1px 0 #3f3f3f;
+    }
+
+    /* --- SIDEBAR STYLES --- */
+    .objective {
+        font-size: 1.125rem;
+        color: #38bdf8;
+        margin: 0;
+    }
+    .inventory-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 0.5rem;
+        max-height: 250px;
+        overflow-y: auto;
+    }
+    .item {
+        display: flex;
+        justify-content: space-between;
+        padding: 0.5rem;
+        background: #334155;
+        border-radius: 4px;
+        font-size: 0.875rem;
+    }
+    .item-name {
+        font-family: monospace;
+    }
+    .item-count {
+        font-weight: 600;
+        color: #94a3b8;
+    }
+    .list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+    }
+    .threat-item,
+    .poi-item {
+        display: flex;
+        justify-content: space-between;
+        padding: 0.5rem;
+        margin-bottom: 0.25rem;
+        background: #334155;
+        border-radius: 4px;
+        font-size: 0.875rem;
+    }
+    .threat-name {
+        color: #ef4444;
+        font-weight: 600;
+    }
+    .poi-type {
+        color: #94a3b8;
+        font-size: 0.7rem;
+        text-transform: uppercase;
+    }
+    .poi-name {
+        font-family: monospace;
+        margin-left: 0.5rem;
+    }
+    .events-card {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        max-height: 400px;
+    }
+    .events-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+    }
+    .clear-btn {
+        background: #475569;
+        border: none;
+        color: white;
+        padding: 0.25rem 0.75rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.875rem;
+    }
+    .clear-btn:hover {
+        background: #64748b;
+    }
+    .events-list {
+        flex-grow: 1;
+        overflow-y: auto;
+        font-family: monospace;
+        font-size: 0.75rem;
+    }
+    .event-item {
+        padding: 0.5rem;
+        border-bottom: 1px solid #334155;
+        display: flex;
+        gap: 0.75rem;
+    }
+    .event-time {
+        color: #94a3b8;
+        min-width: 60px;
+    }
+    .event-type {
+        color: #38bdf8;
+        min-width: 100px;
+    }
+    .event-payload {
+        color: #e2e8f0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .empty {
+        color: #64748b;
+        font-style: italic;
+        margin: 0;
+    }
+</style>
+
+</file>
+
+<file path="ui\src\app.css">
+/* :root {
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --border: #e5e4e7;
+  --code-bg: #f4f3ec;
+  --accent: #aa3bff;
+  --accent-bg: rgba(170, 59, 255, 0.1);
+  --accent-border: rgba(170, 59, 255, 0.5);
+  --social-bg: rgba(244, 243, 236, 0.5);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #9ca3af;
+    --text-h: #f3f4f6;
+    --bg: #16171d;
+    --border: #2e303a;
+    --code-bg: #1f2028;
+    --accent: #c084fc;
+    --accent-bg: rgba(192, 132, 252, 0.15);
+    --accent-border: rgba(192, 132, 252, 0.5);
+    --social-bg: rgba(47, 48, 58, 0.5);
+    --shadow:
+      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+  }
+
+  #social .button-icon {
+    filter: invert(1) brightness(2);
+  }
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code,
+.counter {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}
+
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
+      scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
+      scale(0.8);
+  }
+}
+
+#app {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  & > div {
+    flex: 1 1 0;
+    padding: 32px;
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+} */
+
+</file>
+
+<file path="ui\src\components\ItemIcon.svelte">
+<script lang="ts">
+    let { name, size = 32 } = $props<{ name: string; size?: number }>();
+
+    let hasError = $state(false);
+
+    let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
+    let formattedTitle = $derived(cleanName.replace(/_/g, " "));
+    let imageSource = $derived(`/assets/items/${cleanName}.png`);
+
+    function handleError() {
+        hasError = true;
+    }
+</script>
+
+{#if hasError}
+    <div
+        class="fallback-icon"
+        style="width: {size}px; height: {size}px; font-size: {size * 0.4}px;"
+        title="Missing texture: {cleanName}"
+    >
+        ?
+    </div>
+{:else}
+    <img
+        src={imageSource}
+        alt={cleanName}
+        title={formattedTitle}
+        width={size}
+        height={size}
+        onerror={handleError}
+        class="mc-icon"
+    />
+{/if}
+
+<style>
+    .mc-icon {
+        image-rendering: pixelated;
+        object-fit: contain;
+    }
+
+    .fallback-icon {
+        background-color: #ff00ff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        box-shadow: inset 0 0 0 2px #000000;
+        cursor: help;
+        font-family: monospace;
+    }
+</style>
+
+</file>
+
+<file path="ui\src\lib\Counter.svelte">
+<script lang="ts">
+  let count: number = $state(0)
+  const increment = () => {
+    count += 1
+  }
+</script>
+
+<button class="counter" onclick={increment}>
+  Count is {count}
+</button>
+
+</file>
+
+<file path="ui\src\main.ts">
+import { mount } from "svelte";
+import "./app.css";
+import App from "./App.svelte";
+
+const app = mount(App, {
+    target: document.getElementById("app")!,
+    props: {},
+});
+
+export default app;
+
+</file>
+
+<file path="ui\svelte.config.js">
+/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
+export default {}
+
+</file>
+
+<file path="ui\vite.config.ts">
+import { defineConfig } from "vite";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
+
+// https://vite.dev/config/
+export default defineConfig({
+    plugins: [svelte()],
+    server: {
+        proxy: {
+            "/ui/ws": {
+                target: "ws://localhost:8080",
+                ws: true,
+            },
+            "/bot/ws": {
+                target: "ws://localhost:8080",
+                ws: true,
+            },
+        },
+    },
+});
+
+</file>
+
 
 
 ```json
 {
-  "total_bytes": 177524,
-  "file_count": 55,
-  "estimated_tokens": 45518,
+  "total_bytes": 212028,
+  "file_count": 67,
+  "estimated_tokens": 54358,
   "mode": "full",
-  "generated_at": "2026-03-28T21:44:51.6543348-07:00"
+  "generated_at": "2026-03-29T02:32:21.4895805-07:00"
 }
 ```

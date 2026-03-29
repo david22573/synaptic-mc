@@ -25,7 +25,9 @@ export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
 export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
 
 export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
+
+// FIX: Correct default WebSocket path from /ws to /bot/ws
+export const WS_URL = process.env.WS_URL || "ws://localhost:8080/bot/ws";
 
 export const TASK_TIMEOUTS: Record<string, number> = {
     gather: 30000,
