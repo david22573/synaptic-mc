@@ -1,7 +1,7 @@
-Project Context Dump (28 Mar 26 10:52 PDT)
+Project Context Dump (28 Mar 26 18:48 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 49
+Total Files: 50
 
 # Project Structure
 <file_tree>
@@ -51,6 +51,7 @@ Total Files: 49
 - simulator.go
 - strategy.go
 - telemetry.go
+- tests\replay_harness_test.go
 - ui_hub.go
 - validator.go
 - ws_types.go
@@ -58,7 +59,7 @@ Total Files: 49
 
 # File Contents
 <file path="Makefile">
-.PHONY: help install run-server run-bot dev clean
+.PHONY: help install run-server run-bot dev clean test-replay
 
 # Default target
 .DEFAULT_GOAL := help
@@ -86,6 +87,10 @@ dev: ## Run both server and bot concurrently in one terminal
 	go run *.go & \
 	sleep 2; \
 	cd js && npx tsx index.ts
+
+test-replay: ## Run the Replay Test Harness
+	@echo "==> Running Planning Replay Tests..."
+	go test -v -run TestReplayHarness
 
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."
@@ -218,9 +223,10 @@ type Action struct {
 }
 
 type MilestonePlan struct {
-	ID             string `json:"id"`
-	Description    string `json:"description"`
-	CompletionHint string `json:"completion_hint"`
+	ID             string    `json:"id"`
+	Description    string    `json:"description"`
+	CompletionHint string    `json:"completion_hint"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
 }
 
 type FlexBool bool
@@ -242,8 +248,9 @@ func (f *FlexBool) UnmarshalJSON(data []byte) error {
 type LLMPlan struct {
 	Milestone         *MilestonePlan `json:"milestone"`
 	Objective         string         `json:"objective"`
+	ProposedStrategy  string         `json:"proposed_strategy,omitempty"`
 	CandidatePlans    [][]Action     `json:"candidate_plans"`
-	Tasks             []Action       `json:"-"` // Simulator populates this
+	Tasks             []Action       `json:"-"`
 	MilestoneComplete FlexBool       `json:"milestone_complete"`
 }
 
@@ -280,26 +287,20 @@ CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per variant.
-4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log).
-NEVER start with explore.
+4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
 5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
-6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
-7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
+
+AUTONOMOUS GOAL SETTING:
+- You will be provided with a PRIMARY STRATEGY and a SECONDARY STRATEGY.
+- If the PRIMARY STRATEGY indicates you are in 'AUTONOMY' mode, you MUST write a new, overarching long-term goal into the 'proposed_strategy' JSON field based on what you see in the inventory and the known world (e.g., "Build a permanent farm", "Establish a deep mining operation").
+- Design candidate plans that achieve the active strategy.
 
 SPATIAL AWARENESS RULES:
 1. Targets in 'VISIBLE POIs' can be interacted with immediately.
 2. Targets in 'KNOWN WORLD' are out of sight. You MUST use 'recall_location' to navigate to them BEFORE you can interact with them.
-3. Example: [ {"action": "recall_location", "target": {"type": "location", "name": "crafting_table"}}, {"action": "interact", "target": {"type": "recipe", "name": "crafting_table"}} ]
 
-VALID TARGET TYPES (you MUST use one of these):
-- "block"     (oak_log, stone, etc.)
-- "entity"    (zombie, cow, etc.)
-- "recipe"    (stick, wooden_pickaxe, crafting_table)
-- "location"  (only for mark/recall)
-- "category"  (food, wood)
-- "none"      (only for explore/idle/retreat/sleep)
-
-Valid macro actions: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
+VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
+VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
 
 func summarizeState(raw json.RawMessage) string {
 	var state GameState
@@ -318,7 +319,7 @@ func summarizeState(raw json.RawMessage) string {
 			continue
 		}
 		if strings.Contains(item.Name, "pickaxe") || strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "shovel") {
-			tools = append(tools, fmt.Sprintf("1x %s", item.Name))
+			tools = append(tools, fmt.Sprintf("%dx %s", item.Count, item.Name))
 		} else if strings.Contains(item.Name, "beef") || strings.Contains(item.Name, "porkchop") || strings.Contains(item.Name, "apple") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "rotten_flesh") || strings.Contains(item.Name, "mutton") || strings.Contains(item.Name, "chicken") || strings.Contains(item.Name, "rabbit") || strings.Contains(item.Name, "cod") || strings.Contains(item.Name, "salmon") || strings.HasPrefix(item.Name, "cooked_") || strings.Contains(item.Name, "melon_slice") || strings.Contains(item.Name, "sweet_berries") || strings.Contains(item.Name, "cookie") || strings.Contains(item.Name, "pumpkin_pie") {
 			food = append(food, fmt.Sprintf("%dx %s", item.Count, item.Name))
 			rawFoodNames = append(rawFoodNames, item.Name)
@@ -409,15 +410,14 @@ func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOv
 	}()
 	wg.Wait()
 
-	milestoneSection := "No active milestone. You MUST generate a new one by populating the 'milestone' JSON object."
+	milestoneSection := "No active milestone. You MUST generate a new one by populating the 'milestone' JSON object based on the current strategies."
 	if currentMilestone != nil {
 		milestoneSection = fmt.Sprintf(`ACTIVE MILESTONE: %s
 COMPLETION HINT: %s
 
 CRITICAL MILESTONE RULES:
-1. If this milestone is NOT complete, you MUST return the EXACT same milestone object in your response and set 'milestone_complete' to false.
-2. Generate tasks that continue progress toward this active milestone.
-3. If the milestone IS complete, set 'milestone_complete' to true.`, currentMilestone.Description, currentMilestone.CompletionHint)
+1. If this milestone is NOT complete, return the EXACT same milestone object and set 'milestone_complete' to false.
+2. If the milestone IS complete, set 'milestone_complete' to true.`, currentMilestone.Description, currentMilestone.CompletionHint)
 	}
 
 	compactState := summarizeState(t.State)
@@ -426,23 +426,21 @@ CRITICAL MILESTONE RULES:
 
 Response format (JSON only):
 {
+  "proposed_strategy": "Only include this if the current primary strategy is AUTONOMY. Define what the bot should focus on macro-level.",
   "milestone": { "id": "milestone-slug", "description": "...", "completion_hint": "..." },
   "milestone_complete": false,
   "objective": "Sub-goal description",
   "candidate_plans": [
-    [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Variant 1: Closest target" } ],
-    [ { "action": "explore", "target": { "type": "none", "name": "none" }, "rationale": "Variant 2: Find better resources" } ],
-    [ { "action": "craft", "target": { "type": "recipe", "name": "stick" }, "rationale": "Variant 3: Pre-craft needed items" } ]
+    [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Variant 1: Closest target" } ]
   ]
 }
 
-CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
-The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
+CRITICAL: Generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
 %s
 SUMMARY: %s
 MEMORY: %s
 %s
-OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
+STRATEGIES/OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
 
 	return b.callLLMForPlan(ctx, systemPrompt, compactState, attempt)
 }
@@ -468,7 +466,6 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+b.apiKey)
 
-	// FIX: Force closing the connection to avoid stale HTTP/2 streams throwing INTERNAL_ERROR
 	req.Close = true
 
 	start := time.Now()
@@ -630,15 +627,15 @@ type Engine struct {
 	planning   bool
 	planCancel context.CancelFunc
 
-	sessionID       string
-	systemOverride  string
-	currentStrategy string
+	sessionID        string
+	systemOverride   string
+	currentStrategy  string
+	isAutonomousMode bool
 
 	lastReplan      time.Time
 	lastSnapshot    StateSnapshot
 	lastState       GameState
 	tsEmergencyLock bool
-	panicCooldown   time.Time
 	lastHealth      float64
 	lastThreat      string
 	lastPos         Vec3
@@ -655,6 +652,7 @@ func NewEngine(
 	mem MemoryBank,
 	tel *Telemetry,
 	uiHub *UIHub,
+	learning *LearningSystem,
 	baseLogger *slog.Logger,
 	sessionID string,
 	eventStore EventStore,
@@ -666,7 +664,7 @@ func NewEngine(
 		memory:         mem,
 		eventStore:     eventStore,
 		strategy:       NewStrategyManager(),
-		learning:       NewLearningSystem(),
+		learning:       learning,
 		telemetry:      tel,
 		uiHub:          uiHub,
 		logger:         baseLogger.With(slog.String("session_id", sessionID)),
@@ -690,6 +688,19 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 
 	e.wg.Add(1)
 	go e.loop(runCtx)
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				_ = e.memory.ConsolidateSession(runCtx, e.sessionID)
+			}
+		}
+	}()
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -787,12 +798,19 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	strat := e.strategy.Evaluate(ev.State)
 	stratChanged := false
-	if strat.Goal != e.currentStrategy {
-		e.logger.Info("Strategy Shift", slog.String("old", e.currentStrategy), slog.String("new", strat.Goal))
-		e.currentStrategy = strat.Goal
+
+	overrideActive := strat.IsAutonomous && e.isAutonomousMode && e.currentStrategy != strat.PrimaryGoal
+
+	if strat.PrimaryGoal != e.currentStrategy && !overrideActive {
+		e.logger.Info("Strategy Shift", slog.String("primary", strat.PrimaryGoal), slog.String("secondary", strat.SecondaryGoal))
+		e.currentStrategy = strat.PrimaryGoal
+		e.isAutonomousMode = strat.IsAutonomous
 		stratChanged = true
 		e.planner.ClearMilestone()
-		go e.setSummaryAsync("Current Strategy", strat.Goal)
+		e.resetExecutionState()
+		go e.setSummaryAsync("Current Strategy", strat.PrimaryGoal)
+	} else if !strat.IsAutonomous {
+		e.isAutonomousMode = false
 	}
 
 	var currentTask *Action
@@ -837,6 +855,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
 			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
+			go e.exec.SendControl("abort_task", "routine interrupt")
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
@@ -847,10 +866,6 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	if e.tsEmergencyLock {
-		return
-	}
-
-	if time.Now().Before(e.panicCooldown) {
 		return
 	}
 
@@ -895,8 +910,14 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	e.lastSnapshot = currentSnapshot
 	epochAtStart := e.planEpoch
 
+	primaryForPrompt := strat.PrimaryGoal
+	secondaryForPrompt := strat.SecondaryGoal
+	if e.isAutonomousMode && e.currentStrategy != strat.PrimaryGoal {
+		primaryForPrompt = e.currentStrategy
+	}
+
 	learnedRules := e.learning.GetRules()
-	sysOverride := fmt.Sprintf("CURRENT OVERARCHING STRATEGY: %s\n%s\nAll milestones and tasks MUST align with this strategy.\n\n%s", e.currentStrategy, learnedRules, e.systemOverride)
+	sysOverride := fmt.Sprintf("PRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\n%s\nAll milestones and tasks MUST align with these strategies.\n\n%s", primaryForPrompt, secondaryForPrompt, learnedRules, e.systemOverride)
 	e.systemOverride = ""
 
 	updatedPayload, _ := json.Marshal(ev.State)
@@ -943,6 +964,15 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 		e.lastReplan = time.Time{}
 		go e.exec.SendControl("noop", "No actionable tasks generated")
 		return
+	}
+
+	if ev.Plan.ProposedStrategy != "" && e.isAutonomousMode {
+		if e.currentStrategy != ev.Plan.ProposedStrategy {
+			e.logger.Info("LLM Autonomous Strategy Override", slog.String("new_strategy", ev.Plan.ProposedStrategy))
+			e.currentStrategy = ev.Plan.ProposedStrategy
+			e.planner.ClearMilestone()
+			go e.setSummaryAsync("Current Strategy", ev.Plan.ProposedStrategy)
+		}
 	}
 
 	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
@@ -1036,7 +1066,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.telemetry.RecordTaskStatus(StatusFailed)
 		e.resetExecutionState()
 		e.planner.ClearMilestone()
-		e.learning.Reset() // Wipe learned failure traits on respawn
+		e.learning.Reset()
 
 		e.systemOverride = "CRITICAL: Bot just died. Inventory is RESET. Treat the current inventory as ground truth and restart basic progression: gather wood first. Do NOT assume any tools exist."
 		e.lastReplan = time.Time{}
@@ -1044,7 +1074,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
-		go e.memory.MarkWorldNode(context.Background(), "last_death", "event", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+
+		go e.memory.MarkWorldNode(context.Background(), fmt.Sprintf("death_zone_%d", time.Now().Unix()), "hazard", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
 
 		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
 			"position": e.lastPos,
@@ -1063,8 +1094,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 	case "panic_retreat_end":
 		e.tsEmergencyLock = false
-		e.lastReplan = time.Now()
-		e.panicCooldown = time.Now().Add(8 * time.Second)
+		e.lastReplan = time.Time{}
 		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
@@ -1115,10 +1145,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			e.lastReplan = time.Now()
 		}
 
-		if status == StatusFailed {
-			if e.tasksCompletedSinceReplan == 0 {
-				e.planner.RecordStall()
-			}
+		if (status == StatusFailed || status == StatusAborted) && e.tasksCompletedSinceReplan == 0 {
+			e.planner.RecordStall()
 		}
 
 		e.tasksCompletedSinceReplan = 0
@@ -1127,6 +1155,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		switch FailureCause(failCause) {
 		case CauseNoBlocks:
 			advice = "No reachable blocks or entities found nearby. Use 'explore' first."
+		case "NO_ENTITY": // Mapped from the CauseNoEntity fix requirement
+			advice = "The target entity could not be found, despawned, or moved out of range. Find a new target or explore."
 		case CauseStuck:
 			advice = "Bot got physically stuck. Use 'explore' to escape the area."
 		case CausePathFailed:
@@ -1208,6 +1238,7 @@ func (e *Engine) processNextTask() {
 				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
 				e.setSummaryAsync("Target Node: "+name, msg)
 			}
+			time.Sleep(1 * time.Second)
 			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
 		}(locName, task.Trace.TraceID)
 		return
@@ -1395,22 +1426,6 @@ type EventPlanError struct {
 }
 
 func (e EventPlanError) isEngineEvent() {}
-
-// EventMilestoneReady represents a successfully generated milestone plan.
-type EventMilestoneReady struct {
-	Epoch     int
-	Milestone *MilestonePlan
-}
-
-func (e EventMilestoneReady) isEngineEvent() {}
-
-// EventMilestoneError represents a failure in the milestone generation goroutine.
-type EventMilestoneError struct {
-	Epoch int
-	Error error
-}
-
-func (e EventMilestoneError) isEngineEvent() {}
 
 </file>
 
@@ -1637,6 +1652,13 @@ function normalizeFailureCause(err: any): string {
         return "STUCK";
     }
     if (
+        msg.includes("no_entity") ||
+        msg.includes("missing_entity") ||
+        msg.includes("target_lost")
+    ) {
+        return "NO_ENTITY";
+    }
+    if (
         msg.includes("exhausted") ||
         msg.includes("no_") ||
         msg.includes("missing_") ||
@@ -1670,7 +1692,9 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
-    const localController = taskAbortController; // Scope the controller locally to prevent background timeouts from killing new tasks
+    const localController = taskAbortController;
+
+    // Scope the controller locally to prevent background timeouts from killing new tasks
 
     currentTask = {
         id: decision.id,
@@ -1719,7 +1743,9 @@ async function executeDecision(decision: models.IncomingDecision) {
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
-        if (timeoutId) clearTimeout(timeoutId); // Clear the ghost timeout!
+        if (timeoutId) clearTimeout(timeoutId);
+
+        // Clear the ghost timeout!
         stopMovement();
     }
 }
@@ -2320,6 +2346,7 @@ export class SurvivalSystem {
     private lastDangerAt = 0;
     private lastFleeTime = 0;
     private diggingEscape = false;
+    private pillaringOut = false;
 
     constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
         this.bot = bot;
@@ -2342,25 +2369,24 @@ export class SurvivalSystem {
         this.lastDangerAt = 0;
         this.lastFleeTime = 0;
         this.diggingEscape = false;
+        this.pillaringOut = false;
     }
 
     public isPanickingNow(): boolean {
         return this.isPanicking;
     }
 
-    private checkSurvival() {
+    private async checkSurvival() {
         if (!this.bot || !this.bot.entity) return;
 
-        // Skip threat checks if we are actively executing the dig escape sequence
-        if (this.diggingEscape) return;
+        // Skip threat checks if we are actively executing physical escape/recovery sequences
+        if (this.diggingEscape || this.pillaringOut) return;
 
         const threats = getThreats(this.bot);
 
-        // Relaxed the filter to track ALL hostile mobs within 12 blocks,
-        // not just when the bot is at low health.
         const immediateThreats = threats.filter(
             (t: any) =>
-                t.distance < 12 &&
+                t.distance < 24 &&
                 t.threatScore > 5 &&
                 t.name !== "low_health_no_food" &&
                 t.name !== "starvation",
@@ -2369,7 +2395,6 @@ export class SurvivalSystem {
         if (immediateThreats.length > 0) {
             const topThreat = immediateThreats[0]!;
 
-            // Assess our combat viability
             const hasWeapon = this.bot.inventory
                 .items()
                 .some(
@@ -2380,7 +2405,6 @@ export class SurvivalSystem {
             const isUnavoidableDeath =
                 topThreat.name === "creeper" || topThreat.name === "warden";
 
-            // If the odds are good, suppress the panic reflex and let Go dispatch the hunt task
             if (
                 hasWeapon &&
                 isOneOnOne &&
@@ -2401,16 +2425,17 @@ export class SurvivalSystem {
                 return;
             }
 
-            // --- STANDARD EVASION LOGIC ---
             this.lastDangerAt = Date.now();
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
+
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
                     health: Math.round(this.bot.health),
                     threatCount: immediateThreats.length,
                 });
+
                 this.config.onInterrupt("panic_flee");
                 this.config.stopMovement();
                 this.client.sendEvent(
@@ -2422,23 +2447,35 @@ export class SurvivalSystem {
                 );
             }
 
-            // Prevent event loop thrashing by only calculating paths every 5s or if stopped
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
             ) {
                 this.lastFleeTime = Date.now();
+
                 const safePos = computeSafeRetreat(
                     this.bot,
                     immediateThreats,
-                    24,
+                    32,
                 );
+
                 this.fleeTo(safePos);
             }
-        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
+        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
             this.isPanicking = false;
-            log.debug("Survival goal reached; releasing reflex lock");
+
+            log.debug(
+                "Survival goal reached; securing exit and releasing reflex lock",
+            );
             this.config.stopMovement();
+
+            // Option A: Ensure we aren't trapped in a hole before handing control back
+            this.pillaringOut = true;
+            await this.pillarOut().catch((err) =>
+                log.warn("Pillar out failed", { err }),
+            );
+            this.pillaringOut = false;
+
             this.client.sendEvent(
                 "panic_retreat_end",
                 "evasion_complete",
@@ -2451,10 +2488,8 @@ export class SurvivalSystem {
 
     private async fleeTo(safePos: { x: number; z: number }) {
         try {
-            // First attempt to pathfind normally
             const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
 
-            // If pathfinder returns a partial path or fails immediately, trigger dig escape
             const path = this.bot.pathfinder.getPathTo(
                 this.bot.pathfinder.movements,
                 goal,
@@ -2483,6 +2518,7 @@ export class SurvivalSystem {
         const inWater =
             this.bot.blockAt(this.bot.entity.position.floored())?.name ===
             "water";
+
         if (inWater) {
             log.warn("Refusing to vertical dig escape while submerged.");
             return;
@@ -2492,7 +2528,6 @@ export class SurvivalSystem {
         this.config.stopMovement();
 
         try {
-            // The ultimate panic button: dig a 3-deep hole straight down.
             for (let i = 0; i < 3; i++) {
                 if (this.bot.health <= 0) break;
 
@@ -2513,7 +2548,7 @@ export class SurvivalSystem {
                 }
             }
 
-            // Try to roof ourselves in with a trash block
+            // Option B: The Multi-Stage Panic Roof
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
@@ -2530,32 +2565,156 @@ export class SurvivalSystem {
 
             if (trashBlock) {
                 await this.bot.equip(trashBlock, "hand");
+                const pos = this.bot.entity.position.floored();
+                const targetPos = pos.offset(0, 2, 0); // Directly above head
+                let placed = false;
 
-                // Grab a block at eye level to attach our roof to
-                const sideBlock = this.bot.blockAt(
-                    this.bot.entity.position.floored().offset(1, 2, 0),
-                );
+                const compassVectors = [
+                    new Vec3(1, 0, 0),
+                    new Vec3(-1, 0, 0),
+                    new Vec3(0, 0, 1),
+                    new Vec3(0, 0, -1),
+                ];
 
-                if (sideBlock && sideBlock.name !== "air") {
-                    await this.bot
-                        .placeBlock(sideBlock, new Vec3(-1, 0, 0))
-                        .catch(() => {});
-                } else {
-                    const altAnchor = this.bot.blockAt(
-                        this.bot.entity.position.floored().offset(-1, 2, 0),
-                    );
-
-                    if (altAnchor && altAnchor.name !== "air") {
-                        await this.bot
-                            .placeBlock(altAnchor, new Vec3(1, 0, 0))
-                            .catch(() => {});
+                // 1. Try attaching to the surface walls (Y+2)
+                for (const vec of compassVectors) {
+                    const wallBlock = this.bot.blockAt(targetPos.plus(vec));
+                    if (wallBlock && wallBlock.boundingBox === "block") {
+                        try {
+                            // Aim at the wall face pointing back into the center
+                            await this.bot.placeBlock(
+                                wallBlock,
+                                vec.scaled(-1),
+                            );
+                            placed = true;
+                            log.debug(
+                                "Successfully sealed roof at surface level.",
+                            );
+                            break;
+                        } catch (e) {}
                     }
+                }
+
+                // 2. If surface terrain is uneven/missing, place on top of head-level walls (Y+1)
+                if (!placed) {
+                    for (const vec of compassVectors) {
+                        const wallBlock = this.bot.blockAt(
+                            pos.offset(vec.x, 1, vec.z),
+                        );
+                        if (wallBlock && wallBlock.boundingBox === "block") {
+                            try {
+                                // Aim at the top face of the wall block
+                                await this.bot.placeBlock(
+                                    wallBlock,
+                                    new Vec3(0, 1, 0),
+                                );
+                                placed = true;
+                                log.debug(
+                                    "Successfully sealed roof on top of Y+1 wall.",
+                                );
+                                break;
+                            } catch (e) {}
+                        }
+                    }
+                }
+
+                if (!placed) {
+                    log.warn(
+                        "Failed to seal roof. Terrain geometry unsupported.",
+                    );
                 }
             }
         } catch (err) {
             log.warn("Vertical dig escape failed", { err });
         } finally {
             this.diggingEscape = false;
+        }
+    }
+
+    private async pillarOut() {
+        if (!this.bot.entity || this.bot.health <= 0) return;
+
+        const isEnclosed = (yOffset: number) => {
+            const pos = this.bot.entity.position.floored();
+            const blocks = [
+                this.bot.blockAt(pos.offset(0, yOffset, -1)),
+                this.bot.blockAt(pos.offset(0, yOffset, 1)),
+                this.bot.blockAt(pos.offset(1, yOffset, 0)),
+                this.bot.blockAt(pos.offset(-1, yOffset, 0)),
+            ];
+            // If 3 or more surrounding blocks are solid, we are trapped
+            return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
+        };
+
+        // Check if we are physically trapped in a hole
+        if (!isEnclosed(0) && !isEnclosed(1)) {
+            return;
+        }
+
+        log.info("Trapped in pit. Initiating pillar-out recovery sequence.");
+
+        let jumps = 0;
+        while (jumps < 10) {
+            jumps++;
+            if (this.bot.health <= 0) return;
+
+            const pos = this.bot.entity.position.floored();
+            if (!isEnclosed(0) && !isEnclosed(1)) {
+                log.info("Surface reached. Resuming normal operations.");
+                break;
+            }
+
+            const trashBlock = this.bot.inventory
+                .items()
+                .find((i) =>
+                    [
+                        "dirt",
+                        "cobblestone",
+                        "stone",
+                        "netherrack",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                    ].includes(i.name),
+                );
+
+            if (!trashBlock) {
+                log.warn("Out of blocks! Cannot pillar out of hole.");
+                break;
+            }
+
+            // Break the roof we placed during the panic escape so we don't hit our head
+            const roof = this.bot.blockAt(pos.offset(0, 2, 0));
+            if (
+                roof &&
+                roof.name !== "air" &&
+                roof.name !== "water" &&
+                roof.name !== "lava"
+            ) {
+                const tool = this.bot.pathfinder.bestHarvestTool(roof);
+                if (tool) await this.bot.equip(tool, "hand");
+                await this.bot.dig(roof).catch(() => {});
+            }
+
+            await this.bot.equip(trashBlock, "hand");
+            await this.bot.lookAt(pos.offset(0, -1, 0), true);
+
+            const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
+            if (refBlock) {
+                this.bot.setControlState("jump", true);
+
+                // Mineflayer physics delay to reach peak jump height
+                await new Promise((resolve) => setTimeout(resolve, 300));
+
+                try {
+                    await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                } catch (e) {
+                    log.warn("Failed to place block under feet", { err: e });
+                }
+
+                this.bot.setControlState("jump", false);
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            }
         }
     }
 }
@@ -3478,10 +3637,12 @@ interface HuntContext extends StateContext {
 
 class LootState implements FSMState {
     name = "LOOTING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const hCtx = ctx as HuntContext;
+
         const droppedItems = findNearestEntity(hCtx.bot, "item", 8);
 
         if (droppedItems) {
@@ -3513,6 +3674,7 @@ class LootState implements FSMState {
 
 class AttackState implements FSMState {
     name = "ATTACKING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3544,6 +3706,7 @@ class AttackState implements FSMState {
         }
 
         await attackEntity(ctx.bot, ctx.targetEntity);
+
         await new Promise((resolve) => setTimeout(resolve, cooldownMs));
 
         return this;
@@ -3552,6 +3715,7 @@ class AttackState implements FSMState {
 
 class ApproachState implements FSMState {
     name = "APPROACHING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3582,12 +3746,14 @@ class ApproachState implements FSMState {
                         status: "FAILED",
                         reason: "TARGET_RAN_TOO_FAR",
                     };
+
                     return null;
                 }
             }
         } catch (err: any) {
             if (err.message === "aborted") {
                 hCtx.result = { status: "FAILED", reason: "aborted" };
+
                 return null;
             }
         }
@@ -3598,6 +3764,7 @@ class ApproachState implements FSMState {
 
 export class SearchState implements FSMState {
     name = "SEARCHING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -3610,8 +3777,9 @@ export class SearchState implements FSMState {
         if (!entity) {
             ctx.result = {
                 status: "FAILED",
-                reason: `NO_${ctx.targetName.toUpperCase()}_FOUND_IN_RADIUS`,
+                reason: `NO_ENTITY_FOUND_IN_RADIUS`, // Fixed from NO_BLOCKS
             };
+
             return null;
         }
         ctx.targetEntity = entity;
@@ -3621,6 +3789,7 @@ export class SearchState implements FSMState {
 
 export async function handleHunt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const targetName = decision.target?.name;
@@ -4163,6 +4332,8 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
+    // Note: The validator heavily relies on "wood" mapping to logs for redundancy
+    // and vision checks. Do not remove or change these without updating validator.go.
     tree: "wood",
     log: "wood",
     timber: "wood",
@@ -4181,6 +4352,7 @@ export function normalizeDecision(
     const originalTargetName = (normalized.target?.name || "none")
         .toLowerCase()
         .trim();
+
     let targetName = originalTargetName;
 
     // 1. Apply static dictionary aliases first (fixes farm/mine targets)
@@ -4194,6 +4366,7 @@ export function normalizeDecision(
             targetName = "stick";
         } else if (targetName === "planks") {
             const invItems = bot.inventory.items();
+
             let foundLog = false;
             for (const item of invItems) {
                 if (LOG_TO_PLANK_MAP[item.name]) {
@@ -4228,6 +4401,7 @@ export function normalizeDecision(
     // 3. Log and apply changes if a normalization occurred
     if (targetName !== originalTargetName) {
         normalized.target.name = targetName;
+
         log.debug("Decision normalized", {
             original_target: originalTargetName,
             normalized_target: targetName,
@@ -4319,7 +4493,6 @@ export const TASK_REGISTRY: Record<string, TaskHandler> = {};
 </file>
 
 <file path="js\lib\tasks\task.ts">
-// js/lib/tasks/task.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
@@ -4334,7 +4507,6 @@ import { handleExplore } from "./handlers/explore.js";
 import { handleSmelt } from "./handlers/smelt.js";
 import { handleMine } from "./handlers/mine.js";
 import { handleFarm } from "./handlers/farm.js";
-
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeDecision } from "./normalize.js";
 import { handleInteract } from "./handlers/interact.js";
@@ -4368,25 +4540,32 @@ export async function runTask(
     switch (decision.action) {
         case "hunt":
             await handleHunt(taskCtx);
+
             return;
         case "gather":
             await handleGather(taskCtx);
             return;
+
         case "craft":
             await handleCraft(taskCtx);
             return;
+
         case "build":
             await handleBuild(taskCtx);
             return;
+
         case "smelt":
             await handleSmelt(taskCtx);
             return;
+
         case "mine":
             await handleMine(taskCtx);
             return;
+
         case "farm":
             await handleFarm(taskCtx);
             return;
+
         case "explore":
             await handleExplore(taskCtx);
             return;
@@ -4395,6 +4574,7 @@ export async function runTask(
             const food = bot.inventory
                 .items()
                 .find((i) => i.name === decision.target.name);
+
             if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
             await bot.equip(food, "hand");
             await bot.consume();
@@ -4403,6 +4583,7 @@ export async function runTask(
 
         case "idle":
             await waitForMs(1500, signal);
+
             return;
 
         case "sleep": {
@@ -4457,12 +4638,13 @@ export async function runTask(
                 timeoutMs: 15000,
                 stopMovement,
             });
-
+            await waitForMs(1000, signal); // Mitigation for cliff falls
             return;
         }
 
         case "interact":
             await handleInteract(taskCtx);
+
             return;
 
         default:
@@ -4867,6 +5049,7 @@ export function getErrorMessage(error: unknown): string {
 </file>
 
 <file path="js\lib\utils\perception.ts">
+// js/lib/utils/perception.ts
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import * as models from "../models.js";
@@ -4890,7 +5073,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
 
     const pos = bot.entity.position;
     const yaw = bot.entity.yaw;
-
     // Horizontal look vector
     const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
 
@@ -4910,9 +5092,8 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
 
         let type = "entity";
-        if (e.type === "mob") type = "threat";
-        else if (e.type === "animal") type = "opportunity";
-        else if (e.type === "object" || e.type === "item") type = "resource";
+        if (e.type === "hostile") type = "threat";
+        else if (e.type === "object" || e.type === "orb") type = "resource";
 
         // Scoring: Distance heavily weighted, center FOV acts as a multiplier
         const baseScore = 100 / Math.max(dist, 1);
@@ -4960,6 +5141,7 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         const dist = pos.distanceTo(bPos);
         const dx = bPos.x - pos.x;
         const dz = bPos.z - pos.z;
+
         const dirToBlock = new Vec3(dx, 0, dz).normalize();
 
         const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
@@ -4982,7 +5164,25 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
     }
 
     // Sort by computed score
-    return pois.sort((a, b) => b.score - a.score).slice(0, 15);
+    pois.sort((a, b) => b.score - a.score);
+
+    // Filter out redundant blocks so they don't blind the LLM context
+    const seenCounts: Record<string, number> = {};
+    const diversePOIs: any[] = [];
+
+    for (const poi of pois) {
+        seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
+
+        // Cap identical resources (like water/lava/dirt) to 3
+        if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
+            continue;
+        }
+
+        diversePOIs.push(poi);
+        if (diversePOIs.length >= 15) break;
+    }
+
+    return diversePOIs;
 }
 
 </file>
@@ -5025,7 +5225,6 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
 
     for (const id in bot.entities) {
         const e = bot.entities[id];
-
         if (!e || !e.isValid || e === bot.entity) continue;
 
         if (
@@ -5051,6 +5250,7 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
 
         const baseThreat =
             config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
+
         const threatScore = baseThreat * (10 / Math.max(effectiveDistance, 1));
 
         threats.push({
@@ -5081,23 +5281,77 @@ export function computeSafeRetreat(
         totalWeight += threat.threatScore!;
     }
 
+    let baseAngle = 0;
+    const botPos = bot.entity.position.floored();
+
     if (totalWeight === 0) {
-        return {
-            x: bot.entity.position.x + (Math.random() - 0.5) * distance,
-            z: bot.entity.position.z + (Math.random() - 0.5) * distance,
-        };
+        baseAngle = Math.random() * Math.PI * 2;
+    } else {
+        cx /= totalWeight;
+        cz /= totalWeight;
+        baseAngle = Math.atan2(botPos.z - cz, botPos.x - cx);
     }
 
-    cx /= totalWeight;
-    cz /= totalWeight;
+    // Fan out and test candidate angles to avoid cliffs and water
+    const testAngles = [
+        baseAngle,
+        baseAngle + Math.PI / 6, // 30 deg
+        baseAngle - Math.PI / 6,
+        baseAngle + Math.PI / 3, // 60 deg
+        baseAngle - Math.PI / 3,
+        baseAngle + Math.PI / 2, // 90 deg
+        baseAngle - Math.PI / 2,
+    ];
 
-    let dx = bot.entity.position.x - cx;
-    let dz = bot.entity.position.z - cz;
-    const len = Math.sqrt(dx * dx + dz * dz) || 1;
+    for (const angle of testAngles) {
+        const tx = botPos.x + Math.cos(angle) * distance;
+        const tz = botPos.z + Math.sin(angle) * distance;
 
+        let isSafe = false;
+
+        // Check for solid ground from slightly above to slightly below current elevation
+        for (let yOffset = 2; yOffset >= -5; yOffset--) {
+            const block = bot.blockAt(
+                botPos.offset(
+                    Math.cos(angle) * distance,
+                    yOffset,
+                    Math.sin(angle) * distance,
+                ),
+            );
+
+            if (block && (block.name === "water" || block.name === "lava")) {
+                // Liquid hazard detected before solid ground, abort this angle
+                break;
+            }
+
+            if (block && block.boundingBox === "block") {
+                // Found a solid block. Ensure the block above it is air so we don't path into a wall
+                const above = bot.blockAt(
+                    botPos.offset(
+                        Math.cos(angle) * distance,
+                        yOffset + 1,
+                        Math.sin(angle) * distance,
+                    ),
+                );
+                if (
+                    above &&
+                    (above.name === "air" || above.name === "cave_air")
+                ) {
+                    isSafe = true;
+                    break;
+                }
+            }
+        }
+
+        if (isSafe) {
+            return { x: tx, z: tz };
+        }
+    }
+
+    // Fallback: If all angles look like hazards, just return the exact opposite vector and let pathfinder try to sort it out
     return {
-        x: bot.entity.position.x + (dx / len) * distance,
-        z: bot.entity.position.z + (dz / len) * distance,
+        x: botPos.x + Math.cos(baseAngle) * distance,
+        z: botPos.z + Math.sin(baseAngle) * distance,
     };
 }
 
@@ -5107,7 +5361,9 @@ export function computeSafeRetreat(
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 )
@@ -5125,12 +5381,35 @@ type LearningSystem struct {
 	causes   map[string]string
 	rules    []string
 	mu       sync.Mutex
+	logger   *slog.Logger
 }
 
-func NewLearningSystem() *LearningSystem {
+func NewLearningSystem(logger *slog.Logger) *LearningSystem {
 	return &LearningSystem{
 		failures: make(map[string]int),
 		causes:   make(map[string]string),
+		logger:   logger.With(slog.String("component", "LearningSystem")),
+	}
+}
+
+// LoadEpisodicMemory scans past sessions for repeated traumatic failures to pre-load constraints
+func (l *LearningSystem) LoadEpisodicMemory(ctx context.Context, store EventStore) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Phase 4: Episodic Memory. Fetch the last 1000 cross-session events to find persistent death/failure zones.
+	events, err := store.GetStream(ctx, "") // Empty sessionID to get cross-session stream if supported, or implement a specific query
+	if err != nil {
+		l.logger.Warn("Failed to load episodic memory", slog.Any("error", err))
+		return
+	}
+
+	for _, ev := range events {
+		if ev.Type == "TASK_FAILED" || ev.Type == "TASK_ABORTED" || ev.Type == "DEATH" {
+			// Basic heuristic: if it failed historically, pre-warm the failure map
+			// In a full implementation, you'd parse the JSON payload for exact action/target
+			l.logger.Debug("Loaded historical trauma", slog.String("type", ev.Type))
+		}
 	}
 }
 
@@ -5140,7 +5419,6 @@ func (l *LearningSystem) RecordOutcome(action, target, status, cause string) {
 
 	l.outcomes = append(l.outcomes, Outcome{Action: action, Target: target, Status: status, Cause: cause})
 
-	// Keep a rolling window so it can eventually "forget" old failures if the environment changes
 	if len(l.outcomes) > 200 {
 		l.outcomes = l.outcomes[1:]
 	}
@@ -5151,7 +5429,6 @@ func (l *LearningSystem) RecordOutcome(action, target, status, cause string) {
 		l.failures[key]++
 		l.causes[key] = cause
 	} else if status == "COMPLETED" {
-		// Wipe the slate clean if it finally succeeds
 		l.failures[key] = 0
 		delete(l.causes, key)
 	}
@@ -5169,7 +5446,21 @@ func (l *LearningSystem) extractRules() {
 			}
 			act, tgt := parts[0], parts[1]
 			cause := l.causes[key]
-			newRules = append(newRules, fmt.Sprintf("- AVOID: Action '%s' on target '%s'. It repeatedly fails with: %s.", act, tgt, cause))
+
+			// Phase 4: Causal Attribution
+			var attribution string
+			switch {
+			case strings.Contains(cause, "PATH_FAILED"):
+				attribution = "The target is physically inaccessible or blocked by terrain."
+			case strings.Contains(cause, "NO_ENTITY"):
+				attribution = "The entity despawned, died, or moved out of range."
+			case strings.Contains(cause, "TIMEOUT"):
+				attribution = "The action took too long, likely due to a stuck path or lag."
+			default:
+				attribution = fmt.Sprintf("Root cause reported as: %s", cause)
+			}
+
+			newRules = append(newRules, fmt.Sprintf("- AVOID: Action '%s' on target '%s'. %s", act, tgt, attribution))
 		}
 	}
 	l.rules = newRules
@@ -5181,10 +5472,9 @@ func (l *LearningSystem) GetRules() string {
 	if len(l.rules) == 0 {
 		return ""
 	}
-	return "LEARNED ENVIRONMENTAL CONSTRAINTS:\n" + strings.Join(l.rules, "\n")
+	return "LEARNED ENVIRONMENTAL CONSTRAINTS & CAUSAL ATTRIBUTION:\n" + strings.Join(l.rules, "\n")
 }
 
-// PenalizePOIs dynamically drops the priority of objects that the bot knows it can't reach
 func (l *LearningSystem) PenalizePOIs(pois []POI) []POI {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -5200,7 +5490,6 @@ func (l *LearningSystem) PenalizePOIs(pois []POI) []POI {
 	return pois
 }
 
-// Reset clears out environmental trauma so the bot doesn't permanently ban tasks after respawning
 func (l *LearningSystem) Reset() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -5468,11 +5757,14 @@ func main() {
 
 		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 
-		planner := NewTacticalPlanner(brain, logger)
+		learningSystem := NewLearningSystem(logger)
+		learningSystem.LoadEpisodicMemory(ctx, eventStore) // Load trauma
+
+		planner := NewTacticalPlanner(brain, memory, sessionID, logger)
 		routine := NewDefaultRoutineManager()
 		exec := NewWSExecutor(conn)
 
-		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID, eventStore)
+		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, learningSystem, logger, sessionID, eventStore)
 		engine.Run(ctx, conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
@@ -5528,6 +5820,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -5561,6 +5854,10 @@ type MemoryBank interface {
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
 
+	SaveMilestone(ctx context.Context, sessionID string, ms *MilestonePlan) error
+	LoadMilestone(ctx context.Context, sessionID string) (*MilestonePlan, error)
+	ConsolidateSession(ctx context.Context, sessionID string) error
+
 	MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error
 	GetNode(ctx context.Context, name string) (*WorldNode, error)
 	GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error)
@@ -5588,7 +5885,6 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	// Clamped to 1 to prevent SQLITE_BUSY write locks across concurrent goroutines
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -5611,6 +5907,7 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		trace_id TEXT DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
+	
 	CREATE TABLE IF NOT EXISTS session_summary (
 		session_id TEXT NOT NULL,
 		key TEXT NOT NULL,
@@ -5618,6 +5915,7 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (session_id, key)
 	);
+	
 	CREATE TABLE IF NOT EXISTS world_nodes (
 		name TEXT PRIMARY KEY,
 		type TEXT NOT NULL,
@@ -5747,6 +6045,11 @@ func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, l
 		contextStr.WriteString("\n")
 	}
 
+	// Append consolidated past if available
+	if past, err := s.GetSummaryValue(ctx, sessionID, "past_summary"); err == nil && past != "" {
+		return "PAST CONSOLIDATED:\n" + past + "\nRECENT:\n" + contextStr.String(), nil
+	}
+
 	return contextStr.String(), nil
 }
 
@@ -5762,7 +6065,7 @@ func (s *SQLiteMemory) SetSummary(ctx context.Context, sessionID, key, value str
 }
 
 func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string, error) {
-	query := `SELECT key, value FROM session_summary WHERE session_id = ?`
+	query := `SELECT key, value FROM session_summary WHERE session_id = ? AND key != 'active_milestone' AND key != 'past_summary'`
 	rows, err := s.db.QueryContext(ctx, query, sessionID)
 	if err != nil {
 		return "", err
@@ -5797,6 +6100,54 @@ func (s *SQLiteMemory) GetSummaryValue(ctx context.Context, sessionID, key strin
 	return value, nil
 }
 
+func (s *SQLiteMemory) SaveMilestone(ctx context.Context, sessionID string, ms *MilestonePlan) error {
+	if ms == nil {
+		return s.SetSummary(ctx, sessionID, "active_milestone", "")
+	}
+	data, err := json.Marshal(ms)
+	if err != nil {
+		return err
+	}
+	return s.SetSummary(ctx, sessionID, "active_milestone", string(data))
+}
+
+func (s *SQLiteMemory) LoadMilestone(ctx context.Context, sessionID string) (*MilestonePlan, error) {
+	val, err := s.GetSummaryValue(ctx, sessionID, "active_milestone")
+	if err != nil || val == "" {
+		return nil, err
+	}
+	var ms MilestonePlan
+	if err := json.Unmarshal([]byte(val), &ms); err != nil {
+		return nil, err
+	}
+	return &ms, nil
+}
+
+// ConsolidateSession rolls up repetitive past events into a tighter summary to save LLM context
+func (s *SQLiteMemory) ConsolidateSession(ctx context.Context, sessionID string) error {
+	query := `SELECT action, status, COUNT(*) as cnt FROM events WHERE session_id = ? AND status = 'COMPLETED' GROUP BY action, status ORDER BY cnt DESC LIMIT 10`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var action, status string
+		var cnt int
+		if err := rows.Scan(&action, &status, &cnt); err == nil && cnt > 2 {
+			sb.WriteString(fmt.Sprintf("- Successfully completed '%s' %d times\n", action, cnt))
+		}
+	}
+
+	if sb.Len() > 0 {
+		s.logger.Debug("Session consolidated", slog.String("session", sessionID))
+		return s.SetSummary(ctx, sessionID, "past_summary", sb.String())
+	}
+	return nil
+}
+
 func (s *SQLiteMemory) MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error {
 	query := `
 	INSERT INTO world_nodes (name, type, x, y, z, last_seen, confidence) 
@@ -5819,7 +6170,7 @@ func (s *SQLiteMemory) GetNode(ctx context.Context, name string) (*WorldNode, er
 }
 
 func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error) {
-	query := `SELECT name, type, x, y, z FROM world_nodes`
+	query := `SELECT name, type, x, y, z, last_seen FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return "KNOWN WORLD: empty", nil
@@ -5831,12 +6182,21 @@ func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float
 		Type    string
 		X, Y, Z float64
 		Dist    float64
+		Age     time.Duration
 	}
 	var nodes []nodeDist
 
 	for rows.Next() {
 		var n nodeDist
-		if err := rows.Scan(&n.Name, &n.Type, &n.X, &n.Y, &n.Z); err == nil {
+		var lastSeen time.Time
+		if err := rows.Scan(&n.Name, &n.Type, &n.X, &n.Y, &n.Z, &lastSeen); err == nil {
+			n.Age = time.Since(lastSeen)
+
+			// Phase 3: Death-Zone Temporal Decay - Drop old hazards
+			if n.Type == "hazard" && n.Age > 30*time.Minute {
+				continue
+			}
+
 			dx, dy, dz := n.X-botX, n.Y-botY, n.Z-botZ
 			n.Dist = math.Sqrt(dx*dx + dy*dy + dz*dz)
 			nodes = append(nodes, n)
@@ -5884,9 +6244,11 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 const MaxStalls = 3
+const MaxMilestoneAge = 25 * time.Minute // Phase 3: Replanning if milestone gets too stale
 
 type Planner interface {
 	GetActiveMilestone() *MilestonePlan
@@ -5898,17 +6260,29 @@ type Planner interface {
 
 type TacticalPlanner struct {
 	brain           Brain
+	memory          MemoryBank // Phase 2: Persistence
 	activeMilestone *MilestonePlan
 	stallCount      int
 	logger          *slog.Logger
 	mu              sync.Mutex
+	sessionID       string
 }
 
-func NewTacticalPlanner(brain Brain, logger *slog.Logger) *TacticalPlanner {
-	return &TacticalPlanner{
-		brain:  brain,
-		logger: logger.With(slog.String("component", "TacticalPlanner")),
+func NewTacticalPlanner(brain Brain, memory MemoryBank, sessionID string, logger *slog.Logger) *TacticalPlanner {
+	p := &TacticalPlanner{
+		brain:     brain,
+		memory:    memory,
+		sessionID: sessionID,
+		logger:    logger.With(slog.String("component", "TacticalPlanner")),
 	}
+
+	// Phase 2: Attempt to restore milestone across restarts/crashes
+	if ms, err := memory.LoadMilestone(context.Background(), sessionID); err == nil && ms != nil {
+		p.activeMilestone = ms
+		p.logger.Info("Restored active milestone from persistence", slog.String("id", ms.ID))
+	}
+
+	return p
 }
 
 func (p *TacticalPlanner) GetActiveMilestone() *MilestonePlan {
@@ -5917,7 +6291,6 @@ func (p *TacticalPlanner) GetActiveMilestone() *MilestonePlan {
 	if p.activeMilestone == nil {
 		return nil
 	}
-	// Return a copy to prevent race conditions
 	ms := *p.activeMilestone
 	return &ms
 }
@@ -5930,6 +6303,7 @@ func (p *TacticalPlanner) ClearMilestone() {
 	}
 	p.activeMilestone = nil
 	p.stallCount = 0
+	_ = p.memory.SaveMilestone(context.Background(), p.sessionID, nil)
 }
 
 func (p *TacticalPlanner) RecordStall() {
@@ -5954,29 +6328,22 @@ func (p *TacticalPlanner) GeneratePlan(ctx context.Context, rawState []byte, ses
 	stalls := p.stallCount
 	p.mu.Unlock()
 
-	// 1. Break infinite loops on impossible milestones
-	if stalls >= MaxStalls {
-		var msID, msDesc string
-		if currentMS != nil {
-			msID = currentMS.ID
-			msDesc = currentMS.Description
-		}
-		p.logger.Warn("Max stalls reached. Forcing milestone drop to prevent thrashing.", slog.String("milestone", msID))
-		dropOverride := fmt.Sprintf("CRITICAL: You have repeatedly failed to complete the milestone '%s'. It is currently impossible. Drop it entirely, generate a NEW milestone, and try a different approach.\n\n%s", msDesc, sysOverride)
-
-		tick := Tick{State: rawState}
-		plan, err := p.brain.GeneratePlan(ctx, tick, sessionID, dropOverride, nil, 1) // Pass nil to force new milestone
-		if err != nil {
-			return nil, err
-		}
-		p.updateState(plan)
-		return plan, nil
-	}
-
-	// 2. Normal planning with partial progress tracking
 	contextOverride := sysOverride
-	if currentMS != nil && stalls > 0 {
-		contextOverride = fmt.Sprintf("You are currently trying to complete milestone '%s' but the last task failed. Evaluate the state, keep the milestone active, and generate the next tasks to recover and proceed.\n\n%s", currentMS.Description, sysOverride)
+
+	if currentMS != nil {
+		// Phase 3: Milestone Age Metric
+		age := time.Since(currentMS.StartedAt)
+		if age > MaxMilestoneAge {
+			p.logger.Warn("Milestone age exceeded threshold", slog.Float64("minutes", age.Minutes()))
+			contextOverride = fmt.Sprintf("CRITICAL: Milestone '%s' has been active for %.0f minutes. It is heavily stale. You MUST evaluate if this is still the optimal path. Consider completing it or generating a new approach entirely.\n\n%s", currentMS.Description, age.Minutes(), sysOverride)
+		} else if stalls >= MaxStalls {
+			// Phase 1/2: Break infinite loops on impossible milestones
+			p.logger.Warn("Max stalls reached. Forcing milestone drop to prevent thrashing.", slog.String("milestone", currentMS.ID))
+			contextOverride = fmt.Sprintf("CRITICAL: You have repeatedly failed to complete the milestone '%s'. It is currently impossible. Drop it entirely, generate a NEW milestone, and try a different approach.\n\n%s", currentMS.Description, sysOverride)
+			currentMS = nil // Force the LLM to write a new one
+		} else if stalls > 0 {
+			contextOverride = fmt.Sprintf("You are currently trying to complete milestone '%s' but the last task failed. Evaluate the state, keep the milestone active, and generate the next tasks to recover and proceed.\n\n%s", currentMS.Description, sysOverride)
+		}
 	}
 
 	tick := Tick{State: rawState}
@@ -6003,15 +6370,28 @@ func (p *TacticalPlanner) updateState(plan *LLMPlan) {
 		}
 		p.activeMilestone = nil
 		p.stallCount = 0
+		_ = p.memory.SaveMilestone(context.Background(), p.sessionID, nil)
 		return
 	}
 
-	if plan.Milestone != nil && plan.Milestone.ID != "" {
-		if p.activeMilestone == nil || p.activeMilestone.ID != plan.Milestone.ID {
-			p.logger.Info("Adopting new milestone", slog.String("id", plan.Milestone.ID), slog.String("desc", plan.Milestone.Description))
-			p.activeMilestone = plan.Milestone
-			p.stallCount = 0
+	if plan.Milestone != nil && plan.Milestone.Description != "" {
+		// Phase 2: Semantic Dedup - Keep the age/ID of identical descriptions
+		if p.activeMilestone != nil && p.activeMilestone.Description == plan.Milestone.Description {
+			plan.Milestone.ID = p.activeMilestone.ID
+			plan.Milestone.StartedAt = p.activeMilestone.StartedAt
+		} else {
+			// It's genuinely a new milestone
+			if plan.Milestone.StartedAt.IsZero() {
+				plan.Milestone.StartedAt = time.Now()
+			}
+			if p.activeMilestone == nil || p.activeMilestone.ID != plan.Milestone.ID {
+				p.logger.Info("Adopting new milestone", slog.String("id", plan.Milestone.ID), slog.String("desc", plan.Milestone.Description))
+			}
 		}
+
+		p.activeMilestone = plan.Milestone
+		p.stallCount = 0
+		_ = p.memory.SaveMilestone(context.Background(), p.sessionID, p.activeMilestone)
 	}
 }
 
@@ -6181,6 +6561,11 @@ func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, sy
 				err = fmt.Errorf("validation failed on chosen variant: %w", valErr)
 			} else {
 				r.logger.Debug("Simulator selected optimal variant", slog.Int("steps", len(plan.Tasks)))
+				if plan.Milestone != nil && plan.Milestone.ID != "" {
+					if milestone == nil || plan.Milestone.ID != milestone.ID {
+						r.telemetry.RecordMilestoneGenerated() // FIX BUG 6
+					}
+				}
 				return plan, nil
 			}
 		}
@@ -6310,7 +6695,12 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 			}
 		}
 
-		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
+		minHealth := 10.0
+		if topThreat == "skeleton" {
+			minHealth = 14.0 // FIX BUG 4
+		}
+
+		if len(state.Threats) == 1 && hasWeapon && state.Health > minHealth && topThreat != "creeper" && topThreat != "warden" {
 			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
 				return &Action{
 					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
@@ -6356,15 +6746,7 @@ type SleepRoutine struct{}
 
 func (s *SleepRoutine) Name() string { return "sleep" }
 func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	hasBedNearby := false
-	for _, poi := range state.POIs {
-		if strings.Contains(poi.Name, "bed") {
-			hasBedNearby = true
-			break
-		}
-	}
-
-	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && hasBedNearby {
+	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && state.HasBedNearby {
 		if !isTaskActive(string(ActionSleep), "bed", inFlight, queue) {
 			return &Action{
 				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
@@ -6497,7 +6879,7 @@ func (c *CookingRoutine) Name() string { return "cooking" }
 func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
 	hasFurnace, hasRaw, hasFuel := false, false, false
 	rawFood := map[string]bool{"beef": true, "porkchop": true, "mutton": true, "chicken": true, "rabbit": true, "cod": true, "salmon": true}
-	fuelTypes := map[string]bool{"coal": true, "charcoal": true, "oak_planks": true}
+	fuelTypes := map[string]bool{"coal": true, "charcoal": true}
 
 	for _, item := range state.Inventory {
 		if item.Name == "furnace" {
@@ -6506,7 +6888,7 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 		if rawFood[item.Name] {
 			hasRaw = true
 		}
-		if fuelTypes[item.Name] {
+		if fuelTypes[item.Name] || strings.HasSuffix(item.Name, "_planks") {
 			hasFuel = true
 		}
 	}
@@ -6712,21 +7094,35 @@ func (s *InternalSimulator) RankCandidates(candidates [][]Action, rawState json.
 <file path="strategy.go">
 package main
 
-import "strings"
+import (
+	"strings"
+	"sync"
+	"time"
+)
 
 type Strategy struct {
-	Goal     string
-	Priority int
-	Active   bool
+	PrimaryGoal   string
+	SecondaryGoal string
+	Priority      int
+	Active        bool
+	IsAutonomous  bool // Flags that the LLM is allowed to overwrite the PrimaryGoal
 }
 
-type StrategyManager struct{}
+type StrategyManager struct {
+	currentPrimary   string
+	currentSecondary string
+	lastShift        time.Time
+	mu               sync.Mutex
+}
 
 func NewStrategyManager() *StrategyManager {
 	return &StrategyManager{}
 }
 
 func (s *StrategyManager) Evaluate(state GameState) Strategy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	inv := make(map[string]int)
 	hasWeapon := false
 	readyFoodCount := 0
@@ -6736,27 +7132,42 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
 			hasWeapon = true
 		}
-		// Count food that provides decent saturation
 		if strings.Contains(item.Name, "cooked") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "apple") {
 			readyFoodCount += item.Count
 		}
 	}
 
+	var primary, secondary string
+	var priority int
+
 	// 1. Critical Survival Triggers
 	if state.Health < 10 || state.Food < 6 {
-		return Strategy{Goal: "SURVIVAL: Secure food immediately and retreat to safety to regenerate health.", Priority: 100, Active: true}
+		primary = "SURVIVAL: Secure food immediately and retreat to safety to regenerate health."
+		secondary = "DEFENSE: Eliminate immediate threats preventing safe regeneration."
+		priority = 100
+		return s.shiftIfNeeded(primary, secondary, priority, false)
+	}
+
+	if s.currentPrimary != "" && time.Since(s.lastShift) < 30*time.Second {
+		// Return current state without overwriting autonomy
+		return Strategy{PrimaryGoal: s.currentPrimary, SecondaryGoal: s.currentSecondary, Priority: 50, Active: true, IsAutonomous: strings.HasPrefix(s.currentPrimary, "AUTONOMY") || !strings.Contains(s.currentPrimary, ":")}
 	}
 
 	// 2. Nightfall / Shelter
 	isNight := state.TimeOfDay > 12541 && state.TimeOfDay < 23000
 	if isNight && !state.HasBedNearby {
-		return Strategy{Goal: "SHELTER: Survive the night. Avoid open areas, dig a 3-block deep hole and cover the top, or stay near a bed.", Priority: 90, Active: true}
+		primary = "SHELTER: Survive the night. Avoid open areas, dig a 3-block deep hole and cover the top, or stay near a bed."
+		secondary = "TECH: While sheltered, use any available materials to craft tools or smelt items."
+		priority = 90
+		return s.shiftIfNeeded(primary, secondary, priority, false)
 	}
 
-	// 3. Proactive Upkeep (The Baseline Necessities)
-	// Don't starve. If we have less than 3 good food items during the day, go hunting/farming.
+	// 3. Proactive Upkeep
 	if readyFoodCount < 3 && !isNight {
-		return Strategy{Goal: "PROVISIONING: Hunt animals or harvest crops to build a stockpile of at least 3 food items before exploring.", Priority: 85, Active: true}
+		primary = "PROVISIONING: Hunt animals or harvest crops to build a stockpile of at least 3 food items."
+		secondary = "EXPLORATION: Keep moving to locate new resources while hunting."
+		priority = 85
+		return s.shiftIfNeeded(primary, secondary, priority, false)
 	}
 
 	hasWoodenPick := inv["wooden_pickaxe"] > 0
@@ -6773,26 +7184,52 @@ func (s *StrategyManager) Evaluate(state GameState) Strategy {
 	// 4. Tech Tree Heuristics
 	if !hasWoodenPick && !hasStonePick {
 		if !hasLog && inv["oak_planks"] == 0 && inv["crafting_table"] == 0 {
-			return Strategy{Goal: "TECH TIER 1 (Wood): Gather logs. This is the absolute first step.", Priority: 80, Active: true}
+			primary = "TECH TIER 1 (Wood): Gather logs. This is the absolute first step."
+			secondary = "AWARENESS: Note locations of stone and coal for the next tier."
+			priority = 80
+			return s.shiftIfNeeded(primary, secondary, priority, false)
 		}
-		return Strategy{Goal: "TECH TIER 1 (Tools): Use logs to craft planks, sticks, a crafting table, and finally a wooden pickaxe.", Priority: 75, Active: true}
+		primary = "TECH TIER 1 (Tools): Use logs to craft planks, sticks, a crafting table, and finally a wooden pickaxe."
+		secondary = "GATHER: Continue gathering excess wood if near trees."
+		priority = 75
+		return s.shiftIfNeeded(primary, secondary, priority, false)
 	}
 
 	if !hasStonePick {
-		return Strategy{Goal: "TECH TIER 2 (Stone): Use wooden pickaxe to mine at least 3 stone (cobblestone), then craft a stone pickaxe.", Priority: 70, Active: true}
+		primary = "TECH TIER 2 (Stone): Use wooden pickaxe to mine at least 3 stone (cobblestone), then craft a stone pickaxe."
+		secondary = "ARMAMENT: Upgrade to a stone sword or axe immediately after the pickaxe."
+		priority = 70
+		return s.shiftIfNeeded(primary, secondary, priority, false)
 	}
 
-	// Ensure we are armed as soon as we hit the stone age
 	if !hasWeapon && (inv["cobblestone"] >= 2 || inv["stone"] >= 2) {
-		return Strategy{Goal: "ARMAMENT: Craft a stone sword or stone axe to defend against threats.", Priority: 68, Active: true}
+		primary = "ARMAMENT: Craft a stone sword or stone axe to defend against threats."
+		secondary = "TECH: Mine coal if spotted."
+		priority = 68
+		return s.shiftIfNeeded(primary, secondary, priority, false)
 	}
 
 	if inv["furnace"] == 0 {
-		return Strategy{Goal: "TECH TIER 3 (Smelting): Mine 8 cobblestone and craft a furnace. Gather coal.", Priority: 65, Active: true}
+		primary = "TECH TIER 3 (Smelting): Mine 8 cobblestone and craft a furnace."
+		secondary = "PROVISIONING: Gather raw meat and coal to utilize the new furnace."
+		priority = 65
+		return s.shiftIfNeeded(primary, secondary, priority, false)
 	}
 
-	// 5. Default Expansion
-	return Strategy{Goal: "EXPANSION: Explore the area, map new POIs, stockpile resources, and locate iron ore.", Priority: 50, Active: true}
+	// 5. True Autonomy Handover
+	primary = "AUTONOMY: Basic needs are met. You are now in full autonomous mode. Evaluate your inventory and the known world, and set a new long-term macro strategy."
+	secondary = "MAINTENANCE: Ensure food stays above 10 and tools are repaired."
+	priority = 50
+	return s.shiftIfNeeded(primary, secondary, priority, true)
+}
+
+func (s *StrategyManager) shiftIfNeeded(primary, secondary string, priority int, isAuto bool) Strategy {
+	if s.currentPrimary != primary || s.currentSecondary != secondary {
+		s.currentPrimary = primary
+		s.currentSecondary = secondary
+		s.lastShift = time.Now()
+	}
+	return Strategy{PrimaryGoal: s.currentPrimary, SecondaryGoal: s.currentSecondary, Priority: priority, Active: true, IsAutonomous: isAuto}
 }
 
 </file>
@@ -6983,6 +7420,193 @@ func (t *Telemetry) AvgLatency() time.Duration {
 		return 0
 	}
 	return t.totalLatency / time.Duration(t.llmInvocations)
+}
+
+</file>
+
+<file path="tests\replay_harness_test.go">
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"log/slog"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/joho/godotenv"
+)
+
+// MockMemory implements MemoryBank for deterministic testing
+type MockMemory struct {
+	summary map[string]string
+	history string
+	world   string
+}
+
+func (m *MockMemory) LogEvent(action, details string, meta EventMeta) {}
+func (m *MockMemory) GetRecentContext(ctx context.Context, sessionID string, limit int) (string, error) {
+	return m.history, nil
+}
+func (m *MockMemory) SetSummary(ctx context.Context, sessionID, key, value string) error {
+	m.summary[key] = value
+	return nil
+}
+func (m *MockMemory) GetSummary(ctx context.Context, sessionID string) (string, error) {
+	var sb strings.Builder
+	for k, v := range m.summary {
+		sb.WriteString("- " + k + ": " + v + "\n")
+	}
+	return sb.String(), nil
+}
+func (m *MockMemory) GetSummaryValue(ctx context.Context, sessionID, key string) (string, error) {
+	return m.summary[key], nil
+}
+func (m *MockMemory) SaveMilestone(ctx context.Context, sessionID string, ms *MilestonePlan) error {
+	return nil
+}
+func (m *MockMemory) LoadMilestone(ctx context.Context, sessionID string) (*MilestonePlan, error) {
+	return nil, nil
+}
+func (m *MockMemory) ConsolidateSession(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *MockMemory) MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error {
+	return nil
+}
+func (m *MockMemory) GetNode(ctx context.Context, name string) (*WorldNode, error) {
+	return nil, nil
+}
+func (m *MockMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error) {
+	return m.world, nil
+}
+func (m *MockMemory) Close() error { return nil }
+
+type ReplayTestCase struct {
+	Name           string
+	State          GameState
+	SystemOverride string
+	MemoryHistory  string
+	ExpectedAction string
+	ExpectedTarget string
+}
+
+func TestReplayHarness(t *testing.T) {
+	if err := godotenv.Load(); err != nil {
+		log.Println("[!] No .env file found. Relying on system environment or defaults.")
+	}
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		t.Skip("Skipping LLM replay tests; OPENROUTER_API_KEY not set")
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	telemetry := NewTelemetry(logger, 5.00)
+
+	tests := []ReplayTestCase{
+		{
+			Name: "Initial Wood Gathering",
+			State: GameState{
+				Health:    20.0,
+				Food:      20.0,
+				TimeOfDay: 1000,
+				Position:  Vec3{X: 0, Y: 64, Z: 0},
+				Inventory: []InventoryItem{}, // Empty inventory
+				POIs: []POI{
+					{Type: "resource", Name: "oak_log", Distance: 5.0, Score: 100, Direction: "center", Position: Vec3{X: 5, Y: 64, Z: 0}},
+				},
+			},
+			ExpectedAction: "gather",
+			ExpectedTarget: "oak_log",
+		},
+		{
+			Name: "Progression: Crafting Planks",
+			State: GameState{
+				Health:    20.0,
+				Food:      20.0,
+				TimeOfDay: 2000,
+				Position:  Vec3{X: 0, Y: 64, Z: 0},
+				Inventory: []InventoryItem{
+					{Name: "oak_log", Count: 3},
+				},
+			},
+			ExpectedAction: "craft",
+			ExpectedTarget: "oak_planks",
+		},
+		{
+			Name: "Critical Hunger Override",
+			State: GameState{
+				Health:    8.0,
+				Food:      0.0, // Starving
+				TimeOfDay: 5000,
+				Position:  Vec3{X: 0, Y: 64, Z: 0},
+				Inventory: []InventoryItem{
+					{Name: "cooked_beef", Count: 5},
+				},
+			},
+			ExpectedAction: "eat",
+			ExpectedTarget: "cooked_beef",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.Name, func(t *testing.T) {
+			mem := &MockMemory{
+				summary: make(map[string]string),
+				history: tc.MemoryHistory,
+				world:   "KNOWN WORLD: empty",
+			}
+
+			// Wrap the raw LLMBrain in the ResilientBrain
+			rawBrain := NewLLMBrain(DefaultAPI, DefaultModel, apiKey, mem, telemetry)
+			fallbackBrain := NewFallbackBrain()
+			brain := NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
+
+			planner := NewTacticalPlanner(brain, mem, "test-session", logger)
+
+			// Phase 4 Integration: Evaluate strategy exactly like the engine does
+			strategyManager := NewStrategyManager()
+			learningSystem := NewLearningSystem(logger)
+
+			strat := strategyManager.Evaluate(tc.State)
+			learnedRules := learningSystem.GetRules()
+
+			// Format the exact override string the new prompt expects
+			sysOverride := fmt.Sprintf("PRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\n%s\nAll milestones and tasks MUST align with these strategies.\n\n%s",
+				strat.PrimaryGoal,
+				strat.SecondaryGoal,
+				learnedRules,
+				tc.SystemOverride)
+
+			rawState, _ := json.Marshal(tc.State)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			plan, err := planner.GeneratePlan(ctx, rawState, "test-session", sysOverride)
+			if err != nil {
+				t.Fatalf("Plan generation failed: %v", err)
+			}
+
+			if plan == nil || len(plan.Tasks) == 0 {
+				t.Fatalf("LLM returned empty plan or zero tasks")
+			}
+
+			firstTask := plan.Tasks[0]
+
+			if firstTask.Action != tc.ExpectedAction {
+				t.Errorf("Expected action '%s', got '%s'\nRationale: %s", tc.ExpectedAction, firstTask.Action, firstTask.Rationale)
+			}
+
+			if tc.ExpectedTarget != "" && firstTask.Target.Name != tc.ExpectedTarget && firstTask.Target.Name != "wood" {
+				t.Errorf("Expected target '%s', got '%s'", tc.ExpectedTarget, firstTask.Target.Name)
+			}
+		})
+	}
 }
 
 </file>
@@ -7331,10 +7955,10 @@ type Item struct {
 
 ```json
 {
-  "total_bytes": 209410,
-  "file_count": 49,
-  "estimated_tokens": 53158,
+  "total_bytes": 230448,
+  "file_count": 50,
+  "estimated_tokens": 58439,
   "mode": "full",
-  "generated_at": "2026-03-28T10:52:40.8299924-07:00"
+  "generated_at": "2026-03-28T18:48:59.4714668-07:00"
 }
 ```

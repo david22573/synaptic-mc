@@ -1,4 +1,4 @@
-.PHONY: help install run-server run-bot dev clean
+.PHONY: help install run-server run-bot dev clean test-replay
 
 # Default target
 .DEFAULT_GOAL := help
@@ -26,6 +26,10 @@ dev: ## Run both server and bot concurrently in one terminal
 	go run *.go & \
 	sleep 2; \
 	cd js && npx tsx index.ts
+
+test-replay: ## Run the Replay Test Harness
+	@echo "==> Running Planning Replay Tests..."
+	go test -v -run TestReplayHarness
 
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."

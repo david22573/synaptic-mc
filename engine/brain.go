@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"bytes"
@@ -42,9 +42,10 @@ type Action struct {
 }
 
 type MilestonePlan struct {
-	ID             string `json:"id"`
-	Description    string `json:"description"`
-	CompletionHint string `json:"completion_hint"`
+	ID             string    `json:"id"`
+	Description    string    `json:"description"`
+	CompletionHint string    `json:"completion_hint"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
 }
 
 type FlexBool bool
@@ -66,8 +67,9 @@ func (f *FlexBool) UnmarshalJSON(data []byte) error {
 type LLMPlan struct {
 	Milestone         *MilestonePlan `json:"milestone"`
 	Objective         string         `json:"objective"`
+	ProposedStrategy  string         `json:"proposed_strategy,omitempty"`
 	CandidatePlans    [][]Action     `json:"candidate_plans"`
-	Tasks             []Action       `json:"-"` // Simulator populates this
+	Tasks             []Action       `json:"-"`
 	MilestoneComplete FlexBool       `json:"milestone_complete"`
 }
 
@@ -104,26 +106,20 @@ CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per variant.
-4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log).
-NEVER start with explore.
+4. In the FIRST 10 MINUTES or if you have ZERO logs, ALWAYS start with "gather" (target "wood" or specific log). NEVER start with explore.
 5. ERROR RECOVERY: Only use "explore" if a task fails with PATH_FAILED, STUCK, or NO_BLOCKS.
-6. For "explore" ALWAYS use: {"type": "none", "name": "none"}
-7. If FOOD is listed in inventory AND hunger < 5: ONLY valid action is "eat" with target type "category" and name = exact item name from inventory.
+
+AUTONOMOUS GOAL SETTING:
+- You will be provided with a PRIMARY STRATEGY and a SECONDARY STRATEGY.
+- If the PRIMARY STRATEGY indicates you are in 'AUTONOMY' mode, you MUST write a new, overarching long-term goal into the 'proposed_strategy' JSON field based on what you see in the inventory and the known world (e.g., "Build a permanent farm", "Establish a deep mining operation").
+- Design candidate plans that achieve the active strategy.
 
 SPATIAL AWARENESS RULES:
 1. Targets in 'VISIBLE POIs' can be interacted with immediately.
 2. Targets in 'KNOWN WORLD' are out of sight. You MUST use 'recall_location' to navigate to them BEFORE you can interact with them.
-3. Example: [ {"action": "recall_location", "target": {"type": "location", "name": "crafting_table"}}, {"action": "interact", "target": {"type": "recipe", "name": "crafting_table"}} ]
 
-VALID TARGET TYPES (you MUST use one of these):
-- "block"     (oak_log, stone, etc.)
-- "entity"    (zombie, cow, etc.)
-- "recipe"    (stick, wooden_pickaxe, crafting_table)
-- "location"  (only for mark/recall)
-- "category"  (food, wood)
-- "none"      (only for explore/idle/retreat/sleep)
-
-Valid macro actions: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
+VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
+VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.`
 
 func summarizeState(raw json.RawMessage) string {
 	var state GameState
@@ -142,7 +138,7 @@ func summarizeState(raw json.RawMessage) string {
 			continue
 		}
 		if strings.Contains(item.Name, "pickaxe") || strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") || strings.Contains(item.Name, "shovel") {
-			tools = append(tools, fmt.Sprintf("1x %s", item.Name))
+			tools = append(tools, fmt.Sprintf("%dx %s", item.Count, item.Name))
 		} else if strings.Contains(item.Name, "beef") || strings.Contains(item.Name, "porkchop") || strings.Contains(item.Name, "apple") || strings.Contains(item.Name, "bread") || strings.Contains(item.Name, "rotten_flesh") || strings.Contains(item.Name, "mutton") || strings.Contains(item.Name, "chicken") || strings.Contains(item.Name, "rabbit") || strings.Contains(item.Name, "cod") || strings.Contains(item.Name, "salmon") || strings.HasPrefix(item.Name, "cooked_") || strings.Contains(item.Name, "melon_slice") || strings.Contains(item.Name, "sweet_berries") || strings.Contains(item.Name, "cookie") || strings.Contains(item.Name, "pumpkin_pie") {
 			food = append(food, fmt.Sprintf("%dx %s", item.Count, item.Name))
 			rawFoodNames = append(rawFoodNames, item.Name)
@@ -233,15 +229,14 @@ func (b *LLMBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, systemOv
 	}()
 	wg.Wait()
 
-	milestoneSection := "No active milestone. You MUST generate a new one by populating the 'milestone' JSON object."
+	milestoneSection := "No active milestone. You MUST generate a new one by populating the 'milestone' JSON object based on the current strategies."
 	if currentMilestone != nil {
 		milestoneSection = fmt.Sprintf(`ACTIVE MILESTONE: %s
 COMPLETION HINT: %s
 
 CRITICAL MILESTONE RULES:
-1. If this milestone is NOT complete, you MUST return the EXACT same milestone object in your response and set 'milestone_complete' to false.
-2. Generate tasks that continue progress toward this active milestone.
-3. If the milestone IS complete, set 'milestone_complete' to true.`, currentMilestone.Description, currentMilestone.CompletionHint)
+1. If this milestone is NOT complete, return the EXACT same milestone object and set 'milestone_complete' to false.
+2. If the milestone IS complete, set 'milestone_complete' to true.`, currentMilestone.Description, currentMilestone.CompletionHint)
 	}
 
 	compactState := summarizeState(t.State)
@@ -250,23 +245,21 @@ CRITICAL MILESTONE RULES:
 
 Response format (JSON only):
 {
+  "proposed_strategy": "Only include this if the current primary strategy is AUTONOMY. Define what the bot should focus on macro-level.",
   "milestone": { "id": "milestone-slug", "description": "...", "completion_hint": "..." },
   "milestone_complete": false,
   "objective": "Sub-goal description",
   "candidate_plans": [
-    [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Variant 1: Closest target" } ],
-    [ { "action": "explore", "target": { "type": "none", "name": "none" }, "rationale": "Variant 2: Find better resources" } ],
-    [ { "action": "craft", "target": { "type": "recipe", "name": "stick" }, "rationale": "Variant 3: Pre-craft needed items" } ]
+    [ { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Variant 1: Closest target" } ]
   ]
 }
 
-CRITICAL: You MUST generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
-The internal simulation engine will evaluate them against physics and logic to pick the optimal path.
+CRITICAL: Generate 2 to 3 distinct tactical approaches in the 'candidate_plans' array.
 %s
 SUMMARY: %s
 MEMORY: %s
 %s
-OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
+STRATEGIES/OVERRIDE: %s`, BaseSystemRules, milestoneSection, summary, history, worldModel, systemOverride)
 
 	return b.callLLMForPlan(ctx, systemPrompt, compactState, attempt)
 }
@@ -292,7 +285,6 @@ func (b *LLMBrain) callLLMForPlan(ctx context.Context, systemPrompt, userContent
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+b.apiKey)
 
-	// FIX: Force closing the connection to avoid stale HTTP/2 streams throwing INTERNAL_ERROR
 	req.Close = true
 
 	start := time.Now()

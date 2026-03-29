@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"fmt"
@@ -91,7 +91,12 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 			}
 		}
 
-		if len(state.Threats) == 1 && hasWeapon && state.Health > 10 && topThreat != "creeper" && topThreat != "warden" {
+		minHealth := 10.0
+		if topThreat == "skeleton" {
+			minHealth = 14.0 // FIX BUG 4
+		}
+
+		if len(state.Threats) == 1 && hasWeapon && state.Health > minHealth && topThreat != "creeper" && topThreat != "warden" {
 			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
 				return &Action{
 					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
@@ -137,15 +142,7 @@ type SleepRoutine struct{}
 
 func (s *SleepRoutine) Name() string { return "sleep" }
 func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	hasBedNearby := false
-	for _, poi := range state.POIs {
-		if strings.Contains(poi.Name, "bed") {
-			hasBedNearby = true
-			break
-		}
-	}
-
-	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && hasBedNearby {
+	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && state.HasBedNearby {
 		if !isTaskActive(string(ActionSleep), "bed", inFlight, queue) {
 			return &Action{
 				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
@@ -278,7 +275,7 @@ func (c *CookingRoutine) Name() string { return "cooking" }
 func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
 	hasFurnace, hasRaw, hasFuel := false, false, false
 	rawFood := map[string]bool{"beef": true, "porkchop": true, "mutton": true, "chicken": true, "rabbit": true, "cod": true, "salmon": true}
-	fuelTypes := map[string]bool{"coal": true, "charcoal": true, "oak_planks": true}
+	fuelTypes := map[string]bool{"coal": true, "charcoal": true}
 
 	for _, item := range state.Inventory {
 		if item.Name == "furnace" {
@@ -287,7 +284,7 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 		if rawFood[item.Name] {
 			hasRaw = true
 		}
-		if fuelTypes[item.Name] {
+		if fuelTypes[item.Name] || strings.HasSuffix(item.Name, "_planks") {
 			hasFuel = true
 		}
 	}

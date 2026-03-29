@@ -112,6 +112,13 @@ function normalizeFailureCause(err: any): string {
         return "STUCK";
     }
     if (
+        msg.includes("no_entity") ||
+        msg.includes("missing_entity") ||
+        msg.includes("target_lost")
+    ) {
+        return "NO_ENTITY";
+    }
+    if (
         msg.includes("exhausted") ||
         msg.includes("no_") ||
         msg.includes("missing_") ||
@@ -145,7 +152,9 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
-    const localController = taskAbortController; // Scope the controller locally to prevent background timeouts from killing new tasks
+    const localController = taskAbortController;
+
+    // Scope the controller locally to prevent background timeouts from killing new tasks
 
     currentTask = {
         id: decision.id,
@@ -194,7 +203,9 @@ async function executeDecision(decision: models.IncomingDecision) {
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
-        if (timeoutId) clearTimeout(timeoutId); // Clear the ghost timeout!
+        if (timeoutId) clearTimeout(timeoutId);
+
+        // Clear the ghost timeout!
         stopMovement();
     }
 }

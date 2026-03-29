@@ -1,4 +1,4 @@
-package main
+package engine
 
 // ActionType defines all macro actions the LLM or routines can trigger.
 type ActionType string

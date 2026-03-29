@@ -33,6 +33,8 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
+    // Note: The validator heavily relies on "wood" mapping to logs for redundancy
+    // and vision checks. Do not remove or change these without updating validator.go.
     tree: "wood",
     log: "wood",
     timber: "wood",
@@ -51,6 +53,7 @@ export function normalizeDecision(
     const originalTargetName = (normalized.target?.name || "none")
         .toLowerCase()
         .trim();
+
     let targetName = originalTargetName;
 
     // 1. Apply static dictionary aliases first (fixes farm/mine targets)
@@ -64,6 +67,7 @@ export function normalizeDecision(
             targetName = "stick";
         } else if (targetName === "planks") {
             const invItems = bot.inventory.items();
+
             let foundLog = false;
             for (const item of invItems) {
                 if (LOG_TO_PLANK_MAP[item.name]) {
@@ -98,6 +102,7 @@ export function normalizeDecision(
     // 3. Log and apply changes if a normalization occurred
     if (targetName !== originalTargetName) {
         normalized.target.name = targetName;
+
         log.debug("Decision normalized", {
             original_target: originalTargetName,
             normalized_target: targetName,

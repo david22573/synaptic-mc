@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"context"
@@ -72,6 +72,11 @@ func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, sy
 				err = fmt.Errorf("validation failed on chosen variant: %w", valErr)
 			} else {
 				r.logger.Debug("Simulator selected optimal variant", slog.Int("steps", len(plan.Tasks)))
+				if plan.Milestone != nil && plan.Milestone.ID != "" {
+					if milestone == nil || plan.Milestone.ID != milestone.ID {
+						r.telemetry.RecordMilestoneGenerated() // FIX BUG 6
+					}
+				}
 				return plan, nil
 			}
 		}

@@ -35,7 +35,6 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
 
     for (const id in bot.entities) {
         const e = bot.entities[id];
-
         if (!e || !e.isValid || e === bot.entity) continue;
 
         if (
@@ -61,6 +60,7 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
 
         const baseThreat =
             config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
+
         const threatScore = baseThreat * (10 / Math.max(effectiveDistance, 1));
 
         threats.push({
@@ -91,22 +91,76 @@ export function computeSafeRetreat(
         totalWeight += threat.threatScore!;
     }
 
+    let baseAngle = 0;
+    const botPos = bot.entity.position.floored();
+
     if (totalWeight === 0) {
-        return {
-            x: bot.entity.position.x + (Math.random() - 0.5) * distance,
-            z: bot.entity.position.z + (Math.random() - 0.5) * distance,
-        };
+        baseAngle = Math.random() * Math.PI * 2;
+    } else {
+        cx /= totalWeight;
+        cz /= totalWeight;
+        baseAngle = Math.atan2(botPos.z - cz, botPos.x - cx);
     }
 
-    cx /= totalWeight;
-    cz /= totalWeight;
+    // Fan out and test candidate angles to avoid cliffs and water
+    const testAngles = [
+        baseAngle,
+        baseAngle + Math.PI / 6, // 30 deg
+        baseAngle - Math.PI / 6,
+        baseAngle + Math.PI / 3, // 60 deg
+        baseAngle - Math.PI / 3,
+        baseAngle + Math.PI / 2, // 90 deg
+        baseAngle - Math.PI / 2,
+    ];
 
-    let dx = bot.entity.position.x - cx;
-    let dz = bot.entity.position.z - cz;
-    const len = Math.sqrt(dx * dx + dz * dz) || 1;
+    for (const angle of testAngles) {
+        const tx = botPos.x + Math.cos(angle) * distance;
+        const tz = botPos.z + Math.sin(angle) * distance;
 
+        let isSafe = false;
+
+        // Check for solid ground from slightly above to slightly below current elevation
+        for (let yOffset = 2; yOffset >= -5; yOffset--) {
+            const block = bot.blockAt(
+                botPos.offset(
+                    Math.cos(angle) * distance,
+                    yOffset,
+                    Math.sin(angle) * distance,
+                ),
+            );
+
+            if (block && (block.name === "water" || block.name === "lava")) {
+                // Liquid hazard detected before solid ground, abort this angle
+                break;
+            }
+
+            if (block && block.boundingBox === "block") {
+                // Found a solid block. Ensure the block above it is air so we don't path into a wall
+                const above = bot.blockAt(
+                    botPos.offset(
+                        Math.cos(angle) * distance,
+                        yOffset + 1,
+                        Math.sin(angle) * distance,
+                    ),
+                );
+                if (
+                    above &&
+                    (above.name === "air" || above.name === "cave_air")
+                ) {
+                    isSafe = true;
+                    break;
+                }
+            }
+        }
+
+        if (isSafe) {
+            return { x: tx, z: tz };
+        }
+    }
+
+    // Fallback: If all angles look like hazards, just return the exact opposite vector and let pathfinder try to sort it out
     return {
-        x: bot.entity.position.x + (dx / len) * distance,
-        z: bot.entity.position.z + (dz / len) * distance,
+        x: botPos.x + Math.cos(baseAngle) * distance,
+        z: botPos.z + Math.sin(baseAngle) * distance,
     };
 }

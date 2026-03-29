@@ -1,8 +1,9 @@
-package main
+package engine
 
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -36,6 +37,10 @@ type MemoryBank interface {
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	GetSummaryValue(ctx context.Context, sessionID, key string) (string, error)
 
+	SaveMilestone(ctx context.Context, sessionID string, ms *MilestonePlan) error
+	LoadMilestone(ctx context.Context, sessionID string) (*MilestonePlan, error)
+	ConsolidateSession(ctx context.Context, sessionID string) error
+
 	MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error
 	GetNode(ctx context.Context, name string) (*WorldNode, error)
 	GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error)
@@ -63,7 +68,6 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
-	// Clamped to 1 to prevent SQLITE_BUSY write locks across concurrent goroutines
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -86,6 +90,7 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		trace_id TEXT DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
+	
 	CREATE TABLE IF NOT EXISTS session_summary (
 		session_id TEXT NOT NULL,
 		key TEXT NOT NULL,
@@ -93,6 +98,7 @@ func NewSQLiteMemory(dbPath string, logger *slog.Logger) (*SQLiteMemory, error) 
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (session_id, key)
 	);
+	
 	CREATE TABLE IF NOT EXISTS world_nodes (
 		name TEXT PRIMARY KEY,
 		type TEXT NOT NULL,
@@ -222,6 +228,11 @@ func (s *SQLiteMemory) GetRecentContext(ctx context.Context, sessionID string, l
 		contextStr.WriteString("\n")
 	}
 
+	// Append consolidated past if available
+	if past, err := s.GetSummaryValue(ctx, sessionID, "past_summary"); err == nil && past != "" {
+		return "PAST CONSOLIDATED:\n" + past + "\nRECENT:\n" + contextStr.String(), nil
+	}
+
 	return contextStr.String(), nil
 }
 
@@ -237,7 +248,7 @@ func (s *SQLiteMemory) SetSummary(ctx context.Context, sessionID, key, value str
 }
 
 func (s *SQLiteMemory) GetSummary(ctx context.Context, sessionID string) (string, error) {
-	query := `SELECT key, value FROM session_summary WHERE session_id = ?`
+	query := `SELECT key, value FROM session_summary WHERE session_id = ? AND key != 'active_milestone' AND key != 'past_summary'`
 	rows, err := s.db.QueryContext(ctx, query, sessionID)
 	if err != nil {
 		return "", err
@@ -272,6 +283,54 @@ func (s *SQLiteMemory) GetSummaryValue(ctx context.Context, sessionID, key strin
 	return value, nil
 }
 
+func (s *SQLiteMemory) SaveMilestone(ctx context.Context, sessionID string, ms *MilestonePlan) error {
+	if ms == nil {
+		return s.SetSummary(ctx, sessionID, "active_milestone", "")
+	}
+	data, err := json.Marshal(ms)
+	if err != nil {
+		return err
+	}
+	return s.SetSummary(ctx, sessionID, "active_milestone", string(data))
+}
+
+func (s *SQLiteMemory) LoadMilestone(ctx context.Context, sessionID string) (*MilestonePlan, error) {
+	val, err := s.GetSummaryValue(ctx, sessionID, "active_milestone")
+	if err != nil || val == "" {
+		return nil, err
+	}
+	var ms MilestonePlan
+	if err := json.Unmarshal([]byte(val), &ms); err != nil {
+		return nil, err
+	}
+	return &ms, nil
+}
+
+// ConsolidateSession rolls up repetitive past events into a tighter summary to save LLM context
+func (s *SQLiteMemory) ConsolidateSession(ctx context.Context, sessionID string) error {
+	query := `SELECT action, status, COUNT(*) as cnt FROM events WHERE session_id = ? AND status = 'COMPLETED' GROUP BY action, status ORDER BY cnt DESC LIMIT 10`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var action, status string
+		var cnt int
+		if err := rows.Scan(&action, &status, &cnt); err == nil && cnt > 2 {
+			sb.WriteString(fmt.Sprintf("- Successfully completed '%s' %d times\n", action, cnt))
+		}
+	}
+
+	if sb.Len() > 0 {
+		s.logger.Debug("Session consolidated", slog.String("session", sessionID))
+		return s.SetSummary(ctx, sessionID, "past_summary", sb.String())
+	}
+	return nil
+}
+
 func (s *SQLiteMemory) MarkWorldNode(ctx context.Context, name, nodeType string, x, y, z float64) error {
 	query := `
 	INSERT INTO world_nodes (name, type, x, y, z, last_seen, confidence) 
@@ -294,7 +353,7 @@ func (s *SQLiteMemory) GetNode(ctx context.Context, name string) (*WorldNode, er
 }
 
 func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float64) (string, error) {
-	query := `SELECT name, type, x, y, z FROM world_nodes`
+	query := `SELECT name, type, x, y, z, last_seen FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return "KNOWN WORLD: empty", nil
@@ -306,12 +365,21 @@ func (s *SQLiteMemory) GetKnownWorld(ctx context.Context, botX, botY, botZ float
 		Type    string
 		X, Y, Z float64
 		Dist    float64
+		Age     time.Duration
 	}
 	var nodes []nodeDist
 
 	for rows.Next() {
 		var n nodeDist
-		if err := rows.Scan(&n.Name, &n.Type, &n.X, &n.Y, &n.Z); err == nil {
+		var lastSeen time.Time
+		if err := rows.Scan(&n.Name, &n.Type, &n.X, &n.Y, &n.Z, &lastSeen); err == nil {
+			n.Age = time.Since(lastSeen)
+
+			// Phase 3: Death-Zone Temporal Decay - Drop old hazards
+			if n.Type == "hazard" && n.Age > 30*time.Minute {
+				continue
+			}
+
 			dx, dy, dz := n.X-botX, n.Y-botY, n.Z-botZ
 			n.Dist = math.Sqrt(dx*dx + dy*dy + dz*dz)
 			nodes = append(nodes, n)

@@ -145,11 +145,14 @@ func main() {
 
 		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 
-		planner := NewTacticalPlanner(brain, logger)
+		learningSystem := NewLearningSystem(logger)
+		learningSystem.LoadEpisodicMemory(ctx, eventStore) // Load trauma
+
+		planner := NewTacticalPlanner(brain, memory, sessionID, logger)
 		routine := NewDefaultRoutineManager()
 		exec := NewWSExecutor(conn)
 
-		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, logger, sessionID, eventStore)
+		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, learningSystem, logger, sessionID, eventStore)
 		engine.Run(ctx, conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))

@@ -13,10 +13,12 @@ interface HuntContext extends StateContext {
 
 class LootState implements FSMState {
     name = "LOOTING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const hCtx = ctx as HuntContext;
+
         const droppedItems = findNearestEntity(hCtx.bot, "item", 8);
 
         if (droppedItems) {
@@ -48,6 +50,7 @@ class LootState implements FSMState {
 
 class AttackState implements FSMState {
     name = "ATTACKING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -79,6 +82,7 @@ class AttackState implements FSMState {
         }
 
         await attackEntity(ctx.bot, ctx.targetEntity);
+
         await new Promise((resolve) => setTimeout(resolve, cooldownMs));
 
         return this;
@@ -87,6 +91,7 @@ class AttackState implements FSMState {
 
 class ApproachState implements FSMState {
     name = "APPROACHING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -117,12 +122,14 @@ class ApproachState implements FSMState {
                         status: "FAILED",
                         reason: "TARGET_RAN_TOO_FAR",
                     };
+
                     return null;
                 }
             }
         } catch (err: any) {
             if (err.message === "aborted") {
                 hCtx.result = { status: "FAILED", reason: "aborted" };
+
                 return null;
             }
         }
@@ -133,6 +140,7 @@ class ApproachState implements FSMState {
 
 export class SearchState implements FSMState {
     name = "SEARCHING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -145,8 +153,9 @@ export class SearchState implements FSMState {
         if (!entity) {
             ctx.result = {
                 status: "FAILED",
-                reason: `NO_${ctx.targetName.toUpperCase()}_FOUND_IN_RADIUS`,
+                reason: `NO_ENTITY_FOUND_IN_RADIUS`, // Fixed from NO_BLOCKS
             };
+
             return null;
         }
         ctx.targetEntity = entity;
@@ -156,6 +165,7 @@ export class SearchState implements FSMState {
 
 export async function handleHunt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const targetName = decision.target?.name;

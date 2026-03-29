@@ -21,6 +21,7 @@ export class SurvivalSystem {
     private lastDangerAt = 0;
     private lastFleeTime = 0;
     private diggingEscape = false;
+    private pillaringOut = false;
 
     constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
         this.bot = bot;
@@ -43,25 +44,24 @@ export class SurvivalSystem {
         this.lastDangerAt = 0;
         this.lastFleeTime = 0;
         this.diggingEscape = false;
+        this.pillaringOut = false;
     }
 
     public isPanickingNow(): boolean {
         return this.isPanicking;
     }
 
-    private checkSurvival() {
+    private async checkSurvival() {
         if (!this.bot || !this.bot.entity) return;
 
-        // Skip threat checks if we are actively executing the dig escape sequence
-        if (this.diggingEscape) return;
+        // Skip threat checks if we are actively executing physical escape/recovery sequences
+        if (this.diggingEscape || this.pillaringOut) return;
 
         const threats = getThreats(this.bot);
 
-        // Relaxed the filter to track ALL hostile mobs within 12 blocks,
-        // not just when the bot is at low health.
         const immediateThreats = threats.filter(
             (t: any) =>
-                t.distance < 12 &&
+                t.distance < 24 &&
                 t.threatScore > 5 &&
                 t.name !== "low_health_no_food" &&
                 t.name !== "starvation",
@@ -70,7 +70,6 @@ export class SurvivalSystem {
         if (immediateThreats.length > 0) {
             const topThreat = immediateThreats[0]!;
 
-            // Assess our combat viability
             const hasWeapon = this.bot.inventory
                 .items()
                 .some(
@@ -81,7 +80,6 @@ export class SurvivalSystem {
             const isUnavoidableDeath =
                 topThreat.name === "creeper" || topThreat.name === "warden";
 
-            // If the odds are good, suppress the panic reflex and let Go dispatch the hunt task
             if (
                 hasWeapon &&
                 isOneOnOne &&
@@ -102,16 +100,17 @@ export class SurvivalSystem {
                 return;
             }
 
-            // --- STANDARD EVASION LOGIC ---
             this.lastDangerAt = Date.now();
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
+
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
                     health: Math.round(this.bot.health),
                     threatCount: immediateThreats.length,
                 });
+
                 this.config.onInterrupt("panic_flee");
                 this.config.stopMovement();
                 this.client.sendEvent(
@@ -123,23 +122,35 @@ export class SurvivalSystem {
                 );
             }
 
-            // Prevent event loop thrashing by only calculating paths every 5s or if stopped
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
             ) {
                 this.lastFleeTime = Date.now();
+
                 const safePos = computeSafeRetreat(
                     this.bot,
                     immediateThreats,
-                    24,
+                    32,
                 );
+
                 this.fleeTo(safePos);
             }
-        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 3000) {
+        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
             this.isPanicking = false;
-            log.debug("Survival goal reached; releasing reflex lock");
+
+            log.debug(
+                "Survival goal reached; securing exit and releasing reflex lock",
+            );
             this.config.stopMovement();
+
+            // Option A: Ensure we aren't trapped in a hole before handing control back
+            this.pillaringOut = true;
+            await this.pillarOut().catch((err) =>
+                log.warn("Pillar out failed", { err }),
+            );
+            this.pillaringOut = false;
+
             this.client.sendEvent(
                 "panic_retreat_end",
                 "evasion_complete",
@@ -152,10 +163,8 @@ export class SurvivalSystem {
 
     private async fleeTo(safePos: { x: number; z: number }) {
         try {
-            // First attempt to pathfind normally
             const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
 
-            // If pathfinder returns a partial path or fails immediately, trigger dig escape
             const path = this.bot.pathfinder.getPathTo(
                 this.bot.pathfinder.movements,
                 goal,
@@ -184,6 +193,7 @@ export class SurvivalSystem {
         const inWater =
             this.bot.blockAt(this.bot.entity.position.floored())?.name ===
             "water";
+
         if (inWater) {
             log.warn("Refusing to vertical dig escape while submerged.");
             return;
@@ -193,7 +203,6 @@ export class SurvivalSystem {
         this.config.stopMovement();
 
         try {
-            // The ultimate panic button: dig a 3-deep hole straight down.
             for (let i = 0; i < 3; i++) {
                 if (this.bot.health <= 0) break;
 
@@ -214,7 +223,7 @@ export class SurvivalSystem {
                 }
             }
 
-            // Try to roof ourselves in with a trash block
+            // Option B: The Multi-Stage Panic Roof
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
@@ -231,32 +240,156 @@ export class SurvivalSystem {
 
             if (trashBlock) {
                 await this.bot.equip(trashBlock, "hand");
+                const pos = this.bot.entity.position.floored();
+                const targetPos = pos.offset(0, 2, 0); // Directly above head
+                let placed = false;
 
-                // Grab a block at eye level to attach our roof to
-                const sideBlock = this.bot.blockAt(
-                    this.bot.entity.position.floored().offset(1, 2, 0),
-                );
+                const compassVectors = [
+                    new Vec3(1, 0, 0),
+                    new Vec3(-1, 0, 0),
+                    new Vec3(0, 0, 1),
+                    new Vec3(0, 0, -1),
+                ];
 
-                if (sideBlock && sideBlock.name !== "air") {
-                    await this.bot
-                        .placeBlock(sideBlock, new Vec3(-1, 0, 0))
-                        .catch(() => {});
-                } else {
-                    const altAnchor = this.bot.blockAt(
-                        this.bot.entity.position.floored().offset(-1, 2, 0),
-                    );
-
-                    if (altAnchor && altAnchor.name !== "air") {
-                        await this.bot
-                            .placeBlock(altAnchor, new Vec3(1, 0, 0))
-                            .catch(() => {});
+                // 1. Try attaching to the surface walls (Y+2)
+                for (const vec of compassVectors) {
+                    const wallBlock = this.bot.blockAt(targetPos.plus(vec));
+                    if (wallBlock && wallBlock.boundingBox === "block") {
+                        try {
+                            // Aim at the wall face pointing back into the center
+                            await this.bot.placeBlock(
+                                wallBlock,
+                                vec.scaled(-1),
+                            );
+                            placed = true;
+                            log.debug(
+                                "Successfully sealed roof at surface level.",
+                            );
+                            break;
+                        } catch (e) {}
                     }
+                }
+
+                // 2. If surface terrain is uneven/missing, place on top of head-level walls (Y+1)
+                if (!placed) {
+                    for (const vec of compassVectors) {
+                        const wallBlock = this.bot.blockAt(
+                            pos.offset(vec.x, 1, vec.z),
+                        );
+                        if (wallBlock && wallBlock.boundingBox === "block") {
+                            try {
+                                // Aim at the top face of the wall block
+                                await this.bot.placeBlock(
+                                    wallBlock,
+                                    new Vec3(0, 1, 0),
+                                );
+                                placed = true;
+                                log.debug(
+                                    "Successfully sealed roof on top of Y+1 wall.",
+                                );
+                                break;
+                            } catch (e) {}
+                        }
+                    }
+                }
+
+                if (!placed) {
+                    log.warn(
+                        "Failed to seal roof. Terrain geometry unsupported.",
+                    );
                 }
             }
         } catch (err) {
             log.warn("Vertical dig escape failed", { err });
         } finally {
             this.diggingEscape = false;
+        }
+    }
+
+    private async pillarOut() {
+        if (!this.bot.entity || this.bot.health <= 0) return;
+
+        const isEnclosed = (yOffset: number) => {
+            const pos = this.bot.entity.position.floored();
+            const blocks = [
+                this.bot.blockAt(pos.offset(0, yOffset, -1)),
+                this.bot.blockAt(pos.offset(0, yOffset, 1)),
+                this.bot.blockAt(pos.offset(1, yOffset, 0)),
+                this.bot.blockAt(pos.offset(-1, yOffset, 0)),
+            ];
+            // If 3 or more surrounding blocks are solid, we are trapped
+            return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
+        };
+
+        // Check if we are physically trapped in a hole
+        if (!isEnclosed(0) && !isEnclosed(1)) {
+            return;
+        }
+
+        log.info("Trapped in pit. Initiating pillar-out recovery sequence.");
+
+        let jumps = 0;
+        while (jumps < 10) {
+            jumps++;
+            if (this.bot.health <= 0) return;
+
+            const pos = this.bot.entity.position.floored();
+            if (!isEnclosed(0) && !isEnclosed(1)) {
+                log.info("Surface reached. Resuming normal operations.");
+                break;
+            }
+
+            const trashBlock = this.bot.inventory
+                .items()
+                .find((i) =>
+                    [
+                        "dirt",
+                        "cobblestone",
+                        "stone",
+                        "netherrack",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                    ].includes(i.name),
+                );
+
+            if (!trashBlock) {
+                log.warn("Out of blocks! Cannot pillar out of hole.");
+                break;
+            }
+
+            // Break the roof we placed during the panic escape so we don't hit our head
+            const roof = this.bot.blockAt(pos.offset(0, 2, 0));
+            if (
+                roof &&
+                roof.name !== "air" &&
+                roof.name !== "water" &&
+                roof.name !== "lava"
+            ) {
+                const tool = this.bot.pathfinder.bestHarvestTool(roof);
+                if (tool) await this.bot.equip(tool, "hand");
+                await this.bot.dig(roof).catch(() => {});
+            }
+
+            await this.bot.equip(trashBlock, "hand");
+            await this.bot.lookAt(pos.offset(0, -1, 0), true);
+
+            const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
+            if (refBlock) {
+                this.bot.setControlState("jump", true);
+
+                // Mineflayer physics delay to reach peak jump height
+                await new Promise((resolve) => setTimeout(resolve, 300));
+
+                try {
+                    await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                } catch (e) {
+                    log.warn("Failed to place block under feet", { err: e });
+                }
+
+                this.bot.setControlState("jump", false);
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            }
         }
     }
 }

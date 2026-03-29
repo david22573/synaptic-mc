@@ -1,4 +1,3 @@
-// js/lib/tasks/task.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
@@ -13,7 +12,6 @@ import { handleExplore } from "./handlers/explore.js";
 import { handleSmelt } from "./handlers/smelt.js";
 import { handleMine } from "./handlers/mine.js";
 import { handleFarm } from "./handlers/farm.js";
-
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeDecision } from "./normalize.js";
 import { handleInteract } from "./handlers/interact.js";
@@ -47,25 +45,32 @@ export async function runTask(
     switch (decision.action) {
         case "hunt":
             await handleHunt(taskCtx);
+
             return;
         case "gather":
             await handleGather(taskCtx);
             return;
+
         case "craft":
             await handleCraft(taskCtx);
             return;
+
         case "build":
             await handleBuild(taskCtx);
             return;
+
         case "smelt":
             await handleSmelt(taskCtx);
             return;
+
         case "mine":
             await handleMine(taskCtx);
             return;
+
         case "farm":
             await handleFarm(taskCtx);
             return;
+
         case "explore":
             await handleExplore(taskCtx);
             return;
@@ -74,6 +79,7 @@ export async function runTask(
             const food = bot.inventory
                 .items()
                 .find((i) => i.name === decision.target.name);
+
             if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
             await bot.equip(food, "hand");
             await bot.consume();
@@ -82,6 +88,7 @@ export async function runTask(
 
         case "idle":
             await waitForMs(1500, signal);
+
             return;
 
         case "sleep": {
@@ -136,12 +143,13 @@ export async function runTask(
                 timeoutMs: 15000,
                 stopMovement,
             });
-
+            await waitForMs(1000, signal); // Mitigation for cliff falls
             return;
         }
 
         case "interact":
             await handleInteract(taskCtx);
+
             return;
 
         default:

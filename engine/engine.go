@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"context"
@@ -64,9 +64,10 @@ type Engine struct {
 	planning   bool
 	planCancel context.CancelFunc
 
-	sessionID       string
-	systemOverride  string
-	currentStrategy string
+	sessionID        string
+	systemOverride   string
+	currentStrategy  string
+	isAutonomousMode bool
 
 	lastReplan      time.Time
 	lastSnapshot    StateSnapshot
@@ -88,6 +89,7 @@ func NewEngine(
 	mem MemoryBank,
 	tel *Telemetry,
 	uiHub *UIHub,
+	learning *LearningSystem,
 	baseLogger *slog.Logger,
 	sessionID string,
 	eventStore EventStore,
@@ -99,7 +101,7 @@ func NewEngine(
 		memory:         mem,
 		eventStore:     eventStore,
 		strategy:       NewStrategyManager(),
-		learning:       NewLearningSystem(),
+		learning:       learning,
 		telemetry:      tel,
 		uiHub:          uiHub,
 		logger:         baseLogger.With(slog.String("session_id", sessionID)),
@@ -123,6 +125,19 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 
 	e.wg.Add(1)
 	go e.loop(runCtx)
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				_ = e.memory.ConsolidateSession(runCtx, e.sessionID)
+			}
+		}
+	}()
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -220,12 +235,19 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 	strat := e.strategy.Evaluate(ev.State)
 	stratChanged := false
-	if strat.Goal != e.currentStrategy {
-		e.logger.Info("Strategy Shift", slog.String("old", e.currentStrategy), slog.String("new", strat.Goal))
-		e.currentStrategy = strat.Goal
+
+	overrideActive := strat.IsAutonomous && e.isAutonomousMode && e.currentStrategy != strat.PrimaryGoal
+
+	if strat.PrimaryGoal != e.currentStrategy && !overrideActive {
+		e.logger.Info("Strategy Shift", slog.String("primary", strat.PrimaryGoal), slog.String("secondary", strat.SecondaryGoal))
+		e.currentStrategy = strat.PrimaryGoal
+		e.isAutonomousMode = strat.IsAutonomous
 		stratChanged = true
 		e.planner.ClearMilestone()
-		go e.setSummaryAsync("Current Strategy", strat.Goal)
+		e.resetExecutionState()
+		go e.setSummaryAsync("Current Strategy", strat.PrimaryGoal)
+	} else if !strat.IsAutonomous {
+		e.isAutonomousMode = false
 	}
 
 	var currentTask *Action
@@ -270,6 +292,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 
 		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
 			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
+			go e.exec.SendControl("abort_task", "routine interrupt")
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
@@ -324,8 +347,14 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	e.lastSnapshot = currentSnapshot
 	epochAtStart := e.planEpoch
 
+	primaryForPrompt := strat.PrimaryGoal
+	secondaryForPrompt := strat.SecondaryGoal
+	if e.isAutonomousMode && e.currentStrategy != strat.PrimaryGoal {
+		primaryForPrompt = e.currentStrategy
+	}
+
 	learnedRules := e.learning.GetRules()
-	sysOverride := fmt.Sprintf("CURRENT OVERARCHING STRATEGY: %s\n%s\nAll milestones and tasks MUST align with this strategy.\n\n%s", e.currentStrategy, learnedRules, e.systemOverride)
+	sysOverride := fmt.Sprintf("PRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\n%s\nAll milestones and tasks MUST align with these strategies.\n\n%s", primaryForPrompt, secondaryForPrompt, learnedRules, e.systemOverride)
 	e.systemOverride = ""
 
 	updatedPayload, _ := json.Marshal(ev.State)
@@ -372,6 +401,15 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 		e.lastReplan = time.Time{}
 		go e.exec.SendControl("noop", "No actionable tasks generated")
 		return
+	}
+
+	if ev.Plan.ProposedStrategy != "" && e.isAutonomousMode {
+		if e.currentStrategy != ev.Plan.ProposedStrategy {
+			e.logger.Info("LLM Autonomous Strategy Override", slog.String("new_strategy", ev.Plan.ProposedStrategy))
+			e.currentStrategy = ev.Plan.ProposedStrategy
+			e.planner.ClearMilestone()
+			go e.setSummaryAsync("Current Strategy", ev.Plan.ProposedStrategy)
+		}
 	}
 
 	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
@@ -465,7 +503,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.telemetry.RecordTaskStatus(StatusFailed)
 		e.resetExecutionState()
 		e.planner.ClearMilestone()
-		e.learning.Reset() // Wipe learned failure traits on respawn
+		e.learning.Reset()
 
 		e.systemOverride = "CRITICAL: Bot just died. Inventory is RESET. Treat the current inventory as ground truth and restart basic progression: gather wood first. Do NOT assume any tools exist."
 		e.lastReplan = time.Time{}
@@ -473,7 +511,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		meta.Status = string(StatusFailed)
 		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
-		go e.memory.MarkWorldNode(context.Background(), "last_death", "event", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+
+		go e.memory.MarkWorldNode(context.Background(), fmt.Sprintf("death_zone_%d", time.Now().Unix()), "hazard", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
 
 		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
 			"position": e.lastPos,
@@ -492,7 +531,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 	case "panic_retreat_end":
 		e.tsEmergencyLock = false
-		e.lastReplan = time.Time{} // Force immediate assessment after fleeing
+		e.lastReplan = time.Time{}
 		e.logger.Info("Emergency Lock RELEASED", logCtx...)
 
 	case "task_completed":
@@ -543,10 +582,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 			e.lastReplan = time.Now()
 		}
 
-		if status == StatusFailed {
-			if e.tasksCompletedSinceReplan == 0 {
-				e.planner.RecordStall()
-			}
+		if (status == StatusFailed || status == StatusAborted) && e.tasksCompletedSinceReplan == 0 {
+			e.planner.RecordStall()
 		}
 
 		e.tasksCompletedSinceReplan = 0
@@ -555,6 +592,8 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		switch FailureCause(failCause) {
 		case CauseNoBlocks:
 			advice = "No reachable blocks or entities found nearby. Use 'explore' first."
+		case "NO_ENTITY": // Mapped from the CauseNoEntity fix requirement
+			advice = "The target entity could not be found, despawned, or moved out of range. Find a new target or explore."
 		case CauseStuck:
 			advice = "Bot got physically stuck. Use 'explore' to escape the area."
 		case CausePathFailed:
@@ -636,6 +675,7 @@ func (e *Engine) processNextTask() {
 				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
 				e.setSummaryAsync("Target Node: "+name, msg)
 			}
+			time.Sleep(1 * time.Second)
 			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
 		}(locName, task.Trace.TraceID)
 		return

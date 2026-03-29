@@ -1,4 +1,4 @@
-package main
+package engine
 
 import "encoding/json"
 
@@ -42,19 +42,3 @@ type EventPlanError struct {
 }
 
 func (e EventPlanError) isEngineEvent() {}
-
-// EventMilestoneReady represents a successfully generated milestone plan.
-type EventMilestoneReady struct {
-	Epoch     int
-	Milestone *MilestonePlan
-}
-
-func (e EventMilestoneReady) isEngineEvent() {}
-
-// EventMilestoneError represents a failure in the milestone generation goroutine.
-type EventMilestoneError struct {
-	Epoch int
-	Error error
-}
-
-func (e EventMilestoneError) isEngineEvent() {}
