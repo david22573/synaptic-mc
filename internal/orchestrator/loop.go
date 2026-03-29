@@ -35,7 +35,7 @@ type Orchestrator struct {
 
 	mu              sync.RWMutex
 	currentSnapshot domain.EvaluationSnapshot
-	pendingFeedback []string
+	pendingFeedback []domain.Feedback
 	reflexLock      bool
 	evalCancel      context.CancelFunc
 	evalRunID       uint64
@@ -281,7 +281,10 @@ func (o *Orchestrator) evaluate(ctx context.Context, snap domain.EvaluationSnaps
 			}
 			o.logger.Error("decision evaluation failed", slog.Any("error", err))
 			o.mu.Lock()
-			o.pendingFeedback = append(o.pendingFeedback, "PREVIOUS PLAN REJECTED: "+err.Error())
+			o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
+				Type:  "PLAN_REJECTED",
+				Cause: err.Error(),
+			})
 			o.mu.Unlock()
 			return
 		}
@@ -452,8 +455,15 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 					o.IngestEvent(ctx, event)
 					o.mu.Lock()
 				}
-				o.pendingFeedback = append(o.pendingFeedback, fmt.Sprintf("TASK_FAILED: %s | CAUSE: %s | HINT: %s", payload.Action, payload.Cause, hint))
+
+				o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
+					Type:   "TASK_FAILED",
+					Action: payload.Action,
+					Cause:  payload.Cause,
+					Hint:   hint,
+				})
 				o.mu.Unlock()
+
 			} else if success {
 				parts := strings.SplitN(payload.Action, " ", 2)
 				if len(parts) == 2 {
@@ -476,7 +486,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 						o.logger.Info("Location marked", slog.String("name", targetName))
 
 						o.mu.Lock()
-						o.pendingFeedback = append(o.pendingFeedback, fmt.Sprintf("SYSTEM: Successfully marked current location as '%s'", targetName))
+						o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
+							Type:  "SYSTEM",
+							Cause: fmt.Sprintf("Successfully marked location as '%s'", targetName),
+						})
 						o.mu.Unlock()
 
 					} else if actionType == "recall_location" && o.memory != nil {
@@ -488,7 +501,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 						o.logger.Info("Location recalled", slog.String("world", knownWorld))
 
 						o.mu.Lock()
-						o.pendingFeedback = append(o.pendingFeedback, "SYSTEM RECALL: "+knownWorld)
+						o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
+							Type:  "SYSTEM",
+							Cause: "RECALL: " + knownWorld,
+						})
 						o.mu.Unlock()
 					}
 				}

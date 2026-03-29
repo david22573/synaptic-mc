@@ -18,21 +18,28 @@ type Vec3 struct {
 	Z float64 `json:"z"`
 }
 
+type Feedback struct {
+	Type   string `json:"type"`             // SYSTEM, TASK_FAILED, PLAN_REJECTED, etc.
+	Cause  string `json:"cause"`            // The actual error or reason
+	Action string `json:"action,omitempty"` // The action that caused it (if applicable)
+	Hint   string `json:"hint,omitempty"`   // Remediation hint for the LLM
+}
+
 type GameState struct {
-	Health       float64  `json:"health"`
-	Food         float64  `json:"food"`
-	TimeOfDay    int      `json:"time_of_day"`
-	Experience   float64  `json:"experience"`
-	Level        int      `json:"level"`
-	HasBedNearby bool     `json:"has_bed_nearby"`
-	Position     Vec3     `json:"position"`
-	Threats      []Threat `json:"threats"`
-	POIs         []POI    `json:"pois"`
-	Inventory    []Item   `json:"inventory"`
-	Hotbar       []*Item  `json:"hotbar"`
-	Offhand      *Item    `json:"offhand"`
-	ActiveSlot   int      `json:"active_slot"`
-	Feedback     []string `json:"feedback,omitempty"`
+	Health       float64    `json:"health"`
+	Food         float64    `json:"food"`
+	TimeOfDay    int        `json:"time_of_day"`
+	Experience   float64    `json:"experience"`
+	Level        int        `json:"level"`
+	HasBedNearby bool       `json:"has_bed_nearby"`
+	Position     Vec3       `json:"position"`
+	Threats      []Threat   `json:"threats"`
+	POIs         []POI      `json:"pois"`
+	Inventory    []Item     `json:"inventory"`
+	Hotbar       []*Item    `json:"hotbar"`
+	Offhand      *Item      `json:"offhand"`
+	ActiveSlot   int        `json:"active_slot"`
+	Feedback     []Feedback `json:"feedback,omitempty"`
 }
 
 type VersionedState struct {

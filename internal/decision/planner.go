@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/strategy"
 )
@@ -19,19 +21,27 @@ type RuleExtractor interface {
 	GenerateRules(ctx context.Context, sessionID string) string
 }
 
-type LLMPlanner struct {
+type AdvancedPlanner struct {
 	client    LLMClient
 	evaluator *strategy.Evaluator
 	extractor RuleExtractor
 	memStore  memory.Store
+	store     domain.EventStore
 }
 
-func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor RuleExtractor, memStore memory.Store) *LLMPlanner {
-	return &LLMPlanner{
+func NewAdvancedPlanner(
+	client LLMClient,
+	evaluator *strategy.Evaluator,
+	extractor RuleExtractor,
+	memStore memory.Store,
+	store domain.EventStore,
+) *AdvancedPlanner {
+	return &AdvancedPlanner{
 		client:    client,
 		evaluator: evaluator,
 		extractor: extractor,
 		memStore:  memStore,
+		store:     store,
 	}
 }
 
@@ -39,7 +49,7 @@ const BaseSystemRules = `You are the tactical commander of an autonomous Minecra
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
-3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
+3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per candidate.
 4. SURVIVAL: You CANNOT 'eat' if your inventory has no food.
    You CANNOT 'hunt' if health is under 12.
 5. CRAFTING RECIPES:
@@ -48,21 +58,26 @@ CRITICAL GAME MECHANIC RULES:
    - crafting_table: requires 4 oak_planks
    - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
    - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
-6. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
-7. FEEDBACK LOOP: If the state contains 'feedback' showing a previous plan was rejected, YOU MUST NOT REPEAT THE EXACT SAME PLAN.
-   Fix the validation errors (e.g., gather prerequisites first).
-8. To use a crafting table for recipes like pickaxes, you MUST have a crafting_table item physically in your inventory so the bot can place it.
-   Craft a new one if you lack one.
+6. If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
 
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
 VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
-CRITICAL NAMING RULE: Target names MUST be exact Minecraft IDs (e.g., "pig", "cow", "cobblestone", "dirt").
-DO NOT use generic or abstract terms like "animal", "shelter_hole", "passive_animals", or "food".
+
+OUTPUT REQUIREMENT (ADVANCED PLANNING):
+You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective. 
+Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
+
 Response format (JSON only):
 {
   "objective": "Sub-goal description",
-  "tasks": [
-    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Need wood for planks" }
+  "candidates": [
+    [
+      { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Directly gather wood" }
+    ],
+    [
+      { "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
+      { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood safely" }
+    ]
   ]
 }`
 
@@ -79,16 +94,16 @@ func formatStateForLLM(state domain.GameState) string {
 	}
 
 	compact := struct {
-		Health       float64         `json:"health"`
-		Food         float64         `json:"food"`
-		TimeOfDay    int             `json:"time_of_day"`
-		HasBedNearby bool            `json:"has_bed_nearby"`
-		Inventory    map[string]int  `json:"inventory"`
-		Threats      []compactThreat `json:"threats"`
-		POIs         []compactPOI    `json:"pois"`
-		HasPickaxe   bool            `json:"has_pickaxe"`
-		HasWeapon    bool            `json:"has_weapon"`
-		Feedback     []string        `json:"feedback,omitempty"`
+		Health       float64           `json:"health"`
+		Food         float64           `json:"food"`
+		TimeOfDay    int               `json:"time_of_day"`
+		HasBedNearby bool              `json:"has_bed_nearby"`
+		Inventory    map[string]int    `json:"inventory"`
+		Threats      []compactThreat   `json:"threats"`
+		POIs         []compactPOI      `json:"pois"`
+		HasPickaxe   bool              `json:"has_pickaxe"`
+		HasWeapon    bool              `json:"has_weapon"`
+		Feedback     []domain.Feedback `json:"feedback,omitempty"`
 	}{
 		Health:       state.Health,
 		Food:         state.Food,
@@ -135,7 +150,12 @@ func formatStateForLLM(state domain.GameState) string {
 	return string(b)
 }
 
-func (p *LLMPlanner) Generate(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
+type multiCandidateResponse struct {
+	Objective  string            `json:"objective"`
+	Candidates [][]domain.Action `json:"candidates"`
+}
+
+func (p *AdvancedPlanner) Generate(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	directive := p.evaluator.Evaluate(state)
 	learnedRules := ""
 
@@ -166,12 +186,66 @@ func (p *LLMPlanner) Generate(ctx context.Context, sessionID string, state domai
 		return nil, fmt.Errorf("llm api failure: %w", err)
 	}
 
-	var plan domain.Plan
-	if err := json.Unmarshal([]byte(cleanJSON(rawResponse)), &plan); err != nil {
+	var parsed multiCandidateResponse
+	if err := json.Unmarshal([]byte(cleanJSON(rawResponse)), &parsed); err != nil {
 		return nil, fmt.Errorf("llm schema violation: %w", err)
 	}
 
-	return &plan, nil
+	if len(parsed.Candidates) == 0 {
+		return nil, fmt.Errorf("planner returned zero candidates")
+	}
+
+	// Calculate historical action stats for scoring
+	events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
+	stats := learning.CalculateActionStats(events)
+
+	bestIdx := 0
+	highestScore := math.Inf(-1)
+
+	for i, candidate := range parsed.Candidates {
+		score := p.scoreCandidate(candidate, state, stats)
+		if score > highestScore {
+			highestScore = score
+			bestIdx = i
+		}
+	}
+
+	bestTasks := parsed.Candidates[bestIdx]
+
+	return &domain.Plan{
+		Objective: parsed.Objective,
+		Tasks:     bestTasks,
+	}, nil
+}
+
+func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats) float64 {
+	score := 100.0
+
+	for _, t := range tasks {
+		// 1. Cost Penalty (longer plans are riskier)
+		score -= 5.0
+
+		// 2. Immediate Risk Penalty
+		if t.Action == "hunt" {
+			score -= 20.0
+		}
+		if t.Action == "mine" {
+			score -= 10.0 // potential lava/mobs
+		}
+
+		// 3. Historical Probability Modifier
+		if stat, ok := stats[t.Action]; ok && stat.Attempts > 0 {
+			// Boost score if historically highly successful, heavily penalize if mostly failing
+			probability := stat.SuccessRate
+			score += (probability * 30.0)
+			score -= ((1.0 - probability) * 40.0)
+		} else {
+			// Neutral bump for untried actions to encourage exploration
+			score += 5.0
+		}
+	}
+
+	return score
 }
 
 func cleanJSON(raw string) string {

@@ -84,9 +84,14 @@ func main() {
 
 	strategyEvaluator := strategy.NewEvaluator()
 	policyExtractor := learning.NewPolicyExtractor(eventStore, logger)
-	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator, policyExtractor, memoryStore)
+
+	// Switch to the Phase 7 Advanced Planner
+	planner := decision.NewAdvancedPlanner(llmClient, strategyEvaluator, policyExtractor, memoryStore, eventStore)
+
 	survivalPolicy := policy.NewSurvivalPolicy()
-	policyEngine := policy.NewCompositePolicy(survivalPolicy)
+	intelligencePolicy := policy.NewIntelligencePolicy(eventStore, cfg.SessionID)
+	policyEngine := policy.NewCompositePolicy(survivalPolicy, intelligencePolicy)
+
 	decisionEngine := decision.NewPipeline(planner, policyEngine)
 	uiHub := observability.NewHub(logger)
 
