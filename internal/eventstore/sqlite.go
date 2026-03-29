@@ -37,7 +37,6 @@ func NewSQLiteEventStore(dbPath string) (*SQLiteStore, error) {
 		payload JSON NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
-	
 	CREATE INDEX IF NOT EXISTS idx_events_session ON domain_events(session_id, id ASC);
 	CREATE INDEX IF NOT EXISTS idx_events_trace ON domain_events(trace_id);
 	`
@@ -97,6 +96,51 @@ func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain
 
 		e.Type = domain.EventType(eventTypeStr)
 		events = append(events, e)
+	}
+
+	return events, nil
+}
+
+// 3.2 FIX: Added GetRecentStream to limit the history window
+func (s *SQLiteStore) GetRecentStream(ctx context.Context, sessionID string, limit int) ([]domain.DomainEvent, error) {
+	query := `
+		SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at 
+		FROM domain_events 
+		WHERE session_id = ? 
+		ORDER BY id DESC LIMIT ?
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []domain.DomainEvent
+	for rows.Next() {
+		var e domain.DomainEvent
+		var eventTypeStr string
+
+		if err := rows.Scan(
+			&e.ID,
+			&e.SessionID,
+			&e.Trace.TraceID,
+			&e.Trace.ActionID,
+			&e.Trace.MilestoneID,
+			&eventTypeStr,
+			&e.Payload,
+			&e.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+
+		e.Type = domain.EventType(eventTypeStr)
+		events = append(events, e)
+	}
+
+	// Reverse the slice to restore chronological order (since we queried DESC)
+	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+		events[i], events[j] = events[j], events[i]
 	}
 
 	return events, nil

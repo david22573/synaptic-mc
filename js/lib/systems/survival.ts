@@ -16,7 +16,9 @@ export class SurvivalSystem {
     public bot: Bot;
     private client: ControlPlaneClient;
     private config: SurvivalConfig;
-    private checkInterval: NodeJS.Timeout | null = null;
+
+    // 1.4 FIX: Replaced checkInterval with a boolean state flag
+    private running = false;
     private isPanicking = false;
     private lastDangerAt = 0;
     private lastFleeTime = 0;
@@ -30,15 +32,31 @@ export class SurvivalSystem {
     }
 
     public start() {
-        if (this.checkInterval) clearInterval(this.checkInterval);
-        this.checkInterval = setInterval(() => this.checkSurvival(), 1000);
+        if (this.running) return;
+        this.running = true;
+
+        // 1.4 FIX: Self-rescheduling async loop guarantees no overlapping executions
+        const tick = async () => {
+            if (!this.running) return;
+
+            try {
+                await this.checkSurvival();
+            } catch (err) {
+                log.error("Error in survival loop tick", {
+                    err: err instanceof Error ? err.message : String(err),
+                });
+            }
+
+            if (this.running) {
+                setTimeout(tick, 1000);
+            }
+        };
+
+        tick();
     }
 
     public stop() {
-        if (this.checkInterval) {
-            clearInterval(this.checkInterval);
-            this.checkInterval = null;
-        }
+        this.running = false;
         this.reset();
     }
 
@@ -85,7 +103,6 @@ export class SurvivalSystem {
                 this.bot.health > 10 &&
                 !isUnavoidableDeath
             ) {
-                // FIX: Properly reset panic state when engaging
                 if (this.isPanicking) {
                     this.isPanicking = false;
                     this.config.stopMovement();
@@ -121,7 +138,6 @@ export class SurvivalSystem {
                 );
             }
 
-            // FIX: Prevent spamming flee commands
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
@@ -135,11 +151,11 @@ export class SurvivalSystem {
                 this.fleeTo(safePos);
             }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
-            // FIX: Ensure we reset state properly when safe
             this.isPanicking = false;
             log.debug(
                 "Survival goal reached; securing exit and releasing reflex lock",
             );
+
             this.config.stopMovement();
 
             this.pillaringOut = true;
@@ -189,6 +205,7 @@ export class SurvivalSystem {
         const inWater =
             this.bot.blockAt(this.bot.entity.position.floored())?.name ===
             "water";
+
         if (inWater) {
             log.warn("Refusing to vertical dig escape while submerged.");
             return;
@@ -212,12 +229,11 @@ export class SurvivalSystem {
                     below.name !== "lava"
                 ) {
                     const tool = this.bot.pathfinder.bestHarvestTool(below);
-                    if (tool) await this.bot.equip(tool, "hand");
+                    if (tool) await this.bot.equip(tool.type, "hand");
                     await this.bot.dig(below);
                 }
             }
 
-            // FIX: Improved roof sealing with better error handling
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
@@ -233,7 +249,8 @@ export class SurvivalSystem {
                 );
 
             if (trashBlock) {
-                await this.bot.equip(trashBlock, "hand");
+                await this.bot.equip(trashBlock.type, "hand");
+
                 const pos = this.bot.entity.position.floored();
                 const compassVectors = [
                     new Vec3(1, 0, 0),
@@ -243,10 +260,12 @@ export class SurvivalSystem {
                 ];
 
                 let placed = false;
+
                 for (const vec of compassVectors) {
                     const wallBlock = this.bot.blockAt(
                         pos.offset(vec.x, 2, vec.z),
                     );
+
                     if (wallBlock && wallBlock.boundingBox === "block") {
                         try {
                             await this.bot.placeBlock(
@@ -286,6 +305,7 @@ export class SurvivalSystem {
                 this.bot.blockAt(pos.offset(1, yOffset, 0)),
                 this.bot.blockAt(pos.offset(-1, yOffset, 0)),
             ];
+
             return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
         };
 
@@ -298,6 +318,7 @@ export class SurvivalSystem {
         let jumps = 0;
         while (jumps < 10) {
             jumps++;
+
             if (this.bot.health <= 0) return;
 
             const pos = this.bot.entity.position.floored();
@@ -325,8 +346,8 @@ export class SurvivalSystem {
                 break;
             }
 
-            // FIX: Break roof before jumping to avoid head collision
             const roof = this.bot.blockAt(pos.offset(0, 2, 0));
+
             if (
                 roof &&
                 roof.name !== "air" &&
@@ -334,25 +355,41 @@ export class SurvivalSystem {
                 roof.name !== "lava"
             ) {
                 const tool = this.bot.pathfinder.bestHarvestTool(roof);
-                if (tool) await this.bot.equip(tool, "hand");
+                if (tool) await this.bot.equip(tool.type, "hand");
                 await this.bot.dig(roof).catch(() => {});
             }
 
-            await this.bot.equip(trashBlock, "hand");
-            await this.bot.lookAt(pos.offset(0, -1, 0), true);
+            await this.bot.equip(trashBlock.type, "hand");
 
             const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
-            if (refBlock) {
+            if (refBlock && refBlock.name !== "air") {
+                // Look down accurately at the top center of the block
+                await this.bot.lookAt(pos.offset(0.5, 0, 0.5), true);
                 this.bot.setControlState("jump", true);
-                await new Promise((resolve) => setTimeout(resolve, 300));
+
+                // Active polling to ensure physical bounding box clears the block space
+                const startY = this.bot.entity.position.y;
+
+                for (let k = 0; k < 20; k++) {
+                    await new Promise((resolve) => setTimeout(resolve, 20));
+
+                    if (this.bot.entity.position.y >= startY + 1.1) {
+                        break;
+                    }
+                }
 
                 try {
                     await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                } catch (e) {
-                    log.warn("Failed to place block under feet", { err: e });
+                } catch (e: any) {
+                    log.warn("Failed to place block under feet", {
+                        err: e.message || e,
+                    });
                 }
 
                 this.bot.setControlState("jump", false);
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            } else {
+                // Wait out falls if reference block is missing
                 await new Promise((resolve) => setTimeout(resolve, 200));
             }
         }

@@ -111,7 +111,38 @@ func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 		}
 	}
 
-	// 4. Autonomy Handoff
+	// 4. Autonomy Handoff (3.3 FIX: Added sub-goals to bridge the gap)
+	cookedFoodCount := 0
+	for k, v := range inv {
+		if strings.HasPrefix(k, "cooked_") || k == "bread" || k == "baked_potato" {
+			cookedFoodCount += v
+		}
+	}
+
+	if cookedFoodCount < 5 {
+		return Directive{
+			PrimaryGoal:   "SUSTENANCE: Hunt and smelt meat until you have 5+ cooked food items.",
+			SecondaryGoal: "MAINTENANCE: Ensure tools are repaired and ready.",
+			IsAutonomous:  false,
+		}
+	}
+
+	if inv["coal"] == 0 {
+		return Directive{
+			PrimaryGoal:   "RESOURCES: Find and mine coal_ore. You need it for smelting and torches.",
+			SecondaryGoal: "AWARENESS: Note locations of iron_ore for the next tier.",
+			IsAutonomous:  false,
+		}
+	}
+
+	if inv["iron_pickaxe"] == 0 {
+		return Directive{
+			PrimaryGoal:   "IRON_TIER: Mine iron_ore (needs stone_pickaxe), smelt iron_ingots, craft an iron_pickaxe.",
+			SecondaryGoal: "MAINTENANCE: Maintain food and coal stockpiles.",
+			IsAutonomous:  false,
+		}
+	}
+
 	return Directive{
 		PrimaryGoal:   "AUTONOMY: Basic needs are met. Evaluate inventory and known world, set long-term macro strategy.",
 		SecondaryGoal: "MAINTENANCE: Ensure food stays above 10 and tools are repaired.",

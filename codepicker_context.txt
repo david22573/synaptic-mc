@@ -1,10 +1,11 @@
-Project Context Dump (29 Mar 26 04:00 PDT)
+Project Context Dump (29 Mar 26 13:11 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 54
+Total Files: 55
 
 # Project Structure
 <file_tree>
+- Makefile
 - cmd\server\main.go
 - internal\decision\engine.go
 - internal\decision\pipeline.go
@@ -62,6 +63,46 @@ Total Files: 54
 </file_tree>
 
 # File Contents
+<file path="Makefile">
+.PHONY: help install run-server run-bot dev clean test-replay
+
+# Default target
+.DEFAULT_GOAL := help
+
+help: ## Show this help message
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+install: ## Install Go and JS dependencies
+	@echo "==> Installing JS dependencies..."
+	cd js && npm install
+	@echo "==> Tidying Go modules..."
+	go mod tidy
+
+run-server: ## Run the Go control plane directly
+	@echo "==> Starting Go WebSocket Server..."
+	go run cmd/server/*.go
+
+run-bot: ## Run the Mineflayer TypeScript bot directly
+	@echo "==> Starting Mineflayer Bot..."
+	cd js && npx tsx index.ts
+
+dev: ## Run both server and bot concurrently in one terminal
+	@echo "==> Starting CraftD Control Plane and Bot..."
+	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
+	go run cmd/server/*.go & \
+	sleep 2; \
+	cd js && npx tsx index.ts
+
+test-replay: ## Run the Replay Test Harness
+	@echo "==> Running Planning Replay Tests..."
+	go test -v ./tests/...
+
+clean: ## Clean up Go cache and Node modules
+	@echo "==> Cleaning up environment..."
+	rm -rf js/node_modules
+	go clean
+</file>
+
 <file path="cmd\server\main.go">
 package main
 
@@ -448,8 +489,6 @@ type RuleExtractor interface {
 	GenerateRules(ctx context.Context, sessionID string) string
 }
 
-// LLMPlanner implements Planner.
-// It merges the physical state with the strategic directive.
 type LLMPlanner struct {
 	client    LLMClient
 	evaluator *strategy.Evaluator
@@ -464,7 +503,6 @@ func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor Ru
 	}
 }
 
-// Enhanced System Rules to explicitly block invalid food/combat loops
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
@@ -475,11 +513,18 @@ CRITICAL GAME MECHANIC RULES:
    - oak_planks: requires 1 oak_log (yields 4)
    - stick: requires 2 oak_planks (yields 4)
    - crafting_table: requires 4 oak_planks
-   - wooden_pickaxe: requires 3 oak_planks + 2 stick
-   - stone_pickaxe: requires 3 cobblestone + 2 stick
+   - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
+   - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
 6. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
+7. FEEDBACK LOOP: If the state contains 'feedback' showing a previous plan was rejected, YOU MUST NOT REPEAT THE EXACT SAME PLAN. Fix the validation errors (e.g., gather prerequisites first).
+8. To use a crafting table for recipes like pickaxes, you MUST have a crafting_table item physically in your inventory so the bot can place it. Craft a new one if you lack one.
+
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
 VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
+
+CRITICAL NAMING RULE: Target names MUST be exact Minecraft IDs (e.g., "pig", "cow", "cobblestone", "dirt").
+DO NOT use generic or abstract terms like "animal", "shelter_hole", "passive_animals", or "food".
+
 Response format (JSON only):
 {
   "objective": "Sub-goal description",
@@ -623,6 +668,7 @@ type GameState struct {
 	Hotbar       []*Item  `json:"hotbar"`
 	Offhand      *Item    `json:"offhand"`
 	ActiveSlot   int      `json:"active_slot"`
+	Feedback     []string `json:"feedback,omitempty"` // Short-term memory for pipeline rejections
 }
 
 type Threat struct {
@@ -1608,6 +1654,7 @@ type Orchestrator struct {
 	mu               sync.RWMutex
 	lastState        domain.GameState
 	reflexLock       bool
+	lastPlannerError string
 	uiHub            *observability.Hub
 	planningInFlight atomic.Bool
 
@@ -1739,6 +1786,7 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
+	lastErr := o.lastPlannerError
 	o.mu.RUnlock()
 
 	if tm == nil {
@@ -1754,7 +1802,11 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 	}
 
 	if !o.planningInFlight.CompareAndSwap(false, true) {
-		return nil // Already planning
+		return nil
+	}
+
+	if lastErr != "" {
+		state.Feedback = append(state.Feedback, "PREVIOUS PLAN REJECTED: "+lastErr)
 	}
 
 	trace := domain.TraceContext{
@@ -1769,13 +1821,21 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 	default:
 	}
 
-	go func() {
+	go func(evalState domain.GameState) {
 		defer o.planningInFlight.Store(false)
-		plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
+
+		plan, err := o.decision.Evaluate(ctx, o.sessionID, evalState, trace)
 		if err != nil {
 			o.logger.Error("decision evaluation failed", slog.Any("error", err))
+			o.mu.Lock()
+			o.lastPlannerError = err.Error()
+			o.mu.Unlock()
 			return
 		}
+
+		o.mu.Lock()
+		o.lastPlannerError = ""
+		o.mu.Unlock()
 
 		if plan == nil || len(plan.Tasks) == 0 {
 			return
@@ -1790,7 +1850,7 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 			slog.Int("tasks", len(plan.Tasks)))
 
 		_ = tm.Enqueue(ctx, plan.Tasks...)
-	}()
+	}(state)
 
 	return nil
 }
@@ -1831,9 +1891,20 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		var payload struct {
 			Status    string `json:"status"`
 			CommandID string `json:"command_id"`
+			Cause     string `json:"cause"`
+			Action    string `json:"action"`
 		}
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
 			success := payload.Status == "COMPLETED"
+
+			// If the bot natively rejected the physical execution, feed that back to the LLM immediately
+			if !success && payload.Cause != "" {
+				o.logger.Warn("Task execution failed natively, injecting feedback", slog.String("cause", payload.Cause))
+				o.mu.Lock()
+				o.lastPlannerError = fmt.Sprintf("Physical execution of '%s' failed: %s. You MUST adjust your plan to gather or craft prerequisites first.", payload.Action, payload.Cause)
+				o.mu.Unlock()
+			}
+
 			_ = tm.Complete(ctx, payload.CommandID, success)
 		}
 	}
@@ -2404,14 +2475,58 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 	for i, task := range state.Normalized.Tasks {
 		if err := validateTaskPure(task, state.GameState, simInv); err != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
-			// We no longer break here; we want to collect all validation errors for the whole plan
 		}
 
+		// Simulate inventory yields and consumptions accurately so multi-step plans pass
 		switch task.Action {
-		case "craft", "gather", "mine":
+		case "gather", "mine":
 			simInv[task.Target.Name]++
 		case "eat":
 			simInv[task.Target.Name]--
+		case "craft":
+			target := strings.ToLower(task.Target.Name)
+			if strings.HasSuffix(target, "_planks") {
+				for k := range simInv {
+					if strings.HasSuffix(k, "_log") && simInv[k] > 0 {
+						simInv[k]--
+						break
+					}
+				}
+				simInv[target] += 4
+			} else if target == "stick" {
+				for k := range simInv {
+					if strings.HasSuffix(k, "_planks") && simInv[k] >= 2 {
+						simInv[k] -= 2
+						break
+					}
+				}
+				simInv["stick"] += 4
+			} else if target == "crafting_table" {
+				for k := range simInv {
+					if strings.HasSuffix(k, "_planks") && simInv[k] >= 4 {
+						simInv[k] -= 4
+						break
+					}
+				}
+				simInv[target]++
+			} else if target == "wooden_pickaxe" {
+				simInv["stick"] -= 2
+				for k := range simInv {
+					if strings.HasSuffix(k, "_planks") && simInv[k] >= 3 {
+						simInv[k] -= 3
+						break
+					}
+				}
+				simInv[target]++
+			} else if target == "stone_pickaxe" {
+				simInv["stick"] -= 2
+				if simInv["cobblestone"] >= 3 {
+					simInv["cobblestone"] -= 3
+				}
+				simInv[target]++
+			} else {
+				simInv[target]++
+			}
 		}
 	}
 
@@ -2446,7 +2561,9 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			}
 		}
 	case "craft":
-		if strings.HasSuffix(task.Target.Name, "_planks") {
+		target := strings.ToLower(task.Target.Name)
+
+		if strings.HasSuffix(target, "_planks") {
 			hasLogs := false
 			for k, v := range simInv {
 				if strings.HasSuffix(k, "_log") && v > 0 {
@@ -2455,7 +2572,50 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 				}
 			}
 			if !hasLogs {
-				return fmt.Errorf("cannot craft planks without logs")
+				return fmt.Errorf("cannot craft planks without logs in inventory")
+			}
+		} else if target == "stick" {
+			hasPlanks := false
+			for k, v := range simInv {
+				if strings.HasSuffix(k, "_planks") && v >= 2 {
+					hasPlanks = true
+					break
+				}
+			}
+			if !hasPlanks {
+				return fmt.Errorf("cannot craft sticks without at least 2 planks")
+			}
+		} else if target == "crafting_table" {
+			hasPlanks := false
+			for k, v := range simInv {
+				if strings.HasSuffix(k, "_planks") && v >= 4 {
+					hasPlanks = true
+					break
+				}
+			}
+			if !hasPlanks {
+				return fmt.Errorf("cannot craft crafting_table without at least 4 planks")
+			}
+		} else if target == "wooden_pickaxe" {
+			hasPlanks := false
+			for k, v := range simInv {
+				if strings.HasSuffix(k, "_planks") && v >= 3 {
+					hasPlanks = true
+					break
+				}
+			}
+			if !hasPlanks || simInv["stick"] < 2 {
+				return fmt.Errorf("wooden_pickaxe requires at least 3 planks and 2 sticks in inventory")
+			}
+			if simInv["crafting_table"] <= 0 {
+				return fmt.Errorf("wooden_pickaxe requires a crafting_table in inventory to place/use")
+			}
+		} else if target == "stone_pickaxe" {
+			if simInv["cobblestone"] < 3 || simInv["stick"] < 2 {
+				return fmt.Errorf("stone_pickaxe requires at least 3 cobblestone and 2 sticks in inventory")
+			}
+			if simInv["crafting_table"] <= 0 {
+				return fmt.Errorf("stone_pickaxe requires a crafting_table in inventory to place/use")
 			}
 		}
 	}
@@ -2781,12 +2941,13 @@ const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
 
+// Aggressively filter out protodef noise
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
-    const msg = String(err.message || err);
+    const msg = String(err.message || err.stack || err);
     const name = String(err.name || "");
     return (
-        name === "PartialReadError" ||
+        name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
         msg.includes("Missing characters in string") ||
         msg.includes("protodef") ||
@@ -2798,10 +2959,14 @@ const isIgnorableError = (err: Error | any): boolean => {
 const originalConsoleError = console.error;
 console.error = (...args: any[]) => {
     const firstArg = args[0];
+    const msg =
+        typeof firstArg === "object"
+            ? String(firstArg?.err?.message || firstArg?.message || "")
+            : String(firstArg);
     if (
-        typeof firstArg === "object" &&
-        firstArg?.err &&
-        isIgnorableError(firstArg.err)
+        isIgnorableError(firstArg) ||
+        msg.includes("PartialReadError") ||
+        msg.includes("protodef")
     ) {
         return;
     }
@@ -2814,9 +2979,8 @@ console.warn = (...args: any[]) => {
     if (
         typeof firstArg === "string" &&
         firstArg.includes("Read error for undefined")
-    ) {
+    )
         return;
-    }
     originalConsoleWarn.apply(console, args);
 };
 
@@ -2838,11 +3002,13 @@ let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
+
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
 let lastStateSig = "";
 let lastStatePushTime = 0;
+
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
@@ -2862,9 +3028,8 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-    if (currentTask?.id === task.id) {
-        currentTask = null;
-    }
+    if (currentTask?.id === task.id) currentTask = null;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -2890,45 +3055,34 @@ function normalizeFailureCause(err: any): string {
         msg.includes("path_fail") ||
         msg.includes("failed_to_reach") ||
         msg.includes("pathfinder_timeout")
-    ) {
+    )
         return "PATH_FAILED";
-    }
     if (
         msg.includes("timeout") ||
         msg.includes("fsm_global_timeout") ||
         msg.includes("furnace_timeout_or_lag")
-    ) {
+    )
         return "TIMEOUT";
-    }
-    if (msg.includes("stuck")) {
-        return "STUCK";
-    }
+    if (msg.includes("stuck")) return "STUCK";
     if (
         msg.includes("no_entity") ||
         msg.includes("missing_entity") ||
         msg.includes("target_lost")
-    ) {
+    )
         return "NO_ENTITY";
-    }
     if (
         msg.includes("exhausted") ||
         msg.includes("no_") ||
         msg.includes("missing_") ||
         msg.includes("unknown_")
-    ) {
+    )
         return "NO_BLOCKS";
-    }
     return "UNKNOWN";
 }
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
-    if (isShuttingDown) {
-        log.warn("Ignoring decision during shutdown", {
-            action: decision.action,
-        });
-        return;
-    }
+    if (isShuttingDown) return;
 
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
@@ -2988,29 +3142,34 @@ async function executeDecision(decision: models.IncomingDecision) {
         ]);
 
         if (!signal.aborted) {
+            // Give server half a second to sync inventory over the network before evaluating next step
+            await new Promise((r) => setTimeout(r, 500));
+            pushState();
             completeTask(activeTask, "task_completed");
         }
     } catch (err: any) {
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
+            log.error("Task execution failed natively", {
+                action: decision.action,
+                target: decision.target?.name,
+                raw_error: err.message,
+                normalized_cause: normalizedCause,
+            });
+            pushState(); // Force state update on fail too
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-        if (currentTask?.id === activeTask.id) {
-            currentTask = null;
-        }
-        if (taskAbortController === localController) {
-            taskAbortController = null;
-        }
+        if (currentTask?.id === activeTask.id) currentTask = null;
+        if (taskAbortController === localController) taskAbortController = null;
     }
 }
 
 function pushState() {
     if (!bot?.entity || !client) return;
 
-    // Extract exact hotbar and offhand slots from Mineflayer memory
     const hotbarStart = bot.inventory.hotbarStart || 36;
     const hotbar = Array.from({ length: 9 }, (_, i) => {
         const item = bot.inventory.slots[hotbarStart + i];
@@ -3018,8 +3177,6 @@ function pushState() {
     });
 
     const offhandItem = bot.inventory.slots[45];
-
-    // Added bot.quickBarSlot to the signature so UI updates instantly when switching items
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -3073,12 +3230,9 @@ async function connectWithRetry(maxAttempts = 10) {
             }
             bot.removeAllListeners();
             bot.quit();
-        } catch (e) {
-            log.warn("Error during bot cleanup", { err: e });
-        }
+        } catch (e) {}
     }
 
-    log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
@@ -3089,10 +3243,6 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(pathfinder);
 
     if (!client) {
-        log.info("Initializing Control Plane client", {
-            ws_url: runtimeConfig.ws_url,
-            attempt: reconnectAttempt,
-        });
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (d) => void executeDecision(d),
             onUnlock: () => abortActiveTask("unlock"),
@@ -3116,19 +3266,16 @@ async function connectWithRetry(maxAttempts = 10) {
     });
 
     bot.on("end", (reason) => {
-        log.warn(`Bot disconnected. Reason: ${reason}`);
         abortActiveTask("bot_disconnected");
         survival.stop();
-
         const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
-        const jitter = Math.random() * 1000;
-        const finalBackoff = backoffMs + jitter;
-
-        log.info(`Retrying in ${finalBackoff / 1000}s...`);
-        setTimeout(() => {
-            reconnectAttempt++;
-            connectWithRetry(maxAttempts);
-        }, finalBackoff);
+        setTimeout(
+            () => {
+                reconnectAttempt++;
+                connectWithRetry(maxAttempts);
+            },
+            backoffMs + Math.random() * 1000,
+        );
     });
 
     bot.on("spawn", () => {
@@ -3141,25 +3288,32 @@ async function connectWithRetry(maxAttempts = 10) {
         movements.allowParkour = true;
         movements.allowSprinting = true;
 
-        const water = bot.registry.blocksByName.water?.id;
-        const lava = bot.registry.blocksByName.lava?.id;
-
         movements.liquids = new Set(
-            [water, lava].filter((id) => id !== undefined) as number[],
+            [
+                bot.registry.blocksByName.water?.id,
+                bot.registry.blocksByName.lava?.id,
+            ].filter((id) => id !== undefined) as number[],
         );
         movements.digCost = 1.5;
-
-        const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
-        movements.scafoldingBlocks = trashBlocks
+        movements.scafoldingBlocks = [
+            "dirt",
+            "cobblestone",
+            "netherrack",
+            "stone",
+        ]
             .map((name) => bot.registry.blocksByName[name]?.id)
             .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 10000;
 
-        if (!client.isConnected()) {
-            client.connect();
-        }
+        // Give pathfinder more breathing room to stop timeout spam
+        bot.pathfinder.thinkTimeout = 20000;
+
+        // Safe to attach inventory listeners now
+        bot.inventory.removeAllListeners("updateSlot");
+        bot.inventory.on("updateSlot", pushState);
+
+        if (!client.isConnected()) client.connect();
         survival.start();
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
@@ -3170,9 +3324,7 @@ async function connectWithRetry(maxAttempts = 10) {
                     viewDistance: 4,
                 });
                 viewerStarted = true;
-            } catch (err) {
-                log.warn("Could not start viewer", { err });
-            }
+            } catch (err) {}
         }
     });
 
@@ -3183,9 +3335,6 @@ async function connectWithRetry(maxAttempts = 10) {
     });
 
     bot.on("death", () => {
-        log.warn(
-            `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
-        );
         abortActiveTask("bot_died");
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
@@ -3206,7 +3355,6 @@ async function bootstrap() {
 }
 
 process.on("SIGINT", () => {
-    log.info("Received SIGINT, shutting down gracefully...");
     isShuttingDown = true;
     abortActiveTask("shutdown");
     if (bot) bot.quit();
@@ -3218,7 +3366,10 @@ process.on("SIGINT", () => {
 });
 
 bootstrap().catch((err) => {
-    log.error("Fatal startup", { err });
+    log.error("Fatal startup", {
+        err: err instanceof Error ? err.message : String(err),
+        stack: err?.stack,
+    });
     process.exit(1);
 });
 
@@ -3712,7 +3863,6 @@ export class SurvivalSystem {
                 this.bot.health > 10 &&
                 !isUnavoidableDeath
             ) {
-                // FIX: Properly reset panic state when engaging
                 if (this.isPanicking) {
                     this.isPanicking = false;
                     this.config.stopMovement();
@@ -3748,7 +3898,6 @@ export class SurvivalSystem {
                 );
             }
 
-            // FIX: Prevent spamming flee commands
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
@@ -3762,7 +3911,6 @@ export class SurvivalSystem {
                 this.fleeTo(safePos);
             }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
-            // FIX: Ensure we reset state properly when safe
             this.isPanicking = false;
             log.debug(
                 "Survival goal reached; securing exit and releasing reflex lock",
@@ -3839,12 +3987,11 @@ export class SurvivalSystem {
                     below.name !== "lava"
                 ) {
                     const tool = this.bot.pathfinder.bestHarvestTool(below);
-                    if (tool) await this.bot.equip(tool, "hand");
+                    if (tool) await this.bot.equip(tool.type, "hand");
                     await this.bot.dig(below);
                 }
             }
 
-            // FIX: Improved roof sealing with better error handling
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
@@ -3860,7 +4007,7 @@ export class SurvivalSystem {
                 );
 
             if (trashBlock) {
-                await this.bot.equip(trashBlock, "hand");
+                await this.bot.equip(trashBlock.type, "hand");
                 const pos = this.bot.entity.position.floored();
                 const compassVectors = [
                     new Vec3(1, 0, 0),
@@ -3952,7 +4099,6 @@ export class SurvivalSystem {
                 break;
             }
 
-            // FIX: Break roof before jumping to avoid head collision
             const roof = this.bot.blockAt(pos.offset(0, 2, 0));
             if (
                 roof &&
@@ -3961,25 +4107,40 @@ export class SurvivalSystem {
                 roof.name !== "lava"
             ) {
                 const tool = this.bot.pathfinder.bestHarvestTool(roof);
-                if (tool) await this.bot.equip(tool, "hand");
+                if (tool) await this.bot.equip(tool.type, "hand");
                 await this.bot.dig(roof).catch(() => {});
             }
 
-            await this.bot.equip(trashBlock, "hand");
-            await this.bot.lookAt(pos.offset(0, -1, 0), true);
+            await this.bot.equip(trashBlock.type, "hand");
 
             const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
-            if (refBlock) {
+            if (refBlock && refBlock.name !== "air") {
+                // Look down accurately at the top center of the block
+                await this.bot.lookAt(pos.offset(0.5, 0, 0.5), true);
+
                 this.bot.setControlState("jump", true);
-                await new Promise((resolve) => setTimeout(resolve, 300));
+
+                // Active polling to ensure physical bounding box clears the block space
+                const startY = this.bot.entity.position.y;
+                for (let k = 0; k < 20; k++) {
+                    await new Promise((resolve) => setTimeout(resolve, 20));
+                    if (this.bot.entity.position.y >= startY + 1.1) {
+                        break;
+                    }
+                }
 
                 try {
                     await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                } catch (e) {
-                    log.warn("Failed to place block under feet", { err: e });
+                } catch (e: any) {
+                    log.warn("Failed to place block under feet", {
+                        err: e.message || e,
+                    });
                 }
 
                 this.bot.setControlState("jump", false);
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            } else {
+                // Wait out falls if reference block is missing
                 await new Promise((resolve) => setTimeout(resolve, 200));
             }
         }
@@ -5698,16 +5859,19 @@ export async function gotoEntity(
     opts: MoveOptions,
 ): Promise<boolean> {
     const goal = new goals.GoalFollow(entity, range);
+
     try {
         await moveToGoal(bot, goal, {
             ...opts,
             dynamic: true,
             stuckTimeoutMs: 3000, // Chasing shouldn't stall for long
         });
+
         return true;
     } catch (err: any) {
         if (err.message === "aborted") {
-            throw err; // Bubble up explicit aborts immediately
+            throw err;
+            // Bubble up explicit aborts immediately
         }
 
         // Suppress general pathing/stuck errors for entity chasing
@@ -5727,11 +5891,25 @@ export function findNearestEntity(
     name: string,
     radius: number,
 ): Entity | null {
+    const isGenericAnimal =
+        name === "animal" || name === "passive_animals" || name === "food";
+    const isGenericMonster =
+        name === "monster" || name === "threat" || name === "hostile";
+
     return bot.nearestEntity((entity) => {
-        return (
-            entity.name === name &&
-            bot.entity.position.distanceTo(entity.position) <= radius
-        );
+        if (bot.entity.position.distanceTo(entity.position) > radius)
+            return false;
+
+        if (isGenericAnimal) {
+            return ["pig", "cow", "sheep", "chicken", "rabbit"].includes(
+                entity.name!,
+            );
+        }
+        if (isGenericMonster) {
+            return entity.type === "hostile" || entity.type === "mob";
+        }
+
+        return entity.name === name;
     });
 }
 
@@ -5806,7 +5984,6 @@ export async function runTask(
         stopMovement,
     };
 
-    // FIX: Check abort signal before starting
     if (signal.aborted) {
         throw new Error("aborted");
     }
@@ -5843,9 +6020,9 @@ export async function runTask(
 
             if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
 
-            // FIX: Add try/catch for consume which can fail
             try {
-                await bot.equip(food, "hand");
+                // Must pass .type to equip safely in all contexts
+                await bot.equip(food.type, "hand");
                 await bot.consume();
             } catch (err) {
                 throw new Error(
@@ -5877,7 +6054,6 @@ export async function runTask(
                 { signal, timeoutMs: 20000, stopMovement },
             );
 
-            // FIX: Add timeout for sleep operation
             await Promise.race([
                 bot.sleep(bed),
                 new Promise((_, reject) =>
@@ -5885,7 +6061,6 @@ export async function runTask(
                 ),
             ]);
 
-            // Wait for morning/wake event
             await new Promise<void>((resolve, reject) => {
                 const onWake = () => {
                     bot.removeListener("wake", onWake);
@@ -6591,10 +6766,10 @@ export function computeSafeRetreat(
 
 ```json
 {
-  "total_bytes": 182438,
-  "file_count": 54,
-  "estimated_tokens": 46724,
+  "total_bytes": 188284,
+  "file_count": 55,
+  "estimated_tokens": 48197,
   "mode": "full",
-  "generated_at": "2026-03-29T04:00:01.6742101-07:00"
+  "generated_at": "2026-03-29T13:11:59.0790939-07:00"
 }
 ```

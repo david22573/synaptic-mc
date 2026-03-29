@@ -2,6 +2,9 @@ package policy
 
 import (
 	"context"
+	"strings"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
 // SurvivalPolicy replaces the old HardGuardrails.
@@ -28,9 +31,58 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 			}
 		}
 		if !isValidEscape {
+			// 2.1 FIX: Populate OverridePlan to prevent idle deaths
+			var overridePlan *domain.Plan
+			var foodItemName string
+
+			foodItems := []string{
+				"beef", "porkchop", "mutton", "chicken", "rabbit",
+				"cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_rabbit",
+				"apple", "sweet_berries", "bread", "carrot", "potato", "baked_potato", "kelp", "dried_kelp",
+			}
+
+			for _, invItem := range input.State.Inventory {
+				if invItem.Count > 0 {
+					for _, f := range foodItems {
+						if strings.Contains(invItem.Name, f) {
+							foodItemName = invItem.Name
+							break
+						}
+					}
+				}
+				if foodItemName != "" {
+					break
+				}
+			}
+
+			if foodItemName != "" {
+				overridePlan = &domain.Plan{
+					Objective: "EMERGENCY OVERRIDE: Eat food to survive.",
+					Tasks: []domain.Action{
+						{
+							Action:   "eat",
+							Target:   domain.Target{Type: "item", Name: foodItemName},
+							Priority: 1,
+						},
+					},
+				}
+			} else {
+				overridePlan = &domain.Plan{
+					Objective: "EMERGENCY OVERRIDE: Retreat to safety.",
+					Tasks: []domain.Action{
+						{
+							Action:   "retreat",
+							Target:   domain.Target{Type: "none", Name: "none"},
+							Priority: 1,
+						},
+					},
+				}
+			}
+
 			return Decision{
-				IsApproved: false,
-				Reason:     "POLICY VIOLATION: Health is critical. Plan must prioritize survival (retreat, eat, gather, explore).",
+				IsApproved:   false,
+				Reason:       "POLICY VIOLATION: Health is critical. Plan must prioritize survival (retreat, eat, gather, explore).",
+				OverridePlan: overridePlan,
 			}
 		}
 	}

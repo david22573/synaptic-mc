@@ -51,6 +51,11 @@ func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
 	}
 
 	if !decision.IsApproved {
+		// 2.1 FIX: Use OverridePlan if provided by the policy engine
+		if decision.OverridePlan != nil {
+			state.FinalPlan = decision.OverridePlan
+			return nil
+		}
 		return fmt.Errorf("policy rejection: %s", decision.Reason)
 	}
 

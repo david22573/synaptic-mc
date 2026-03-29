@@ -88,7 +88,11 @@ func main() {
 	policyEngine := policy.NewCompositePolicy(survivalPolicy)
 	decisionEngine := decision.NewPipeline(planner, policyEngine)
 	uiHub := observability.NewHub(logger)
-	orch := orchestrator.New(cfg.SessionID, eventStore, decisionEngine, &noopController{}, uiHub, logger)
+
+	// Pass memoryStore into the orchestrator
+	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, decisionEngine, &noopController{}, uiHub, logger)
+
+	g, ctx := errgroup.WithContext(context.Background())
 
 	mux := http.NewServeMux()
 
@@ -103,7 +107,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	mux.HandleFunc("/bot/ws", handleBotConnection(orch, logger))
+	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, orch, logger))
 
 	uiPath := cfg.UIPath
 	if !filepath.IsAbs(uiPath) {
@@ -117,8 +121,6 @@ func main() {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
-
-	g, ctx := errgroup.WithContext(context.Background())
 
 	g.Go(func() error {
 		logger.Info("Starting UI hub")
@@ -203,7 +205,7 @@ func (n *noopController) Close() error {
 	return nil
 }
 
-func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) http.HandlerFunc {
+func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator, logger *slog.Logger) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -225,7 +227,18 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 
 		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()))
 
+		go func() {
+			<-appCtx.Done()
+			conn.Close()
+		}()
+
 		for {
+			if err := appCtx.Err(); err != nil {
+				logger.Info("Closing bot connection due to server shutdown")
+				conn.Close()
+				return
+			}
+
 			var msg struct {
 				Type    string              `json:"type"`
 				Payload json.RawMessage     `json:"payload"`
@@ -238,8 +251,6 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 				return
 			}
 
-			ctx := context.Background()
-
 			switch domain.EventType(msg.Type) {
 			case domain.EventTypeStateTick:
 				var state domain.GameState
@@ -247,7 +258,7 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 					logger.Error("Failed to unmarshal state", slog.Any("error", err))
 					continue
 				}
-				orch.IngestState(ctx, state)
+				orch.IngestState(appCtx, state)
 
 			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic, domain.EventTypePanicResolved:
 				var payload any
@@ -255,7 +266,7 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 					logger.Error("Failed to unmarshal event", slog.Any("error", err))
 					continue
 				}
-				orch.IngestEvent(ctx, domain.DomainEvent{
+				orch.IngestEvent(appCtx, domain.DomainEvent{
 					SessionID: orch.SessionID(),
 					Trace:     msg.Trace,
 					Type:      domain.EventType(msg.Type),

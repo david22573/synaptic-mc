@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
@@ -15,17 +16,24 @@ import (
 type TaskManager struct {
 	controller execution.Controller
 	logger     *slog.Logger
+	timeouts   map[string]time.Duration
+	OnDrain    func() // 4.1 FIX: Callback triggered when the queue empties
 
 	mu           sync.Mutex
 	activeTask   *domain.Action
 	activeCancel context.CancelFunc
+	watchdogDone chan struct{}
 	queue        []domain.Action
 }
 
-func NewTaskManager(ctrl execution.Controller, logger *slog.Logger) *TaskManager {
+func NewTaskManager(ctrl execution.Controller, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
+	if timeouts == nil {
+		timeouts = make(map[string]time.Duration)
+	}
 	return &TaskManager{
 		controller: ctrl,
 		logger:     logger.With(slog.String("component", "task_manager")),
+		timeouts:   timeouts,
 		queue:      make([]domain.Action, 0),
 	}
 }
@@ -84,7 +92,12 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 
 	m.logger.Info("Task concluded", slog.String("action", m.activeTask.Action), slog.Bool("success", success))
 
-	// Release resources for the active task
+	// Release resources for the active task and cancel its watchdog
+	if m.watchdogDone != nil {
+		close(m.watchdogDone)
+		m.watchdogDone = nil
+	}
+
 	if m.activeCancel != nil {
 		m.activeCancel()
 		m.activeCancel = nil
@@ -95,10 +108,21 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	if !success {
 		m.logger.Warn("Task failed, flushing remaining plan queue")
 		m.queue = make([]domain.Action, 0)
+
+		if m.OnDrain != nil {
+			go m.OnDrain()
+		}
 		return nil
 	}
 
-	return m.dispatchNextLocked(ctx)
+	err := m.dispatchNextLocked(ctx)
+
+	// 4.1 FIX: Trigger replanning immediately if the queue just ran dry
+	if m.activeTask == nil && len(m.queue) == 0 && m.OnDrain != nil {
+		go m.OnDrain()
+	}
+
+	return err
 }
 
 // Halt is the emergency brake for Bot Death or Flee events.
@@ -113,6 +137,11 @@ func (m *TaskManager) Halt(ctx context.Context, reason string) error {
 func (m *TaskManager) abortActiveLocked(ctx context.Context, reason string) error {
 	if m.activeTask == nil {
 		return nil
+	}
+
+	if m.watchdogDone != nil {
+		close(m.watchdogDone)
+		m.watchdogDone = nil
 	}
 
 	if m.activeCancel != nil {
@@ -138,14 +167,39 @@ func (m *TaskManager) dispatchNextLocked(ctx context.Context) error {
 
 	m.activeTask = &next
 	m.activeCancel = cancel
+	m.watchdogDone = make(chan struct{})
 
 	m.logger.Info("Dispatching task", slog.String("action", next.Action), slog.String("target", next.Target.Name))
 
 	if err := m.controller.Dispatch(taskCtx, next); err != nil {
 		m.activeTask = nil
 		m.activeCancel = nil
+		if m.watchdogDone != nil {
+			close(m.watchdogDone)
+			m.watchdogDone = nil
+		}
 		return fmt.Errorf("dispatch failed: %w", err)
 	}
+
+	// Watchdog Setup
+	timeout, exists := m.timeouts[next.Action]
+	if !exists {
+		timeout = 45 * time.Second // Safe fallback if the action isn't mapped
+	}
+	gracePeriod := timeout + 10*time.Second
+	taskID := next.ID
+
+	go func(done chan struct{}, waitTime time.Duration, id string) {
+		select {
+		case <-time.After(waitTime):
+			m.logger.Warn("Task watchdog triggered; task timed out natively", slog.String("task_id", id))
+			// Force completion with failure
+			_ = m.Complete(context.Background(), id, false)
+		case <-done:
+			// Task completed or aborted normally before the timeout
+			return
+		}
+	}(m.watchdogDone, gracePeriod, taskID)
 
 	return nil
 }

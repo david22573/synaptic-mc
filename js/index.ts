@@ -15,13 +15,14 @@ const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
 
+// Aggressively filter out protodef noise
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
-    const msg = String(err.message || err);
+    const msg = String(err.message || err.stack || err);
     const name = String(err.name || "");
 
     return (
-        name === "PartialReadError" ||
+        name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
         msg.includes("Missing characters in string") ||
         msg.includes("protodef") ||
@@ -33,10 +34,15 @@ const isIgnorableError = (err: Error | any): boolean => {
 const originalConsoleError = console.error;
 console.error = (...args: any[]) => {
     const firstArg = args[0];
+    const msg =
+        typeof firstArg === "object"
+            ? String(firstArg?.err?.message || firstArg?.message || "")
+            : String(firstArg);
+
     if (
-        typeof firstArg === "object" &&
-        firstArg?.err &&
-        isIgnorableError(firstArg.err)
+        isIgnorableError(firstArg) ||
+        msg.includes("PartialReadError") ||
+        msg.includes("protodef")
     ) {
         return;
     }
@@ -49,9 +55,9 @@ console.warn = (...args: any[]) => {
     if (
         typeof firstArg === "string" &&
         firstArg.includes("Read error for undefined")
-    ) {
+    )
         return;
-    }
+
     originalConsoleWarn.apply(console, args);
 };
 
@@ -97,9 +103,9 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-    if (currentTask?.id === task.id) {
-        currentTask = null;
-    }
+
+    if (currentTask?.id === task.id) currentTask = null;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -124,48 +130,59 @@ function normalizeFailureCause(err: any): string {
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
-        msg.includes("failed_to_reach") ||
+        (msg.includes("failed_to_reach") && !msg.includes("furnace")) ||
         msg.includes("pathfinder_timeout")
-    ) {
+    )
         return "PATH_FAILED";
-    }
+
     if (
         msg.includes("timeout") ||
         msg.includes("fsm_global_timeout") ||
         msg.includes("furnace_timeout_or_lag")
-    ) {
+    )
         return "TIMEOUT";
-    }
-    if (msg.includes("stuck")) {
-        return "STUCK";
-    }
+
+    if (msg.includes("stuck")) return "STUCK";
+
     if (
         msg.includes("no_entity") ||
         msg.includes("missing_entity") ||
         msg.includes("target_lost")
-    ) {
+    )
         return "NO_ENTITY";
-    }
+
+    // 2.3 FIX: Catch specific errors before falling back to NO_BLOCKS
+    if (msg.includes("no_pickaxe_equipped") || msg.includes("no_tool"))
+        return "NO_TOOL";
+
+    if (
+        msg.includes("no_furnace_available") ||
+        msg.includes("failed_to_reach_furnace")
+    )
+        return "NO_FURNACE";
+
+    if (msg.includes("no_mature_")) return "NO_MATURE_CROP";
+
+    if (
+        msg.includes("missing_ingredients") ||
+        msg.includes("missing_crafting_table")
+    )
+        return "MISSING_INGREDIENTS";
+
     if (
         msg.includes("exhausted") ||
         msg.includes("no_") ||
         msg.includes("missing_") ||
         msg.includes("unknown_")
-    ) {
+    )
         return "NO_BLOCKS";
-    }
+
     return "UNKNOWN";
 }
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
-
-    if (isShuttingDown) {
-        log.warn("Ignoring decision during shutdown", {
-            action: decision.action,
-        });
-        return;
-    }
+    if (isShuttingDown) return;
 
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
@@ -226,6 +243,9 @@ async function executeDecision(decision: models.IncomingDecision) {
         ]);
 
         if (!signal.aborted) {
+            // Give server half a second to sync inventory over the network before evaluating next step
+            await new Promise((r) => setTimeout(r, 500));
+            pushState();
             completeTask(activeTask, "task_completed");
         }
     } catch (err: any) {
@@ -239,17 +259,15 @@ async function executeDecision(decision: models.IncomingDecision) {
                 normalized_cause: normalizedCause,
             });
 
+            pushState(); // Force state update on fail too
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-        if (currentTask?.id === activeTask.id) {
-            currentTask = null;
-        }
-        if (taskAbortController === localController) {
-            taskAbortController = null;
-        }
+
+        if (currentTask?.id === activeTask.id) currentTask = null;
+        if (taskAbortController === localController) taskAbortController = null;
     }
 }
 
@@ -263,7 +281,6 @@ function pushState() {
     });
 
     const offhandItem = bot.inventory.slots[45];
-
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -317,12 +334,8 @@ async function connectWithRetry(maxAttempts = 10) {
             }
             bot.removeAllListeners();
             bot.quit();
-        } catch (e) {
-            log.warn("Error during bot cleanup", { err: e });
-        }
+        } catch (e) {}
     }
-
-    log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
 
     bot = mineflayer.createBot({
         host: "127.0.0.1",
@@ -334,11 +347,6 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(pathfinder);
 
     if (!client) {
-        log.info("Initializing Control Plane client", {
-            ws_url: runtimeConfig.ws_url,
-            attempt: reconnectAttempt,
-        });
-
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (d) => void executeDecision(d),
             onUnlock: () => abortActiveTask("unlock"),
@@ -362,19 +370,16 @@ async function connectWithRetry(maxAttempts = 10) {
     });
 
     bot.on("end", (reason) => {
-        log.warn(`Bot disconnected. Reason: ${reason}`);
         abortActiveTask("bot_disconnected");
         survival.stop();
-
         const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
-        const jitter = Math.random() * 1000;
-        const finalBackoff = backoffMs + jitter;
-
-        log.info(`Retrying in ${finalBackoff / 1000}s...`);
-        setTimeout(() => {
-            reconnectAttempt++;
-            connectWithRetry(maxAttempts);
-        }, finalBackoff);
+        setTimeout(
+            () => {
+                reconnectAttempt++;
+                connectWithRetry(maxAttempts);
+            },
+            backoffMs + Math.random() * 1000,
+        );
     });
 
     bot.on("spawn", () => {
@@ -387,25 +392,32 @@ async function connectWithRetry(maxAttempts = 10) {
         movements.allowParkour = true;
         movements.allowSprinting = true;
 
-        const water = bot.registry.blocksByName.water?.id;
-        const lava = bot.registry.blocksByName.lava?.id;
-
         movements.liquids = new Set(
-            [water, lava].filter((id) => id !== undefined) as number[],
+            [
+                bot.registry.blocksByName.water?.id,
+                bot.registry.blocksByName.lava?.id,
+            ].filter((id) => id !== undefined) as number[],
         );
         movements.digCost = 1.5;
-
-        const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
-        movements.scafoldingBlocks = trashBlocks
+        movements.scafoldingBlocks = [
+            "dirt",
+            "cobblestone",
+            "netherrack",
+            "stone",
+        ]
             .map((name) => bot.registry.blocksByName[name]?.id)
             .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 10000;
 
-        if (!client.isConnected()) {
-            client.connect();
-        }
+        // Give pathfinder more breathing room to stop timeout spam
+        bot.pathfinder.thinkTimeout = 20000;
+
+        // Safe to attach inventory listeners now
+        bot.inventory.removeAllListeners("updateSlot");
+        bot.inventory.on("updateSlot", pushState);
+
+        if (!client.isConnected()) client.connect();
         survival.start();
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
@@ -416,9 +428,7 @@ async function connectWithRetry(maxAttempts = 10) {
                     viewDistance: 4,
                 });
                 viewerStarted = true;
-            } catch (err) {
-                log.warn("Could not start viewer", { err });
-            }
+            } catch (err) {}
         }
     });
 
@@ -429,9 +439,6 @@ async function connectWithRetry(maxAttempts = 10) {
     });
 
     bot.on("death", () => {
-        log.warn(
-            `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
-        );
         abortActiveTask("bot_died");
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
@@ -452,7 +459,6 @@ async function bootstrap() {
 }
 
 process.on("SIGINT", () => {
-    log.info("Received SIGINT, shutting down gracefully...");
     isShuttingDown = true;
     abortActiveTask("shutdown");
     if (bot) bot.quit();
@@ -464,6 +470,9 @@ process.on("SIGINT", () => {
 });
 
 bootstrap().catch((err) => {
-    log.error("Fatal startup", { err });
+    log.error("Fatal startup", {
+        err: err instanceof Error ? err.message : String(err),
+        stack: err?.stack,
+    });
     process.exit(1);
 });

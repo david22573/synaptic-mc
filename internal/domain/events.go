@@ -40,5 +40,6 @@ type DomainEvent struct {
 type EventStore interface {
 	Append(ctx context.Context, sessionID string, trace TraceContext, eventType EventType, payload any) error
 	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)
+	GetRecentStream(ctx context.Context, sessionID string, limit int) ([]DomainEvent, error)
 	Close() error
 }

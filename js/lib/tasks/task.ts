@@ -42,7 +42,6 @@ export async function runTask(
         stopMovement,
     };
 
-    // FIX: Check abort signal before starting
     if (signal.aborted) {
         throw new Error("aborted");
     }
@@ -76,12 +75,11 @@ export async function runTask(
             const food = bot.inventory
                 .items()
                 .find((i) => i.name === decision.target.name);
-
             if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
 
-            // FIX: Add try/catch for consume which can fail
             try {
-                await bot.equip(food, "hand");
+                // Must pass .type to equip safely in all contexts
+                await bot.equip(food.type, "hand");
                 await bot.consume();
             } catch (err) {
                 throw new Error(
@@ -95,6 +93,7 @@ export async function runTask(
             return;
         case "sleep": {
             await escapeTree(bot, signal);
+
             const bed = bot.findBlock({
                 maxDistance: 32,
                 matching: (b: any) => b?.name.includes("bed"),
@@ -113,45 +112,52 @@ export async function runTask(
                 { signal, timeoutMs: 20000, stopMovement },
             );
 
-            // FIX: Add timeout for sleep operation
-            await Promise.race([
-                bot.sleep(bed),
-                new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error("SLEEP_TIMEOUT")), 10000),
-                ),
-            ]);
+            // 2.4 FIX: Setup wake listener first to prevent race condition, then
+            // race the combined sleep+wake promise against a graceful 12s timeout.
+            let onWake: (() => void) | undefined;
+            let onAbort: (() => void) | undefined;
 
-            // Wait for morning/wake event
-            await new Promise<void>((resolve, reject) => {
-                const onWake = () => {
-                    bot.removeListener("wake", onWake);
-                    resolve();
-                };
+            try {
+                const wakePromise = new Promise<void>((resolve, reject) => {
+                    onWake = () => resolve();
+                    onAbort = () => reject(new Error("aborted"));
 
-                const onAbort = () => {
-                    bot.removeListener("wake", onWake);
-                    bot.wake().catch(() => {});
-                    reject(new Error("aborted"));
-                };
+                    bot.on("wake", onWake);
+                    signal.addEventListener("abort", onAbort, { once: true });
+                });
 
-                bot.on("wake", onWake);
-                signal.addEventListener("abort", onAbort, { once: true });
-            });
+                const sleepPromise = bot.sleep(bed).then(() => wakePromise);
+                const timeoutPromise = new Promise<void>((resolve) =>
+                    setTimeout(resolve, 12000),
+                );
+
+                await Promise.race([sleepPromise, timeoutPromise]);
+            } finally {
+                if (onWake) bot.removeListener("wake", onWake);
+                if (onAbort) signal.removeEventListener("abort", onAbort);
+            }
+
             return;
         }
         case "retreat": {
             await escapeTree(bot, signal);
+
             const pos = computeSafeRetreat(getThreats());
             await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
                 signal,
                 timeoutMs: 15000,
                 stopMovement,
             });
+
             await waitForMs(1000, signal);
             return;
         }
         case "interact":
             await handleInteract(taskCtx);
+            return;
+        case "mark_location":
+        case "recall_location":
+            await waitForMs(500, signal);
             return;
         default:
             throw new Error(`unsupported: ${decision.action}`);
