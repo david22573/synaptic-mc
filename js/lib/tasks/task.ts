@@ -42,58 +42,59 @@ export async function runTask(
         stopMovement,
     };
 
+    // FIX: Check abort signal before starting
+    if (signal.aborted) {
+        throw new Error("aborted");
+    }
+
     switch (decision.action) {
         case "hunt":
             await handleHunt(taskCtx);
-
             return;
         case "gather":
             await handleGather(taskCtx);
             return;
-
         case "craft":
             await handleCraft(taskCtx);
             return;
-
         case "build":
             await handleBuild(taskCtx);
             return;
-
         case "smelt":
             await handleSmelt(taskCtx);
             return;
-
         case "mine":
             await handleMine(taskCtx);
             return;
-
         case "farm":
             await handleFarm(taskCtx);
             return;
-
         case "explore":
             await handleExplore(taskCtx);
             return;
-
         case "eat": {
             const food = bot.inventory
                 .items()
                 .find((i) => i.name === decision.target.name);
 
             if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
-            await bot.equip(food, "hand");
-            await bot.consume();
+
+            // FIX: Add try/catch for consume which can fail
+            try {
+                await bot.equip(food, "hand");
+                await bot.consume();
+            } catch (err) {
+                throw new Error(
+                    `CONSUME_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+                );
+            }
             return;
         }
-
         case "idle":
             await waitForMs(1500, signal);
-
             return;
-
         case "sleep": {
             await escapeTree(bot, signal);
-
             const bed = bot.findBlock({
                 maxDistance: 32,
                 matching: (b: any) => b?.name.includes("bed"),
@@ -112,9 +113,15 @@ export async function runTask(
                 { signal, timeoutMs: 20000, stopMovement },
             );
 
-            await bot.sleep(bed);
+            // FIX: Add timeout for sleep operation
+            await Promise.race([
+                bot.sleep(bed),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error("SLEEP_TIMEOUT")), 10000),
+                ),
+            ]);
 
-            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
+            // Wait for morning/wake event
             await new Promise<void>((resolve, reject) => {
                 const onWake = () => {
                     bot.removeListener("wake", onWake);
@@ -130,28 +137,22 @@ export async function runTask(
                 bot.on("wake", onWake);
                 signal.addEventListener("abort", onAbort, { once: true });
             });
-
             return;
         }
-
         case "retreat": {
             await escapeTree(bot, signal);
-
             const pos = computeSafeRetreat(getThreats());
             await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
                 signal,
                 timeoutMs: 15000,
                 stopMovement,
             });
-            await waitForMs(1000, signal); // Mitigation for cliff falls
+            await waitForMs(1000, signal);
             return;
         }
-
         case "interact":
             await handleInteract(taskCtx);
-
             return;
-
         default:
             throw new Error(`unsupported: ${decision.action}`);
     }

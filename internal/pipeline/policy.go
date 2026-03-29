@@ -1,4 +1,3 @@
-// internal/pipeline/policy.go
 package pipeline
 
 import (
@@ -9,7 +8,6 @@ import (
 	"david22573/synaptic-mc/internal/policy"
 )
 
-// PolicyStage applies the authoritative policy engine against the optimized plan.
 type PolicyStage struct {
 	engine policy.Engine
 }
@@ -19,6 +17,11 @@ func NewPolicyStage(engine policy.Engine) *PolicyStage {
 }
 
 func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
+	// FIX: Check for nil Normalized plan
+	if state.Normalized == nil {
+		return fmt.Errorf("cannot run policy stage: normalized plan is nil")
+	}
+
 	if state.Simulation == nil {
 		return fmt.Errorf("cannot run policy stage without simulation artifact")
 	}
@@ -33,6 +36,13 @@ func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
 		State: state.GameState,
 	}
 
+	// FIX: Respect context cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	decision := s.engine.Decide(ctx, input)
 
 	state.Policy = &PolicyDecision{
@@ -44,7 +54,6 @@ func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
 		return fmt.Errorf("policy rejection: %s", decision.Reason)
 	}
 
-	// The plan survives the entire pipeline. Lock it in.
 	state.FinalPlan = candidatePlan
 	return nil
 }

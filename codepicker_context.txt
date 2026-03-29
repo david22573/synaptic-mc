@@ -1,10 +1,11 @@
-Project Context Dump (28 Mar 26 21:27 PDT)
+Project Context Dump (28 Mar 26 21:44 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 37
+Total Files: 55
 
 # Project Structure
 <file_tree>
+- cmd\server\main.go
 - internal\decision\engine.go
 - internal\decision\pipeline.go
 - internal\decision\planner.go
@@ -34,17 +35,300 @@ Total Files: 37
 - internal\policy\survival.go
 - internal\policy\survival_test.go
 - internal\strategy\evaluator.go
-- ui\index.html
-- ui\src\App.svelte
-- ui\src\app.css
-- ui\src\components\ItemIcon.svelte
-- ui\src\lib\Counter.svelte
-- ui\src\main.ts
-- ui\svelte.config.js
-- ui\vite.config.ts
+- js\index.ts
+- js\lib\config.ts
+- js\lib\logger.ts
+- js\lib\models.ts
+- js\lib\network\client.ts
+- js\lib\systems\survival.ts
+- js\lib\tasks\fsm.ts
+- js\lib\tasks\handlers\build.ts
+- js\lib\tasks\handlers\craft.ts
+- js\lib\tasks\handlers\explore.ts
+- js\lib\tasks\handlers\farm.ts
+- js\lib\tasks\handlers\gather.ts
+- js\lib\tasks\handlers\hunt.ts
+- js\lib\tasks\handlers\interact.ts
+- js\lib\tasks\handlers\mine.ts
+- js\lib\tasks\handlers\smelt.ts
+- js\lib\tasks\normalize.ts
+- js\lib\tasks\primitives.ts
+- js\lib\tasks\registry.ts
+- js\lib\tasks\task.ts
+- js\lib\tasks\utils.ts
+- js\lib\types.d.ts
+- js\lib\utils\errors.ts
+- js\lib\utils\perception.ts
+- js\lib\utils\threats.ts
 </file_tree>
 
 # File Contents
+<file path="cmd\server\main.go">
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
+
+	"david22573/synaptic-mc/internal/decision"
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/eventstore"
+	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/llm"
+	"david22573/synaptic-mc/internal/memory"
+	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/orchestrator"
+	"david22573/synaptic-mc/internal/policy"
+	"david22573/synaptic-mc/internal/strategy"
+)
+
+type Config struct {
+	HTTPAddr     string
+	EventStoreDB string
+	MemoryDB     string
+	UIPath       string
+	LLMURL       string
+	LLMKey       string
+	LLMModel     string
+	SessionID    string
+	DataDir      string
+}
+
+func main() {
+	// Load .env file (optional - will log debug if missing)
+	if err := godotenv.Load(); err != nil {
+		slog.Debug("Could not load .env file", slog.Any("error", err))
+	}
+
+	cfg := parseConfig()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		logger.Error("Failed to create data directory", slog.String("path", cfg.DataDir), slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	// Use absolute paths for SQLite databases
+	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
+	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
+
+	eventStore, err := eventstore.NewSQLiteEventStore(eventStorePath)
+	if err != nil {
+		logger.Error("Failed to create event store", slog.String("path", eventStorePath), slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer eventStore.Close()
+
+	memoryStore, err := memory.NewSQLiteStore(memoryStorePath)
+	if err != nil {
+		logger.Error("Failed to create memory store", slog.String("path", memoryStorePath), slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer memoryStore.Close()
+
+	llmClient := llm.NewClient(llm.Config{
+		APIURL:     cfg.LLMURL,
+		APIKey:     cfg.LLMKey,
+		Model:      cfg.LLMModel,
+		MaxRetries: 3,
+	})
+
+	strategyEvaluator := strategy.NewEvaluator()
+	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator)
+	survivalPolicy := policy.NewSurvivalPolicy()
+	policyEngine := policy.NewCompositePolicy(survivalPolicy)
+	decisionEngine := decision.NewPipeline(planner, policyEngine)
+	uiHub := observability.NewHub(logger)
+	orch := orchestrator.New(cfg.SessionID, eventStore, decisionEngine, &noopController{}, uiHub, logger)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
+	mux.HandleFunc("/bot/ws", handleBotConnection(orch, logger))
+
+	// Resolve UI path to absolute
+	uiPath := cfg.UIPath
+	if !filepath.IsAbs(uiPath) {
+		uiPath = filepath.Join(".", uiPath)
+	}
+	mux.Handle("/", http.FileServer(http.Dir(uiPath)))
+
+	server := &http.Server{
+		Addr:         cfg.HTTPAddr,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	g.Go(func() error {
+		logger.Info("Starting UI hub")
+		uiHub.Run(ctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting orchestrator")
+		return orch.Run(ctx)
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting HTTP server", slog.String("addr", cfg.HTTPAddr))
+		return server.ListenAndServe()
+	})
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	logger.Info("Shutdown signal received")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("HTTP server shutdown error", slog.Any("error", err))
+	}
+
+	if err := g.Wait(); err != nil {
+		logger.Error("Service error", slog.Any("error", err))
+	}
+}
+
+func parseConfig() Config {
+	// Define flags with environment variable defaults
+	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
+	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
+	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
+	uiPath := flag.String("ui", getEnvOrDefault("UI_PATH", "ui/dist"), "UI static files path")
+	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
+	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
+	llmModel := flag.String("llm-model", getEnvOrDefault("LLM_MODEL", "llama3.2"), "LLM model name")
+	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
+	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
+
+	flag.Parse()
+
+	return Config{
+		HTTPAddr:     *httpAddr,
+		EventStoreDB: *eventsDB,
+		MemoryDB:     *memoryDB,
+		UIPath:       *uiPath,
+		LLMURL:       *llmURL,
+		LLMKey:       *llmKey,
+		LLMModel:     *llmModel,
+		SessionID:    *sessionID,
+		DataDir:      *dataDir,
+	}
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+type noopController struct{}
+
+func (n *noopController) Dispatch(ctx context.Context, action domain.Action) error {
+	slog.Warn("Dispatch called with no bot connected", slog.String("action", action.Action))
+	return nil
+}
+
+func (n *noopController) AbortCurrent(ctx context.Context, reason string) error {
+	slog.Warn("Abort called with no bot connected", slog.String("reason", reason))
+	return nil
+}
+
+func (n *noopController) Close() error {
+	return nil
+}
+
+func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) http.HandlerFunc {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			logger.Error("Bot WS upgrade failed", slog.Any("error", err))
+			return
+		}
+
+		botController := execution.NewWSController(conn)
+		idempotentController := execution.NewIdempotentController(botController, 1000)
+		orch.SetController(idempotentController)
+
+		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()))
+
+		for {
+			var msg struct {
+				Type    string              `json:"type"`
+				Payload json.RawMessage     `json:"payload"`
+				Trace   domain.TraceContext `json:"trace"`
+			}
+
+			if err := conn.ReadJSON(&msg); err != nil {
+				logger.Warn("Bot connection closed", slog.Any("error", err))
+				conn.Close()
+				return
+			}
+
+			ctx := context.Background()
+
+			switch domain.EventType(msg.Type) {
+			case domain.EventTypeStateTick:
+				var state domain.GameState
+				if err := json.Unmarshal(msg.Payload, &state); err != nil {
+					logger.Error("Failed to unmarshal state", slog.Any("error", err))
+					continue
+				}
+				orch.IngestState(ctx, state)
+
+			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic:
+				var payload any
+				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+					logger.Error("Failed to unmarshal event", slog.Any("error", err))
+					continue
+				}
+				orch.IngestEvent(ctx, domain.DomainEvent{
+					SessionID: orch.SessionID(),
+					Trace:     msg.Trace,
+					Type:      domain.EventType(msg.Type),
+					Payload:   msg.Payload,
+				})
+
+			default:
+				logger.Warn("Unknown bot message type", slog.String("type", msg.Type))
+			}
+		}
+	}
+}
+
+</file>
+
 <file path="internal\decision\engine.go">
 // internal/decision/engine.go
 package decision
@@ -1208,8 +1492,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Orchestrator manages the lifecycle, concurrency, and routing.
-// It is the ONLY component allowed to spawn goroutines for the core loop.
 type Orchestrator struct {
 	sessionID  string
 	store      domain.EventStore
@@ -1217,7 +1499,6 @@ type Orchestrator struct {
 	controller execution.Controller
 	logger     *slog.Logger
 
-	// Channels for managing incoming telemetry and execution events
 	stateCh chan domain.GameState
 	eventCh chan domain.DomainEvent
 
@@ -1246,18 +1527,15 @@ func New(
 	}
 }
 
-// Run starts the core loop with guaranteed lifecycle teardown via errgroup.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("Starting orchestrator lifecycle")
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	// Sub-routine: State Processing Loop
 	g.Go(func() error {
 		return o.processStateLoop(gCtx)
 	})
 
-	// Sub-routine: Event Processing Loop
 	g.Go(func() error {
 		return o.processEventLoop(gCtx)
 	})
@@ -1265,7 +1543,6 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
-// IngestState is called by the network layer when the TS bot pushes a tick.
 func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) {
 	select {
 	case <-ctx.Done():
@@ -1275,12 +1552,24 @@ func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) 
 	}
 }
 
-// IngestEvent is called by the network layer for explicit bot actions (deaths, task completion).
 func (o *Orchestrator) IngestEvent(ctx context.Context, event domain.DomainEvent) {
 	select {
 	case <-ctx.Done():
 	case o.eventCh <- event:
 	}
+}
+
+// SessionID returns the current session identifier
+func (o *Orchestrator) SessionID() string {
+	return o.sessionID
+}
+
+// SetController updates the execution controller when bot connects
+func (o *Orchestrator) SetController(ctrl execution.Controller) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.controller = ctrl
+	o.logger.Info("Execution controller updated")
 }
 
 func (o *Orchestrator) processStateLoop(ctx context.Context) error {
@@ -1296,8 +1585,7 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 			if o.uiHub != nil {
 				o.uiHub.Broadcast("state_update", state)
 			}
-			// Check routines / reflexes immediately (Phase 1: Fast Path)
-			// Trigger replan if necessary (Phase 1: Slow Path)
+
 			if err := o.evaluateState(ctx, state); err != nil {
 				o.logger.Error("Failed to evaluate state", slog.Any("error", err))
 			}
@@ -1311,7 +1599,6 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case ev := <-o.eventCh:
-			// 1. Commit to ground truth EventStore
 			if err := o.store.Append(ctx, o.sessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
 				o.logger.Error("Failed to append event to store", slog.Any("error", err))
 				continue
@@ -1321,47 +1608,62 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 				o.uiHub.Broadcast("event_stream", ev)
 			}
 
-			// 2. React to specific domain events
 			o.handleDomainEvent(ctx, ev)
 		}
 	}
 }
 
 func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState) error {
-	// E.g., if we are actively executing, skip replanning unless interrupted.
-	// For this refactor, we mock the trace generation.
-	trace := domain.TraceContext{
-		TraceID: fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+	o.mu.RLock()
+	controller := o.controller
+	o.mu.RUnlock()
+
+	if controller == nil {
+		o.logger.Debug("No controller available, skipping evaluation")
+		return nil
 	}
 
-	// This is the clean handoff to the pure decision pipeline
+	trace := domain.TraceContext{
+		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
+	}
+
 	plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
 	if err != nil {
-		return err
+		return fmt.Errorf("decision evaluation failed: %w", err)
 	}
 
 	if plan == nil || len(plan.Tasks) == 0 {
-		return nil // No action required
+		return nil
 	}
 
 	if o.uiHub != nil {
 		o.uiHub.Broadcast("objective_update", plan.Objective)
 	}
 
-	o.logger.Info("New plan generated", slog.String("objective", plan.Objective), slog.Int("tasks", len(plan.Tasks)))
+	o.logger.Info("New plan generated",
+		slog.String("objective", plan.Objective),
+		slog.Int("tasks", len(plan.Tasks)))
 
-	// Dispatch the first task. Queueing logic will be moved to a dedicated ExecutionManager in Phase 2.
-	return o.controller.Dispatch(ctx, plan.Tasks[0])
+	return controller.Dispatch(ctx, plan.Tasks[0])
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {
+	o.mu.RLock()
+	controller := o.controller
+	o.mu.RUnlock()
+
+	if controller == nil {
+		return
+	}
+
 	switch ev.Type {
 	case domain.EventBotDeath:
 		o.logger.Warn("Bot death detected, aborting active plans")
-		_ = o.controller.AbortCurrent(ctx, "bot_died")
+		_ = controller.AbortCurrent(ctx, "bot_died")
 	case domain.EventTypePanic:
 		o.logger.Warn("Bot panicked, halting execution")
-		_ = o.controller.AbortCurrent(ctx, "panic_triggered")
+		_ = controller.AbortCurrent(ctx, "panic_triggered")
 	}
 }
 
@@ -2258,817 +2560,3823 @@ func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 
 </file>
 
-<file path="ui\index.html">
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ui</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
-</html>
+<file path="js\index.ts">
+import pkg from "mineflayer-pathfinder";
+import mineflayer from "mineflayer";
+import { mineflayer as viewer } from "prismarine-viewer";
+
+import * as config from "./lib/config.js";
+import { log } from "./lib/logger.js";
+import * as models from "./lib/models.js";
+import { runTask } from "./lib/tasks/task.js";
+import { ControlPlaneClient } from "./lib/network/client.js";
+import { SurvivalSystem } from "./lib/systems/survival.js";
+import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
+import { getPOIs } from "./lib/utils/perception.js";
+
+const { pathfinder, Movements } = pkg;
+
+let viewerStarted = false;
+const isIgnorableError = (err: Error | any) => {
+    const msg = err?.message || "";
+
+    const name = err?.name || "";
+    return (
+        name === "PartialReadError" ||
+        msg.includes("Read error for undefined") ||
+        msg.includes("Missing characters in string")
+    );
+};
+
+process.on("uncaughtException", (err: Error) => {
+    if (isIgnorableError(err)) return;
+    log.error("Fatal uncaught exception", {
+        err: err.message,
+        stack: err.stack,
+    });
+    process.exit(1);
+});
+
+process.on("unhandledRejection", (reason: any) => {
+    if (isIgnorableError(reason)) return;
+    log.error("Unhandled promise rejection", { reason });
+});
+
+let currentTask: models.ActiveTask | null = null;
+let taskAbortController: AbortController | null = null;
+let bot: mineflayer.Bot;
+let client: ControlPlaneClient;
+
+let survival: SurvivalSystem;
+let runtimeConfig: config.Config;
+let lastDeathMessage: string = "unknown causes";
+
+let lastStateSig = "";
+let lastStatePushTime = 0;
+
+let reconnectAttempt = 1;
+let stateInterval: NodeJS.Timeout | null = null;
+
+function stopMovement() {
+    if (!bot) return;
+
+    bot.clearControlStates();
+    if (bot.pathfinder) bot.pathfinder.setGoal(null);
+}
+
+function completeTask(
+    task: models.ActiveTask | null,
+    status:
+        | "task_completed"
+        | "task_failed"
+        | "task_aborted" = "task_completed",
+    cause: string = "",
+) {
+    if (!task || !client) return;
+
+    client.sendEvent(
+        status,
+        `${task.action} ${task.target?.name || "none"}`,
+        task.id,
+        cause,
+        task.startTime,
+    );
+
+    if (currentTask?.id === task.id) currentTask = null;
+}
+
+function abortActiveTask(reason: string) {
+    if (currentTask) {
+        if (taskAbortController) taskAbortController.abort(reason);
+
+        completeTask(currentTask, "task_aborted", reason);
+    }
+}
+
+function normalizeFailureCause(err: any): string {
+    const msg = String(err?.message || err).toLowerCase();
+
+    if (
+        msg.includes("no path") ||
+        msg.includes("path_fail") ||
+        msg.includes("failed_to_reach") ||
+        msg.includes("pathfinder_timeout")
+    ) {
+        return "PATH_FAILED";
+    }
+    if (
+        msg.includes("timeout") ||
+        msg.includes("fsm_global_timeout") ||
+        msg.includes("furnace_timeout_or_lag")
+    ) {
+        return "TIMEOUT";
+    }
+    if (msg.includes("stuck")) {
+        return "STUCK";
+    }
+    if (
+        msg.includes("no_entity") ||
+        msg.includes("missing_entity") ||
+        msg.includes("target_lost")
+    ) {
+        return "NO_ENTITY";
+    }
+    if (
+        msg.includes("exhausted") ||
+        msg.includes("no_") ||
+        msg.includes("missing_") ||
+        msg.includes("unknown_")
+    ) {
+        return "NO_BLOCKS";
+    }
+
+    return "UNKNOWN";
+}
+
+async function executeDecision(decision: models.IncomingDecision) {
+    if (!decision?.action) return;
+
+    if (survival?.isPanickingNow()) {
+        if (decision.action === "retreat") {
+            survival.reset();
+        } else {
+            client.sendEvent(
+                "task_aborted",
+                "lock",
+                decision.id,
+                "panic",
+                Date.now(),
+            );
+            return;
+        }
+    }
+
+    abortActiveTask("preempted");
+
+    taskAbortController = new AbortController();
+    const signal = taskAbortController.signal;
+    const localController = taskAbortController;
+
+    // Scope the controller locally to prevent background timeouts from killing new tasks
+
+    currentTask = {
+        id: decision.id,
+        action: decision.action,
+        target: decision.target || { type: "none", name: "none" },
+        startTime: Date.now(),
+        trace: decision.trace || {
+            trace_id: "unknown",
+            action_id: decision.id,
+        },
+    };
+
+    stopMovement();
+    const activeTask = currentTask;
+    let timeoutId: NodeJS.Timeout | undefined;
+
+    try {
+        const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
+
+        const timeoutMs = timeouts[decision.action] || 15000;
+
+        await Promise.race([
+            runTask(
+                bot,
+                decision,
+                signal,
+                timeouts,
+                () => getThreats(bot),
+                (t) => computeSafeRetreat(bot, t, 20),
+                stopMovement,
+            ),
+            new Promise((_, r) => {
+                timeoutId = setTimeout(() => {
+                    localController.abort("timeout");
+                    r(new Error("timeout"));
+                }, timeoutMs);
+            }),
+        ]);
+
+        if (!signal.aborted) completeTask(activeTask, "task_completed");
+    } catch (err: any) {
+        // Fix: Allow timeout errors to bypass the aborted check so they actually report to the engine
+        if (!signal.aborted || err.message === "timeout") {
+            const normalizedCause = normalizeFailureCause(err);
+
+            completeTask(activeTask, "task_failed", normalizedCause);
+        }
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+
+        // Clear the ghost timeout!
+        stopMovement();
+    }
+}
+
+function pushState() {
+    if (!bot?.entity || !client) return;
+
+    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
+        .items()
+        .map((i) => `${i.name}:${i.count}`)
+        .sort()
+        .join(",")}`;
+
+    const now = Date.now();
+
+    if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
+
+    lastStateSig = sig;
+
+    lastStatePushTime = now;
+
+    client.sendState({
+        health: Math.round(bot.health),
+        food: Math.round(bot.food),
+        time_of_day: bot.time.timeOfDay,
+        position: {
+            x: Math.round(bot.entity.position.x),
+            y: Math.round(bot.entity.position.y),
+            z: Math.round(bot.entity.position.z),
+        },
+        threats: getThreats(bot)
+            .slice(0, 3)
+            .map((t) => ({ name: t.name })),
+        pois: getPOIs(bot),
+        inventory: bot.inventory
+            .items()
+            .map((i) => ({ name: i.name, count: i.count })),
+    });
+}
+
+async function connectWithRetry(maxAttempts = 10) {
+    if (reconnectAttempt > maxAttempts) {
+        log.error("Max reconnection attempts reached. Shutting down.");
+
+        process.exit(1);
+    }
+
+    if (bot) {
+        try {
+            if ((bot as any).viewer) {
+                (bot as any).viewer.close();
+
+                viewerStarted = false;
+            }
+            bot.removeAllListeners();
+            bot.quit();
+        } catch (e) {}
+    }
+
+    log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
+
+    bot = mineflayer.createBot({
+        host: "0.0.0.0",
+        port: 25565,
+        username: "CraftBot",
+        version: "1.19",
+    });
+
+    bot.loadPlugin(pathfinder);
+
+    if (!client) {
+        client = new ControlPlaneClient(runtimeConfig.ws_url, {
+            onCommand: (d) => void executeDecision(d),
+            onUnlock: () => abortActiveTask("unlock"),
+        });
+    }
+
+    if (!survival) {
+        survival = new SurvivalSystem(bot, client, {
+            onInterrupt: (r) => {
+                if (r === "panic_flee") abortActiveTask("survival_panic");
+            },
+            stopMovement: () => stopMovement(),
+        });
+    } else {
+        survival.bot = bot;
+    }
+
+    bot.on("error", (err: Error) => {
+        if (isIgnorableError(err)) return;
+        log.warn("Mineflayer bot emitted error", { err: err.message });
+    });
+
+    bot.on("end", (reason) => {
+        log.warn(`Bot disconnected. Reason: ${reason}`);
+        abortActiveTask("bot_disconnected");
+        survival.stop();
+
+        const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
+        log.info(`Retrying in ${backoffMs / 1000}s...`);
+        setTimeout(() => connectWithRetry(maxAttempts), backoffMs);
+        reconnectAttempt++;
+    });
+
+    bot.on("spawn", () => {
+        reconnectAttempt = 1;
+        log.info("Bot spawned successfully.");
+        const movements = new Movements(bot);
+        movements.canDig = true;
+        movements.allow1by1towers = true;
+        movements.allowParkour = true;
+        movements.allowSprinting = true;
+
+        const water = bot.registry.blocksByName.water?.id;
+        const lava = bot.registry.blocksByName.lava?.id;
+
+        movements.liquids = new Set(
+            [water, lava].filter((id) => id !== undefined) as number[],
+        );
+        movements.digCost = 1.5;
+
+        const trashBlocks = ["dirt", "cobblestone", "netherrack", "stone"];
+        movements.scafoldingBlocks = trashBlocks
+            .map((name) => bot.registry.blocksByName[name]?.id)
+            .filter((id) => id !== undefined);
+
+        bot.pathfinder.setMovements(movements);
+        bot.pathfinder.thinkTimeout = 10000;
+
+        if (!client.isConnected()) {
+            client.connect();
+        }
+        survival.start();
+
+        if (runtimeConfig.enable_viewer) {
+            try {
+                if (viewerStarted) {
+                    log.warn("Viewer already started, skipping new instance");
+
+                    return;
+                }
+                viewer(bot, {
+                    port: runtimeConfig.viewer_port,
+                    firstPerson: true,
+                    viewDistance: 4,
+                });
+
+                viewerStarted = true;
+            } catch (err) {
+                log.warn("Could not start viewer", { err });
+            }
+        }
+    });
+
+    bot.on("message", (msg) => {
+        const text = msg.toString();
+        if (text.includes(bot.username) && !text.startsWith("<"))
+            lastDeathMessage = text;
+    });
+
+    bot.on("death", () => {
+        log.warn(
+            `Bot died. Cause: ${lastDeathMessage}. Notifying control plane.`,
+        );
+        abortActiveTask("bot_died");
+        client.sendEvent("death", "death", "", lastDeathMessage, 0);
+        lastDeathMessage = "unknown causes";
+    });
+
+    bot.on("health", pushState);
+
+    if (stateInterval) clearInterval(stateInterval);
+    stateInterval = setInterval(pushState, 2000);
+}
+
+async function bootstrap() {
+    runtimeConfig = await config.loadConfig();
+
+    await connectWithRetry();
+}
+
+bootstrap().catch((err) => log.error("Fatal startup", { err }));
 
 </file>
 
-<file path="ui\src\App.svelte">
-<script lang="ts">
-    import { onMount, onDestroy } from "svelte";
-    import ItemIcon from "./components/ItemIcon.svelte";
+<file path="js\lib\config.ts">
+import * as dotenv from "dotenv";
+import * as fs from "fs";
+import * as path from "path";
 
-    type Vec3 = { x: number; y: number; z: number };
-    type Threat = { name: string };
-    type InventoryItem = { name: string; count: number };
+function loadEnv(): string {
+    const candidates = [
+        path.resolve(process.cwd(), ".env"),
+        path.resolve(process.cwd(), "../.env"),
+    ];
 
-    type BotState = {
-        health: number;
-        food: number;
-        time_of_day: number;
-        has_bed_nearby: boolean;
-        position: Vec3;
-        threats: Threat[];
-        inventory: InventoryItem[];
-    };
+    for (const envPath of candidates) {
+        if (fs.existsSync(envPath)) {
+            dotenv.config({ path: envPath });
+            return envPath;
+        }
+    }
 
-    let botState: BotState = $state({
-        health: 20,
-        food: 20,
-        time_of_day: 0,
-        has_bed_nearby: false,
-        position: { x: 0, y: 0, z: 0 },
-        threats: [],
-        inventory: [],
-    });
+    dotenv.config();
+    return "default-dotenv-lookup";
+}
 
-    let ws: WebSocket;
-    let connected = $state(false);
+export const ENV_PATH = loadEnv();
 
-    onMount(() => {
-        connect();
-    });
+export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
+export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
 
-    onDestroy(() => {
-        if (ws) ws.close();
-    });
+export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
+export const WS_URL = process.env.WS_URL || "ws://localhost:8080/ws";
 
-    function connect() {
-        ws = new WebSocket("ws://localhost:8080/ui/ws");
+export const TASK_TIMEOUTS: Record<string, number> = {
+    gather: 30000,
+    craft: 20000,
+    hunt: 30000,
+    explore: 20000,
+    build: 20000,
+    smelt: 30000,
+    farm: 40000,
+    mine: 45000,
+    retreat: 15000,
+    sleep: 20000,
+    mark_location: 5000,
+    recall_location: 5000,
+    idle: 3000,
+};
 
-        ws.onopen = () => {
-            connected = true;
+export const THREAT_WEIGHTS: Record<string, number> = {
+    warden: 1000,
+    creeper: 50,
+    skeleton: 20,
+    zombie: 10,
+    spider: 10,
+};
+
+export interface Config {
+    ws_url: string;
+    viewer_port: number;
+    enable_viewer: boolean;
+    debug_chat: boolean;
+    task_timeouts: Record<string, number>;
+    threat_weights: Record<string, number>;
+}
+
+let configCache: Config | null = null;
+
+export async function loadConfig(): Promise<Config> {
+    if (configCache) return configCache;
+
+    let timeoutId: NodeJS.Timeout | null = null;
+
+    try {
+        const controller = new AbortController();
+        timeoutId = setTimeout(() => controller.abort(), 3000);
+
+        const res = await fetch("http://127.0.0.1:8080/api/config", {
+            signal: controller.signal,
+        });
+
+        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
+
+        configCache = await res.json();
+
+        if (configCache!.task_timeouts) {
+            Object.assign(TASK_TIMEOUTS, configCache!.task_timeouts);
+        }
+        if (configCache!.threat_weights) {
+            Object.assign(THREAT_WEIGHTS, configCache!.threat_weights);
+        }
+
+        configCache!.task_timeouts = TASK_TIMEOUTS;
+        configCache!.threat_weights = THREAT_WEIGHTS;
+
+        return configCache!;
+    } catch (err) {
+        console.warn(
+            "Failed to fetch dynamic config, relying on static defaults",
+            err instanceof Error ? err.message : String(err),
+        );
+
+        configCache = {
+            ws_url: WS_URL,
+            viewer_port: VIEWER_PORT,
+            enable_viewer: ENABLE_VIEWER,
+            debug_chat: DEBUG_CHAT,
+            task_timeouts: TASK_TIMEOUTS,
+            threat_weights: THREAT_WEIGHTS,
         };
 
-        ws.onmessage = (event) => {
+        return configCache;
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+    }
+}
+
+</file>
+
+<file path="js\lib\logger.ts">
+import { type TraceContext } from "./models.js";
+
+const DEBUG = process.env.DEBUG === "true";
+
+interface LogMeta extends Record<string, unknown> {
+    trace?: TraceContext;
+}
+
+interface Logger {
+    info: (msg: string, meta?: LogMeta) => void;
+    warn: (msg: string, meta?: LogMeta) => void;
+    error: (msg: string, meta?: LogMeta) => void;
+    debug: (msg: string, meta?: LogMeta) => void;
+}
+
+function formatLog(level: string, msg: string, meta: LogMeta = {}): string {
+    const { trace, ...rest } = meta;
+    return JSON.stringify({
+        level,
+        msg,
+        trace_id: trace?.trace_id,
+        action_id: trace?.action_id,
+        milestone_id: trace?.milestone_id,
+        ...rest,
+        timestamp: new Date().toISOString(),
+    });
+}
+
+export const log: Logger = {
+    info: (msg, meta) => console.log(formatLog("INFO", msg, meta)),
+    warn: (msg, meta) => console.warn(formatLog("WARN", msg, meta)),
+    error: (msg, meta) => console.error(formatLog("ERROR", msg, meta)),
+    debug: (msg, meta) => {
+        if (!DEBUG) return;
+        console.log(formatLog("DEBUG", msg, meta));
+    },
+};
+
+</file>
+
+<file path="js\lib\models.ts">
+export enum ActionType {
+    Gather = "gather",
+    Craft = "craft",
+    Hunt = "hunt",
+    Explore = "explore",
+    Build = "build",
+    Smelt = "smelt",
+    Farm = "farm",
+    Mine = "mine",
+    MarkLocation = "mark_location",
+    RecallLocation = "recall_location",
+    Idle = "idle",
+    Sleep = "sleep",
+    Retreat = "retreat",
+    Eat = "eat",
+    Interact = "interact",
+}
+
+export enum ClientEventType {
+    TaskCompleted = "task_completed",
+    TaskFailed = "task_failed",
+    TaskAborted = "task_aborted",
+    Death = "death",
+    PanicRetreat = "panic_retreat",
+}
+
+export interface TraceContext {
+    trace_id: string;
+    action_id: string;
+    milestone_id?: string;
+}
+
+export interface DecisionTarget {
+    type: string;
+    name: string;
+}
+
+export interface IncomingDecision {
+    id: string;
+    action: ActionType;
+    target: DecisionTarget;
+    rationale?: string;
+    trace?: TraceContext;
+}
+
+export interface ActiveTask {
+    id: string;
+    action: ActionType;
+    target: DecisionTarget;
+    startTime: number;
+    trace: TraceContext;
+}
+
+export interface ThreatInfo {
+    id: number;
+    name: string;
+    distance: number;
+    threatScore: number;
+    position: { x: number; y: number; z: number };
+    entity?: any;
+}
+
+export interface POI {
+    type: string;
+    name: string;
+    position: { x: number; y: number; z: number };
+    distance: number;
+    visibility: number;
+    score: number;
+}
+
+</file>
+
+<file path="js\lib\network\client.ts">
+import WebSocket from "ws";
+import { log } from "../logger.js";
+import * as models from "../models.js";
+
+export interface ControlPlaneEvents {
+    onCommand: (decision: models.IncomingDecision) => void;
+    onUnlock: () => void;
+}
+
+export class ControlPlaneClient {
+    private ws: WebSocket | null = null;
+    private readonly url: string;
+    private readonly callbacks: ControlPlaneEvents;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private reconnectAttempts: number = 0;
+
+    constructor(url: string, callbacks: ControlPlaneEvents) {
+        this.url = url;
+        this.callbacks = callbacks;
+    }
+
+    public isConnected(): boolean {
+        return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    }
+
+    public connect(): void {
+        if (this.ws) {
+            // Remove listeners to prevent memory leaks and duplicate callbacks
+            this.ws.removeAllListeners();
+            // Terminate destroys the socket immediately, preventing lingering connections
+            // during aggressive reconnection loops
+            this.ws.terminate();
+            this.ws = null;
+        }
+
+        this.ws = new WebSocket(this.url);
+
+        this.ws.on("open", () => {
+            log.info("Connected to Go Control Plane", { ws_url: this.url });
+            this.reconnectAttempts = 0;
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer);
+                this.reconnectTimer = null;
+            }
+        });
+
+        this.ws.on("message", (data: Buffer) => {
             try {
-                const msg = JSON.parse(event.data);
-                if (msg.type === "state_update") {
-                    botState = msg.payload;
+                const msg = JSON.parse(data.toString());
+
+                if (msg.type === "command") {
+                    const decision = msg.payload as models.IncomingDecision;
+
+                    if (!decision || !decision.action) {
+                        log.error("Received malformed command payload", {
+                            payload: msg.payload,
+                        });
+
+                        this.callbacks.onUnlock();
+                        return;
+                    }
+
+                    decision.trace = msg.trace || {
+                        trace_id: "unknown",
+                        action_id: decision.id,
+                    };
+
+                    this.callbacks.onCommand(decision);
+                    return;
+                }
+
+                if (
+                    msg.type === "planning_error" ||
+                    msg.type === "noop" ||
+                    msg.type === "abort_task"
+                ) {
+                    log.debug("Control plane unlocked bot", {
+                        type: msg.type,
+
+                        payload: msg.payload,
+                    });
+                    this.callbacks.onUnlock();
                 }
             } catch (err) {
-                console.error("Failed to parse WS message:", err);
+                log.error("Failed to parse control-plane message", {
+                    err: err instanceof Error ? err.message : String(err),
+                });
+                this.callbacks.onUnlock();
+            }
+        });
+
+        this.ws.on("close", () => {
+            log.error("Disconnected from Control Plane. Reconnecting...");
+            this.callbacks.onUnlock();
+            this.scheduleReconnect();
+        });
+
+        this.ws.on("error", (err) => {
+            log.error("WebSocket error", {
+                err: err instanceof Error ? err.message : String(err),
+            });
+        });
+    }
+
+    private scheduleReconnect(): void {
+        if (this.reconnectTimer) return;
+        const baseDelay = 2000;
+        const maxDelay = 30000;
+        let delay = baseDelay * Math.pow(2, this.reconnectAttempts);
+        if (delay > maxDelay) delay = maxDelay;
+
+        const jitter = delay * 0.2 * (Math.random() * 2 - 1);
+        const finalDelay = Math.max(1000, delay + jitter);
+
+        log.info("Scheduling reconnect", {
+            delay_ms: Math.round(finalDelay),
+            attempt: this.reconnectAttempts + 1,
+        });
+
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectAttempts++;
+            this.reconnectTimer = null;
+            this.connect();
+        }, finalDelay);
+    }
+
+    public sendEvent(
+        event: string,
+        actionStr: string,
+        commandId = "",
+        cause = "",
+        startTime = 0,
+    ): void {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
+
+        this.ws.send(
+            JSON.stringify({
+                type: "event",
+                payload: {
+                    event,
+                    action: actionStr,
+
+                    command_id: commandId,
+                    cause,
+                    duration_ms,
+                },
+            }),
+        );
+    }
+
+    public sendState(state: Record<string, unknown>): void {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        this.ws.send(JSON.stringify({ type: "state", payload: state }));
+    }
+}
+
+</file>
+
+<file path="js\lib\systems\survival.ts">
+import type { Bot } from "mineflayer";
+import type { ControlPlaneClient } from "../network/client.js";
+import { log } from "../logger.js";
+import { getThreats, computeSafeRetreat } from "../utils/threats.js";
+import pkg from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
+
+const { goals } = pkg;
+
+export interface SurvivalConfig {
+    onInterrupt: (reason: string) => void;
+    stopMovement: () => void;
+}
+
+export class SurvivalSystem {
+    public bot: Bot;
+    private client: ControlPlaneClient;
+    private config: SurvivalConfig;
+    private checkInterval: NodeJS.Timeout | null = null;
+    private isPanicking = false;
+    private lastDangerAt = 0;
+    private lastFleeTime = 0;
+    private diggingEscape = false;
+    private pillaringOut = false;
+
+    constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
+        this.bot = bot;
+        this.client = client;
+        this.config = config;
+    }
+
+    public start() {
+        if (this.checkInterval) clearInterval(this.checkInterval);
+        this.checkInterval = setInterval(() => this.checkSurvival(), 1000);
+    }
+
+    public stop() {
+        if (this.checkInterval) clearInterval(this.checkInterval);
+        this.checkInterval = null;
+    }
+
+    public reset() {
+        this.isPanicking = false;
+        this.lastDangerAt = 0;
+        this.lastFleeTime = 0;
+        this.diggingEscape = false;
+        this.pillaringOut = false;
+    }
+
+    public isPanickingNow(): boolean {
+        return this.isPanicking;
+    }
+
+    private async checkSurvival() {
+        if (!this.bot || !this.bot.entity) return;
+
+        // Skip threat checks if we are actively executing physical escape/recovery sequences
+        if (this.diggingEscape || this.pillaringOut) return;
+
+        const threats = getThreats(this.bot);
+
+        const immediateThreats = threats.filter(
+            (t: any) =>
+                t.distance < 24 &&
+                t.threatScore > 5 &&
+                t.name !== "low_health_no_food" &&
+                t.name !== "starvation",
+        );
+
+        if (immediateThreats.length > 0) {
+            const topThreat = immediateThreats[0]!;
+
+            const hasWeapon = this.bot.inventory
+                .items()
+                .some(
+                    (i) => i.name.includes("axe") || i.name.includes("sword"),
+                );
+
+            const isOneOnOne = immediateThreats.length === 1;
+            const isUnavoidableDeath =
+                topThreat.name === "creeper" || topThreat.name === "warden";
+
+            if (
+                hasWeapon &&
+                isOneOnOne &&
+                this.bot.health > 10 &&
+                !isUnavoidableDeath
+            ) {
+                if (this.isPanicking) {
+                    this.isPanicking = false;
+                    this.config.stopMovement();
+                    this.client.sendEvent(
+                        "panic_retreat_end",
+                        "evasion_complete",
+                        "",
+                        "engaging_in_combat",
+                        0,
+                    );
+                }
+                return;
+            }
+
+            this.lastDangerAt = Date.now();
+
+            if (!this.isPanicking) {
+                this.isPanicking = true;
+
+                log.warn("Reflex: Critical Flee triggered", {
+                    cause: topThreat.name,
+                    health: Math.round(this.bot.health),
+                    threatCount: immediateThreats.length,
+                });
+
+                this.config.onInterrupt("panic_flee");
+                this.config.stopMovement();
+                this.client.sendEvent(
+                    "panic_retreat_start",
+                    "evasion",
+                    "",
+                    topThreat.name,
+                    0,
+                );
+            }
+
+            if (
+                !this.bot.pathfinder.isMoving() ||
+                Date.now() - this.lastFleeTime > 5000
+            ) {
+                this.lastFleeTime = Date.now();
+
+                const safePos = computeSafeRetreat(
+                    this.bot,
+                    immediateThreats,
+                    32,
+                );
+
+                this.fleeTo(safePos);
+            }
+        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
+            this.isPanicking = false;
+
+            log.debug(
+                "Survival goal reached; securing exit and releasing reflex lock",
+            );
+            this.config.stopMovement();
+
+            // Option A: Ensure we aren't trapped in a hole before handing control back
+            this.pillaringOut = true;
+            await this.pillarOut().catch((err) =>
+                log.warn("Pillar out failed", { err }),
+            );
+            this.pillaringOut = false;
+
+            this.client.sendEvent(
+                "panic_retreat_end",
+                "evasion_complete",
+                "",
+                "safe",
+                0,
+            );
+        }
+    }
+
+    private async fleeTo(safePos: { x: number; z: number }) {
+        try {
+            const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
+
+            const path = this.bot.pathfinder.getPathTo(
+                this.bot.pathfinder.movements,
+                goal,
+            );
+
+            if (path.status === "noPath" || path.status === "timeout") {
+                log.warn(
+                    "Panic pathfinding failed, attempting vertical dig escape",
+                );
+                await this.digEscape();
+                return;
+            }
+
+            this.bot.pathfinder.setGoal(goal);
+        } catch (e) {
+            log.warn(
+                "Pathfinder threw during panic, attempting vertical dig escape",
+            );
+            await this.digEscape();
+        }
+    }
+
+    private async digEscape() {
+        if (this.diggingEscape) return;
+
+        const inWater =
+            this.bot.blockAt(this.bot.entity.position.floored())?.name ===
+            "water";
+
+        if (inWater) {
+            log.warn("Refusing to vertical dig escape while submerged.");
+            return;
+        }
+
+        this.diggingEscape = true;
+        this.config.stopMovement();
+
+        try {
+            for (let i = 0; i < 3; i++) {
+                if (this.bot.health <= 0) break;
+
+                const pos = this.bot.entity.position.floored();
+                const below = this.bot.blockAt(pos.offset(0, -1, 0));
+
+                if (
+                    below &&
+                    below.name !== "air" &&
+                    below.name !== "bedrock" &&
+                    below.name !== "water" &&
+                    below.name !== "lava"
+                ) {
+                    const tool = this.bot.pathfinder.bestHarvestTool(below);
+                    if (tool) await this.bot.equip(tool, "hand");
+
+                    await this.bot.dig(below);
+                }
+            }
+
+            // Option B: The Multi-Stage Panic Roof
+            const trashBlock = this.bot.inventory
+                .items()
+                .find((i) =>
+                    [
+                        "dirt",
+                        "cobblestone",
+                        "stone",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                        "netherrack",
+                    ].includes(i.name),
+                );
+
+            if (trashBlock) {
+                await this.bot.equip(trashBlock, "hand");
+                const pos = this.bot.entity.position.floored();
+                const targetPos = pos.offset(0, 2, 0); // Directly above head
+                let placed = false;
+
+                const compassVectors = [
+                    new Vec3(1, 0, 0),
+                    new Vec3(-1, 0, 0),
+                    new Vec3(0, 0, 1),
+                    new Vec3(0, 0, -1),
+                ];
+
+                // 1. Try attaching to the surface walls (Y+2)
+                for (const vec of compassVectors) {
+                    const wallBlock = this.bot.blockAt(targetPos.plus(vec));
+                    if (wallBlock && wallBlock.boundingBox === "block") {
+                        try {
+                            // Aim at the wall face pointing back into the center
+                            await this.bot.placeBlock(
+                                wallBlock,
+                                vec.scaled(-1),
+                            );
+                            placed = true;
+                            log.debug(
+                                "Successfully sealed roof at surface level.",
+                            );
+                            break;
+                        } catch (e) {}
+                    }
+                }
+
+                // 2. If surface terrain is uneven/missing, place on top of head-level walls (Y+1)
+                if (!placed) {
+                    for (const vec of compassVectors) {
+                        const wallBlock = this.bot.blockAt(
+                            pos.offset(vec.x, 1, vec.z),
+                        );
+                        if (wallBlock && wallBlock.boundingBox === "block") {
+                            try {
+                                // Aim at the top face of the wall block
+                                await this.bot.placeBlock(
+                                    wallBlock,
+                                    new Vec3(0, 1, 0),
+                                );
+                                placed = true;
+                                log.debug(
+                                    "Successfully sealed roof on top of Y+1 wall.",
+                                );
+                                break;
+                            } catch (e) {}
+                        }
+                    }
+                }
+
+                if (!placed) {
+                    log.warn(
+                        "Failed to seal roof. Terrain geometry unsupported.",
+                    );
+                }
+            }
+        } catch (err) {
+            log.warn("Vertical dig escape failed", { err });
+        } finally {
+            this.diggingEscape = false;
+        }
+    }
+
+    private async pillarOut() {
+        if (!this.bot.entity || this.bot.health <= 0) return;
+
+        const isEnclosed = (yOffset: number) => {
+            const pos = this.bot.entity.position.floored();
+            const blocks = [
+                this.bot.blockAt(pos.offset(0, yOffset, -1)),
+                this.bot.blockAt(pos.offset(0, yOffset, 1)),
+                this.bot.blockAt(pos.offset(1, yOffset, 0)),
+                this.bot.blockAt(pos.offset(-1, yOffset, 0)),
+            ];
+            // If 3 or more surrounding blocks are solid, we are trapped
+            return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
+        };
+
+        // Check if we are physically trapped in a hole
+        if (!isEnclosed(0) && !isEnclosed(1)) {
+            return;
+        }
+
+        log.info("Trapped in pit. Initiating pillar-out recovery sequence.");
+
+        let jumps = 0;
+        while (jumps < 10) {
+            jumps++;
+            if (this.bot.health <= 0) return;
+
+            const pos = this.bot.entity.position.floored();
+            if (!isEnclosed(0) && !isEnclosed(1)) {
+                log.info("Surface reached. Resuming normal operations.");
+                break;
+            }
+
+            const trashBlock = this.bot.inventory
+                .items()
+                .find((i) =>
+                    [
+                        "dirt",
+                        "cobblestone",
+                        "stone",
+                        "netherrack",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                    ].includes(i.name),
+                );
+
+            if (!trashBlock) {
+                log.warn("Out of blocks! Cannot pillar out of hole.");
+                break;
+            }
+
+            // Break the roof we placed during the panic escape so we don't hit our head
+            const roof = this.bot.blockAt(pos.offset(0, 2, 0));
+            if (
+                roof &&
+                roof.name !== "air" &&
+                roof.name !== "water" &&
+                roof.name !== "lava"
+            ) {
+                const tool = this.bot.pathfinder.bestHarvestTool(roof);
+                if (tool) await this.bot.equip(tool, "hand");
+                await this.bot.dig(roof).catch(() => {});
+            }
+
+            await this.bot.equip(trashBlock, "hand");
+            await this.bot.lookAt(pos.offset(0, -1, 0), true);
+
+            const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
+            if (refBlock) {
+                this.bot.setControlState("jump", true);
+
+                // Mineflayer physics delay to reach peak jump height
+                await new Promise((resolve) => setTimeout(resolve, 300));
+
+                try {
+                    await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                } catch (e) {
+                    log.warn("Failed to place block under feet", { err: e });
+                }
+
+                this.bot.setControlState("jump", false);
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            }
+        }
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\fsm.ts">
+import type { Bot } from "mineflayer";
+import type { Entity } from "prismarine-entity";
+import { getErrorMessage } from "../utils/errors.js";
+
+export type TaskStatus = "RUNNING" | "SUCCESS" | "FAILED";
+
+export interface TaskResult {
+    status: TaskStatus;
+    reason?: string;
+    data?: any;
+}
+
+export interface StateContext {
+    bot: Bot;
+    targetName: string;
+    targetEntity: Entity | null;
+    searchRadius: number;
+    timeoutMs: number;
+    startTime: number;
+    signal: AbortSignal;
+    result?: TaskResult;
+}
+
+export interface FSMState {
+    name: string;
+    enter(ctx: StateContext): Promise<void> | void;
+    execute(ctx: StateContext): Promise<FSMState | null>;
+}
+
+export class StateMachineRunner {
+    private currentState: FSMState | null = null;
+    private context: StateContext;
+
+    constructor(initialState: FSMState, context: StateContext) {
+        this.currentState = initialState;
+        this.context = context;
+    }
+
+    public async run(): Promise<TaskResult> {
+        this.context.startTime = Date.now();
+
+        if (this.currentState) {
+            await this.currentState.enter(this.context);
+        }
+
+        while (this.currentState !== null) {
+            if (this.context.signal.aborted) {
+                return { status: "FAILED", reason: "aborted" };
+            }
+
+            if (Date.now() - this.context.startTime > this.context.timeoutMs) {
+                return { status: "FAILED", reason: "FSM_GLOBAL_TIMEOUT" };
+            }
+
+            try {
+                const nextState = await this.currentState.execute(this.context);
+                if (nextState !== this.currentState) {
+                    if (nextState) {
+                        await nextState.enter(this.context);
+                    }
+                    this.currentState = nextState;
+                }
+            } catch (err: unknown) {
+                return {
+                    status: "FAILED",
+                    reason: `FSM_CRASH: ${getErrorMessage(err)}`,
+                };
+            }
+        }
+
+        return (
+            this.context.result || {
+                status: "FAILED",
+                reason: "UNKNOWN_TERMINATION",
+            }
+        );
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\build.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { type TaskContext } from "../registry.js";
+import { escapeTree, placePortableUtility, waitForMs } from "../utils.js";
+
+class PlaceState implements FSMState {
+    name = "PLACING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const placedBlock = await placePortableUtility(ctx.bot, ctx.targetName);
+
+        if (!placedBlock) {
+            ctx.result = {
+                status: "FAILED",
+                reason: `NO_VALID_SURFACE_FOR_${ctx.targetName.toUpperCase()}`,
+            };
+            return null;
+        }
+
+        await waitForMs(500, ctx.signal);
+        ctx.result = { status: "SUCCESS", reason: "BLOCK_PLACED" };
+        return null;
+    }
+}
+
+class CheckInventoryState implements FSMState {
+    name = "CHECKING_INVENTORY";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const item = ctx.bot.inventory
+            .items()
+            .find((i: any) => i.name === ctx.targetName);
+
+        if (!item) {
+            ctx.result = {
+                status: "FAILED",
+                reason: `MISSING_${ctx.targetName.toUpperCase()}_IN_INVENTORY`,
+            };
+            return null;
+        }
+
+        return new PlaceState();
+    }
+}
+
+export async function handleBuild(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts } = ctx;
+    await escapeTree(bot, signal);
+
+    const targetName = decision.target?.name;
+    if (!targetName || targetName === "none") {
+        throw new Error("missing build target");
+    }
+
+    const fsmCtx: StateContext = {
+        bot,
+        targetName,
+        targetEntity: null,
+        searchRadius: 0,
+        timeoutMs: timeouts.build ?? 20000,
+        startTime: 0,
+        signal,
+    };
+
+    const fsm = new StateMachineRunner(new CheckInventoryState(), fsmCtx);
+    const result = await fsm.run();
+
+    if (result.status === "FAILED") {
+        throw new Error(result.reason || "unknown_fsm_failure");
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\craft.ts">
+// js/lib/tasks/handlers/craft.ts
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import type { TaskContext } from "../registry.js";
+import {
+    findNearestBlockByName,
+    placePortableUtility,
+    makeRoomInInventory,
+    escapeTree,
+    waitForMs,
+    moveToGoal,
+} from "../utils.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+interface CraftContext extends StateContext {
+    itemType: any;
+    recipe: any;
+    craftingTable: any;
+    isPortableTable: boolean;
+    stopMovement: () => void;
+}
+
+class CleanupState implements FSMState {
+    name = "CLEANUP";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+        if (cCtx.isPortableTable && cCtx.craftingTable) {
+            await makeRoomInInventory(cCtx.bot, 1);
+            const pickaxe = cCtx.bot.pathfinder.bestHarvestTool(
+                cCtx.craftingTable,
+            );
+            if (pickaxe) await cCtx.bot.equip(pickaxe, "hand");
+
+            try {
+                await cCtx.bot.dig(cCtx.craftingTable);
+                await waitForMs(1000, cCtx.signal);
+            } catch (_err) {}
+        }
+
+        cCtx.result = { status: "SUCCESS", reason: "CRAFTING_COMPLETE" };
+        return null;
+    }
+}
+
+class CraftingState implements FSMState {
+    name = "CRAFTING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+        try {
+            // FIX: Prevent bot.craft from hanging indefinitely when inventory is full
+            await makeRoomInInventory(cCtx.bot, 1);
+
+            const tableToUse = cCtx.recipe.requiresTable
+                ? cCtx.craftingTable
+                : null;
+            await cCtx.bot.craft(cCtx.recipe, 1, tableToUse);
+        } catch (err: any) {
+            cCtx.result = {
+                status: "FAILED",
+                reason: `CRAFT_ACTION_FAILED: ${err.message}`,
+            };
+            return null;
+        }
+
+        return new CleanupState();
+    }
+}
+
+class NavigateTableState implements FSMState {
+    name = "NAVIGATING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+        if (cCtx.recipe.requiresTable && cCtx.craftingTable) {
+            const pos = cCtx.craftingTable.position;
+            try {
+                await moveToGoal(
+                    cCtx.bot,
+                    new goals.GoalNear(pos.x, pos.y, pos.z, 2),
+                    {
+                        signal: cCtx.signal,
+                        timeoutMs: 15000,
+                        stopMovement: cCtx.stopMovement,
+                        dynamic: false,
+                    },
+                );
+            } catch (err: any) {
+                if (err.message === "aborted") {
+                    cCtx.result = { status: "FAILED", reason: "aborted" };
+                } else {
+                    cCtx.result = {
+                        status: "FAILED",
+                        reason: "FAILED_TO_REACH_TABLE",
+                    };
+                }
+                return null;
+            }
+        }
+
+        return new CraftingState();
+    }
+}
+
+class SetupRecipeState implements FSMState {
+    name = "SETUP_RECIPE";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const cCtx = ctx as CraftContext;
+        const targetRecipeName = cCtx.targetName;
+        const itemType = cCtx.bot.registry.itemsByName[targetRecipeName];
+        if (!itemType) {
+            cCtx.result = {
+                status: "FAILED",
+                reason: `UNKNOWN_ITEM: ${targetRecipeName}`,
+            };
+            return null;
+        }
+        cCtx.itemType = itemType;
+
+        let craftingTable = findNearestBlockByName(cCtx.bot, "crafting_table");
+        let isPortableTable = false;
+
+        let recipes = cCtx.bot.recipesFor(itemType.id, null, 1, craftingTable);
+        if (recipes.length === 0 && !craftingTable) {
+            const hasTableInInv = cCtx.bot.inventory
+                .items()
+                .some((i: any) => i.name === "crafting_table");
+            if (hasTableInInv) {
+                craftingTable = await placePortableUtility(
+                    cCtx.bot,
+                    "crafting_table",
+                );
+                if (craftingTable) {
+                    isPortableTable = true;
+                    recipes = cCtx.bot.recipesFor(
+                        itemType.id,
+                        null,
+                        1,
+                        craftingTable,
+                    );
+                }
+            }
+        }
+
+        if (recipes.length === 0) {
+            cCtx.result = {
+                status: "FAILED",
+                reason: `MISSING_INGREDIENTS_OR_CRAFTING_TABLE_FOR_${targetRecipeName.toUpperCase()}`,
+            };
+            return null;
+        }
+
+        cCtx.recipe = recipes[0];
+        cCtx.craftingTable = craftingTable;
+        cCtx.isPortableTable = isPortableTable;
+        return new NavigateTableState();
+    }
+}
+
+export async function handleCraft(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    await escapeTree(bot, signal);
+
+    const targetName = decision.target?.name;
+    if (!targetName || targetName === "none") {
+        throw new Error("missing craft target");
+    }
+
+    const fsmCtx: CraftContext = {
+        bot,
+        targetName,
+        targetEntity: null,
+        searchRadius: 0,
+        timeoutMs: timeouts.craft ?? 20000,
+        startTime: 0,
+        signal,
+        itemType: null,
+        recipe: null,
+        craftingTable: null,
+        isPortableTable: false,
+        stopMovement,
+    };
+    const fsm = new StateMachineRunner(new SetupRecipeState(), fsmCtx);
+    const result = await fsm.run();
+    if (result.status === "FAILED") {
+        throw new Error(result.reason || "unknown_fsm_failure");
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\explore.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { type TaskContext } from "../registry.js";
+import { escapeTree, moveToGoal } from "../utils.js";
+import { log } from "../../logger.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+interface ExploreContext extends StateContext {
+    targetX: number;
+    targetZ: number;
+    attempts: number;
+    stopMovement: () => void;
+    visitedPoints: { x: number; z: number }[];
+}
+
+class NavigateState implements FSMState {
+    name = "NAVIGATING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const eCtx = ctx as ExploreContext;
+        try {
+            await moveToGoal(
+                eCtx.bot,
+                new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
+                {
+                    signal: eCtx.signal,
+                    timeoutMs: 12000, // Reduced from 15s to fit within global limit better
+                    stopMovement: eCtx.stopMovement,
+                    dynamic: false,
+                },
+            );
+            // Successfully reached new area. Record it to repel future exploration.
+            eCtx.visitedPoints.push({
+                x: eCtx.bot.entity.position.x,
+                z: eCtx.bot.entity.position.z,
+            });
+            if (eCtx.visitedPoints.length > 20) eCtx.visitedPoints.shift();
+
+            eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
+            return null;
+        } catch (err: any) {
+            const msg = String(err?.message ?? err);
+            if (eCtx.signal.aborted || msg.includes("aborted")) {
+                eCtx.result = { status: "FAILED", reason: "aborted" };
+                return null;
+            }
+
+            log.warn("Exploration path failed, picking new direction", {
+                reason: msg,
+            });
+            return new PickDirectionState();
+        }
+    }
+}
+
+class PickDirectionState implements FSMState {
+    name = "PICKING_DIRECTION";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const eCtx = ctx as ExploreContext;
+        eCtx.attempts++;
+
+        // Reduced from 4 attempts to 2 to prevent hitting global 25s FSM timeout
+        if (eCtx.attempts > 2) {
+            eCtx.result = {
+                status: "FAILED",
+                reason: "SURROUNDED_BY_OBSTACLES_OR_WATER",
+            };
+            return null;
+        }
+
+        const dist = 16 + Math.random() * 16;
+        let bestAngle = 0;
+        let maxRepulsionScore = -1;
+
+        // Sample 8 angles and pick the one furthest from our visited history
+        for (let i = 0; i < 8; i++) {
+            const testAngle = Math.random() * Math.PI * 2;
+            const tx = eCtx.bot.entity.position.x + Math.cos(testAngle) * dist;
+            const tz = eCtx.bot.entity.position.z + Math.sin(testAngle) * dist;
+
+            let minDistanceToHistory = 999999;
+            for (const pt of eCtx.visitedPoints) {
+                const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
+                if (d < minDistanceToHistory) minDistanceToHistory = d;
+            }
+
+            if (eCtx.visitedPoints.length === 0) minDistanceToHistory = 1;
+            if (minDistanceToHistory > maxRepulsionScore) {
+                maxRepulsionScore = minDistanceToHistory;
+                bestAngle = testAngle;
+            }
+        }
+
+        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(bestAngle) * dist;
+        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(bestAngle) * dist;
+
+        log.info("Picked exploration vector", {
+            dist: Math.round(dist),
+            targetX: Math.round(eCtx.targetX),
+            targetZ: Math.round(eCtx.targetZ),
+            attempt: eCtx.attempts,
+        });
+        return new NavigateState();
+    }
+}
+
+export async function handleExplore(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    await escapeTree(bot, signal);
+
+    // Bind the history array to the bot instance itself.
+    const botRef = bot as any;
+    botRef.explorationHistory = botRef.explorationHistory || [];
+    const fsmCtx: ExploreContext = {
+        bot,
+        targetName: "explore",
+        targetEntity: null,
+        searchRadius: 0,
+        timeoutMs: timeouts.explore ?? 25000,
+        startTime: 0,
+        signal,
+        targetX: 0,
+        targetZ: 0,
+        attempts: 0,
+        stopMovement,
+        visitedPoints: botRef.explorationHistory,
+    };
+    const result = await new StateMachineRunner(
+        new PickDirectionState(),
+        fsmCtx,
+    ).run();
+    if (result.status === "FAILED")
+        throw new Error(result.reason || "unknown_fsm_failure");
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\farm.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { type TaskContext } from "../registry.js";
+import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
+import { Vec3 } from "vec3";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+// Map crops to their fully grown metadata value and corresponding seed
+const CROP_DATA: Record<string, { matureAge: number; seedName: string }> = {
+    wheat: { matureAge: 7, seedName: "wheat_seeds" },
+    carrots: { matureAge: 7, seedName: "carrot" },
+    potatoes: { matureAge: 7, seedName: "potato" },
+    beetroots: { matureAge: 3, seedName: "beetroot_seeds" },
+};
+
+interface FarmContext extends StateContext {
+    candidatePositions: any[];
+    currentIndex: number;
+    targetBlock: any;
+    stopMovement: () => void;
+}
+
+class ReplantState implements FSMState {
+    name = "REPLANTING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const fCtx = ctx as FarmContext;
+        const cropInfo = CROP_DATA[fCtx.targetName];
+
+        // Find the farmland block directly below the crop we just broke
+        const farmlandPos = fCtx.targetBlock.position.offset(0, -1, 0);
+        const farmlandBlock = fCtx.bot.blockAt(farmlandPos);
+
+        if (farmlandBlock && farmlandBlock.name === "farmland") {
+            const seed = fCtx.bot.inventory
+                .items()
+                .find((i: any) => i.name === cropInfo!.seedName);
+            if (seed) {
+                try {
+                    await fCtx.bot.equip(seed, "hand");
+                    // Place seed on top of farmland
+                    await fCtx.bot.placeBlock(farmlandBlock, new Vec3(0, 1, 0));
+                    await waitForMs(300, fCtx.signal);
+                } catch (err) {
+                    // If replanting fails, we still succeeded at harvesting.
+                }
+            }
+        }
+
+        fCtx.result = { status: "SUCCESS", reason: "HARVESTED_AND_REPLANTED" };
+        return null;
+    }
+}
+
+class HarvestState implements FSMState {
+    name = "HARVESTING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const fCtx = ctx as FarmContext;
+        const cropBlock = fCtx.bot.blockAt(fCtx.targetBlock.position);
+
+        if (!cropBlock || cropBlock.name !== fCtx.targetName) {
+            return advanceToNextCrop(fCtx, "CROP_MISSING");
+        }
+
+        try {
+            await fCtx.bot.dig(cropBlock, true);
+            await waitForMs(400, fCtx.signal);
+            return new ReplantState();
+        } catch (err: any) {
+            return advanceToNextCrop(fCtx, `DIG_FAIL: ${err.message}`);
+        }
+    }
+}
+
+class NavigateCropState implements FSMState {
+    name = "NAVIGATING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const fCtx = ctx as FarmContext;
+        const pos = fCtx.candidatePositions[fCtx.currentIndex];
+        fCtx.targetBlock = fCtx.bot.blockAt(pos);
+
+        try {
+            await moveToGoal(
+                fCtx.bot,
+                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
+                {
+                    signal: fCtx.signal,
+                    timeoutMs: 12000,
+                    stopMovement: fCtx.stopMovement,
+                },
+            );
+            return new HarvestState();
+        } catch (err: any) {
+            return advanceToNextCrop(fCtx, `PATH_FAIL: ${err.message}`);
+        }
+    }
+}
+
+class SearchCropState implements FSMState {
+    name = "SEARCHING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const fCtx = ctx as FarmContext;
+        const cropInfo = CROP_DATA[fCtx.targetName];
+
+        if (!cropInfo) {
+            fCtx.result = {
+                status: "FAILED",
+                reason: `UNSUPPORTED_CROP: ${fCtx.targetName}`,
+            };
+            return null;
+        }
+
+        const blockId = fCtx.bot.registry.blocksByName[fCtx.targetName]?.id;
+        let blocks = fCtx.bot.findBlocks({
+            matching: blockId!,
+            maxDistance: 32,
+            count: 128,
+        });
+
+        const botPos = fCtx.bot.entity.position;
+
+        // Filter for ONLY fully mature crops using metadata
+        blocks = blocks.filter((pos: any) => {
+            const block = fCtx.bot.blockAt(pos);
+            return block && block.metadata === cropInfo.matureAge;
+        });
+
+        if (blocks.length === 0) {
+            fCtx.result = {
+                status: "FAILED",
+                reason: `NO_MATURE_${fCtx.targetName.toUpperCase()}_FOUND`,
+            };
+            return null;
+        }
+
+        blocks.sort(
+            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
+        );
+        fCtx.candidatePositions = blocks.slice(0, 5);
+        fCtx.currentIndex = 0;
+
+        return new NavigateCropState();
+    }
+}
+
+function advanceToNextCrop(fCtx: FarmContext, reason: string): FSMState | null {
+    fCtx.currentIndex++;
+    if (fCtx.currentIndex >= fCtx.candidatePositions.length) {
+        fCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
+        return null;
+    }
+    return new NavigateCropState();
+}
+
+export async function handleFarm(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    await escapeTree(bot, signal);
+
+    const fsmCtx: FarmContext = {
+        bot,
+        targetName: decision.target?.name || "",
+        targetEntity: null,
+        searchRadius: 32,
+        timeoutMs: timeouts.farm ?? 40000,
+        startTime: 0,
+        signal,
+        candidatePositions: [],
+        currentIndex: 0,
+        targetBlock: null,
+        stopMovement,
+    };
+
+    const result = await new StateMachineRunner(
+        new SearchCropState(),
+        fsmCtx,
+    ).run();
+    if (result.status === "FAILED") throw new Error(result.reason);
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\gather.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { type TaskContext } from "../registry.js";
+import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+const LOG_TYPES = [
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "acacia_log",
+    "jungle_log",
+    "dark_oak_log",
+    "mangrove_log",
+    "cherry_log",
+];
+
+interface GatherContext extends StateContext {
+    candidatePositions: any[];
+    currentIndex: number;
+    resolvedTarget: string;
+    targetBlock: any;
+    stopMovement: () => void;
+}
+
+class MineState implements FSMState {
+    name = "MINING";
+
+    async enter() {}
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const gCtx = ctx as GatherContext;
+        const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
+
+        if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
+            return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
+
+        const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
+        if (tool) await gCtx.bot.equip(tool, "hand");
+
+        try {
+            await gCtx.bot.dig(freshBlock);
+
+            // Whole-tree harvesting / vein mining
+            const blockId =
+                gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
+
+            if (blockId) {
+                const nearby = gCtx.bot.findBlocks({
+                    matching: blockId,
+                    maxDistance: 4,
+                    count: 16,
+                });
+
+                for (const pos of nearby) {
+                    if (gCtx.signal.aborted) break;
+
+                    const nextBlock = gCtx.bot.blockAt(pos);
+                    if (nextBlock) {
+                        await gCtx.bot.dig(nextBlock).catch(() => {});
+                    }
+                }
+            }
+
+            await waitForMs(500, gCtx.signal);
+
+            gCtx.result = { status: "SUCCESS" };
+            return null;
+        } catch (err: any) {
+            return advanceToNextCandidate(gCtx, `DIG_FAIL: ${err.message}`);
+        }
+    }
+}
+
+class NavigateState implements FSMState {
+    name = "NAVIGATING";
+
+    async enter() {}
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const gCtx = ctx as GatherContext;
+        const pos = gCtx.candidatePositions[gCtx.currentIndex];
+
+        gCtx.targetBlock = gCtx.bot.blockAt(pos);
+        gCtx.resolvedTarget = gCtx.targetBlock.name;
+
+        try {
+            await moveToGoal(
+                gCtx.bot,
+                new goals.GoalNear(pos.x, pos.y, pos.z, 1.5),
+                {
+                    signal: gCtx.signal,
+                    timeoutMs: 15000,
+                    stopMovement: gCtx.stopMovement,
+                },
+            );
+
+            return new MineState();
+        } catch (err: any) {
+            return advanceToNextCandidate(gCtx, `PATH_FAIL: ${err.message}`);
+        }
+    }
+}
+
+class SearchState implements FSMState {
+    name = "SEARCHING";
+
+    async enter() {}
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const gCtx = ctx as GatherContext;
+
+        const candidates =
+            gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
+
+        const ids = candidates
+            .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
+            .filter((id) => id !== undefined);
+
+        let blocks = gCtx.bot.findBlocks({
+            matching: ids,
+            maxDistance: 32, // Reduced from 64 to avoid blocking event loop
+            count: 64, // Reduced from 256
+        });
+
+        const botPos = gCtx.bot.entity.position;
+        blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
+
+        if (blocks.length === 0) {
+            gCtx.result = { status: "FAILED", reason: "NO_REACHABLE_BLOCKS" };
+            return null;
+        }
+
+        blocks.sort(
+            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
+        );
+
+        gCtx.candidatePositions = blocks.slice(0, 6);
+        gCtx.currentIndex = 0;
+
+        return new NavigateState();
+    }
+}
+
+function advanceToNextCandidate(
+    gCtx: GatherContext,
+    reason: string,
+): FSMState | null {
+    gCtx.currentIndex++;
+
+    if (
+        gCtx.currentIndex >= gCtx.candidatePositions.length ||
+        gCtx.currentIndex > 5
+    ) {
+        gCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
+        return null;
+    }
+    return new NavigateState();
+}
+
+export async function handleGather(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
+    await escapeTree(bot, signal);
+
+    const fsmCtx: GatherContext = {
+        bot,
+        targetName: decision.target?.name,
+        targetEntity: null,
+        searchRadius: 32, // Matches the reduced findBlocks radius
+        timeoutMs: timeouts.gather ?? 30000,
+        startTime: 0,
+        signal,
+        candidatePositions: [],
+        currentIndex: 0,
+        resolvedTarget: "",
+        targetBlock: null,
+        stopMovement,
+    };
+
+    const result = await new StateMachineRunner(
+        new SearchState(),
+        fsmCtx,
+    ).run();
+
+    if (result.status === "FAILED") throw new Error(result.reason);
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\hunt.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { gotoEntity, attackEntity, findNearestEntity } from "../primitives.js";
+import { type TaskContext } from "../registry.js";
+import { escapeTree } from "../utils.js";
+
+interface HuntContext extends StateContext {
+    stopMovement: () => void;
+}
+
+class LootState implements FSMState {
+    name = "LOOTING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const hCtx = ctx as HuntContext;
+
+        const droppedItems = findNearestEntity(hCtx.bot, "item", 8);
+
+        if (droppedItems) {
+            try {
+                const reached = await gotoEntity(hCtx.bot, droppedItems, 0.5, {
+                    signal: hCtx.signal,
+                    timeoutMs: 10000,
+                    stopMovement: hCtx.stopMovement,
+                });
+
+                if (!reached) {
+                    hCtx.result = {
+                        status: "FAILED",
+                        reason: "FAILED_TO_REACH_LOOT",
+                    };
+                    return null;
+                }
+            } catch (err: any) {
+                if (err.message === "aborted") {
+                    hCtx.result = { status: "FAILED", reason: "aborted" };
+                    return null;
+                }
+            }
+        }
+        hCtx.result = { status: "SUCCESS", reason: "HUNT_COMPLETE" };
+        return null;
+    }
+}
+
+class AttackState implements FSMState {
+    name = "ATTACKING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        if (!ctx.targetEntity || !ctx.targetEntity.isValid) {
+            return new LootState();
+        }
+
+        const dist = ctx.bot.entity.position.distanceTo(
+            ctx.targetEntity.position,
+        );
+
+        if (dist > 3.2) {
+            return new ApproachState();
+        }
+
+        const weapon = ctx.bot.inventory
+            .items()
+            .find((i) => i.name.includes("sword") || i.name.includes("axe"));
+
+        let cooldownMs = 650; // Default punch/sword cooldown
+
+        if (weapon) {
+            await ctx.bot.equip(weapon, "hand");
+            if (weapon.name.includes("axe")) {
+                cooldownMs = 1050; // Axes attack much slower but hit harder
+            } else if (weapon.name.includes("sword")) {
+                cooldownMs = 625;
+            }
+        }
+
+        await attackEntity(ctx.bot, ctx.targetEntity);
+
+        await new Promise((resolve) => setTimeout(resolve, cooldownMs));
+
+        return this;
+    }
+}
+
+class ApproachState implements FSMState {
+    name = "APPROACHING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const hCtx = ctx as HuntContext;
+
+        if (!hCtx.targetEntity || !hCtx.targetEntity.isValid) {
+            hCtx.result = {
+                status: "FAILED",
+                reason: "TARGET_LOST_OR_DESPAWNED",
+            };
+            return null;
+        }
+
+        try {
+            const reached = await gotoEntity(hCtx.bot, hCtx.targetEntity, 2, {
+                signal: hCtx.signal,
+                timeoutMs: 15000,
+                stopMovement: hCtx.stopMovement,
+            });
+
+            if (!reached) {
+                const dist = hCtx.bot.entity.position.distanceTo(
+                    hCtx.targetEntity.position,
+                );
+
+                if (dist > 32) {
+                    hCtx.result = {
+                        status: "FAILED",
+                        reason: "TARGET_RAN_TOO_FAR",
+                    };
+
+                    return null;
+                }
+            }
+        } catch (err: any) {
+            if (err.message === "aborted") {
+                hCtx.result = { status: "FAILED", reason: "aborted" };
+
+                return null;
+            }
+        }
+
+        return new AttackState();
+    }
+}
+
+export class SearchState implements FSMState {
+    name = "SEARCHING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const entity = findNearestEntity(
+            ctx.bot,
+            ctx.targetName,
+            ctx.searchRadius,
+        );
+
+        if (!entity) {
+            ctx.result = {
+                status: "FAILED",
+                reason: `NO_ENTITY_FOUND_IN_RADIUS`, // Fixed from NO_BLOCKS
+            };
+
+            return null;
+        }
+        ctx.targetEntity = entity;
+        return new ApproachState();
+    }
+}
+
+export async function handleHunt(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
+    await escapeTree(bot, signal);
+
+    const targetName = decision.target?.name;
+    if (!targetName || targetName === "none") {
+        throw new Error("missing hunt target");
+    }
+
+    const fsmCtx: HuntContext = {
+        bot,
+        targetName,
+        targetEntity: null,
+        searchRadius: 32,
+        timeoutMs: timeouts.hunt ?? 30000,
+        startTime: 0,
+        signal,
+        stopMovement,
+    };
+
+    const fsm = new StateMachineRunner(new SearchState(), fsmCtx);
+    const result = await fsm.run();
+
+    if (result.status === "FAILED") {
+        throw new Error(result.reason || "unknown_fsm_failure");
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\interact.ts">
+// js/lib/tasks/handlers/interact.ts
+import { type TaskContext } from "../registry.js";
+import { findNearestEntity } from "../primitives.js";
+import { findNearestBlockByName, moveToGoal } from "../utils.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+export async function handleInteract(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, stopMovement, timeouts } = ctx;
+    const targetName = decision.target?.name;
+
+    if (!targetName || targetName === "none") {
+        throw new Error("missing interact target");
+    }
+
+    // 1. Try to find it as an Entity (Boats, Minecarts, Villagers)
+    const entity = findNearestEntity(bot, targetName, 16);
+    if (entity) {
+        await moveToGoal(
+            bot,
+            new goals.GoalNear(
+                entity.position.x,
+                entity.position.y,
+                entity.position.z,
+                2,
+            ),
+            {
+                signal,
+                timeoutMs: timeouts.interact ?? 15000,
+                stopMovement,
+            },
+        );
+
+        if (
+            targetName.includes("boat") ||
+            targetName.includes("minecart") ||
+            targetName.includes("horse")
+        ) {
+            await bot.mount(entity);
+        } else {
+            bot.activateEntity(entity);
+        }
+        return;
+    }
+
+    // 2. Try to find it as a Block (Doors, Buttons, Levers, Beds)
+    const block = findNearestBlockByName(bot, targetName);
+    if (block) {
+        await moveToGoal(
+            bot,
+            new goals.GoalNear(
+                block.position.x,
+                block.position.y,
+                block.position.z,
+                2,
+            ),
+            {
+                signal,
+                timeoutMs: timeouts.interact ?? 15000,
+                stopMovement,
+            },
+        );
+        await bot.activateBlock(block);
+        return;
+    }
+
+    throw new Error(`NO_INTERACTABLE_FOUND: ${targetName}`);
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\mine.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { type TaskContext } from "../registry.js";
+import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+interface MineContext extends StateContext {
+    candidatePositions: any[];
+    currentIndex: number;
+    targetBlock: any;
+    stopMovement: () => void;
+}
+
+class MineBlockState implements FSMState {
+    name = "BREAKING_ORE";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const mCtx = ctx as MineContext;
+        const freshBlock = mCtx.bot.blockAt(mCtx.targetBlock.position);
+
+        if (!freshBlock || freshBlock.name === "air") {
+            return advanceToNextOre(mCtx, "BLOCK_ALREADY_MINED");
+        }
+
+        const pickaxe = mCtx.bot.inventory
+            .items()
+            .find((i: any) => i.name.includes("pickaxe"));
+        if (!pickaxe) {
+            mCtx.result = { status: "FAILED", reason: "NO_PICKAXE_EQUIPPED" };
+            return null;
+        }
+
+        await mCtx.bot.equip(pickaxe, "hand");
+
+        try {
+            await mCtx.bot.dig(freshBlock, true); // true forces line-of-sight bypass
+            await waitForMs(500, mCtx.signal);
+            mCtx.result = { status: "SUCCESS" };
+            return null;
+        } catch (err: any) {
+            return advanceToNextOre(mCtx, `DIG_FAIL: ${err.message}`);
+        }
+    }
+}
+
+class NavigateOreState implements FSMState {
+    name = "NAVIGATING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const mCtx = ctx as MineContext;
+        const pos = mCtx.candidatePositions[mCtx.currentIndex];
+        mCtx.targetBlock = mCtx.bot.blockAt(pos);
+
+        try {
+            // Use GoalGetToBlock so the bot stands *next* to the ore, not inside it
+            await moveToGoal(
+                mCtx.bot,
+                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
+                {
+                    signal: mCtx.signal,
+                    timeoutMs: 15000,
+                    stopMovement: mCtx.stopMovement,
+                },
+            );
+            return new MineBlockState();
+        } catch (err: any) {
+            return advanceToNextOre(mCtx, `PATH_FAIL: ${err.message}`);
+        }
+    }
+}
+
+class SearchOreState implements FSMState {
+    name = "SEARCHING";
+
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const mCtx = ctx as MineContext;
+        const blockId = mCtx.bot.registry.blocksByName[mCtx.targetName]?.id;
+
+        if (blockId === undefined) {
+            mCtx.result = {
+                status: "FAILED",
+                reason: `UNKNOWN_ORE: ${mCtx.targetName}`,
+            };
+            return null;
+        }
+
+        // Expanded search radius since ores can be sparse
+        let blocks = mCtx.bot.findBlocks({
+            matching: blockId,
+            maxDistance: 64,
+            count: 128,
+        });
+
+        if (blocks.length === 0) {
+            mCtx.result = {
+                status: "FAILED",
+                reason: `NO_${mCtx.targetName.toUpperCase()}_NEARBY`,
+            };
+            return null;
+        }
+
+        const botPos = mCtx.bot.entity.position;
+        blocks.sort(
+            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
+        );
+
+        mCtx.candidatePositions = blocks.slice(0, 5);
+        mCtx.currentIndex = 0;
+        return new NavigateOreState();
+    }
+}
+
+function advanceToNextOre(mCtx: MineContext, reason: string): FSMState | null {
+    mCtx.currentIndex++;
+    if (mCtx.currentIndex >= mCtx.candidatePositions.length) {
+        mCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
+        return null;
+    }
+    return new NavigateOreState();
+}
+
+export async function handleMine(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    await escapeTree(bot, signal);
+
+    if (!decision.target?.name || decision.target.name === "none") {
+        throw new Error("missing mine target");
+    }
+
+    const fsmCtx: MineContext = {
+        bot,
+        targetName: decision.target.name,
+        targetEntity: null,
+        searchRadius: 64,
+        timeoutMs: timeouts.mine ?? 45000,
+        startTime: 0,
+        signal,
+        candidatePositions: [],
+        currentIndex: 0,
+        targetBlock: null,
+        stopMovement,
+    };
+
+    const result = await new StateMachineRunner(
+        new SearchOreState(),
+        fsmCtx,
+    ).run();
+    if (result.status === "FAILED") throw new Error(result.reason);
+}
+
+</file>
+
+<file path="js\lib\tasks\handlers\smelt.ts">
+import {
+    type FSMState,
+    type StateContext,
+    StateMachineRunner,
+} from "../fsm.js";
+import { type TaskContext } from "../registry.js";
+import {
+    escapeTree,
+    findNearestBlockByName,
+    placePortableUtility,
+    makeRoomInInventory,
+    waitForMs,
+    moveToGoal,
+} from "../utils.js";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
+interface SmeltContext extends StateContext {
+    furnaceBlock: any | null;
+    isPortable: boolean;
+    meatType: number | null;
+    meatCount: number;
+    fuelType: number | null;
+    fuelCount: number;
+    stopMovement: () => void;
+}
+
+class CleanupState implements FSMState {
+    name = "CLEANUP";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const sCtx = ctx as SmeltContext;
+
+        if (sCtx.isPortable && sCtx.furnaceBlock) {
+            await makeRoomInInventory(sCtx.bot, 1);
+            const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
+                sCtx.furnaceBlock,
+            );
+            if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
+
+            try {
+                await sCtx.bot.dig(sCtx.furnaceBlock);
+                await waitForMs(1000, sCtx.signal);
+            } catch (_err) {}
+        }
+
+        sCtx.result = { status: "SUCCESS", reason: "SMELTING_COMPLETE" };
+        return null;
+    }
+}
+
+class SmeltingState implements FSMState {
+    name = "SMELTING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const sCtx = ctx as SmeltContext;
+        let furnaceWindow: any = null;
+
+        try {
+            // Load the furnace with everything available so we don't waste fuel
+            const inputAmount = Math.min(sCtx.meatCount, 64);
+            const fuelAmount = Math.min(sCtx.fuelCount, 64);
+
+            furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
+            await furnaceWindow.putFuel(sCtx.fuelType, null, fuelAmount);
+            await furnaceWindow.putInput(sCtx.meatType, null, inputAmount);
+
+            let itemsSmelted = 0;
+            // Max wait time based on how much food we put in (15s per item buffer)
+            const maxWaitMs = 15000 * inputAmount;
+            const pollIntervalMs = 500;
+            let elapsedMs = 0;
+
+            while (elapsedMs < maxWaitMs && itemsSmelted < inputAmount) {
+                if (sCtx.signal.aborted) throw new Error("aborted");
+
+                const outItem = furnaceWindow.outputItem();
+                if (outItem) {
+                    await makeRoomInInventory(sCtx.bot, 1);
+                    await furnaceWindow.takeOutput();
+                    itemsSmelted += outItem.count;
+                } else {
+                    await waitForMs(pollIntervalMs, sCtx.signal);
+                    elapsedMs += pollIntervalMs;
+                }
+            }
+
+            if (itemsSmelted === 0) {
+                throw new Error("FURNACE_TIMEOUT_OR_LAG");
+            }
+        } catch (err: any) {
+            sCtx.result = {
+                status: "FAILED",
+                reason:
+                    err.message === "aborted"
+                        ? "aborted"
+                        : `SMELT_INTERACTION_FAILED: ${err.message}`,
+            };
+            return null;
+        } finally {
+            if (furnaceWindow) {
+                try {
+                    furnaceWindow.close();
+                } catch (_err) {}
+            }
+        }
+
+        return new CleanupState();
+    }
+}
+
+class ApproachFurnaceState implements FSMState {
+    name = "APPROACHING";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const sCtx = ctx as SmeltContext;
+        const fPos = sCtx.furnaceBlock.position;
+
+        try {
+            await moveToGoal(
+                sCtx.bot,
+                new goals.GoalNear(fPos.x, fPos.y, fPos.z, 2),
+                {
+                    signal: sCtx.signal,
+                    timeoutMs: 15000,
+                    stopMovement: sCtx.stopMovement,
+                    dynamic: false,
+                },
+            );
+        } catch (err: any) {
+            if (err.message === "aborted") {
+                sCtx.result = { status: "FAILED", reason: "aborted" };
+            } else {
+                sCtx.result = {
+                    status: "FAILED",
+                    reason: "FAILED_TO_REACH_FURNACE",
+                };
+            }
+            return null;
+        }
+
+        return new SmeltingState();
+    }
+}
+
+class LocateFurnaceState implements FSMState {
+    name = "LOCATING_FURNACE";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const sCtx = ctx as SmeltContext;
+        let furnace = findNearestBlockByName(sCtx.bot, "furnace");
+
+        if (!furnace) {
+            furnace = await placePortableUtility(sCtx.bot, "furnace");
+            if (!furnace) {
+                sCtx.result = {
+                    status: "FAILED",
+                    reason: "NO_FURNACE_AVAILABLE",
+                };
+                return null;
+            }
+            sCtx.isPortable = true;
+        }
+
+        sCtx.furnaceBlock = furnace;
+        return new ApproachFurnaceState();
+    }
+}
+
+class CheckResourcesState implements FSMState {
+    name = "CHECKING_RESOURCES";
+    async enter() {}
+
+    async execute(ctx: StateContext): Promise<FSMState | null> {
+        const sCtx = ctx as SmeltContext;
+
+        const rawMeat = sCtx.bot.inventory
+            .items()
+            .find((i: any) =>
+                ["beef", "porkchop", "mutton", "chicken", "rabbit"].includes(
+                    i.name,
+                ),
+            );
+
+        const fuel = sCtx.bot.inventory
+            .items()
+            .find((i: any) =>
+                ["coal", "charcoal", "oak_planks"].includes(i.name),
+            );
+
+        if (!rawMeat || !fuel) {
+            sCtx.result = { status: "FAILED", reason: "MISSING_MEAT_OR_FUEL" };
+            return null;
+        }
+
+        sCtx.meatType = rawMeat.type;
+        sCtx.meatCount = rawMeat.count;
+        sCtx.fuelType = fuel.type;
+        sCtx.fuelCount = fuel.count;
+
+        return new LocateFurnaceState();
+    }
+}
+
+export async function handleSmelt(ctx: TaskContext): Promise<void> {
+    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    await escapeTree(bot, signal);
+
+    const fsmCtx: SmeltContext = {
+        bot,
+        targetName: "furnace",
+        targetEntity: null,
+        searchRadius: 0,
+        timeoutMs: timeouts.smelt ?? 30000,
+        startTime: 0,
+        signal,
+        furnaceBlock: null,
+        isPortable: false,
+        meatType: null,
+        meatCount: 0,
+        fuelType: null,
+        fuelCount: 0,
+        stopMovement,
+    };
+
+    const fsm = new StateMachineRunner(new CheckResourcesState(), fsmCtx);
+    const result = await fsm.run();
+
+    if (result.status === "FAILED") {
+        throw new Error(result.reason || "unknown_fsm_failure");
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\normalize.ts">
+import type { Bot } from "mineflayer";
+import * as models from "../models.js";
+import { log } from "../logger.js";
+
+const LOG_TO_PLANK_MAP: Record<string, string> = {
+    oak_log: "oak_planks",
+    birch_log: "birch_planks",
+    spruce_log: "spruce_planks",
+    jungle_log: "jungle_planks",
+    acacia_log: "acacia_planks",
+    dark_oak_log: "dark_oak_planks",
+    mangrove_log: "mangrove_planks",
+    cherry_log: "cherry_planks",
+};
+
+// Map common LLM shorthand/misspellings to strict Minecraft registry names
+const TARGET_ALIASES: Record<string, string> = {
+    // Farming Aliases
+    carrot: "carrots",
+    potato: "potatoes",
+    beetroot: "beetroots",
+    sugar_cane: "reeds",
+
+    // Mining Aliases
+    iron: "iron_ore",
+    gold: "gold_ore",
+    diamond: "diamond_ore",
+    coal: "coal_ore",
+    copper: "copper_ore",
+    lapis: "lapis_ore",
+    redstone: "redstone_ore",
+    emerald: "emerald_ore",
+    cobble: "cobblestone",
+
+    // Gathering Aliases
+    // Note: The validator heavily relies on "wood" mapping to logs for redundancy
+    // and vision checks. Do not remove or change these without updating validator.go.
+    tree: "wood",
+    log: "wood",
+    timber: "wood",
+};
+
+export function normalizeDecision(
+    bot: Bot,
+    decision: models.IncomingDecision,
+): models.IncomingDecision {
+    const normalized: models.IncomingDecision = {
+        ...decision,
+        target: { ...decision.target },
+    };
+
+    const action = normalized.action;
+    const originalTargetName = (normalized.target?.name || "none")
+        .toLowerCase()
+        .trim();
+
+    let targetName = originalTargetName;
+
+    // 1. Apply static dictionary aliases first (fixes farm/mine targets)
+    if (TARGET_ALIASES[targetName]) {
+        targetName = TARGET_ALIASES[targetName]!;
+    }
+
+    // 2. Apply action-specific dynamic normalization
+    if (action === "craft") {
+        if (targetName === "sticks" || targetName === "stick") {
+            targetName = "stick";
+        } else if (targetName === "planks") {
+            const invItems = bot.inventory.items();
+
+            let foundLog = false;
+            for (const item of invItems) {
+                if (LOG_TO_PLANK_MAP[item.name]) {
+                    targetName = LOG_TO_PLANK_MAP[item.name]!;
+                    foundLog = true;
+                    break;
+                }
+            }
+            if (!foundLog) throw new Error("MISSING_LOGS_FOR_PLANKS");
+        } else if (
+            targetName === "table" ||
+            targetName === "workbench" ||
+            targetName === "crafting_table"
+        ) {
+            targetName = "crafting_table";
+        } else if (
+            targetName.includes("wooden_pickaxe") ||
+            targetName === "pickaxe"
+        ) {
+            targetName = "wooden_pickaxe";
+        } else if (targetName.includes("stone_pickaxe")) {
+            targetName = "stone_pickaxe";
+        }
+    } else if (action === "build") {
+        if (targetName === "table" || targetName === "workbench") {
+            targetName = "crafting_table";
+        }
+    } else if (action === "gather" && targetName === "wood") {
+        // Handled naturally by the gather handler
+    }
+
+    // 3. Log and apply changes if a normalization occurred
+    if (targetName !== originalTargetName) {
+        normalized.target.name = targetName;
+
+        log.debug("Decision normalized", {
+            original_target: originalTargetName,
+            normalized_target: targetName,
+            action,
+        });
+    }
+
+    return normalized;
+}
+
+</file>
+
+<file path="js\lib\tasks\primitives.ts">
+import type { Bot } from "mineflayer";
+import type { Entity } from "prismarine-entity";
+import pkg from "mineflayer-pathfinder";
+import { moveToGoal, type MoveOptions } from "./utils.js";
+
+const { goals } = pkg;
+
+export async function gotoEntity(
+    bot: Bot,
+    entity: Entity,
+    range: number,
+    opts: MoveOptions,
+): Promise<boolean> {
+    const goal = new goals.GoalFollow(entity, range);
+    try {
+        await moveToGoal(bot, goal, {
+            ...opts,
+            dynamic: true,
+            stuckTimeoutMs: 3000, // Chasing shouldn't stall for long
+        });
+        return true;
+    } catch (err: any) {
+        if (err.message === "aborted") {
+            throw err; // Bubble up explicit aborts immediately
+        }
+
+        // Suppress general pathing/stuck errors for entity chasing
+        bot.pathfinder.setGoal(null);
+        bot.clearControlStates();
+        return false;
+    }
+}
+
+export async function attackEntity(bot: Bot, entity: Entity): Promise<void> {
+    await bot.lookAt(entity.position.offset(0, entity.height ?? 1.5, 0), true);
+    bot.attack(entity);
+}
+
+export function findNearestEntity(
+    bot: Bot,
+    name: string,
+    radius: number,
+): Entity | null {
+    return bot.nearestEntity((entity) => {
+        return (
+            entity.name === name &&
+            bot.entity.position.distanceTo(entity.position) <= radius
+        );
+    });
+}
+
+</file>
+
+<file path="js\lib\tasks\registry.ts">
+import type { Bot } from "mineflayer";
+import type * as models from "../models.js";
+
+export interface TaskContext {
+    bot: Bot;
+    decision: models.IncomingDecision;
+    signal: AbortSignal;
+    timeouts: Record<string, number>;
+    stopMovement: () => void;
+
+    getThreats: () => any[];
+    computeSafeRetreat: (
+        threats: any[],
+        radius?: number,
+    ) => { x: number; z: number };
+}
+
+export type TaskHandler = (ctx: TaskContext) => Promise<void>;
+
+export const TASK_REGISTRY: Record<string, TaskHandler> = {};
+
+</file>
+
+<file path="js\lib\tasks\task.ts">
+import type { Bot } from "mineflayer";
+import pkg from "mineflayer-pathfinder";
+import * as models from "../models.js";
+import { type TaskContext } from "./registry.js";
+
+// Handlers
+import { handleGather } from "./handlers/gather.js";
+import { handleCraft } from "./handlers/craft.js";
+import { handleHunt } from "./handlers/hunt.js";
+import { handleBuild } from "./handlers/build.js";
+import { handleExplore } from "./handlers/explore.js";
+import { handleSmelt } from "./handlers/smelt.js";
+import { handleMine } from "./handlers/mine.js";
+import { handleFarm } from "./handlers/farm.js";
+import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
+import { normalizeDecision } from "./normalize.js";
+import { handleInteract } from "./handlers/interact.js";
+
+const { goals } = pkg;
+
+export async function runTask(
+    bot: Bot,
+    rawDecision: models.IncomingDecision,
+    signal: AbortSignal,
+    timeouts: Record<string, number>,
+    getThreats: () => models.ThreatInfo[],
+    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
+        x: number;
+        z: number;
+    },
+    stopMovement: () => void,
+): Promise<void> {
+    const decision = normalizeDecision(bot, rawDecision);
+
+    const taskCtx: TaskContext = {
+        bot,
+        decision,
+        signal,
+        timeouts,
+        getThreats,
+        computeSafeRetreat,
+        stopMovement,
+    };
+
+    switch (decision.action) {
+        case "hunt":
+            await handleHunt(taskCtx);
+
+            return;
+        case "gather":
+            await handleGather(taskCtx);
+            return;
+
+        case "craft":
+            await handleCraft(taskCtx);
+            return;
+
+        case "build":
+            await handleBuild(taskCtx);
+            return;
+
+        case "smelt":
+            await handleSmelt(taskCtx);
+            return;
+
+        case "mine":
+            await handleMine(taskCtx);
+            return;
+
+        case "farm":
+            await handleFarm(taskCtx);
+            return;
+
+        case "explore":
+            await handleExplore(taskCtx);
+            return;
+
+        case "eat": {
+            const food = bot.inventory
+                .items()
+                .find((i) => i.name === decision.target.name);
+
+            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
+            await bot.equip(food, "hand");
+            await bot.consume();
+            return;
+        }
+
+        case "idle":
+            await waitForMs(1500, signal);
+
+            return;
+
+        case "sleep": {
+            await escapeTree(bot, signal);
+
+            const bed = bot.findBlock({
+                maxDistance: 32,
+                matching: (b: any) => b?.name.includes("bed"),
+            });
+
+            if (!bed) throw new Error("no bed found");
+
+            await moveToGoal(
+                bot,
+                new goals.GoalNear(
+                    bed.position.x,
+                    bed.position.y,
+                    bed.position.z,
+                    1.5,
+                ),
+                { signal, timeoutMs: 20000, stopMovement },
+            );
+
+            await bot.sleep(bed);
+
+            // Wait for morning/wake event to prevent immediate task dispatch while sleeping
+            await new Promise<void>((resolve, reject) => {
+                const onWake = () => {
+                    bot.removeListener("wake", onWake);
+                    resolve();
+                };
+
+                const onAbort = () => {
+                    bot.removeListener("wake", onWake);
+                    bot.wake().catch(() => {});
+                    reject(new Error("aborted"));
+                };
+
+                bot.on("wake", onWake);
+                signal.addEventListener("abort", onAbort, { once: true });
+            });
+
+            return;
+        }
+
+        case "retreat": {
+            await escapeTree(bot, signal);
+
+            const pos = computeSafeRetreat(getThreats());
+            await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
+                signal,
+                timeoutMs: 15000,
+                stopMovement,
+            });
+            await waitForMs(1000, signal); // Mitigation for cliff falls
+            return;
+        }
+
+        case "interact":
+            await handleInteract(taskCtx);
+
+            return;
+
+        default:
+            throw new Error(`unsupported: ${decision.action}`);
+    }
+}
+
+</file>
+
+<file path="js\lib\tasks\utils.ts">
+import type { Bot } from "mineflayer";
+import pkg from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
+
+const { goals } = pkg;
+
+// ==========================================
+// CONSTANTS
+// ==========================================
+
+const TREE_BLOCKS = new Set([
+    "oak_leaves",
+    "birch_leaves",
+    "spruce_leaves",
+    "jungle_leaves",
+    "acacia_leaves",
+    "dark_oak_leaves",
+    "mangrove_leaves",
+    "azalea_leaves",
+    "flowering_azalea_leaves",
+    "cherry_leaves",
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "jungle_log",
+    "acacia_log",
+    "dark_oak_log",
+    "mangrove_log",
+]);
+
+const TRASH_ITEMS = new Set([
+    "dirt",
+    "cobblestone",
+    "gravel",
+    "rotten_flesh",
+    "spider_eye",
+    "bone",
+    "string",
+    "andesite",
+    "diorite",
+    "granite",
+    "seeds",
+    "tall_grass",
+    "grass",
+]);
+
+// ==========================================
+// MOVEMENT & POSITION HELPERS
+// ==========================================
+
+export function isOnSolidGround(bot: any): boolean {
+    if (!bot.entity.onGround) return false;
+    const pos = bot.entity.position.floored();
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
+}
+
+export function isInFoliage(bot: any): boolean {
+    const pos = bot.entity.position.floored();
+    const at = bot.blockAt(pos);
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    return (
+        (at && TREE_BLOCKS.has(at.name)) ||
+        (below && TREE_BLOCKS.has(below.name))
+    );
+}
+
+export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
+    if (!isInFoliage(bot)) return;
+
+    try {
+        bot.pathfinder.setGoal(null);
+        bot.clearControlStates();
+    } catch (_err) {}
+
+    const MAX_ATTEMPTS = 30;
+
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        if (signal.aborted) throw new Error("aborted");
+        if (isOnSolidGround(bot)) return;
+
+        const pos = bot.entity.position.floored();
+
+        // Added horizontal blocks to break out of 1x1 leaf prisons
+        const blocksToClear = [
+            bot.blockAt(pos.offset(0, 1, 0)), // Head
+            bot.blockAt(pos), // Torso
+            bot.blockAt(pos.offset(0, -1, 0)), // Below
+            bot.blockAt(pos.offset(1, 0, 0)), // East
+            bot.blockAt(pos.offset(-1, 0, 0)), // West
+            bot.blockAt(pos.offset(0, 0, 1)), // South
+            bot.blockAt(pos.offset(0, 0, -1)), // North
+        ];
+
+        let clearedSomething = false;
+
+        for (const targetBlock of blocksToClear) {
+            if (
+                targetBlock &&
+                TREE_BLOCKS.has(targetBlock.name) &&
+                targetBlock.name !== "air"
+            ) {
+                try {
+                    const tool = bot.pathfinder.bestHarvestTool(targetBlock);
+                    if (tool) {
+                        await bot.equip(tool, "hand");
+                    } else {
+                        // Force unequip to punch leaves if no tool is better
+                        await bot.unequip("hand");
+                    }
+
+                    // Use "ignore" raycast to break blocks even if clipped inside them
+                    await bot.dig(targetBlock, true, "ignore");
+                    clearedSomething = true;
+                } catch (err) {
+                    // Ignore dig errors
+                }
+            }
+        }
+
+        if (!clearedSomething && !isOnSolidGround(bot)) {
+            const dir = Math.random() > 0.5 ? "forward" : "back";
+            const strafe = Math.random() > 0.5 ? "left" : "right";
+
+            bot.setControlState(dir, true);
+            bot.setControlState(strafe, true);
+            await new Promise((res) => setTimeout(res, 250));
+            bot.setControlState(dir, false);
+            bot.setControlState(strafe, false);
+        }
+
+        await new Promise<void>((resolve) => {
+            let ticks = 0;
+            const check = () => {
+                ticks++;
+                if (isOnSolidGround(bot) || ticks > 10) {
+                    bot.removeListener("physicsTick", check);
+                    resolve();
+                }
+            };
+            bot.on("physicsTick", check);
+
+            setTimeout(() => {
+                bot.removeListener("physicsTick", check);
+                resolve();
+            }, 1000);
+        });
+    }
+
+    if (!isOnSolidGround(bot)) {
+        throw new Error(
+            "EscapeTree - could not reach ground after 30 attempts. Likely stuck in a massive canopy.",
+        );
+    }
+}
+
+export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(new Error("aborted"));
+            return;
+        }
+
+        const timer = setTimeout(() => {
+            cleanup();
+            resolve();
+        }, ms);
+
+        const onAbort = () => {
+            clearTimeout(timer);
+            cleanup();
+            reject(new Error("aborted"));
+        };
+
+        const cleanup = () => {
+            signal.removeEventListener("abort", onAbort);
+        };
+
+        signal.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+export interface MoveOptions {
+    signal: AbortSignal;
+    timeoutMs: number;
+    stopMovement: () => void;
+    dynamic?: boolean;
+    stuckTimeoutMs?: number;
+}
+
+export function moveToGoal(
+    bot: any,
+    goal: any,
+    opts: MoveOptions,
+): Promise<void> {
+    const {
+        signal,
+        timeoutMs,
+        stopMovement,
+        dynamic = false,
+        stuckTimeoutMs = 5000,
+    } = opts;
+
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(new Error("aborted"));
+            return;
+        }
+
+        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
+            return resolve();
+        }
+
+        let settled = false;
+        let lastPos = bot.entity.position.clone();
+        let stuckTimer: NodeJS.Timeout | null = null;
+
+        const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+
+            clearTimeout(timer);
+            if (stuckTimer) clearInterval(stuckTimer);
+
+            signal.removeEventListener("abort", onAbort);
+            bot.removeListener("goal_reached", onGoalReached);
+            bot.removeListener("path_update", onPathUpdate);
+
+            if (err) {
+                reject(err);
+                return;
+            }
+            resolve();
+        };
+
+        const safeStop = () => {
+            try {
+                bot.clearControlStates();
+                stopMovement();
+            } catch (_err) {}
+        };
+
+        const onAbort = () => {
+            safeStop();
+            finish(new Error("aborted"));
+        };
+
+        const onGoalReached = () => {
+            safeStop();
+            finish();
+        };
+
+        const onPathUpdate = (results: any) => {
+            if (results.status === "noPath") {
+                setTimeout(() => {
+                    if (!settled) {
+                        safeStop();
+                        finish(new Error("no_path"));
+                    }
+                }, 3500);
+            } else if (results.status === "timeout") {
+                safeStop();
+                finish(new Error("pathfinder_timeout"));
             }
         };
 
-        ws.onclose = () => {
-            connected = false;
-            setTimeout(connect, 2000);
-        };
-    }
+        const timer = setTimeout(() => {
+            safeStop();
+            finish(new Error("timeout"));
+        }, timeoutMs);
 
-    let isNight = $derived(
-        botState.time_of_day >= 12000 && botState.time_of_day <= 24000,
-    );
-    let darkness = $derived(
-        isNight
-            ? Math.sin(((botState.time_of_day - 12000) / 12000) * Math.PI) * 0.6
-            : 0,
-    );
+        let stuckStrikes = 0;
 
-    let hotbarItems = $derived(
-        Array.from({ length: 9 }, (_, i) => botState.inventory[i] || null),
-    );
-    let sideInventory = $derived(botState.inventory.slice(9));
+        stuckTimer = setInterval(() => {
+            const currentPos = bot.entity.position;
+            const dist = lastPos.distanceTo(currentPos);
 
-    function formatName(name: string) {
-        return name
-            .split("_")
-            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-            .join(" ");
-    }
-</script>
+            if (dist < 0.5) {
+                stuckStrikes++;
+                if (stuckStrikes >= 2) {
+                    safeStop();
+                    finish(new Error("stuck"));
+                }
+            } else {
+                stuckStrikes = 0;
+                lastPos = currentPos.clone();
+            }
+        }, stuckTimeoutMs);
 
-<svelte:head>
-    <link
-        href="https://fonts.googleapis.com/css2?family=VT323&display=swap"
-        rel="stylesheet"
-    />
-</svelte:head>
+        signal.addEventListener("abort", onAbort, { once: true });
+        bot.once("goal_reached", onGoalReached);
+        bot.on("path_update", onPathUpdate);
 
-<main class="dashboard">
-    <iframe src="http://localhost:3000" title="Prismarine Viewer"></iframe>
-
-    <div
-        class="night-tint"
-        style="background-color: rgba(5, 5, 20, {darkness});"
-    ></div>
-
-    <div class="hud">
-        <div class="top-left">
-            <div class="coord-box">
-                XYZ: {Math.floor(botState.position.x)}, {Math.floor(
-                    botState.position.y,
-                )}, {Math.floor(botState.position.z)}
-            </div>
-            <div class="status-box {connected ? 'online' : 'offline'}">
-                {connected ? "LINK ESTABLISHED" : "SEARCHING FOR SIGNAL..."}
-            </div>
-        </div>
-
-        <div class="side-inventory">
-            {#each sideInventory as item}
-                <div class="side-item">
-                    <ItemIcon name={item.name} size={24} />
-                    <span class="item-count">{item.count}</span>
-                    <span class="item-name">{formatName(item.name)}</span>
-                </div>
-            {/each}
-        </div>
-
-        <div class="bottom-center">
-            {#if botState.threats && botState.threats.length > 0}
-                <div class="threat-warning">
-                    HOSTILES NEARBY: {botState.threats
-                        .map((t) => formatName(t.name))
-                        .join(", ")}
-                </div>
-            {/if}
-
-            <div class="stat-bars">
-                <div class="bar-wrapper">
-                    <div
-                        class="bar-fill health-fill"
-                        style="width: {(botState.health / 20) * 100}%"
-                    ></div>
-                    <span class="bar-text">HP {botState.health}/20</span>
-                </div>
-                <div class="bar-wrapper">
-                    <div
-                        class="bar-fill food-fill"
-                        style="width: {(botState.food / 20) * 100}%"
-                    ></div>
-                    <span class="bar-text">HUNGER {botState.food}/20</span>
-                </div>
-            </div>
-
-            <div class="hotbar">
-                {#each hotbarItems as item, i}
-                    <div class="hotbar-slot">
-                        <span class="slot-number">{i + 1}</span>
-                        {#if item}
-                            <div class="slot-content">
-                                <ItemIcon name={item.name} size={32} />
-                                {#if item.count > 1}
-                                    <span class="slot-count">{item.count}</span>
-                                {/if}
-                            </div>
-                        {/if}
-                    </div>
-                {/each}
-            </div>
-        </div>
-    </div>
-</main>
-
-<style>
-    :global(body) {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background: #000;
-    }
-
-    .dashboard {
-        position: relative;
-        width: 100vw;
-        height: 100vh;
-        font-family: "VT323", monospace;
-        font-size: 20px;
-        color: white;
-        text-shadow: 2px 2px 0px #3f3f3f;
-        user-select: none;
-    }
-
-    iframe {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        border: none;
-        z-index: 1;
-    }
-
-    .night-tint {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 2;
-        transition: background-color 1s linear;
-    }
-
-    .hud {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 3;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-    }
-
-    .top-left {
-        padding: 10px;
-        display: flex;
-        flex-direction: column;
-        gap: 5px;
-    }
-
-    .coord-box,
-    .status-box {
-        background: rgba(0, 0, 0, 0.4);
-        display: inline-block;
-        padding: 2px 8px;
-        border: 2px solid rgba(0, 0, 0, 0.6);
-        width: fit-content;
-    }
-
-    .status-box.online {
-        color: #55ff55;
-    }
-    .status-box.offline {
-        color: #ff5555;
-    }
-
-    .side-inventory {
-        position: absolute;
-        left: 10px;
-        top: 30%;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        background: rgba(0, 0, 0, 0.2);
-        padding: 10px;
-        border-radius: 4px;
-    }
-
-    .side-item {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-
-    .item-count {
-        color: #ffff55;
-        min-width: 25px;
-        text-align: right;
-    }
-
-    .item-name {
-        color: #ffffff;
-    }
-
-    .bottom-center {
-        position: absolute;
-        bottom: 10px;
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 8px;
-    }
-
-    .threat-warning {
-        color: #ff5555;
-        background: rgba(0, 0, 0, 0.6);
-        padding: 4px 12px;
-        border: 2px solid #ff5555;
-        animation: blink 1s infinite;
-    }
-
-    @keyframes blink {
-        0%,
-        100% {
-            opacity: 1;
+        try {
+            bot.pathfinder.setGoal(goal, dynamic);
+        } catch (err) {
+            finish(err instanceof Error ? err : new Error(String(err)));
         }
-        50% {
-            opacity: 0.5;
+    });
+}
+
+export function findNearestBlockByName(bot: Bot, blockName: string): any {
+    return bot.findBlock({
+        maxDistance: 32,
+        matching: (block: any) => block?.name === blockName,
+    });
+}
+
+// ==========================================
+// INVENTORY MANAGEMENT
+// ==========================================
+
+export async function makeRoomInInventory(
+    bot: any,
+    slotsNeeded: number = 1,
+): Promise<void> {
+    if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
+
+    const inventory = bot.inventory.items();
+    const sortedItems = [...inventory].sort((a, b) => {
+        const aIsTrash = TRASH_ITEMS.has(a.name) ? -1 : 1;
+        const bIsTrash = TRASH_ITEMS.has(b.name) ? -1 : 1;
+        if (aIsTrash !== bIsTrash) return aIsTrash - bIsTrash;
+        return a.count - b.count;
+    });
+
+    let slotsFreed = 0;
+    for (const item of sortedItems) {
+        if (slotsFreed >= slotsNeeded) break;
+        try {
+            await bot.tossStack(item);
+            slotsFreed++;
+        } catch (err) {
+            // Ignore failure, try next item
         }
     }
+}
 
-    .stat-bars {
-        display: flex;
-        gap: 20px;
-        width: 100%;
-        justify-content: center;
-    }
+// ==========================================
+// BLOCK PLACEMENT
+// ==========================================
 
-    .bar-wrapper {
-        position: relative;
-        width: 160px;
-        height: 20px;
-        background: rgba(0, 0, 0, 0.5);
-        border: 2px solid #222;
-        border-top-color: #555;
-        border-left-color: #555;
-    }
+export async function placePortableUtility(
+    bot: any,
+    blockName: string,
+): Promise<any> {
+    const item = bot.inventory.items().find((i: any) => i.name === blockName);
+    if (!item) return null;
 
-    .bar-fill {
-        height: 100%;
-        transition: width 0.2s;
-    }
+    await bot.equip(item, "hand");
 
-    .health-fill {
-        background: #ff5555;
-        border-right: 2px solid #aa0000;
-    }
-    .food-fill {
-        background: #ffaa00;
-        border-right: 2px solid #cc6600;
-    }
+    const pos = bot.entity.position.floored();
+    const candidates = [
+        bot.blockAt(pos.offset(1, -1, 0)),
+        bot.blockAt(pos.offset(-1, -1, 0)),
+        bot.blockAt(pos.offset(0, -1, 1)),
+        bot.blockAt(pos.offset(0, -1, -1)),
+    ];
 
-    .bar-text {
-        position: absolute;
-        top: -2px;
-        left: 0;
-        width: 100%;
-        text-align: center;
-        font-size: 18px;
-        text-shadow: 1px 1px 0px #000;
+    for (const refBlock of candidates) {
+        if (refBlock && refBlock.name !== "air" && refBlock.name !== "water") {
+            try {
+                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                return findNearestBlockByName(bot, blockName);
+            } catch (err) {
+                // Ignore placement failure, check next adjacent block
+            }
+        }
     }
-
-    .hotbar {
-        display: flex;
-        background: rgba(0, 0, 0, 0.4);
-        padding: 2px;
-        border: 2px solid #222;
-        border-top-color: #555;
-        border-left-color: #555;
-    }
-
-    .hotbar-slot {
-        position: relative;
-        width: 40px;
-        height: 40px;
-        background: rgba(139, 139, 139, 0.4);
-        border: 2px solid #373737;
-        border-bottom-color: #fff;
-        border-right-color: #fff;
-        margin: 2px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-
-    .slot-number {
-        position: absolute;
-        top: 2px;
-        left: 4px;
-        font-size: 14px;
-        color: rgba(255, 255, 255, 0.5);
-        text-shadow: none;
-        z-index: 10;
-    }
-
-    .slot-content {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        height: 100%;
-        position: relative;
-    }
-
-    .slot-count {
-        position: absolute;
-        bottom: -2px;
-        right: 2px;
-        font-size: 18px;
-        color: #fff;
-        text-shadow: 2px 2px 0px #000;
-        z-index: 10;
-    }
-</style>
+    return null;
+}
 
 </file>
 
-<file path="ui\src\app.css">
-/* :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+<file path="js\lib\types.d.ts">
+import { Pathfinder } from "mineflayer-pathfinder";
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
-
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
-}
-
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
-
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
-
-#app {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
-}
-
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
-
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
+declare module "mineflayer" {
+    interface Bot {
+        pathfinder: Pathfinder;
     }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
 }
-
-#docs {
-  border-right: 1px solid var(--border);
-
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-}
-
-#next-steps ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
-}
-
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
-}
-
-.ticks {
-  position: relative;
-  width: 100%;
-
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
-
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
-  }
-} */
 
 </file>
 
-<file path="ui\src\components\ItemIcon.svelte">
-<script lang="ts">
-    let { name, size = 32 } = $props<{ name: string; size?: number }>();
+<file path="js\lib\utils\errors.ts">
+export function getErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
+}
 
-    let hasError = $state(false);
+</file>
 
-    let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
-    let formattedTitle = $derived(cleanName.replace(/_/g, " "));
-    let imageSource = $derived(`../../public/assets/items/${cleanName}.png`);
+<file path="js\lib\utils\perception.ts">
+// js/lib/utils/perception.ts
+import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import * as models from "../models.js";
 
-    function handleError() {
-        hasError = true;
+function getDirectionLabel(
+    lookDir: Vec3,
+    targetDir: Vec3,
+    dot: number,
+): string {
+    if (dot > 0.8) return "center";
+    if (dot < -0.2) return "behind";
+
+    // 2D cross product for left/right
+    const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
+    return crossY > 0 ? "left" : "right";
+}
+
+export function getPOIs(bot: Bot, radius: number = 32): any[] {
+    const pois: any[] = [];
+    if (!bot.entity) return pois;
+
+    const pos = bot.entity.position;
+    const yaw = bot.entity.yaw;
+    // Horizontal look vector
+    const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
+
+    // 1. Entities (Mobs, Animals, Items)
+    for (const id in bot.entities) {
+        const e = bot.entities[id];
+        if (!e || e === bot.entity || !e.isValid) continue;
+
+        const dist = pos.distanceTo(e.position);
+        if (dist > radius) continue;
+
+        const dx = e.position.x - pos.x;
+        const dz = e.position.z - pos.z;
+        const dirToEntity = new Vec3(dx, 0, dz).normalize();
+
+        const visibility = parseFloat(lookDir.dot(dirToEntity).toFixed(2));
+        const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
+
+        let type = "entity";
+        if (e.type === "hostile") type = "threat";
+        else if (e.type === "object" || e.type === "orb") type = "resource";
+
+        // Scoring: Distance heavily weighted, center FOV acts as a multiplier
+        const baseScore = 100 / Math.max(dist, 1);
+        const scoreMultiplier =
+            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
+        const score = Math.round(baseScore * scoreMultiplier);
+
+        pois.push({
+            type,
+            name: e.name || "unknown",
+            position: {
+                x: Math.round(e.position.x),
+                y: Math.round(e.position.y),
+                z: Math.round(e.position.z),
+            },
+            distance: parseFloat(dist.toFixed(1)),
+            visibility,
+            score,
+            direction,
+        });
     }
-</script>
 
-{#if hasError}
-    <div
-        class="fallback-icon"
-        style="width: {size}px; height: {size}px; font-size: {size * 0.4}px;"
-        title="Missing texture: {cleanName}"
-    >
-        ?
-    </div>
-{:else}
-    <img
-        src={imageSource}
-        alt={cleanName}
-        title={formattedTitle}
-        width={size}
-        height={size}
-        onerror={handleError}
-        class="mc-icon"
-    />
-{/if}
+    // 2. Blocks (Filtered strictly to avoid heavy tick lag)
+    const blocks = bot.findBlocks({
+        matching: (b) => {
+            if (!b) return false;
+            return (
+                b.name.endsWith("_log") ||
+                b.name.includes("ore") ||
+                b.name === "stone" ||
+                b.name === "crafting_table" ||
+                b.name.includes("bed") ||
+                b.name === "water" ||
+                b.name === "lava"
+            );
+        },
+        maxDistance: radius,
+        count: 24,
+    });
 
-<style>
-    .mc-icon {
-        image-rendering: pixelated; /* Keeps 16x16 pixel art crispy */
-        object-fit: contain;
+    for (const bPos of blocks) {
+        const block = bot.blockAt(bPos);
+        if (!block) continue;
+
+        const dist = pos.distanceTo(bPos);
+        const dx = bPos.x - pos.x;
+        const dz = bPos.z - pos.z;
+
+        const dirToBlock = new Vec3(dx, 0, dz).normalize();
+
+        const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
+        const direction = getDirectionLabel(lookDir, dirToBlock, visibility);
+
+        const baseScore = 100 / Math.max(dist, 1);
+        const scoreMultiplier =
+            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
+        const score = Math.round(baseScore * scoreMultiplier);
+
+        pois.push({
+            type: "resource",
+            name: block.name,
+            position: { x: bPos.x, y: bPos.y, z: bPos.z },
+            distance: parseFloat(dist.toFixed(1)),
+            visibility,
+            score,
+            direction,
+        });
     }
 
-    .fallback-icon {
-        background-color: #ff00ff; /* Magenta missing texture vibe */
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
-        font-weight: bold;
-        box-shadow: inset 0 0 0 2px #000000;
-        cursor: help;
-        font-family: monospace;
+    // Sort by computed score
+    pois.sort((a, b) => b.score - a.score);
+
+    // Filter out redundant blocks so they don't blind the LLM context
+    const seenCounts: Record<string, number> = {};
+    const diversePOIs: any[] = [];
+
+    for (const poi of pois) {
+        seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
+
+        // Cap identical resources (like water/lava/dirt) to 3
+        if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
+            continue;
+        }
+
+        diversePOIs.push(poi);
+        if (diversePOIs.length >= 15) break;
     }
-</style>
+
+    return diversePOIs;
+}
 
 </file>
 
-<file path="ui\src\lib\Counter.svelte">
-<script lang="ts">
-  let count: number = $state(0)
-  const increment = () => {
-    count += 1
-  }
-</script>
+<file path="js\lib\utils\threats.ts">
+// js/lib/utils/threats.ts
+import { type Bot } from "mineflayer";
+import * as config from "../config.js";
+import * as models from "../models.js";
 
-<button class="counter" onclick={increment}>
-  Count is {count}
-</button>
+const HOSTILE_MOBS = new Set([
+    "zombie",
+    "zombie_villager",
+    "husk",
+    "drowned",
+    "skeleton",
+    "stray",
+    "wither_skeleton",
+    "creeper",
+    "spider",
+    "cave_spider",
+    "slime",
+    "magma_cube",
+    "phantom",
+    "blaze",
+    "ghast",
+    "enderman",
+    "silverfish",
+    "witch",
+    "ravager",
+    "pillager",
+    "evoker",
+    "vindicator",
+    "warden",
+]);
 
-</file>
+export function getThreats(bot: Bot): models.ThreatInfo[] {
+    const threats: models.ThreatInfo[] = [];
+    const botPos = bot.entity.position;
 
-<file path="ui\src\main.ts">
-import { mount } from 'svelte'
-import './app.css'
-import App from './App.svelte'
+    for (const id in bot.entities) {
+        const e = bot.entities[id];
+        if (!e || !e.isValid || e === bot.entity) continue;
 
-const app = mount(App, {
-  target: document.getElementById('app')!,
-})
+        if (
+            (e.type !== "mob" && e.type !== "hostile") ||
+            !HOSTILE_MOBS.has(e.name!)
+        )
+            continue;
 
-export default app
+        // Apply a heavy vertical discount to prevent panicking over mobs in caves
+        // when the bot is safely on the surface (and vice versa).
+        const dy = Math.abs(botPos.y - e.position.y);
+        const dx = botPos.x - e.position.x;
+        const dz = botPos.z - e.position.z;
 
-</file>
+        const horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        let effectiveDistance = horizontalDist;
 
-<file path="ui\svelte.config.js">
-/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
-export default {}
+        if (dy > 3) {
+            effectiveDistance += dy * 2.5;
+        }
 
-</file>
+        if (effectiveDistance > 16) continue;
 
-<file path="ui\vite.config.ts">
-import { defineConfig } from 'vite'
-import { svelte } from '@sveltejs/vite-plugin-svelte'
+        const baseThreat =
+            config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
 
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [svelte()],
-})
+        const threatScore = baseThreat * (10 / Math.max(effectiveDistance, 1));
+
+        threats.push({
+            id: e.id,
+            name: e.name || "unknown",
+            distance: parseFloat(effectiveDistance.toFixed(1)),
+            threatScore: Math.round(threatScore),
+            position: { x: e.position.x, y: e.position.y, z: e.position.z },
+            entity: e,
+        });
+    }
+
+    return threats.sort((a, b) => b.threatScore! - a.threatScore!);
+}
+
+export function computeSafeRetreat(
+    bot: Bot,
+    threats: models.ThreatInfo[],
+    distance: number = 20,
+) {
+    let cx = 0,
+        cz = 0,
+        totalWeight = 0;
+
+    for (const threat of threats) {
+        cx += threat.position.x * threat.threatScore!;
+        cz += threat.position.z * threat.threatScore!;
+        totalWeight += threat.threatScore!;
+    }
+
+    let baseAngle = 0;
+    const botPos = bot.entity.position.floored();
+
+    if (totalWeight === 0) {
+        baseAngle = Math.random() * Math.PI * 2;
+    } else {
+        cx /= totalWeight;
+        cz /= totalWeight;
+        baseAngle = Math.atan2(botPos.z - cz, botPos.x - cx);
+    }
+
+    // Fan out and test candidate angles to avoid cliffs and water
+    const testAngles = [
+        baseAngle,
+        baseAngle + Math.PI / 6, // 30 deg
+        baseAngle - Math.PI / 6,
+        baseAngle + Math.PI / 3, // 60 deg
+        baseAngle - Math.PI / 3,
+        baseAngle + Math.PI / 2, // 90 deg
+        baseAngle - Math.PI / 2,
+    ];
+
+    for (const angle of testAngles) {
+        const tx = botPos.x + Math.cos(angle) * distance;
+        const tz = botPos.z + Math.sin(angle) * distance;
+
+        let isSafe = false;
+
+        // Check for solid ground from slightly above to slightly below current elevation
+        for (let yOffset = 2; yOffset >= -5; yOffset--) {
+            const block = bot.blockAt(
+                botPos.offset(
+                    Math.cos(angle) * distance,
+                    yOffset,
+                    Math.sin(angle) * distance,
+                ),
+            );
+
+            if (block && (block.name === "water" || block.name === "lava")) {
+                // Liquid hazard detected before solid ground, abort this angle
+                break;
+            }
+
+            if (block && block.boundingBox === "block") {
+                // Found a solid block. Ensure the block above it is air so we don't path into a wall
+                const above = bot.blockAt(
+                    botPos.offset(
+                        Math.cos(angle) * distance,
+                        yOffset + 1,
+                        Math.sin(angle) * distance,
+                    ),
+                );
+                if (
+                    above &&
+                    (above.name === "air" || above.name === "cave_air")
+                ) {
+                    isSafe = true;
+                    break;
+                }
+            }
+        }
+
+        if (isSafe) {
+            return { x: tx, z: tz };
+        }
+    }
+
+    // Fallback: If all angles look like hazards, just return the exact opposite vector and let pathfinder try to sort it out
+    return {
+        x: botPos.x + Math.cos(baseAngle) * distance,
+        z: botPos.z + Math.sin(baseAngle) * distance,
+    };
+}
 
 </file>
 
@@ -3076,10 +6384,10 @@ export default defineConfig({
 
 ```json
 {
-  "total_bytes": 73520,
-  "file_count": 37,
-  "estimated_tokens": 19155,
+  "total_bytes": 177524,
+  "file_count": 55,
+  "estimated_tokens": 45518,
   "mode": "full",
-  "generated_at": "2026-03-28T21:27:16.124233-07:00"
+  "generated_at": "2026-03-28T21:44:51.6543348-07:00"
 }
 ```

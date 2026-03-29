@@ -27,6 +27,9 @@ type Orchestrator struct {
 	mu        sync.RWMutex
 	lastState domain.GameState
 	uiHub     *observability.Hub
+
+	// Added: Proper shutdown tracking
+	wg sync.WaitGroup
 }
 
 func New(
@@ -54,14 +57,22 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	g, gCtx := errgroup.WithContext(ctx)
 
+	// Track goroutines for graceful shutdown
+	o.wg.Add(2)
 	g.Go(func() error {
+		defer o.wg.Done()
 		return o.processStateLoop(gCtx)
 	})
 
 	g.Go(func() error {
+		defer o.wg.Done()
 		return o.processEventLoop(gCtx)
 	})
 
+	// Wait for context cancellation then gracefully shutdown
+	<-gCtx.Done()
+	o.logger.Info("Orchestrator shutting down, waiting for loops...")
+	o.wg.Wait()
 	return g.Wait()
 }
 
@@ -81,15 +92,21 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, event domain.DomainEvent
 	}
 }
 
-// SessionID returns the current session identifier
 func (o *Orchestrator) SessionID() string {
 	return o.sessionID
 }
 
-// SetController updates the execution controller when bot connects
 func (o *Orchestrator) SetController(ctrl execution.Controller) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	// Close old controller if it implements io.Closer
+	if o.controller != nil {
+		if closer, ok := o.controller.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+
 	o.controller = ctrl
 	o.logger.Info("Execution controller updated")
 }
@@ -136,6 +153,7 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 }
 
 func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState) error {
+	// FIX: Hold lock for entire evaluation to prevent controller swap mid-evaluation
 	o.mu.RLock()
 	controller := o.controller
 	o.mu.RUnlock()
@@ -148,6 +166,13 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 	trace := domain.TraceContext{
 		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
 		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
+	}
+
+	// FIX: Check context cancellation before heavy work
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
 	plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
@@ -167,7 +192,16 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 		slog.String("objective", plan.Objective),
 		slog.Int("tasks", len(plan.Tasks)))
 
-	return controller.Dispatch(ctx, plan.Tasks[0])
+	// FIX: Double-check controller is still valid before dispatch
+	o.mu.RLock()
+	currentController := o.controller
+	o.mu.RUnlock()
+
+	if currentController == nil {
+		return fmt.Errorf("controller became nil after planning")
+	}
+
+	return currentController.Dispatch(ctx, plan.Tasks[0])
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {

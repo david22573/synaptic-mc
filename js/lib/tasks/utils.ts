@@ -4,10 +4,6 @@ import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
-// ==========================================
-// CONSTANTS
-// ==========================================
-
 const TREE_BLOCKS = new Set([
     "oak_leaves",
     "birch_leaves",
@@ -44,10 +40,6 @@ const TRASH_ITEMS = new Set([
     "grass",
 ]);
 
-// ==========================================
-// MOVEMENT & POSITION HELPERS
-// ==========================================
-
 export function isOnSolidGround(bot: any): boolean {
     if (!bot.entity.onGround) return false;
     const pos = bot.entity.position.floored();
@@ -76,24 +68,22 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
     const MAX_ATTEMPTS = 30;
 
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        // FIX: Check signal.abort in loop
         if (signal.aborted) throw new Error("aborted");
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
-
-        // Added horizontal blocks to break out of 1x1 leaf prisons
         const blocksToClear = [
-            bot.blockAt(pos.offset(0, 1, 0)), // Head
-            bot.blockAt(pos), // Torso
-            bot.blockAt(pos.offset(0, -1, 0)), // Below
-            bot.blockAt(pos.offset(1, 0, 0)), // East
-            bot.blockAt(pos.offset(-1, 0, 0)), // West
-            bot.blockAt(pos.offset(0, 0, 1)), // South
-            bot.blockAt(pos.offset(0, 0, -1)), // North
+            bot.blockAt(pos.offset(0, 1, 0)),
+            bot.blockAt(pos),
+            bot.blockAt(pos.offset(0, -1, 0)),
+            bot.blockAt(pos.offset(1, 0, 0)),
+            bot.blockAt(pos.offset(-1, 0, 0)),
+            bot.blockAt(pos.offset(0, 0, 1)),
+            bot.blockAt(pos.offset(0, 0, -1)),
         ];
 
         let clearedSomething = false;
-
         for (const targetBlock of blocksToClear) {
             if (
                 targetBlock &&
@@ -102,14 +92,8 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
             ) {
                 try {
                     const tool = bot.pathfinder.bestHarvestTool(targetBlock);
-                    if (tool) {
-                        await bot.equip(tool, "hand");
-                    } else {
-                        // Force unequip to punch leaves if no tool is better
-                        await bot.unequip("hand");
-                    }
-
-                    // Use "ignore" raycast to break blocks even if clipped inside them
+                    if (tool) await bot.equip(tool, "hand");
+                    else await bot.unequip("hand");
                     await bot.dig(targetBlock, true, "ignore");
                     clearedSomething = true;
                 } catch (err) {
@@ -121,7 +105,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
         if (!clearedSomething && !isOnSolidGround(bot)) {
             const dir = Math.random() > 0.5 ? "forward" : "back";
             const strafe = Math.random() > 0.5 ? "left" : "right";
-
             bot.setControlState(dir, true);
             bot.setControlState(strafe, true);
             await new Promise((res) => setTimeout(res, 250));
@@ -129,27 +112,29 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
             bot.setControlState(strafe, false);
         }
 
-        await new Promise<void>((resolve) => {
+        // FIX: Add timeout to physics tick listener
+        await new Promise<void>((resolve, reject) => {
             let ticks = 0;
+            const timeout = setTimeout(() => {
+                bot.removeListener("physicsTick", check);
+                resolve();
+            }, 1000);
+
             const check = () => {
                 ticks++;
                 if (isOnSolidGround(bot) || ticks > 10) {
+                    clearTimeout(timeout);
                     bot.removeListener("physicsTick", check);
                     resolve();
                 }
             };
             bot.on("physicsTick", check);
-
-            setTimeout(() => {
-                bot.removeListener("physicsTick", check);
-                resolve();
-            }, 1000);
         });
     }
 
     if (!isOnSolidGround(bot)) {
         throw new Error(
-            "EscapeTree - could not reach ground after 30 attempts. Likely stuck in a massive canopy.",
+            "EscapeTree - could not reach ground after 30 attempts",
         );
     }
 }
@@ -214,17 +199,25 @@ export function moveToGoal(
         let settled = false;
         let lastPos = bot.entity.position.clone();
         let stuckTimer: NodeJS.Timeout | null = null;
+        const listeners = new Map<string, any>();
+
+        const cleanup = () => {
+            listeners.forEach((handler, event) =>
+                bot.removeListener(event, handler),
+            );
+            listeners.clear();
+            if (stuckTimer) clearInterval(stuckTimer);
+        };
 
         const finish = (err?: Error) => {
             if (settled) return;
             settled = true;
+            cleanup();
 
-            clearTimeout(timer);
-            if (stuckTimer) clearInterval(stuckTimer);
-
-            signal.removeEventListener("abort", onAbort);
-            bot.removeListener("goal_reached", onGoalReached);
-            bot.removeListener("path_update", onPathUpdate);
+            try {
+                bot.clearControlStates();
+                stopMovement();
+            } catch (_err) {}
 
             if (err) {
                 reject(err);
@@ -233,52 +226,26 @@ export function moveToGoal(
             resolve();
         };
 
-        const safeStop = () => {
-            try {
-                bot.clearControlStates();
-                stopMovement();
-            } catch (_err) {}
-        };
-
-        const onAbort = () => {
-            safeStop();
-            finish(new Error("aborted"));
-        };
-
-        const onGoalReached = () => {
-            safeStop();
-            finish();
-        };
+        const onAbort = () => finish(new Error("aborted"));
+        const onGoalReached = () => finish();
 
         const onPathUpdate = (results: any) => {
             if (results.status === "noPath") {
                 setTimeout(() => {
-                    if (!settled) {
-                        safeStop();
-                        finish(new Error("no_path"));
-                    }
+                    if (!settled) finish(new Error("no_path"));
                 }, 3500);
             } else if (results.status === "timeout") {
-                safeStop();
                 finish(new Error("pathfinder_timeout"));
             }
         };
 
-        const timer = setTimeout(() => {
-            safeStop();
-            finish(new Error("timeout"));
-        }, timeoutMs);
-
         let stuckStrikes = 0;
-
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
-
             if (dist < 0.5) {
                 stuckStrikes++;
                 if (stuckStrikes >= 2) {
-                    safeStop();
                     finish(new Error("stuck"));
                 }
             } else {
@@ -287,13 +254,20 @@ export function moveToGoal(
             }
         }, stuckTimeoutMs);
 
+        // FIX: Store listeners for proper cleanup
+        listeners.set("goal_reached", onGoalReached);
+        listeners.set("path_update", onPathUpdate);
+
         signal.addEventListener("abort", onAbort, { once: true });
         bot.once("goal_reached", onGoalReached);
         bot.on("path_update", onPathUpdate);
 
+        const timer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
+
         try {
             bot.pathfinder.setGoal(goal, dynamic);
         } catch (err) {
+            clearTimeout(timer);
             finish(err instanceof Error ? err : new Error(String(err)));
         }
     });
@@ -305,10 +279,6 @@ export function findNearestBlockByName(bot: Bot, blockName: string): any {
         matching: (block: any) => block?.name === blockName,
     });
 }
-
-// ==========================================
-// INVENTORY MANAGEMENT
-// ==========================================
 
 export async function makeRoomInInventory(
     bot: any,
@@ -336,10 +306,6 @@ export async function makeRoomInInventory(
     }
 }
 
-// ==========================================
-// BLOCK PLACEMENT
-// ==========================================
-
 export async function placePortableUtility(
     bot: any,
     blockName: string,
@@ -348,7 +314,6 @@ export async function placePortableUtility(
     if (!item) return null;
 
     await bot.equip(item, "hand");
-
     const pos = bot.entity.position.floored();
     const candidates = [
         bot.blockAt(pos.offset(1, -1, 0)),
@@ -363,7 +328,7 @@ export async function placePortableUtility(
                 await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
                 return findNearestBlockByName(bot, blockName);
             } catch (err) {
-                // Ignore placement failure, check next adjacent block
+                // Ignore placement failure
             }
         }
     }

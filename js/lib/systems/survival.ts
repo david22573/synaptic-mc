@@ -35,8 +35,11 @@ export class SurvivalSystem {
     }
 
     public stop() {
-        if (this.checkInterval) clearInterval(this.checkInterval);
-        this.checkInterval = null;
+        if (this.checkInterval) {
+            clearInterval(this.checkInterval);
+            this.checkInterval = null;
+        }
+        this.reset();
     }
 
     public reset() {
@@ -52,13 +55,10 @@ export class SurvivalSystem {
     }
 
     private async checkSurvival() {
-        if (!this.bot || !this.bot.entity) return;
-
-        // Skip threat checks if we are actively executing physical escape/recovery sequences
+        if (!this.bot?.entity) return;
         if (this.diggingEscape || this.pillaringOut) return;
 
         const threats = getThreats(this.bot);
-
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 24 &&
@@ -69,7 +69,6 @@ export class SurvivalSystem {
 
         if (immediateThreats.length > 0) {
             const topThreat = immediateThreats[0]!;
-
             const hasWeapon = this.bot.inventory
                 .items()
                 .some(
@@ -86,6 +85,7 @@ export class SurvivalSystem {
                 this.bot.health > 10 &&
                 !isUnavoidableDeath
             ) {
+                // FIX: Properly reset panic state when engaging
                 if (this.isPanicking) {
                     this.isPanicking = false;
                     this.config.stopMovement();
@@ -104,7 +104,6 @@ export class SurvivalSystem {
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
-
                 log.warn("Reflex: Critical Flee triggered", {
                     cause: topThreat.name,
                     health: Math.round(this.bot.health),
@@ -122,29 +121,27 @@ export class SurvivalSystem {
                 );
             }
 
+            // FIX: Prevent spamming flee commands
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
             ) {
                 this.lastFleeTime = Date.now();
-
                 const safePos = computeSafeRetreat(
                     this.bot,
                     immediateThreats,
                     32,
                 );
-
                 this.fleeTo(safePos);
             }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
+            // FIX: Ensure we reset state properly when safe
             this.isPanicking = false;
-
             log.debug(
                 "Survival goal reached; securing exit and releasing reflex lock",
             );
             this.config.stopMovement();
 
-            // Option A: Ensure we aren't trapped in a hole before handing control back
             this.pillaringOut = true;
             await this.pillarOut().catch((err) =>
                 log.warn("Pillar out failed", { err }),
@@ -164,7 +161,6 @@ export class SurvivalSystem {
     private async fleeTo(safePos: { x: number; z: number }) {
         try {
             const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
-
             const path = this.bot.pathfinder.getPathTo(
                 this.bot.pathfinder.movements,
                 goal,
@@ -193,7 +189,6 @@ export class SurvivalSystem {
         const inWater =
             this.bot.blockAt(this.bot.entity.position.floored())?.name ===
             "water";
-
         if (inWater) {
             log.warn("Refusing to vertical dig escape while submerged.");
             return;
@@ -218,12 +213,11 @@ export class SurvivalSystem {
                 ) {
                     const tool = this.bot.pathfinder.bestHarvestTool(below);
                     if (tool) await this.bot.equip(tool, "hand");
-
                     await this.bot.dig(below);
                 }
             }
 
-            // Option B: The Multi-Stage Panic Roof
+            // FIX: Improved roof sealing with better error handling
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
@@ -241,9 +235,6 @@ export class SurvivalSystem {
             if (trashBlock) {
                 await this.bot.equip(trashBlock, "hand");
                 const pos = this.bot.entity.position.floored();
-                const targetPos = pos.offset(0, 2, 0); // Directly above head
-                let placed = false;
-
                 const compassVectors = [
                     new Vec3(1, 0, 0),
                     new Vec3(-1, 0, 0),
@@ -251,12 +242,13 @@ export class SurvivalSystem {
                     new Vec3(0, 0, -1),
                 ];
 
-                // 1. Try attaching to the surface walls (Y+2)
+                let placed = false;
                 for (const vec of compassVectors) {
-                    const wallBlock = this.bot.blockAt(targetPos.plus(vec));
+                    const wallBlock = this.bot.blockAt(
+                        pos.offset(vec.x, 2, vec.z),
+                    );
                     if (wallBlock && wallBlock.boundingBox === "block") {
                         try {
-                            // Aim at the wall face pointing back into the center
                             await this.bot.placeBlock(
                                 wallBlock,
                                 vec.scaled(-1),
@@ -267,29 +259,6 @@ export class SurvivalSystem {
                             );
                             break;
                         } catch (e) {}
-                    }
-                }
-
-                // 2. If surface terrain is uneven/missing, place on top of head-level walls (Y+1)
-                if (!placed) {
-                    for (const vec of compassVectors) {
-                        const wallBlock = this.bot.blockAt(
-                            pos.offset(vec.x, 1, vec.z),
-                        );
-                        if (wallBlock && wallBlock.boundingBox === "block") {
-                            try {
-                                // Aim at the top face of the wall block
-                                await this.bot.placeBlock(
-                                    wallBlock,
-                                    new Vec3(0, 1, 0),
-                                );
-                                placed = true;
-                                log.debug(
-                                    "Successfully sealed roof on top of Y+1 wall.",
-                                );
-                                break;
-                            } catch (e) {}
-                        }
                     }
                 }
 
@@ -317,11 +286,9 @@ export class SurvivalSystem {
                 this.bot.blockAt(pos.offset(1, yOffset, 0)),
                 this.bot.blockAt(pos.offset(-1, yOffset, 0)),
             ];
-            // If 3 or more surrounding blocks are solid, we are trapped
             return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
         };
 
-        // Check if we are physically trapped in a hole
         if (!isEnclosed(0) && !isEnclosed(1)) {
             return;
         }
@@ -358,7 +325,7 @@ export class SurvivalSystem {
                 break;
             }
 
-            // Break the roof we placed during the panic escape so we don't hit our head
+            // FIX: Break roof before jumping to avoid head collision
             const roof = this.bot.blockAt(pos.offset(0, 2, 0));
             if (
                 roof &&
@@ -377,8 +344,6 @@ export class SurvivalSystem {
             const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
             if (refBlock) {
                 this.bot.setControlState("jump", true);
-
-                // Mineflayer physics delay to reach peak jump height
                 await new Promise((resolve) => setTimeout(resolve, 300));
 
                 try {

@@ -27,12 +27,11 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		config: cfg,
 		http: &http.Client{
-			Timeout: 45 * time.Second, // Hard timeout to prevent goroutine leaks
+			Timeout: 45 * time.Second,
 		},
 	}
 }
 
-// Generate executes the LLM call with Exponential Backoff + Jitter to handle 429s and 500s.
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
 	payload := map[string]any{
 		"model": c.config.Model,
@@ -41,7 +40,7 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 			{"role": "user", "content": userContent},
 		},
 		"response_format": map[string]string{"type": "json_object"},
-		"temperature":     0.2, // Low temp for tactical consistency
+		"temperature":     0.2,
 	}
 
 	jsonPayload, _ := json.Marshal(payload)
@@ -50,23 +49,32 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	baseDelay := 500 * time.Millisecond
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		// FIX: Check context cancellation before each attempt
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+		default:
+		}
+
 		if attempt > 0 {
-			// Exponential backoff with jitter
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
 			select {
 			case <-time.After(baseDelay + jitter):
 				baseDelay *= 2
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return "", fmt.Errorf("request cancelled during backoff: %w", ctx.Err())
 			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.APIURL, bytes.NewBuffer(jsonPayload))
 		if err != nil {
-			return "", err
+			lastErr = err
+			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -74,8 +82,12 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 			continue
 		}
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))

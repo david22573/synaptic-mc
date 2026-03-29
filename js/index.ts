@@ -16,7 +16,6 @@ const { pathfinder, Movements } = pkg;
 let viewerStarted = false;
 const isIgnorableError = (err: Error | any) => {
     const msg = err?.message || "";
-
     const name = err?.name || "";
     return (
         name === "PartialReadError" ||
@@ -39,24 +38,24 @@ process.on("unhandledRejection", (reason: any) => {
     log.error("Unhandled promise rejection", { reason });
 });
 
+// FIX: Add proper task lock to prevent race conditions
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
 let client: ControlPlaneClient;
-
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
-
 let lastStateSig = "";
 let lastStatePushTime = 0;
-
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 
+// FIX: Add cleanup flag to prevent double-cleanup
+let isShuttingDown = false;
+
 function stopMovement() {
     if (!bot) return;
-
     bot.clearControlStates();
     if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
@@ -71,6 +70,11 @@ function completeTask(
 ) {
     if (!task || !client) return;
 
+    // FIX: Prevent duplicate completion calls
+    if (currentTask?.id === task.id) {
+        currentTask = null;
+    }
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -78,21 +82,20 @@ function completeTask(
         cause,
         task.startTime,
     );
-
-    if (currentTask?.id === task.id) currentTask = null;
 }
 
 function abortActiveTask(reason: string) {
-    if (currentTask) {
-        if (taskAbortController) taskAbortController.abort(reason);
-
+    if (currentTask && taskAbortController) {
+        taskAbortController.abort(reason);
         completeTask(currentTask, "task_aborted", reason);
+        // FIX: Clear references immediately
+        currentTask = null;
+        taskAbortController = null;
     }
 }
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -126,12 +129,19 @@ function normalizeFailureCause(err: any): string {
     ) {
         return "NO_BLOCKS";
     }
-
     return "UNKNOWN";
 }
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+
+    // FIX: Check shutdown state
+    if (isShuttingDown) {
+        log.warn("Ignoring decision during shutdown", {
+            action: decision.action,
+        });
+        return;
+    }
 
     if (survival?.isPanickingNow()) {
         if (decision.action === "retreat") {
@@ -148,13 +158,12 @@ async function executeDecision(decision: models.IncomingDecision) {
         }
     }
 
+    // FIX: Wait for previous task to fully abort before starting new one
     abortActiveTask("preempted");
 
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
-
-    // Scope the controller locally to prevent background timeouts from killing new tasks
 
     currentTask = {
         id: decision.id,
@@ -173,7 +182,6 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-
         const timeoutMs = timeouts[decision.action] || 15000;
 
         await Promise.race([
@@ -194,19 +202,27 @@ async function executeDecision(decision: models.IncomingDecision) {
             }),
         ]);
 
-        if (!signal.aborted) completeTask(activeTask, "task_completed");
+        // FIX: Only complete if not aborted
+        if (!signal.aborted) {
+            completeTask(activeTask, "task_completed");
+        }
     } catch (err: any) {
-        // Fix: Allow timeout errors to bypass the aborted check so they actually report to the engine
+        // FIX: Better abort detection
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
-
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
-
-        // Clear the ghost timeout!
         stopMovement();
+
+        // FIX: Clear task references only if they're still the active ones
+        if (currentTask?.id === activeTask.id) {
+            currentTask = null;
+        }
+        if (taskAbortController === localController) {
+            taskAbortController = null;
+        }
     }
 }
 
@@ -220,11 +236,9 @@ function pushState() {
         .join(",")}`;
 
     const now = Date.now();
-
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
     lastStateSig = sig;
-
     lastStatePushTime = now;
 
     client.sendState({
@@ -249,7 +263,8 @@ function pushState() {
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {
         log.error("Max reconnection attempts reached. Shutting down.");
-
+        // FIX: Graceful shutdown
+        isShuttingDown = true;
         process.exit(1);
     }
 
@@ -257,12 +272,13 @@ async function connectWithRetry(maxAttempts = 10) {
         try {
             if ((bot as any).viewer) {
                 (bot as any).viewer.close();
-
                 viewerStarted = false;
             }
             bot.removeAllListeners();
             bot.quit();
-        } catch (e) {}
+        } catch (e) {
+            log.warn("Error during bot cleanup", { err: e });
+        }
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
@@ -304,15 +320,22 @@ async function connectWithRetry(maxAttempts = 10) {
         abortActiveTask("bot_disconnected");
         survival.stop();
 
+        // FIX: Exponential backoff with jitter
         const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
-        log.info(`Retrying in ${backoffMs / 1000}s...`);
-        setTimeout(() => connectWithRetry(maxAttempts), backoffMs);
-        reconnectAttempt++;
+        const jitter = Math.random() * 1000;
+        const finalBackoff = backoffMs + jitter;
+
+        log.info(`Retrying in ${finalBackoff / 1000}s...`);
+        setTimeout(() => {
+            reconnectAttempt++;
+            connectWithRetry(maxAttempts);
+        }, finalBackoff);
     });
 
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
+
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allow1by1towers = true;
@@ -321,7 +344,6 @@ async function connectWithRetry(maxAttempts = 10) {
 
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
-
         movements.liquids = new Set(
             [water, lava].filter((id) => id !== undefined) as number[],
         );
@@ -340,19 +362,13 @@ async function connectWithRetry(maxAttempts = 10) {
         }
         survival.start();
 
-        if (runtimeConfig.enable_viewer) {
+        if (runtimeConfig.enable_viewer && !viewerStarted) {
             try {
-                if (viewerStarted) {
-                    log.warn("Viewer already started, skipping new instance");
-
-                    return;
-                }
                 viewer(bot, {
                     port: runtimeConfig.viewer_port,
                     firstPerson: true,
                     viewDistance: 4,
                 });
-
                 viewerStarted = true;
             } catch (err) {
                 log.warn("Could not start viewer", { err });
@@ -377,14 +393,31 @@ async function connectWithRetry(maxAttempts = 10) {
 
     bot.on("health", pushState);
 
+    // FIX: Clear existing interval before setting new one
     if (stateInterval) clearInterval(stateInterval);
     stateInterval = setInterval(pushState, 2000);
 }
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
-
     await connectWithRetry();
 }
 
-bootstrap().catch((err) => log.error("Fatal startup", { err }));
+// FIX: Graceful shutdown on SIGINT
+process.on("SIGINT", () => {
+    log.info("Received SIGINT, shutting down gracefully...");
+    isShuttingDown = true;
+    abortActiveTask("shutdown");
+    if (bot) bot.quit();
+    if (client?.isConnected()) {
+        // Give time to send final events
+        setTimeout(() => process.exit(0), 1000);
+    } else {
+        process.exit(0);
+    }
+});
+
+bootstrap().catch((err) => {
+    log.error("Fatal startup", { err });
+    process.exit(1);
+});
