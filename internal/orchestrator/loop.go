@@ -5,6 +5,7 @@ import (
 	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/observability"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -28,6 +29,7 @@ type Orchestrator struct {
 
 	mu        sync.RWMutex
 	lastState domain.GameState
+	uiHub     *observability.Hub
 }
 
 func New(
@@ -35,6 +37,7 @@ func New(
 	store domain.EventStore,
 	decisionEngine decision.Engine,
 	exec execution.Controller,
+	uiHub *observability.Hub,
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
@@ -42,6 +45,7 @@ func New(
 		store:      store,
 		decision:   decisionEngine,
 		controller: exec,
+		uiHub:      uiHub,
 		logger:     logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
 		stateCh:    make(chan domain.GameState, 10),
 		eventCh:    make(chan domain.DomainEvent, 100),
@@ -95,6 +99,9 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 			o.lastState = state
 			o.mu.Unlock()
 
+			if o.uiHub != nil {
+				o.uiHub.Broadcast("state_update", state)
+			}
 			// Check routines / reflexes immediately (Phase 1: Fast Path)
 			// Trigger replan if necessary (Phase 1: Slow Path)
 			if err := o.evaluateState(ctx, state); err != nil {
@@ -114,6 +121,10 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 			if err := o.store.Append(ctx, o.sessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
 				o.logger.Error("Failed to append event to store", slog.Any("error", err))
 				continue
+			}
+
+			if o.uiHub != nil {
+				o.uiHub.Broadcast("event_stream", ev)
 			}
 
 			// 2. React to specific domain events
@@ -137,6 +148,10 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 
 	if plan == nil || len(plan.Tasks) == 0 {
 		return nil // No action required
+	}
+
+	if o.uiHub != nil {
+		o.uiHub.Broadcast("objective_update", plan.Objective)
 	}
 
 	o.logger.Info("New plan generated", slog.String("objective", plan.Objective), slog.Int("tasks", len(plan.Tasks)))

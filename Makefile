@@ -14,7 +14,7 @@ install: ## Install Go and JS dependencies
 
 run-server: ## Run the Go control plane directly
 	@echo "==> Starting Go WebSocket Server..."
-	go run *.go
+	go run cmd/server/*.go
 
 run-bot: ## Run the Mineflayer TypeScript bot directly
 	@echo "==> Starting Mineflayer Bot..."
@@ -23,13 +23,13 @@ run-bot: ## Run the Mineflayer TypeScript bot directly
 dev: ## Run both server and bot concurrently in one terminal
 	@echo "==> Starting CraftD Control Plane and Bot..."
 	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
-	go run *.go & \
+	go run cmd/server/*.go & \
 	sleep 2; \
 	cd js && npx tsx index.ts
 
 test-replay: ## Run the Replay Test Harness
 	@echo "==> Running Planning Replay Tests..."
-	go test -v -run TestReplayHarness
+	go test -v ./tests/...
 
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."
