@@ -17,13 +17,16 @@ type TraceContext struct {
 type EventType string
 
 const (
-	EventTypeStateTick     EventType = "STATE_TICK"
-	EventTypeTaskStart     EventType = "TASK_START"
-	EventTypeTaskEnd       EventType = "TASK_END"
-	EventTypePlanCreated   EventType = "PLAN_CREATED"
-	EventTypePanic         EventType = "PANIC_TRIGGERED"
-	EventTypePanicResolved EventType = "PANIC_RESOLVED"
-	EventBotDeath          EventType = "BOT_DEATH"
+	EventTypeStateTick       EventType = "STATE_TICK"
+	EventTypeTaskStart       EventType = "TASK_START"
+	EventTypeTaskEnd         EventType = "TASK_END"
+	EventTypePlanCreated     EventType = "PLAN_CREATED"
+	EventTypePlanInvalidated EventType = "PLAN_INVALIDATED"
+	EventTypePlanCompleted   EventType = "PLAN_COMPLETED"
+	EventTypePlanFailed      EventType = "PLAN_FAILED"
+	EventTypePanic           EventType = "PANIC_TRIGGERED"
+	EventTypePanicResolved   EventType = "PANIC_RESOLVED"
+	EventBotDeath            EventType = "BOT_DEATH"
 )
 
 // DomainEvent is the immutable record of a state transition.

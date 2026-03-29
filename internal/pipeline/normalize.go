@@ -1,4 +1,3 @@
-// internal/pipeline/normalize.go
 package pipeline
 
 import (
@@ -9,43 +8,45 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// NormalizeStage sanitizes the raw LLM plan, ensuring structural invariants.
 type NormalizeStage struct{}
 
 func NewNormalizeStage() *NormalizeStage {
 	return &NormalizeStage{}
 }
 
-func (s *NormalizeStage) Process(ctx context.Context, state *PipelineState) error {
-	if state.Plan == nil {
-		state.Normalized = &domain.Plan{Tasks: []domain.Action{}}
-		return nil
+func (s *NormalizeStage) Name() string {
+	return "Normalize"
+}
+
+func (s *NormalizeStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
+	output := input // By-value shallow copy to preserve prior fields
+
+	if input.Plan == nil {
+		output.Normalized = &domain.Plan{Tasks: []domain.Action{}}
+		return output, nil
 	}
 
 	normalized := &domain.Plan{
-		Objective: strings.TrimSpace(state.Plan.Objective),
-		Tasks:     make([]domain.Action, 0, len(state.Plan.Tasks)),
+		Objective: strings.TrimSpace(input.Plan.Objective),
+		Tasks:     make([]domain.Action, 0, len(input.Plan.Tasks)),
 	}
 
-	for i, task := range state.Plan.Tasks {
+	for i, task := range input.Plan.Tasks {
 		normTask := task
 
-		// Sanitize structural strings
 		normTask.Action = strings.ToLower(strings.TrimSpace(task.Action))
 		normTask.Target.Name = strings.ToLower(strings.TrimSpace(task.Target.Name))
 		normTask.Target.Type = strings.ToLower(strings.TrimSpace(task.Target.Type))
 
-		// Imbue a deterministic ID for the TaskManager & Idempotency controller
 		if normTask.ID == "" {
-			normTask.ID = fmt.Sprintf("cmd-%s-%d", state.Trace.ActionID, i)
+			normTask.ID = fmt.Sprintf("cmd-%s-%d", input.Trace.ActionID, i)
 		}
 
-		// Imbue the execution trace context at the boundary
-		normTask.Trace = state.Trace
+		normTask.Trace = input.Trace
 
 		normalized.Tasks = append(normalized.Tasks, normTask)
 	}
 
-	state.Normalized = normalized
-	return nil
+	output.Normalized = normalized
+	return output, nil
 }

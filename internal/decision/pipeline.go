@@ -1,4 +1,3 @@
-// internal/decision/pipeline.go
 package decision
 
 import (
@@ -27,7 +26,7 @@ func NewPipeline(p Planner, policyEngine policy.Engine) *Pipeline {
 			pipeline.NewNormalizeStage(),
 			pipeline.NewValidateStage(),
 			pipeline.NewSimulateStage(),
-			pipeline.NewPolicyStage(policyEngine), // Policy is now officially in the pipeline
+			pipeline.NewPolicyStage(policyEngine),
 		},
 	}
 }
@@ -38,18 +37,31 @@ func (p *Pipeline) Evaluate(ctx context.Context, sessionID string, state domain.
 		return nil, fmt.Errorf("planning phase failed: %w", err)
 	}
 
-	pipeState := &pipeline.PipelineState{
+	pipeState := pipeline.PipelineState{
 		SessionID: sessionID,
 		GameState: state,
 		Trace:     trace,
 		Plan:      rawPlan,
 	}
 
+	var snapshots []pipeline.StageSnapshot
+
 	// Execute Pure Stages: Normalize -> Validate -> Simulate -> Policy
 	for _, stage := range p.stages {
-		if err := stage.Process(ctx, pipeState); err != nil {
-			return nil, fmt.Errorf("pipeline stage failed: %w", err)
+		nextState, err := stage.Process(ctx, pipeState)
+
+		// Capture exact state transition
+		snapshots = append(snapshots, pipeline.StageSnapshot{
+			StageName: stage.Name(),
+			Input:     pipeState,
+			Output:    nextState,
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("pipeline stage %s failed: %w", stage.Name(), err)
 		}
+
+		pipeState = nextState
 	}
 
 	if pipeState.Validation != nil && !pipeState.Validation.IsValid {

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/strategy"
 )
 
@@ -22,13 +23,15 @@ type LLMPlanner struct {
 	client    LLMClient
 	evaluator *strategy.Evaluator
 	extractor RuleExtractor
+	memStore  memory.Store
 }
 
-func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor RuleExtractor) *LLMPlanner {
+func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor RuleExtractor, memStore memory.Store) *LLMPlanner {
 	return &LLMPlanner{
 		client:    client,
 		evaluator: evaluator,
 		extractor: extractor,
+		memStore:  memStore,
 	}
 }
 
@@ -63,7 +66,6 @@ Response format (JSON only):
   ]
 }`
 
-// 3.1 FIX: Compact state formatting to reduce token noise
 func formatStateForLLM(state domain.GameState) string {
 	type compactPOI struct {
 		Type      string  `json:"type"`
@@ -95,7 +97,7 @@ func formatStateForLLM(state domain.GameState) string {
 		Inventory:    make(map[string]int),
 		Threats:      make([]compactThreat, 0),
 		POIs:         make([]compactPOI, 0),
-		Feedback:     state.Feedback, // Keep feedback intact to break loops
+		Feedback:     state.Feedback,
 	}
 
 	for _, item := range state.Inventory {
@@ -141,14 +143,22 @@ func (p *LLMPlanner) Generate(ctx context.Context, sessionID string, state domai
 		learnedRules = p.extractor.GenerateRules(ctx, sessionID)
 	}
 
-	systemPrompt := fmt.Sprintf("%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
+	knownWorld := "KNOWN WORLD: empty"
+	longTermMem := "No active summary."
+	if p.memStore != nil {
+		knownWorld, _ = p.memStore.GetKnownWorld(ctx, state.Position)
+		longTermMem, _ = p.memStore.GetSummary(ctx, sessionID)
+	}
+
+	systemPrompt := fmt.Sprintf("%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
 		BaseSystemRules,
 		learnedRules,
+		longTermMem,
+		knownWorld,
 		directive.PrimaryGoal,
 		directive.SecondaryGoal,
 	)
 
-	// 3.1 FIX: Use the compact state format instead of dumping the raw state
 	userContent := formatStateForLLM(state)
 
 	rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)

@@ -16,49 +16,52 @@ func NewPolicyStage(engine policy.Engine) *PolicyStage {
 	return &PolicyStage{engine: engine}
 }
 
-func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
-	// FIX: Check for nil Normalized plan
-	if state.Normalized == nil {
-		return fmt.Errorf("cannot run policy stage: normalized plan is nil")
+func (s *PolicyStage) Name() string {
+	return "Policy"
+}
+
+func (s *PolicyStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
+	output := input
+
+	if input.Normalized == nil {
+		return output, fmt.Errorf("cannot run policy stage: normalized plan is nil")
 	}
 
-	if state.Simulation == nil {
-		return fmt.Errorf("cannot run policy stage without simulation artifact")
+	if input.Simulation == nil {
+		return output, fmt.Errorf("cannot run policy stage without simulation artifact")
 	}
 
 	candidatePlan := &domain.Plan{
-		Objective: state.Normalized.Objective,
-		Tasks:     state.Simulation.OptimizedTasks,
+		Objective: input.Normalized.Objective,
+		Tasks:     input.Simulation.OptimizedTasks,
 	}
 
-	input := policy.DecisionInput{
+	decisionInput := policy.DecisionInput{
 		Plan:  candidatePlan,
-		State: state.GameState,
+		State: input.GameState,
 	}
 
-	// FIX: Respect context cancellation
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return output, ctx.Err()
 	default:
 	}
 
-	decision := s.engine.Decide(ctx, input)
+	decision := s.engine.Decide(ctx, decisionInput)
 
-	state.Policy = &PolicyDecision{
+	output.Policy = &PolicyDecision{
 		IsApproved: decision.IsApproved,
 		Reason:     decision.Reason,
 	}
 
 	if !decision.IsApproved {
-		// 2.1 FIX: Use OverridePlan if provided by the policy engine
 		if decision.OverridePlan != nil {
-			state.FinalPlan = decision.OverridePlan
-			return nil
+			output.FinalPlan = decision.OverridePlan
+			return output, nil
 		}
-		return fmt.Errorf("policy rejection: %s", decision.Reason)
+		return output, fmt.Errorf("policy rejection: %s", decision.Reason)
 	}
 
-	state.FinalPlan = candidatePlan
-	return nil
+	output.FinalPlan = candidatePlan
+	return output, nil
 }

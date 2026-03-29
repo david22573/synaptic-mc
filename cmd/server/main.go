@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -83,13 +84,12 @@ func main() {
 
 	strategyEvaluator := strategy.NewEvaluator()
 	policyExtractor := learning.NewPolicyExtractor(eventStore, logger)
-	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator, policyExtractor)
+	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator, policyExtractor, memoryStore)
 	survivalPolicy := policy.NewSurvivalPolicy()
 	policyEngine := policy.NewCompositePolicy(survivalPolicy)
 	decisionEngine := decision.NewPipeline(planner, policyEngine)
 	uiHub := observability.NewHub(logger)
 
-	// Pass memoryStore into the orchestrator
 	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, decisionEngine, &noopController{}, uiHub, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
@@ -223,9 +223,11 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 
 		botController := execution.NewWSController(conn)
 		idempotentController := execution.NewIdempotentController(botController, 1000)
-		orch.SetController(idempotentController)
+		controllerID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
 
-		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()))
+		orch.SetController(controllerID, idempotentController)
+
+		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
 
 		go func() {
 			<-appCtx.Done()

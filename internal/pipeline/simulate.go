@@ -1,4 +1,3 @@
-// internal/pipeline/simulate.go
 package pipeline
 
 import (
@@ -7,34 +6,38 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// SimulateStage evaluates risk and trims overly dangerous or complex tails from the plan.
 type SimulateStage struct{}
 
 func NewSimulateStage() *SimulateStage {
 	return &SimulateStage{}
 }
 
-func (s *SimulateStage) Process(ctx context.Context, state *PipelineState) error {
-	if state.Validation == nil || !state.Validation.IsValid {
-		state.Simulation = &SimulationResult{
+func (s *SimulateStage) Name() string {
+	return "Simulate"
+}
+
+func (s *SimulateStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
+	output := input
+
+	if input.Validation == nil || !input.Validation.IsValid {
+		output.Simulation = &SimulationResult{
 			OptimizedTasks: []domain.Action{},
 			RiskScore:      0.0,
 		}
-		return nil
+		return output, nil
 	}
 
 	poiMap := make(map[string]domain.POI)
-	for _, p := range state.GameState.POIs {
+	for _, p := range input.GameState.POIs {
 		poiMap[p.Name] = p
 	}
 
-	optimizedTasks := make([]domain.Action, 0, len(state.Normalized.Tasks))
+	optimizedTasks := make([]domain.Action, 0, len(input.Normalized.Tasks))
 	accumulatedRisk := 0.0
 
-	for _, task := range state.Normalized.Tasks {
+	for _, task := range input.Normalized.Tasks {
 		stepRisk := 1.0
 
-		// Penalize physical distance
 		if p, exists := poiMap[task.Target.Name]; exists {
 			stepRisk += p.Distance * 0.1
 		}
@@ -45,7 +48,6 @@ func (s *SimulateStage) Process(ctx context.Context, state *PipelineState) error
 
 		accumulatedRisk += stepRisk
 
-		// Threshold truncation
 		if accumulatedRisk > 15.0 && len(optimizedTasks) > 0 {
 			break
 		}
@@ -53,10 +55,10 @@ func (s *SimulateStage) Process(ctx context.Context, state *PipelineState) error
 		optimizedTasks = append(optimizedTasks, task)
 	}
 
-	state.Simulation = &SimulationResult{
+	output.Simulation = &SimulationResult{
 		OptimizedTasks: optimizedTasks,
 		RiskScore:      accumulatedRisk,
 	}
 
-	return nil
+	return output, nil
 }

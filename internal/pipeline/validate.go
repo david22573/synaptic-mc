@@ -14,32 +14,36 @@ func NewValidateStage() *ValidateStage {
 	return &ValidateStage{}
 }
 
-func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error {
-	if state.Normalized == nil || len(state.Normalized.Tasks) == 0 {
-		state.Validation = &ValidationResult{IsValid: false, Errors: []error{fmt.Errorf("empty normalized plan")}}
-		return nil
+func (s *ValidateStage) Name() string {
+	return "Validate"
+}
+
+func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
+	output := input
+
+	if input.Normalized == nil || len(input.Normalized.Tasks) == 0 {
+		output.Validation = &ValidationResult{IsValid: false, Errors: []error{fmt.Errorf("empty normalized plan")}}
+		return output, nil
 	}
 
 	simInv := make(map[string]int)
-	for _, item := range state.GameState.Inventory {
+	for _, item := range input.GameState.Inventory {
 		simInv[item.Name] += item.Count
 	}
 
 	var validationErrors []error
 
-	for i, task := range state.Normalized.Tasks {
-		if err := validateTaskPure(task, state.GameState, simInv); err != nil {
+	for i, task := range input.Normalized.Tasks {
+		if err := validateTaskPure(task, input.GameState, simInv); err != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
 		}
 
-		// Simulate inventory yields and consumptions accurately so multi-step plans pass
 		switch task.Action {
 		case "gather", "mine":
 			simInv[task.Target.Name]++
 		case "eat":
 			simInv[task.Target.Name]--
 		case "smelt":
-			// 2.2 FIX: Simulate smelting consumption and yield
 			var consumedInput string
 			validMeats := []string{"beef", "porkchop", "mutton", "chicken", "rabbit"}
 
@@ -138,11 +142,11 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 		}
 	}
 
-	state.Validation = &ValidationResult{
+	output.Validation = &ValidationResult{
 		IsValid: len(validationErrors) == 0,
 		Errors:  validationErrors,
 	}
-	return nil
+	return output, nil
 }
 
 func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map[string]int) error {
@@ -154,7 +158,6 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			return fmt.Errorf("cannot eat %s: not in inventory", task.Target.Name)
 		}
 	case "smelt":
-		// 2.2 FIX: Validate smelt inputs and fuels
 		hasRawMeat := false
 		hasFuel := false
 		validMeats := []string{"beef", "porkchop", "mutton", "chicken", "rabbit"}
