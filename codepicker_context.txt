@@ -1,16 +1,14 @@
-Project Context Dump (29 Mar 26 02:32 PDT)
+Project Context Dump (29 Mar 26 04:00 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 67
+Total Files: 54
 
 # Project Structure
 <file_tree>
-- Makefile
 - cmd\server\main.go
 - internal\decision\engine.go
 - internal\decision\pipeline.go
 - internal\decision\planner.go
-- internal\decision\simulator.go
 - internal\decision\types.go
 - internal\domain\events.go
 - internal\domain\state.go
@@ -61,60 +59,9 @@ Total Files: 67
 - js\lib\utils\errors.ts
 - js\lib\utils\perception.ts
 - js\lib\utils\threats.ts
-- pipeline\Untitled.java
-- scripts\find_deprecated_decision_logic.sh
-- scripts\lint_pipeline_immutability.sh
-- ui\index.html
-- ui\src\App.svelte
-- ui\src\app.css
-- ui\src\components\ItemIcon.svelte
-- ui\src\lib\Counter.svelte
-- ui\src\main.ts
-- ui\svelte.config.js
-- ui\vite.config.ts
 </file_tree>
 
 # File Contents
-<file path="Makefile">
-.PHONY: help install run-server run-bot dev clean test-replay
-
-# Default target
-.DEFAULT_GOAL := help
-
-help: ## Show this help message
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-
-install: ## Install Go and JS dependencies
-	@echo "==> Installing JS dependencies..."
-	cd js && npm install
-	@echo "==> Tidying Go modules..."
-	go mod tidy
-
-run-server: ## Run the Go control plane directly
-	@echo "==> Starting Go WebSocket Server..."
-	go run cmd/server/*.go
-
-run-bot: ## Run the Mineflayer TypeScript bot directly
-	@echo "==> Starting Mineflayer Bot..."
-	cd js && npx tsx index.ts
-
-dev: ## Run both server and bot concurrently in one terminal
-	@echo "==> Starting CraftD Control Plane and Bot..."
-	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
-	go run cmd/server/*.go & \
-	sleep 2; \
-	cd js && npx tsx index.ts
-
-test-replay: ## Run the Replay Test Harness
-	@echo "==> Running Planning Replay Tests..."
-	go test -v ./tests/...
-
-clean: ## Clean up Go cache and Node modules
-	@echo "==> Cleaning up environment..."
-	rm -rf js/node_modules
-	go clean
-</file>
-
 <file path="cmd\server\main.go">
 package main
 
@@ -138,6 +85,7 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
@@ -199,7 +147,8 @@ func main() {
 	})
 
 	strategyEvaluator := strategy.NewEvaluator()
-	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator)
+	policyExtractor := learning.NewPolicyExtractor(eventStore, logger)
+	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator, policyExtractor)
 	survivalPolicy := policy.NewSurvivalPolicy()
 	policyEngine := policy.NewCompositePolicy(survivalPolicy)
 	decisionEngine := decision.NewPipeline(planner, policyEngine)
@@ -365,7 +314,6 @@ func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) h
 				}
 				orch.IngestState(ctx, state)
 
-			// Included EventTypePanicResolved here so it routes to the orchestrator properly
 			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic, domain.EventTypePanicResolved:
 				var payload any
 				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -496,37 +444,42 @@ type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
 }
 
-// LLMPlanner implements Planner. It merges the physical state with the strategic directive.
+type RuleExtractor interface {
+	GenerateRules(ctx context.Context, sessionID string) string
+}
+
+// LLMPlanner implements Planner.
+// It merges the physical state with the strategic directive.
 type LLMPlanner struct {
 	client    LLMClient
 	evaluator *strategy.Evaluator
+	extractor RuleExtractor
 }
 
-func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator) *LLMPlanner {
+func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor RuleExtractor) *LLMPlanner {
 	return &LLMPlanner{
 		client:    client,
 		evaluator: evaluator,
+		extractor: extractor,
 	}
 }
 
-// FIX: Enhanced System Rules to include explicit recipe knowledge
+// Enhanced System Rules to explicitly block invalid food/combat loops
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
-
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. CRAFTING RECIPES:
+4. SURVIVAL: You CANNOT 'eat' if your inventory has no food. You CANNOT 'hunt' if health is under 12.
+5. CRAFTING RECIPES:
    - oak_planks: requires 1 oak_log (yields 4)
    - stick: requires 2 oak_planks (yields 4)
    - crafting_table: requires 4 oak_planks
    - wooden_pickaxe: requires 3 oak_planks + 2 stick
    - stone_pickaxe: requires 3 cobblestone + 2 stick
-5. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
-
+6. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
 VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
-
 Response format (JSON only):
 {
   "objective": "Sub-goal description",
@@ -537,9 +490,15 @@ Response format (JSON only):
 
 func (p *LLMPlanner) Generate(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	directive := p.evaluator.Evaluate(state)
+	learnedRules := ""
 
-	systemPrompt := fmt.Sprintf("%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
+	if p.extractor != nil {
+		learnedRules = p.extractor.GenerateRules(ctx, sessionID)
+	}
+
+	systemPrompt := fmt.Sprintf("%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
 		BaseSystemRules,
+		learnedRules,
 		directive.PrimaryGoal,
 		directive.SecondaryGoal,
 	)
@@ -566,64 +525,6 @@ func cleanJSON(raw string) string {
 	cleaned = strings.TrimPrefix(cleaned, "```")
 	cleaned = strings.TrimSuffix(cleaned, "```")
 	return strings.TrimSpace(cleaned)
-}
-
-</file>
-
-<file path="internal\decision\simulator.go">
-package decision
-
-import (
-	"david22573/synaptic-mc/internal/domain"
-)
-
-// CostSimulator evaluates the validated plan and optimizes it (e.g., dropping overly risky tail-end tasks).
-type CostSimulator struct{}
-
-func NewCostSimulator() *CostSimulator {
-	return &CostSimulator{}
-}
-
-func (s *CostSimulator) RankAndSelect(plan *domain.Plan, state domain.GameState) *domain.Plan {
-	if plan == nil || len(plan.Tasks) == 0 {
-		return plan
-	}
-
-	poiMap := make(map[string]domain.POI)
-	for _, p := range state.POIs {
-		poiMap[p.Name] = p
-	}
-
-	optimizedTasks := make([]domain.Action, 0, len(plan.Tasks))
-	accumulatedRisk := 0.0
-
-	// We iterate through the chain. If a step pushes the cumulative risk too high,
-	// we truncate the plan early to prevent mid-execution failures.
-	for _, task := range plan.Tasks {
-		stepRisk := 1.0
-
-		// Penalize physical distance [cite: 161]
-		if p, exists := poiMap[task.Target.Name]; exists {
-			stepRisk += p.Distance * 0.1
-		}
-
-		if task.Action == "hunt" {
-			stepRisk += 5.0
-		}
-
-		accumulatedRisk += stepRisk
-
-		// If the chain gets too complex or dangerous, stop adding tasks.
-		// The orchestrator will replan naturally after these complete.
-		if accumulatedRisk > 15.0 && len(optimizedTasks) > 0 {
-			break
-		}
-
-		optimizedTasks = append(optimizedTasks, task)
-	}
-
-	plan.Tasks = optimizedTasks
-	return plan
 }
 
 </file>
@@ -712,11 +613,16 @@ type GameState struct {
 	Health       float64  `json:"health"`
 	Food         float64  `json:"food"`
 	TimeOfDay    int      `json:"time_of_day"`
+	Experience   float64  `json:"experience"`
+	Level        int      `json:"level"`
 	HasBedNearby bool     `json:"has_bed_nearby"`
 	Position     Vec3     `json:"position"`
 	Threats      []Threat `json:"threats"`
 	POIs         []POI    `json:"pois"`
 	Inventory    []Item   `json:"inventory"`
+	Hotbar       []*Item  `json:"hotbar"`
+	Offhand      *Item    `json:"offhand"`
+	ActiveSlot   int      `json:"active_slot"`
 }
 
 type Threat struct {
@@ -899,12 +805,13 @@ import (
 )
 
 // IdempotentController wraps an Execution Controller to silently drop duplicate commands.
-// It uses a bounded LRU cache (simplified here as a map with a manual flush) to track dispatched Task IDs.
+// It uses a bounded LRU cache track dispatched Task IDs.
 type IdempotentController struct {
 	base Controller
 
 	mu       sync.Mutex
 	seen     map[string]bool
+	keys     []string
 	capacity int
 }
 
@@ -912,6 +819,7 @@ func NewIdempotentController(base Controller, capacity int) *IdempotentControlle
 	return &IdempotentController{
 		base:     base,
 		seen:     make(map[string]bool, capacity),
+		keys:     make([]string, 0, capacity),
 		capacity: capacity,
 	}
 }
@@ -923,12 +831,14 @@ func (c *IdempotentController) Dispatch(ctx context.Context, action domain.Actio
 		return nil // Silently drop, already dispatched
 	}
 
-	// Poor man's LRU clear to prevent OOM
-	if len(c.seen) >= c.capacity {
-		c.seen = make(map[string]bool, c.capacity)
+	if len(c.keys) >= c.capacity {
+		oldest := c.keys[0]
+		c.keys = c.keys[1:]
+		delete(c.seen, oldest)
 	}
 
 	c.seen[action.ID] = true
+	c.keys = append(c.keys, action.ID)
 	c.mu.Unlock()
 
 	return c.base.Dispatch(ctx, action)
@@ -1673,6 +1583,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -1694,10 +1605,11 @@ type Orchestrator struct {
 	stateCh chan domain.GameState
 	eventCh chan domain.DomainEvent
 
-	mu         sync.RWMutex
-	lastState  domain.GameState
-	reflexLock bool
-	uiHub      *observability.Hub
+	mu               sync.RWMutex
+	lastState        domain.GameState
+	reflexLock       bool
+	uiHub            *observability.Hub
+	planningInFlight atomic.Bool
 
 	wg sync.WaitGroup
 }
@@ -1758,6 +1670,8 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, event domain.DomainEvent
 	select {
 	case <-ctx.Done():
 	case o.eventCh <- event:
+	default:
+		o.logger.Warn("Event channel full, dropping event", slog.String("type", string(event.Type)))
 	}
 }
 
@@ -1839,6 +1753,10 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 		return nil
 	}
 
+	if !o.planningInFlight.CompareAndSwap(false, true) {
+		return nil // Already planning
+	}
+
 	trace := domain.TraceContext{
 		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
 		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
@@ -1846,28 +1764,35 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 
 	select {
 	case <-ctx.Done():
+		o.planningInFlight.Store(false)
 		return ctx.Err()
 	default:
 	}
 
-	plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
-	if err != nil {
-		return fmt.Errorf("decision evaluation failed: %w", err)
-	}
+	go func() {
+		defer o.planningInFlight.Store(false)
+		plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
+		if err != nil {
+			o.logger.Error("decision evaluation failed", slog.Any("error", err))
+			return
+		}
 
-	if plan == nil || len(plan.Tasks) == 0 {
-		return nil
-	}
+		if plan == nil || len(plan.Tasks) == 0 {
+			return
+		}
 
-	if o.uiHub != nil {
-		o.uiHub.Broadcast("objective_update", plan.Objective)
-	}
+		if o.uiHub != nil {
+			o.uiHub.Broadcast("objective_update", plan.Objective)
+		}
 
-	o.logger.Info("New plan generated",
-		slog.String("objective", plan.Objective),
-		slog.Int("tasks", len(plan.Tasks)))
+		o.logger.Info("New plan generated",
+			slog.String("objective", plan.Objective),
+			slog.Int("tasks", len(plan.Tasks)))
 
-	return tm.Enqueue(ctx, plan.Tasks...)
+		_ = tm.Enqueue(ctx, plan.Tasks...)
+	}()
+
+	return nil
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {
@@ -2479,7 +2404,7 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 	for i, task := range state.Normalized.Tasks {
 		if err := validateTaskPure(task, state.GameState, simInv); err != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
-			break
+			// We no longer break here; we want to collect all validation errors for the whole plan
 		}
 
 		switch task.Action {
@@ -2512,13 +2437,10 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			return fmt.Errorf("target must be a specific resource (e.g., 'oak_log', 'dirt'), got generic '%s'", task.Target.Name)
 		}
 
-		isHardBlock := strings.Contains(target, "stone") ||
-			strings.Contains(target, "coal") ||
-			strings.Contains(target, "iron")
+		isHardBlock := strings.Contains(target, "stone") || strings.Contains(target, "coal") || strings.Contains(target, "iron")
 
 		if task.Action == "mine" && isHardBlock {
-			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 ||
-				simInv["iron_pickaxe"] > 0
+			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0
 			if !hasPick {
 				return fmt.Errorf("mining %s requires a pickaxe", task.Target.Name)
 			}
@@ -2600,15 +2522,14 @@ type Engine interface {
 </file>
 
 <file path="internal\policy\survival.go">
-// internal/policy/survival.go
 package policy
 
 import (
 	"context"
 )
 
-// SurvivalPolicy replaces the old HardGuardrails. It strictly enforces
-// biological and physical bot safety invariants.
+// SurvivalPolicy replaces the old HardGuardrails.
+// It strictly enforces biological and physical bot safety invariants.
 type SurvivalPolicy struct{}
 
 func NewSurvivalPolicy() *SurvivalPolicy {
@@ -2622,17 +2543,18 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 
 	// 1. Critical Health Override
 	if input.State.Health < 6.0 {
-		isRetreatingOrEating := false
+		isValidEscape := false
 		for _, t := range input.Plan.Tasks {
-			if t.Action == "retreat" || t.Action == "eat" {
-				isRetreatingOrEating = true
+			// Loosened to allow gathering passive food or exploring when starving
+			if t.Action == "retreat" || t.Action == "eat" || t.Action == "gather" || t.Action == "explore" {
+				isValidEscape = true
 				break
 			}
 		}
-		if !isRetreatingOrEating {
+		if !isValidEscape {
 			return Decision{
 				IsApproved: false,
-				Reason:     "POLICY VIOLATION: Health is critical. Plan must include 'retreat' or 'eat'",
+				Reason:     "POLICY VIOLATION: Health is critical. Plan must prioritize survival (retreat, eat, gather, explore).",
 			}
 		}
 	}
@@ -2737,23 +2659,48 @@ func NewEvaluator() *Evaluator {
 	return &Evaluator{}
 }
 
-// Evaluate defines the core progression logic deterministically. [cite: 172, 175, 177]
+func isFood(itemName string) bool {
+	foodItems := []string{
+		"beef", "porkchop", "mutton", "chicken", "rabbit",
+		"cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_rabbit",
+		"apple", "sweet_berries", "bread", "carrot", "potato", "baked_potato", "kelp", "dried_kelp",
+	}
+	for _, f := range foodItems {
+		if strings.Contains(itemName, f) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 	inv := make(map[string]int)
 	hasWeapon := false
+	hasFood := false
 
 	for _, item := range state.Inventory {
 		inv[item.Name] += item.Count
 		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
 			hasWeapon = true
 		}
+		if isFood(item.Name) {
+			hasFood = true
+		}
 	}
 
-	// 1. Survival First
+	// 1. Survival First (Now Food-Aware)
 	if state.Health < 10 || state.Food < 6 {
+		if hasFood {
+			return Directive{
+				PrimaryGoal:   "SURVIVAL: You have food in your inventory. Use the 'eat' action immediately to regenerate health.",
+				SecondaryGoal: "DEFENSE: Retreat to a safe location while healing.",
+				IsAutonomous:  false,
+			}
+		}
+
 		return Directive{
-			PrimaryGoal:   "SURVIVAL: Secure food immediately and retreat to safety.",
-			SecondaryGoal: "DEFENSE: Eliminate immediate threats preventing safe regeneration.",
+			PrimaryGoal:   "SURVIVAL: You are starving and have NO food. You CANNOT hunt (health too low). Use 'gather' for passive food (sweet_berries, apples) or 'explore' to find a village.",
+			SecondaryGoal: "DEFENSE: Avoid all combat. Retreat if threatened.",
 			IsAutonomous:  false,
 		}
 	}
@@ -2768,7 +2715,7 @@ func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 		}
 	}
 
-	// 3. Tech Progression (Deterministic checks)
+	// 3. Tech Progression
 	hasWoodenPick := inv["wooden_pickaxe"] > 0
 	hasStonePick := inv["stone_pickaxe"] > 0 || inv["iron_pickaxe"] > 0 || inv["diamond_pickaxe"] > 0
 	hasLog := false
@@ -2834,26 +2781,20 @@ const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
 
-// FIX: More aggressive error filtering to suppress protodef spam
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
-
     const msg = String(err.message || err);
     const name = String(err.name || "");
-
-    // Suppress all protodef parsing errors
     return (
         name === "PartialReadError" ||
         msg.includes("Read error for undefined") ||
         msg.includes("Missing characters in string") ||
         msg.includes("protodef") ||
         (msg.includes("size is") && msg.includes("expected size")) ||
-        // Also suppress websocket errors during reconnect
         msg.includes("Unexpected server response")
     );
 };
 
-// FIX: Suppress console.error for ignorable errors
 const originalConsoleError = console.error;
 console.error = (...args: any[]) => {
     const firstArg = args[0];
@@ -2862,7 +2803,7 @@ console.error = (...args: any[]) => {
         firstArg?.err &&
         isIgnorableError(firstArg.err)
     ) {
-        return; // Suppress ignorable errors
+        return;
     }
     originalConsoleError.apply(console, args);
 };
@@ -2874,7 +2815,7 @@ console.warn = (...args: any[]) => {
         typeof firstArg === "string" &&
         firstArg.includes("Read error for undefined")
     ) {
-        return; // Suppress protodef warnings
+        return;
     }
     originalConsoleWarn.apply(console, args);
 };
@@ -3005,7 +2946,6 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 
     abortActiveTask("preempted");
-
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
@@ -3070,7 +3010,17 @@ async function executeDecision(decision: models.IncomingDecision) {
 function pushState() {
     if (!bot?.entity || !client) return;
 
-    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
+    // Extract exact hotbar and offhand slots from Mineflayer memory
+    const hotbarStart = bot.inventory.hotbarStart || 36;
+    const hotbar = Array.from({ length: 9 }, (_, i) => {
+        const item = bot.inventory.slots[hotbarStart + i];
+        return item ? { name: item.name, count: item.count } : null;
+    });
+
+    const offhandItem = bot.inventory.slots[45];
+
+    // Added bot.quickBarSlot to the signature so UI updates instantly when switching items
+    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
@@ -3086,6 +3036,8 @@ function pushState() {
         health: Math.round(bot.health),
         food: Math.round(bot.food),
         time_of_day: bot.time.timeOfDay,
+        experience: bot.experience?.progress ?? 0,
+        level: bot.experience?.level ?? 0,
         position: {
             x: Math.round(bot.entity.position.x),
             y: Math.round(bot.entity.position.y),
@@ -3098,6 +3050,11 @@ function pushState() {
         inventory: bot.inventory
             .items()
             .map((i) => ({ name: i.name, count: i.count })),
+        hotbar: hotbar,
+        offhand: offhandItem
+            ? { name: offhandItem.name, count: offhandItem.count }
+            : null,
+        active_slot: bot.quickBarSlot,
     });
 }
 
@@ -3122,9 +3079,8 @@ async function connectWithRetry(maxAttempts = 10) {
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
-
     bot = mineflayer.createBot({
-        host: "0.0.0.0",
+        host: "127.0.0.1",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
@@ -3133,12 +3089,10 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(pathfinder);
 
     if (!client) {
-        // FIX: Log the actual WebSocket URL being used
         log.info("Initializing Control Plane client", {
             ws_url: runtimeConfig.ws_url,
             attempt: reconnectAttempt,
         });
-
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (d) => void executeDecision(d),
             onUnlock: () => abortActiveTask("unlock"),
@@ -3189,6 +3143,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
         const water = bot.registry.blocksByName.water?.id;
         const lava = bot.registry.blocksByName.lava?.id;
+
         movements.liquids = new Set(
             [water, lava].filter((id) => id !== undefined) as number[],
         );
@@ -3237,6 +3192,8 @@ async function connectWithRetry(maxAttempts = 10) {
     });
 
     bot.on("health", pushState);
+    bot.on("experience", pushState);
+    bot.on("heldItemChanged", pushState);
 
     if (stateInterval) clearInterval(stateInterval);
     stateInterval = setInterval(pushState, 2000);
@@ -3244,7 +3201,6 @@ async function connectWithRetry(maxAttempts = 10) {
 
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
-    // FIX: Log the final WebSocket URL after config load
     log.info("Bot configuration loaded", { ws_url: runtimeConfig.ws_url });
     await connectWithRetry();
 }
@@ -4772,7 +4728,6 @@ interface GatherContext extends StateContext {
 
 class MineState implements FSMState {
     name = "MINING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -4787,7 +4742,6 @@ class MineState implements FSMState {
         try {
             await gCtx.bot.dig(freshBlock);
 
-            // Whole-tree harvesting / vein mining
             const blockId =
                 gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
 
@@ -4800,9 +4754,11 @@ class MineState implements FSMState {
 
                 for (const pos of nearby) {
                     if (gCtx.signal.aborted) break;
-
                     const nextBlock = gCtx.bot.blockAt(pos);
-                    if (nextBlock) {
+                    if (nextBlock && nextBlock.name !== "air") {
+                        const nextTool =
+                            gCtx.bot.pathfinder.bestHarvestTool(nextBlock);
+                        if (nextTool) await gCtx.bot.equip(nextTool, "hand");
                         await gCtx.bot.dig(nextBlock).catch(() => {});
                     }
                 }
@@ -4820,13 +4776,15 @@ class MineState implements FSMState {
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
         const pos = gCtx.candidatePositions[gCtx.currentIndex];
 
         gCtx.targetBlock = gCtx.bot.blockAt(pos);
+        if (!gCtx.targetBlock) {
+            return advanceToNextCandidate(gCtx, "BLOCK_UNLOADED");
+        }
         gCtx.resolvedTarget = gCtx.targetBlock.name;
 
         try {
@@ -4849,7 +4807,6 @@ class NavigateState implements FSMState {
 
 class SearchState implements FSMState {
     name = "SEARCHING";
-
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const gCtx = ctx as GatherContext;
@@ -4863,8 +4820,8 @@ class SearchState implements FSMState {
 
         let blocks = gCtx.bot.findBlocks({
             matching: ids,
-            maxDistance: 32, // Reduced from 64 to avoid blocking event loop
-            count: 64, // Reduced from 256
+            maxDistance: 32,
+            count: 64,
         });
 
         const botPos = gCtx.bot.entity.position;
@@ -4911,7 +4868,7 @@ export async function handleGather(ctx: TaskContext): Promise<void> {
         bot,
         targetName: decision.target?.name,
         targetEntity: null,
-        searchRadius: 32, // Matches the reduced findBlocks radius
+        searchRadius: 32,
         timeoutMs: timeouts.gather ?? 30000,
         startTime: 0,
         signal,
@@ -5404,9 +5361,11 @@ class CleanupState implements FSMState {
 
         if (sCtx.isPortable && sCtx.furnaceBlock) {
             await makeRoomInInventory(sCtx.bot, 1);
+
             const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
                 sCtx.furnaceBlock,
             );
+
             if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
 
             try {
@@ -5429,7 +5388,6 @@ class SmeltingState implements FSMState {
         let furnaceWindow: any = null;
 
         try {
-            // Load the furnace with everything available so we don't waste fuel
             const inputAmount = Math.min(sCtx.meatCount, 64);
             const fuelAmount = Math.min(sCtx.fuelCount, 64);
 
@@ -5438,8 +5396,10 @@ class SmeltingState implements FSMState {
             await furnaceWindow.putInput(sCtx.meatType, null, inputAmount);
 
             let itemsSmelted = 0;
-            // Max wait time based on how much food we put in (15s per item buffer)
-            const maxWaitMs = 15000 * inputAmount;
+            const maxWaitMs = Math.min(
+                15000 * inputAmount,
+                sCtx.timeoutMs ?? 30000,
+            );
             const pollIntervalMs = 500;
             let elapsedMs = 0;
 
@@ -5578,6 +5538,7 @@ class CheckResourcesState implements FSMState {
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, decision, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: SmeltContext = {
@@ -5629,7 +5590,6 @@ const TARGET_ALIASES: Record<string, string> = {
     carrot: "carrots",
     potato: "potatoes",
     beetroot: "beetroots",
-    sugar_cane: "reeds",
 
     // Mining Aliases
     iron: "iron_ore",
@@ -5677,7 +5637,6 @@ export function normalizeDecision(
             targetName = "stick";
         } else if (targetName === "planks") {
             const invItems = bot.inventory.items();
-
             let foundLog = false;
             for (const item of invItems) {
                 if (LOG_TO_PLANK_MAP[item.name]) {
@@ -5712,7 +5671,6 @@ export function normalizeDecision(
     // 3. Log and apply changes if a normalization occurred
     if (targetName !== originalTargetName) {
         normalized.target.name = targetName;
-
         log.debug("Decision normalized", {
             original_target: originalTargetName,
             normalized_target: targetName,
@@ -6037,7 +5995,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
     const MAX_ATTEMPTS = 30;
 
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
-        // FIX: Check signal.abort in loop
         if (signal.aborted) throw new Error("aborted");
         if (isOnSolidGround(bot)) return;
 
@@ -6053,6 +6010,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
         ];
 
         let clearedSomething = false;
+
         for (const targetBlock of blocksToClear) {
             if (
                 targetBlock &&
@@ -6081,7 +6039,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
             bot.setControlState(strafe, false);
         }
 
-        // FIX: Add timeout to physics tick listener
         await new Promise<void>((resolve, reject) => {
             let ticks = 0;
             const timeout = setTimeout(() => {
@@ -6209,6 +6166,7 @@ export function moveToGoal(
         };
 
         let stuckStrikes = 0;
+
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
@@ -6223,7 +6181,6 @@ export function moveToGoal(
             }
         }, stuckTimeoutMs);
 
-        // FIX: Store listeners for proper cleanup
         listeners.set("goal_reached", onGoalReached);
         listeners.set("path_update", onPathUpdate);
 
@@ -6256,15 +6213,13 @@ export async function makeRoomInInventory(
     if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
 
     const inventory = bot.inventory.items();
-    const sortedItems = [...inventory].sort((a, b) => {
-        const aIsTrash = TRASH_ITEMS.has(a.name) ? -1 : 1;
-        const bIsTrash = TRASH_ITEMS.has(b.name) ? -1 : 1;
-        if (aIsTrash !== bIsTrash) return aIsTrash - bIsTrash;
-        return a.count - b.count;
-    });
+
+    // Pre-filter the inventory to only sort and process trash items
+    const trashItems = inventory.filter((i: any) => TRASH_ITEMS.has(i.name));
+    trashItems.sort((a: any, b: any) => a.count - b.count);
 
     let slotsFreed = 0;
-    for (const item of sortedItems) {
+    for (const item of trashItems) {
         if (slotsFreed >= slotsNeeded) break;
         try {
             await bot.tossStack(item);
@@ -6284,6 +6239,7 @@ export async function placePortableUtility(
 
     await bot.equip(item, "hand");
     const pos = bot.entity.position.floored();
+
     const candidates = [
         bot.blockAt(pos.offset(1, -1, 0)),
         bot.blockAt(pos.offset(-1, -1, 0)),
@@ -6326,7 +6282,6 @@ export function getErrorMessage(error: unknown): string {
 </file>
 
 <file path="js\lib\utils\perception.ts">
-// js/lib/utils/perception.ts
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import * as models from "../models.js";
@@ -6339,21 +6294,24 @@ function getDirectionLabel(
     if (dot > 0.8) return "center";
     if (dot < -0.2) return "behind";
 
-    // 2D cross product for left/right
     const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
     return crossY > 0 ? "left" : "right";
 }
 
+let lastPOIUpdate = 0;
+let cachedPOIs: any[] = [];
+
 export function getPOIs(bot: Bot, radius: number = 32): any[] {
+    const now = Date.now();
+    if (now - lastPOIUpdate < 1000) return cachedPOIs;
+
     const pois: any[] = [];
     if (!bot.entity) return pois;
 
     const pos = bot.entity.position;
     const yaw = bot.entity.yaw;
-    // Horizontal look vector
     const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
 
-    // 1. Entities (Mobs, Animals, Items)
     for (const id in bot.entities) {
         const e = bot.entities[id];
         if (!e || e === bot.entity || !e.isValid) continue;
@@ -6372,7 +6330,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         if (e.type === "hostile") type = "threat";
         else if (e.type === "object" || e.type === "orb") type = "resource";
 
-        // Scoring: Distance heavily weighted, center FOV acts as a multiplier
         const baseScore = 100 / Math.max(dist, 1);
         const scoreMultiplier =
             visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
@@ -6393,7 +6350,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         });
     }
 
-    // 2. Blocks (Filtered strictly to avoid heavy tick lag)
     const blocks = bot.findBlocks({
         matching: (b) => {
             if (!b) return false;
@@ -6418,7 +6374,6 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         const dist = pos.distanceTo(bPos);
         const dx = bPos.x - pos.x;
         const dz = bPos.z - pos.z;
-
         const dirToBlock = new Vec3(dx, 0, dz).normalize();
 
         const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
@@ -6440,17 +6395,13 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         });
     }
 
-    // Sort by computed score
     pois.sort((a, b) => b.score - a.score);
 
-    // Filter out redundant blocks so they don't blind the LLM context
     const seenCounts: Record<string, number> = {};
     const diversePOIs: any[] = [];
 
     for (const poi of pois) {
         seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
-
-        // Cap identical resources (like water/lava/dirt) to 3
         if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
             continue;
         }
@@ -6459,6 +6410,8 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         if (diversePOIs.length >= 15) break;
     }
 
+    lastPOIUpdate = now;
+    cachedPOIs = diversePOIs;
     return diversePOIs;
 }
 
@@ -6634,1210 +6587,14 @@ export function computeSafeRetreat(
 
 </file>
 
-<file path="pipeline\Untitled.java">
-// internal/pipeline/stage_test.go
-package pipeline
-
-import (
-	"context"
-	"testing"
-
-	"david22573/synaptic-mc/internal/domain"
-)
-
-type mockStage struct {
-	processFunc func(ctx context.Context, state *PipelineState) error
-}
-
-func (m *mockStage) Process(ctx context.Context, state *PipelineState) error {
-	return m.processFunc(ctx, state)
-}
-
-func TestPipelineStage_ImmutabilityContract(t *testing.T) {
-	initialPlan := &domain.Plan{
-		Objective: "Gather Wood",
-		Tasks: []domain.Action{
-			{Action: "gather", Target: domain.Target{Name: "oak_log"}},
-		},
-	}
-
-	state := &PipelineState{
-		Plan: initialPlan,
-	}
-
-	stage := &mockStage{
-		processFunc: func(ctx context.Context, s *PipelineState) error {
-			// A compliant stage creates a new artifact rather than mutating the previous one
-			s.Validation = &ValidationResult{IsValid: true}
-			return nil
-		},
-	}
-
-	err := stage.Process(context.Background(), state)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Verify the original plan pointer and its contents remain untouched
-	if state.Plan.Objective != "Gather Wood" {
-		t.Errorf("expected original plan to remain immutable")
-	}
-
-	if state.Validation == nil || !state.Validation.IsValid {
-		t.Errorf("expected validation artifact to be populated correctly")
-	}
-}
-</file>
-
-<file path="scripts\find_deprecated_decision_logic.sh">
-#!/bin/bash
-echo "Identifying old decision logic for removal..."
-grep -rn "func (.*Validator) Validate" internal/decision/validator.go
-grep -rn "func (.*Simulator) RankAndSelect" internal/decision/simulator.go
-echo "These functions should be deleted after Step 1.3 is complete."
-</file>
-
-<file path="scripts\lint_pipeline_immutability.sh">
-#!/bin/bash
-# scripts/lint_policy_authority.sh
-
-echo "Checking for rogue policy overrides outside policy package..."
-ROGUE=$(grep -r "POLICY VIOLATION" internal/ | grep -v "internal/policy/")
-
-if [ -n "$ROGUE" ]; then
-    echo "ERROR: Hardcoded policy constraints found outside internal/policy/!"
-    echo "$ROGUE"
-    exit 1
-fi
-echo "Policy authority checks passed."
-</file>
-
-<file path="ui\index.html">
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ui</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
-</html>
-
-</file>
-
-<file path="ui\src\App.svelte">
-<script lang="ts">
-    import { onMount } from "svelte";
-    import ItemIcon from "./components/ItemIcon.svelte";
-
-    // State runes
-    let gameState = $state<any>(null);
-    let events = $state<any[]>([]);
-    let objective = $state<string>("Initializing...");
-    let connectionStatus = $state<"connecting" | "connected" | "disconnected">(
-        "connecting",
-    );
-
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    const maxEvents = 50;
-
-    // Derived runes
-    const position = $derived(gameState?.position || { x: 0, y: 0, z: 0 });
-    const health = $derived(gameState?.health ?? 20);
-    const food = $derived(gameState?.food ?? 20);
-    const timeOfDay = $derived(gameState?.time_of_day ?? 0);
-    const inventory = $derived(gameState?.inventory || []);
-    const threats = $derived(gameState?.threats || []);
-    const pois = $derived(gameState?.pois || []);
-
-    const timeDisplay = $derived(formatTimeOfDay(timeOfDay));
-    const coordsDisplay = $derived(
-        `X: ${Math.round(position.x)} Y: ${Math.round(position.y)} Z: ${Math.round(position.z)}`,
-    );
-
-    let viewerUrl = $state("about:blank");
-
-    // HUD Math
-    const fullHearts = $derived(Math.max(0, Math.floor(health / 2)));
-    const halfHearts = $derived(health % 2 !== 0 && health > 0 ? 1 : 0);
-    const emptyHearts = $derived(Math.max(0, 10 - fullHearts - halfHearts));
-
-    const fullFood = $derived(Math.max(0, Math.floor(food / 2)));
-    const halfFood = $derived(food % 2 !== 0 && food > 0 ? 1 : 0);
-    const emptyFood = $derived(Math.max(0, 10 - fullFood - halfFood));
-
-    const hotbarSlots = $derived(
-        Array.from({ length: 9 }, (_, i) => inventory[i] || null),
-    );
-    const xpProgress = $derived((timeOfDay % 1000) / 10); // Slowly fills based on time of day
-
-    function formatTimeOfDay(time: number): string {
-        const hours = Math.floor((time / 1000 + 6) % 24);
-        const minutes = Math.floor(((time % 1000) / 1000) * 60);
-        return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}`;
-    }
-
-    function connect() {
-        connectionStatus = "connecting";
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const host = window.location.host;
-        const wsUrl = `${protocol}//${host}/ui/ws`;
-
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-            connectionStatus = "connected";
-            if (reconnectTimer) clearTimeout(reconnectTimer);
-        };
-
-        ws.onmessage = (event) => {
-            try {
-                const message = JSON.parse(event.data);
-                handleMessage(message);
-            } catch (err) {
-                console.error("Failed to parse message:", err);
-            }
-        };
-
-        ws.onclose = () => {
-            connectionStatus = "disconnected";
-            scheduleReconnect();
-        };
-
-        ws.onerror = (error) => {
-            connectionStatus = "disconnected";
-        };
-    }
-
-    function handleMessage(message: any) {
-        if (!message.type || !message.payload) return;
-
-        switch (message.type) {
-            case "state_update":
-                gameState = message.payload;
-                break;
-            case "event_stream": {
-                const newEvent = {
-                    ...message.payload,
-                    timestamp: new Date().toLocaleTimeString(),
-                };
-                events = [newEvent, ...events].slice(0, maxEvents);
-                break;
-            }
-            case "objective_update":
-                objective = message.payload;
-                break;
-        }
-    }
-
-    function scheduleReconnect() {
-        const delay = 3000;
-        reconnectTimer = setTimeout(() => {
-            connect();
-        }, delay);
-    }
-
-    function clearEventLog() {
-        events = [];
-    }
-
-    onMount(() => {
-        viewerUrl = `http://${window.location.hostname}:3000`;
-        connect();
-        return () => {
-            if (ws) ws.close();
-            if (reconnectTimer) clearTimeout(reconnectTimer);
-        };
-    });
-</script>
-
-<main class="container">
-    <header class="header">
-        <div class="title-group">
-            <h1>Synaptic MC</h1>
-            <span class="coords-badge">{timeDisplay} | {coordsDisplay}</span>
-        </div>
-        <div class="status">
-            <span class="indicator {connectionStatus}"></span>
-            <span class="status-text">
-                {#if connectionStatus === "connecting"}
-                    Connecting...
-                {:else if connectionStatus === "connected"}
-                    Connected
-                {:else}
-                    Disconnected
-                {/if}
-            </span>
-        </div>
-    </header>
-
-    <div class="split-layout">
-        <div class="main-column">
-            <section class="card viewer-card">
-                <iframe
-                    src={viewerUrl}
-                    title="Mineflayer Viewer"
-                    class="viewer-iframe"
-                ></iframe>
-
-                <div class="mc-overlay">
-                    <div class="mc-crosshair"></div>
-
-                    <div class="mc-hud">
-                        <div class="mc-bars">
-                            <div class="mc-bar-half">
-                                {#each Array(fullHearts) as _}
-                                    <span class="mc-icon-stat">❤️</span>
-                                {/each}
-                                {#each Array(halfHearts) as _}
-                                    <span class="mc-icon-stat">💔</span>
-                                {/each}
-                                {#each Array(emptyHearts) as _}
-                                    <span class="mc-icon-stat empty">🖤</span>
-                                {/each}
-                            </div>
-                            <div class="mc-bar-half right-align">
-                                {#each Array(emptyFood) as _}
-                                    <span class="mc-icon-stat empty">🍖</span>
-                                {/each}
-                                {#each Array(halfFood) as _}
-                                    <span class="mc-icon-stat">🍗</span>
-                                {/each}
-                                {#each Array(fullFood) as _}
-                                    <span class="mc-icon-stat">🍖</span>
-                                {/each}
-                            </div>
-                        </div>
-
-                        <div class="mc-xp-bar">
-                            <div
-                                class="mc-xp-fill"
-                                style:width="{xpProgress}%"
-                            ></div>
-                        </div>
-
-                        <div class="mc-hotbar-container">
-                            <div class="mc-offhand slot"></div>
-                            <div class="mc-hotbar">
-                                {#each hotbarSlots as slot, i}
-                                    <div class="slot {i === 0 ? 'active' : ''}">
-                                        {#if slot}
-                                            <ItemIcon
-                                                name={slot.name}
-                                                size={24}
-                                            />
-                                            {#if slot.count > 1}
-                                                <span class="slot-count"
-                                                    >{slot.count}</span
-                                                >
-                                            {/if}
-                                        {/if}
-                                    </div>
-                                {/each}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <section class="card objective-card">
-                <h3>🎯 Current Objective</h3>
-                <p class="objective">{objective}</p>
-            </section>
-        </div>
-
-        <aside class="sidebar">
-            <section class="card">
-                <h3>🎒 Inventory ({inventory.length} items)</h3>
-                {#if inventory.length > 0}
-                    <div class="inventory-grid">
-                        {#each inventory as item}
-                            <div class="item">
-                                <span class="item-name">{item.name}</span>
-                                <span class="item-count">{item.count}</span>
-                            </div>
-                        {/each}
-                    </div>
-                {:else}
-                    <p class="empty">Empty</p>
-                {/if}
-            </section>
-
-            <section class="card">
-                <h3>⚠️ Threats ({threats.length})</h3>
-                {#if threats.length > 0}
-                    <ul class="list">
-                        {#each threats as threat}
-                            <li class="threat-item">
-                                <span class="threat-name">{threat.name}</span>
-                                <span class="threat-dist"
-                                    >{threat.distance}m</span
-                                >
-                            </li>
-                        {/each}
-                    </ul>
-                {:else}
-                    <p class="empty">No threats detected</p>
-                {/if}
-            </section>
-
-            <section class="card">
-                <h3>📡 POIs ({pois.length})</h3>
-                {#if pois.length > 0}
-                    <ul class="list">
-                        {#each pois.slice(0, 10) as poi}
-                            <li class="poi-item">
-                                <span class="poi-type">{poi.type}</span>
-                                <span class="poi-name">{poi.name}</span>
-                                <span class="poi-dist"
-                                    >{poi.distance}m {poi.direction}</span
-                                >
-                            </li>
-                        {/each}
-                    </ul>
-                {:else}
-                    <p class="empty">No POIs detected</p>
-                {/if}
-            </section>
-
-            <section class="card events-card">
-                <div class="events-header">
-                    <h3>📋 Event Stream</h3>
-                    <button onclick={clearEventLog} class="clear-btn"
-                        >Clear</button
-                    >
-                </div>
-                <div class="events-list">
-                    {#if events.length > 0}
-                        {#each events as event}
-                            <div class="event-item">
-                                <span class="event-time">{event.timestamp}</span
-                                >
-                                <span class="event-type">{event.type}</span>
-                                <span
-                                    class="event-payload"
-                                    title={JSON.stringify(event.payload)}
-                                >
-                                    {JSON.stringify(event.payload)}
-                                </span>
-                            </div>
-                        {/each}
-                    {:else}
-                        <p class="empty">No events yet</p>
-                    {/if}
-                </div>
-            </section>
-        </aside>
-    </div>
-</main>
-
-<style>
-    :global(body) {
-        margin: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-            Oxygen, Ubuntu, Cantarell, sans-serif;
-        background: #0f172a;
-        color: #e2e8f0;
-    }
-
-    .container {
-        max-width: 1600px;
-        margin: 0 auto;
-        padding: 1rem;
-    }
-
-    .header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 1.5rem;
-        padding-bottom: 1rem;
-        border-bottom: 1px solid #334155;
-    }
-
-    .title-group {
-        display: flex;
-        align-items: center;
-        gap: 1rem;
-    }
-
-    .header h1 {
-        margin: 0;
-        color: #38bdf8;
-    }
-
-    .coords-badge {
-        background: #1e293b;
-        padding: 0.25rem 0.75rem;
-        border-radius: 4px;
-        font-family: monospace;
-        font-size: 0.875rem;
-        border: 1px solid #334155;
-    }
-
-    .split-layout {
-        display: grid;
-        grid-template-columns: 2fr 1fr;
-        gap: 1.5rem;
-    }
-
-    @media (max-width: 1024px) {
-        .split-layout {
-            grid-template-columns: 1fr;
-        }
-    }
-
-    .main-column,
-    .sidebar {
-        display: flex;
-        flex-direction: column;
-        gap: 1rem;
-    }
-
-    .status {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-    .indicator {
-        width: 12px;
-        height: 12px;
-        border-radius: 50%;
-        display: inline-block;
-    }
-    .indicator.connecting {
-        background: #fbbf24;
-        animation: pulse 1s infinite;
-    }
-    .indicator.connected {
-        background: #34d399;
-    }
-    .indicator.disconnected {
-        background: #ef4444;
-    }
-
-    @keyframes pulse {
-        0%,
-        100% {
-            opacity: 1;
-        }
-        50% {
-            opacity: 0.5;
-        }
-    }
-
-    .card {
-        background: #1e293b;
-        border: 1px solid #334155;
-        border-radius: 8px;
-        padding: 1rem;
-    }
-
-    .card h3 {
-        margin: 0 0 0.5rem 0;
-        color: #94a3b8;
-        font-size: 0.875rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    /* --- MINECRAFT HUD STYLES --- */
-    .viewer-card {
-        padding: 0;
-        position: relative;
-        overflow: hidden;
-        height: 600px;
-        border: 2px solid #000;
-        border-radius: 4px;
-    }
-
-    .viewer-iframe {
-        width: 100%;
-        height: 100%;
-        border: none;
-        background: #000;
-    }
-
-    .mc-overlay {
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-        display: flex;
-        flex-direction: column;
-        justify-content: flex-end;
-        align-items: center;
-        padding-bottom: 12px;
-    }
-
-    .mc-crosshair {
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        width: 16px;
-        height: 16px;
-        pointer-events: none;
-    }
-
-    .mc-crosshair::before,
-    .mc-crosshair::after {
-        content: "";
-        position: absolute;
-        background: rgba(255, 255, 255, 0.6);
-        mix-blend-mode: difference;
-    }
-
-    .mc-crosshair::before {
-        top: 7px;
-        left: 0;
-        width: 16px;
-        height: 2px;
-    }
-    .mc-crosshair::after {
-        top: 0;
-        left: 7px;
-        width: 2px;
-        height: 16px;
-    }
-
-    .mc-hud {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        width: 100%;
-    }
-
-    .mc-bars {
-        display: flex;
-        justify-content: space-between;
-        width: 364px; /* Align to hotbar width */
-        margin-bottom: 4px;
-    }
-
-    .mc-bar-half {
-        display: flex;
-        gap: 1px;
-    }
-
-    .mc-icon-stat {
-        font-size: 14px;
-        line-height: 1;
-        filter: drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
-    }
-
-    .mc-icon-stat.empty {
-        filter: grayscale(1) brightness(0.2)
-            drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
-    }
-
-    .mc-xp-bar {
-        width: 364px;
-        height: 8px;
-        background: #222;
-        border: 1px solid #000;
-        margin-bottom: 6px;
-    }
-
-    .mc-xp-fill {
-        height: 100%;
-        background: #84e82a;
-        border-top: 1px solid #c2ff75;
-    }
-
-    .mc-hotbar-container {
-        display: flex;
-        align-items: flex-end;
-        gap: 8px;
-    }
-
-    .mc-hotbar {
-        display: flex;
-        background: #8b8b8b;
-        border: 2px solid #111;
-        padding: 2px;
-        box-shadow:
-            inset 2px 2px 0px rgba(255, 255, 255, 0.4),
-            inset -2px -2px 0px rgba(0, 0, 0, 0.4);
-    }
-
-    .slot {
-        width: 36px;
-        height: 36px;
-        background: #8b8b8b;
-        border-style: solid;
-        border-width: 2px;
-        border-color: #373737 #fff #fff #373737;
-        position: relative;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-    }
-
-    .mc-offhand {
-        border-color: #373737 #fff #fff #373737;
-    }
-
-    .slot.active {
-        outline: 3px solid rgba(255, 255, 255, 0.9);
-        outline-offset: -3px;
-        z-index: 10;
-    }
-
-    .slot-count {
-        position: absolute;
-        bottom: -2px;
-        right: 1px;
-        font-size: 14px;
-        font-weight: 900;
-        color: white;
-        text-shadow:
-            2px 2px 0 #3f3f3f,
-            -1px -1px 0 #3f3f3f,
-            1px -1px 0 #3f3f3f,
-            -1px 1px 0 #3f3f3f;
-    }
-
-    /* --- SIDEBAR STYLES --- */
-    .objective {
-        font-size: 1.125rem;
-        color: #38bdf8;
-        margin: 0;
-    }
-    .inventory-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-        gap: 0.5rem;
-        max-height: 250px;
-        overflow-y: auto;
-    }
-    .item {
-        display: flex;
-        justify-content: space-between;
-        padding: 0.5rem;
-        background: #334155;
-        border-radius: 4px;
-        font-size: 0.875rem;
-    }
-    .item-name {
-        font-family: monospace;
-    }
-    .item-count {
-        font-weight: 600;
-        color: #94a3b8;
-    }
-    .list {
-        list-style: none;
-        padding: 0;
-        margin: 0;
-    }
-    .threat-item,
-    .poi-item {
-        display: flex;
-        justify-content: space-between;
-        padding: 0.5rem;
-        margin-bottom: 0.25rem;
-        background: #334155;
-        border-radius: 4px;
-        font-size: 0.875rem;
-    }
-    .threat-name {
-        color: #ef4444;
-        font-weight: 600;
-    }
-    .poi-type {
-        color: #94a3b8;
-        font-size: 0.7rem;
-        text-transform: uppercase;
-    }
-    .poi-name {
-        font-family: monospace;
-        margin-left: 0.5rem;
-    }
-    .events-card {
-        display: flex;
-        flex-direction: column;
-        height: 100%;
-        max-height: 400px;
-    }
-    .events-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 0.5rem;
-    }
-    .clear-btn {
-        background: #475569;
-        border: none;
-        color: white;
-        padding: 0.25rem 0.75rem;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 0.875rem;
-    }
-    .clear-btn:hover {
-        background: #64748b;
-    }
-    .events-list {
-        flex-grow: 1;
-        overflow-y: auto;
-        font-family: monospace;
-        font-size: 0.75rem;
-    }
-    .event-item {
-        padding: 0.5rem;
-        border-bottom: 1px solid #334155;
-        display: flex;
-        gap: 0.75rem;
-    }
-    .event-time {
-        color: #94a3b8;
-        min-width: 60px;
-    }
-    .event-type {
-        color: #38bdf8;
-        min-width: 100px;
-    }
-    .event-payload {
-        color: #e2e8f0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    .empty {
-        color: #64748b;
-        font-style: italic;
-        margin: 0;
-    }
-</style>
-
-</file>
-
-<file path="ui\src\app.css">
-/* :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
-
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
-
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
-}
-
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
-
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
-
-#app {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
-}
-
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
-
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
-    }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
-}
-
-#docs {
-  border-right: 1px solid var(--border);
-
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-}
-
-#next-steps ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
-}
-
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
-}
-
-.ticks {
-  position: relative;
-  width: 100%;
-
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
-
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
-  }
-} */
-
-</file>
-
-<file path="ui\src\components\ItemIcon.svelte">
-<script lang="ts">
-    let { name, size = 32 } = $props<{ name: string; size?: number }>();
-
-    let hasError = $state(false);
-
-    let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
-    let formattedTitle = $derived(cleanName.replace(/_/g, " "));
-    let imageSource = $derived(`/assets/items/${cleanName}.png`);
-
-    function handleError() {
-        hasError = true;
-    }
-</script>
-
-{#if hasError}
-    <div
-        class="fallback-icon"
-        style="width: {size}px; height: {size}px; font-size: {size * 0.4}px;"
-        title="Missing texture: {cleanName}"
-    >
-        ?
-    </div>
-{:else}
-    <img
-        src={imageSource}
-        alt={cleanName}
-        title={formattedTitle}
-        width={size}
-        height={size}
-        onerror={handleError}
-        class="mc-icon"
-    />
-{/if}
-
-<style>
-    .mc-icon {
-        image-rendering: pixelated;
-        object-fit: contain;
-    }
-
-    .fallback-icon {
-        background-color: #ff00ff;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
-        font-weight: bold;
-        box-shadow: inset 0 0 0 2px #000000;
-        cursor: help;
-        font-family: monospace;
-    }
-</style>
-
-</file>
-
-<file path="ui\src\lib\Counter.svelte">
-<script lang="ts">
-  let count: number = $state(0)
-  const increment = () => {
-    count += 1
-  }
-</script>
-
-<button class="counter" onclick={increment}>
-  Count is {count}
-</button>
-
-</file>
-
-<file path="ui\src\main.ts">
-import { mount } from "svelte";
-import "./app.css";
-import App from "./App.svelte";
-
-const app = mount(App, {
-    target: document.getElementById("app")!,
-    props: {},
-});
-
-export default app;
-
-</file>
-
-<file path="ui\svelte.config.js">
-/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
-export default {}
-
-</file>
-
-<file path="ui\vite.config.ts">
-import { defineConfig } from "vite";
-import { svelte } from "@sveltejs/vite-plugin-svelte";
-
-// https://vite.dev/config/
-export default defineConfig({
-    plugins: [svelte()],
-    server: {
-        proxy: {
-            "/ui/ws": {
-                target: "ws://localhost:8080",
-                ws: true,
-            },
-            "/bot/ws": {
-                target: "ws://localhost:8080",
-                ws: true,
-            },
-        },
-    },
-});
-
-</file>
-
 
 
 ```json
 {
-  "total_bytes": 212028,
-  "file_count": 67,
-  "estimated_tokens": 54358,
+  "total_bytes": 182438,
+  "file_count": 54,
+  "estimated_tokens": 46724,
   "mode": "full",
-  "generated_at": "2026-03-29T02:32:21.4895805-07:00"
+  "generated_at": "2026-03-29T04:00:01.6742101-07:00"
 }
 ```

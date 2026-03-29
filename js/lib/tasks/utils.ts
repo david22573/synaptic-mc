@@ -68,7 +68,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
     const MAX_ATTEMPTS = 30;
 
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
-        // FIX: Check signal.abort in loop
         if (signal.aborted) throw new Error("aborted");
         if (isOnSolidGround(bot)) return;
 
@@ -84,6 +83,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
         ];
 
         let clearedSomething = false;
+
         for (const targetBlock of blocksToClear) {
             if (
                 targetBlock &&
@@ -112,7 +112,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
             bot.setControlState(strafe, false);
         }
 
-        // FIX: Add timeout to physics tick listener
         await new Promise<void>((resolve, reject) => {
             let ticks = 0;
             const timeout = setTimeout(() => {
@@ -240,6 +239,7 @@ export function moveToGoal(
         };
 
         let stuckStrikes = 0;
+
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
@@ -254,7 +254,6 @@ export function moveToGoal(
             }
         }, stuckTimeoutMs);
 
-        // FIX: Store listeners for proper cleanup
         listeners.set("goal_reached", onGoalReached);
         listeners.set("path_update", onPathUpdate);
 
@@ -287,15 +286,13 @@ export async function makeRoomInInventory(
     if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
 
     const inventory = bot.inventory.items();
-    const sortedItems = [...inventory].sort((a, b) => {
-        const aIsTrash = TRASH_ITEMS.has(a.name) ? -1 : 1;
-        const bIsTrash = TRASH_ITEMS.has(b.name) ? -1 : 1;
-        if (aIsTrash !== bIsTrash) return aIsTrash - bIsTrash;
-        return a.count - b.count;
-    });
+
+    // Pre-filter the inventory to only sort and process trash items
+    const trashItems = inventory.filter((i: any) => TRASH_ITEMS.has(i.name));
+    trashItems.sort((a: any, b: any) => a.count - b.count);
 
     let slotsFreed = 0;
-    for (const item of sortedItems) {
+    for (const item of trashItems) {
         if (slotsFreed >= slotsNeeded) break;
         try {
             await bot.tossStack(item);
@@ -315,6 +312,7 @@ export async function placePortableUtility(
 
     await bot.equip(item, "hand");
     const pos = bot.entity.position.floored();
+
     const candidates = [
         bot.blockAt(pos.offset(1, -1, 0)),
         bot.blockAt(pos.offset(-1, -1, 0)),

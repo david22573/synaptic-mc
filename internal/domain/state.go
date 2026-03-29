@@ -10,11 +10,16 @@ type GameState struct {
 	Health       float64  `json:"health"`
 	Food         float64  `json:"food"`
 	TimeOfDay    int      `json:"time_of_day"`
+	Experience   float64  `json:"experience"`
+	Level        int      `json:"level"`
 	HasBedNearby bool     `json:"has_bed_nearby"`
 	Position     Vec3     `json:"position"`
 	Threats      []Threat `json:"threats"`
 	POIs         []POI    `json:"pois"`
 	Inventory    []Item   `json:"inventory"`
+	Hotbar       []*Item  `json:"hotbar"`
+	Offhand      *Item    `json:"offhand"`
+	ActiveSlot   int      `json:"active_slot"`
 }
 
 type Threat struct {

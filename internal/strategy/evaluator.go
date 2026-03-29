@@ -17,23 +17,48 @@ func NewEvaluator() *Evaluator {
 	return &Evaluator{}
 }
 
-// Evaluate defines the core progression logic deterministically. [cite: 172, 175, 177]
+func isFood(itemName string) bool {
+	foodItems := []string{
+		"beef", "porkchop", "mutton", "chicken", "rabbit",
+		"cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_rabbit",
+		"apple", "sweet_berries", "bread", "carrot", "potato", "baked_potato", "kelp", "dried_kelp",
+	}
+	for _, f := range foodItems {
+		if strings.Contains(itemName, f) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 	inv := make(map[string]int)
 	hasWeapon := false
+	hasFood := false
 
 	for _, item := range state.Inventory {
 		inv[item.Name] += item.Count
 		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
 			hasWeapon = true
 		}
+		if isFood(item.Name) {
+			hasFood = true
+		}
 	}
 
-	// 1. Survival First
+	// 1. Survival First (Now Food-Aware)
 	if state.Health < 10 || state.Food < 6 {
+		if hasFood {
+			return Directive{
+				PrimaryGoal:   "SURVIVAL: You have food in your inventory. Use the 'eat' action immediately to regenerate health.",
+				SecondaryGoal: "DEFENSE: Retreat to a safe location while healing.",
+				IsAutonomous:  false,
+			}
+		}
+
 		return Directive{
-			PrimaryGoal:   "SURVIVAL: Secure food immediately and retreat to safety.",
-			SecondaryGoal: "DEFENSE: Eliminate immediate threats preventing safe regeneration.",
+			PrimaryGoal:   "SURVIVAL: You are starving and have NO food. You CANNOT hunt (health too low). Use 'gather' for passive food (sweet_berries, apples) or 'explore' to find a village.",
+			SecondaryGoal: "DEFENSE: Avoid all combat. Retreat if threatened.",
 			IsAutonomous:  false,
 		}
 	}
@@ -48,7 +73,7 @@ func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 		}
 	}
 
-	// 3. Tech Progression (Deterministic checks)
+	// 3. Tech Progression
 	hasWoodenPick := inv["wooden_pickaxe"] > 0
 	hasStonePick := inv["stone_pickaxe"] > 0 || inv["iron_pickaxe"] > 0 || inv["diamond_pickaxe"] > 0
 	hasLog := false

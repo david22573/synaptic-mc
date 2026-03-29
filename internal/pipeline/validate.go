@@ -30,7 +30,7 @@ func (s *ValidateStage) Process(ctx context.Context, state *PipelineState) error
 	for i, task := range state.Normalized.Tasks {
 		if err := validateTaskPure(task, state.GameState, simInv); err != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
-			break
+			// We no longer break here; we want to collect all validation errors for the whole plan
 		}
 
 		switch task.Action {
@@ -63,13 +63,10 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			return fmt.Errorf("target must be a specific resource (e.g., 'oak_log', 'dirt'), got generic '%s'", task.Target.Name)
 		}
 
-		isHardBlock := strings.Contains(target, "stone") ||
-			strings.Contains(target, "coal") ||
-			strings.Contains(target, "iron")
+		isHardBlock := strings.Contains(target, "stone") || strings.Contains(target, "coal") || strings.Contains(target, "iron")
 
 		if task.Action == "mine" && isHardBlock {
-			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 ||
-				simInv["iron_pickaxe"] > 0
+			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0
 			if !hasPick {
 				return fmt.Errorf("mining %s requires a pickaxe", task.Target.Name)
 			}

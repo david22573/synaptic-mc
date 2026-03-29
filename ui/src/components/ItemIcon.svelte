@@ -1,52 +1,20 @@
 <script lang="ts">
-    let { name, size = 32 } = $props<{ name: string; size?: number }>();
+    let { name, size = 32 } = $props();
 
-    let hasError = $state(false);
-
-    let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
-    let formattedTitle = $derived(cleanName.replace(/_/g, " "));
-    let imageSource = $derived(`/assets/items/${cleanName}.png`);
-
-    function handleError() {
-        hasError = true;
-    }
+    // Points to the local public folder (e.g., ui/public/textures/apple.png)
+    // Vite serves everything in /public at the root path '/'
+    const iconUrl = $derived(`/assets/items/${name}.png`);
 </script>
 
-{#if hasError}
-    <div
-        class="fallback-icon"
-        style="width: {size}px; height: {size}px; font-size: {size * 0.4}px;"
-        title="Missing texture: {cleanName}"
-    >
-        ?
-    </div>
-{:else}
-    <img
-        src={imageSource}
-        alt={cleanName}
-        title={formattedTitle}
-        width={size}
-        height={size}
-        onerror={handleError}
-        class="mc-icon"
-    />
-{/if}
-
-<style>
-    .mc-icon {
-        image-rendering: pixelated;
-        object-fit: contain;
-    }
-
-    .fallback-icon {
-        background-color: #ff00ff;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
-        font-weight: bold;
-        box-shadow: inset 0 0 0 2px #000000;
-        cursor: help;
-        font-family: monospace;
-    }
-</style>
+<img
+    src={iconUrl}
+    alt={name}
+    width={size}
+    height={size}
+    style="image-rendering: pixelated; object-fit: contain;"
+    onerror={(e) => {
+        // Fallback to the classic missing texture checkerboard if the local file is missing
+        e.currentTarget.src =
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAKElEQVR42mP8z8DAwMgwEAwUMAK1M1Ero7RmcGjAwEBz1DCqGAYAAI8Z/8H/h7i+AAAAAElFTkSuQmCC";
+    }}
+/>

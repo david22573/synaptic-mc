@@ -14,24 +14,21 @@ import { getPOIs } from "./lib/utils/perception.js";
 const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
-// More aggressive error filtering to suppress protodef spam
+
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err);
     const name = String(err.name || "");
-    // Suppress all protodef parsing errors
     return (
         name === "PartialReadError" ||
         msg.includes("Read error for undefined") ||
         msg.includes("Missing characters in string") ||
         msg.includes("protodef") ||
         (msg.includes("size is") && msg.includes("expected size")) ||
-        // Also suppress websocket errors during reconnect
         msg.includes("Unexpected server response")
     );
 };
 
-// Suppress console.error for ignorable errors
 const originalConsoleError = console.error;
 console.error = (...args: any[]) => {
     const firstArg = args[0];
@@ -246,7 +243,18 @@ async function executeDecision(decision: models.IncomingDecision) {
 
 function pushState() {
     if (!bot?.entity || !client) return;
-    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.inventory
+
+    // Extract exact hotbar and offhand slots from Mineflayer memory
+    const hotbarStart = bot.inventory.hotbarStart || 36;
+    const hotbar = Array.from({ length: 9 }, (_, i) => {
+        const item = bot.inventory.slots[hotbarStart + i];
+        return item ? { name: item.name, count: item.count } : null;
+    });
+
+    const offhandItem = bot.inventory.slots[45];
+
+    // Added bot.quickBarSlot to the signature so UI updates instantly when switching items
+    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
@@ -262,6 +270,8 @@ function pushState() {
         health: Math.round(bot.health),
         food: Math.round(bot.food),
         time_of_day: bot.time.timeOfDay,
+        experience: bot.experience?.progress ?? 0,
+        level: bot.experience?.level ?? 0,
         position: {
             x: Math.round(bot.entity.position.x),
             y: Math.round(bot.entity.position.y),
@@ -274,6 +284,11 @@ function pushState() {
         inventory: bot.inventory
             .items()
             .map((i) => ({ name: i.name, count: i.count })),
+        hotbar: hotbar,
+        offhand: offhandItem
+            ? { name: offhandItem.name, count: offhandItem.count }
+            : null,
+        active_slot: bot.quickBarSlot,
     });
 }
 
@@ -411,6 +426,8 @@ async function connectWithRetry(maxAttempts = 10) {
     });
 
     bot.on("health", pushState);
+    bot.on("experience", pushState);
+    bot.on("heldItemChanged", pushState);
 
     if (stateInterval) clearInterval(stateInterval);
     stateInterval = setInterval(pushState, 2000);
