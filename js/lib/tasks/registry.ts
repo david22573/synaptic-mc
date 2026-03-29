@@ -3,11 +3,10 @@ import type * as models from "../models.js";
 
 export interface TaskContext {
     bot: Bot;
-    decision: models.IncomingDecision;
+    intent: models.ActionIntent;
     signal: AbortSignal;
     timeouts: Record<string, number>;
     stopMovement: () => void;
-
     getThreats: () => any[];
     computeSafeRetreat: (
         threats: any[],

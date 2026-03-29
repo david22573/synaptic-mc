@@ -2,8 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,18 +12,21 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/voyager"
 )
 
 type Orchestrator struct {
-	sessionID   string
-	store       domain.EventStore
-	memory      memory.Store
-	decision    decision.Engine
+	sessionID string
+	store     domain.EventStore
+	memory    memory.Store
+
+	curriculum voyager.Curriculum
+	critic     voyager.Critic
+
 	ctrlManager *execution.ControllerManager
 	taskManager *TaskManager
 	logger      *slog.Logger
@@ -35,10 +36,12 @@ type Orchestrator struct {
 
 	mu              sync.RWMutex
 	currentSnapshot domain.EvaluationSnapshot
-	pendingFeedback []domain.Feedback
-	reflexLock      bool
-	evalCancel      context.CancelFunc
-	evalRunID       uint64
+	taskHistory     []domain.TaskHistory
+	activeIntent    *domain.ActionIntent
+	beforeState     domain.GameState
+
+	reflexLock bool
+	evalCancel context.CancelFunc
 
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
@@ -48,7 +51,8 @@ func New(
 	sessionID string,
 	store domain.EventStore,
 	memStore memory.Store,
-	decisionEngine decision.Engine,
+	curriculum voyager.Curriculum,
+	critic voyager.Critic,
 	exec execution.Controller,
 	uiHub *observability.Hub,
 	logger *slog.Logger,
@@ -64,13 +68,15 @@ func New(
 		sessionID:   sessionID,
 		store:       store,
 		memory:      memStore,
-		decision:    decisionEngine,
+		curriculum:  curriculum,
+		critic:      critic,
 		ctrlManager: cm,
 		taskManager: tm,
 		uiHub:       uiHub,
 		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
 		stateCh:     make(chan domain.VersionedState, 10),
 		eventCh:     make(chan domain.DomainEvent, 100),
+		taskHistory: make([]domain.TaskHistory, 0),
 	}
 
 	tm.OnDrain = o.handleQueueDrain
@@ -146,29 +152,7 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 }
 
 func (o *Orchestrator) handleQueueDrain() {
-	o.mu.RLock()
-	snap := o.currentSnapshot
-	o.mu.RUnlock()
-
-	if snap.ActivePlan != nil {
-		o.mu.Lock()
-		if o.currentSnapshot.ActivePlan.Status == domain.PlanStatusActive || o.currentSnapshot.ActivePlan.Status == domain.PlanStatusPending {
-			o.currentSnapshot.ActivePlan.Status = domain.PlanStatusCompleted
-
-			event := domain.DomainEvent{
-				SessionID: o.sessionID,
-				Trace:     domain.TraceContext{TraceID: "sys-drain", ActionID: o.currentSnapshot.ActivePlan.ID},
-				Type:      domain.EventTypePlanCompleted,
-				Payload:   marshalJSON(map[string]string{"plan_id": o.currentSnapshot.ActivePlan.ID}),
-			}
-			o.mu.Unlock()
-			o.IngestEvent(context.Background(), event)
-		} else {
-			o.mu.Unlock()
-		}
-	}
-
-	_ = o.evaluate(context.Background(), snap)
+	_ = o.evaluateNextTask(context.Background())
 }
 
 func (o *Orchestrator) processStateLoop(ctx context.Context) error {
@@ -178,27 +162,14 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 			return ctx.Err()
 		case vState := <-o.stateCh:
 			o.mu.Lock()
-
-			if o.evalCancel != nil {
-				o.evalCancel()
-				o.evalCancel = nil
-			}
-
-			if len(o.pendingFeedback) > 0 {
-				vState.State.Feedback = append(vState.State.Feedback, o.pendingFeedback...)
-				o.pendingFeedback = nil
-			}
-
 			o.currentSnapshot.State = vState
-			snap := o.currentSnapshot
-
 			o.mu.Unlock()
 
 			if o.uiHub != nil {
 				o.uiHub.Broadcast("state_update", vState.State)
 			}
 
-			if err := o.evaluate(ctx, snap); err != nil {
+			if err := o.evaluateNextTask(ctx); err != nil {
 				o.logger.Error("Failed to evaluate state", slog.Any("error", err))
 			}
 		}
@@ -225,150 +196,83 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 	}
 }
 
-func generatePlanID(plan *domain.Plan) string {
-	h := sha1.New()
-	for _, t := range plan.Tasks {
-		h.Write([]byte(t.Action + ":" + t.Target.Name + "|"))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 func marshalJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
 
-func (o *Orchestrator) evaluate(ctx context.Context, snap domain.EvaluationSnapshot) error {
+func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
+	state := o.currentSnapshot.State.State
+	history := o.taskHistory
 	o.mu.RUnlock()
 
 	if tm == nil || isLocked || !tm.IsIdle() {
 		return nil
 	}
 
-	evalCtx, cancel := context.WithCancel(ctx)
-
 	o.mu.Lock()
 	if o.evalCancel != nil {
 		o.evalCancel()
 	}
+	evalCtx, cancel := context.WithCancel(ctx)
 	o.evalCancel = cancel
-	o.evalRunID++
-	runID := o.evalRunID
 	o.mu.Unlock()
 
-	trace := domain.TraceContext{
-		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
-		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
-	}
+	go func() {
+		defer cancel()
 
-	go func(evalCtx context.Context, snapshot domain.EvaluationSnapshot, evalID uint64) {
-		defer func() {
-			o.mu.Lock()
-			if o.evalRunID == evalID {
-				o.evalCancel = nil
-			}
-			o.mu.Unlock()
-			cancel()
-		}()
-
-		plan, err := o.decision.Evaluate(evalCtx, o.sessionID, snapshot.State.State, trace)
+		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
 		if err != nil {
-			if evalCtx.Err() != nil {
-				return
-			}
-			o.logger.Error("decision evaluation failed", slog.Any("error", err))
-			o.mu.Lock()
-			o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-				Type:  "PLAN_REJECTED",
-				Cause: err.Error(),
-			})
-			o.mu.Unlock()
+			o.logger.Error("Curriculum failed to propose task", slog.Any("error", err))
 			return
 		}
 
-		if plan == nil || len(plan.Tasks) == 0 {
+		if intent == nil {
 			return
 		}
 
-		plan.StateVersion = snapshot.State.Version
-		plan.CreatedAt = time.Now()
-		plan.Status = domain.PlanStatusPending
+		if intent.ID == "" {
+			intent.ID = fmt.Sprintf("int-%d", time.Now().UnixNano())
+		}
 
-		if plan.ID == "" {
-			plan.ID = generatePlanID(plan)
+		trace := domain.TraceContext{
+			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+			ActionID: intent.ID,
 		}
 
 		o.mu.Lock()
-		isLoop := false
-		if o.currentSnapshot.ActivePlan != nil {
-			isLoop = o.currentSnapshot.ActivePlan.ID == plan.ID
-			if o.currentSnapshot.ActivePlan.ID != plan.ID {
-				if o.currentSnapshot.ActivePlan.Status == domain.PlanStatusPending || o.currentSnapshot.ActivePlan.Status == domain.PlanStatusActive {
-					now := time.Now()
-					o.currentSnapshot.ActivePlan.Status = domain.PlanStatusInvalidated
-					o.currentSnapshot.ActivePlan.InvalidatedAt = &now
-					plan.ParentPlanID = o.currentSnapshot.ActivePlan.ID
-
-					o.IngestEvent(ctx, domain.DomainEvent{
-						SessionID: o.sessionID,
-						Trace:     trace,
-						Type:      domain.EventTypePlanInvalidated,
-						Payload:   marshalJSON(map[string]string{"plan_id": o.currentSnapshot.ActivePlan.ID, "superseded_by": plan.ID}),
-					})
-				}
-			}
-		}
-
-		o.currentSnapshot.ActivePlan = plan
+		o.activeIntent = intent
+		o.beforeState = state
 		o.mu.Unlock()
 
-		o.IngestEvent(ctx, domain.DomainEvent{
+		o.logger.Info("New Intent Proposed", slog.String("action", intent.Action), slog.String("target", intent.Target))
+
+		// Map ActionIntent to domain.Action for the TS bridge TaskManager execution constraints
+		action := domain.Action{
+			ID:        intent.ID,
+			Trace:     trace,
+			Action:    intent.Action,
+			Target:    domain.Target{Name: intent.Target, Type: "intent"},
+			Rationale: intent.Rationale,
+			Priority:  10,
+		}
+
+		o.IngestEvent(evalCtx, domain.DomainEvent{
 			SessionID: o.sessionID,
 			Trace:     trace,
 			Type:      domain.EventTypePlanCreated,
-			Payload:   marshalJSON(plan),
+			Payload:   marshalJSON(intent),
 		})
 
-		if isLoop {
-			o.logger.Warn("plan_loop_detected", slog.String("id", plan.ID))
-			exploreTask := domain.Action{
-				ID:       fmt.Sprintf("cmd-%s-explore-break", trace.ActionID),
-				Trace:    trace,
-				Action:   "explore",
-				Target:   domain.Target{Type: "location", Name: "unknown"},
-				Priority: 50,
-			}
-			plan.Tasks = append([]domain.Action{exploreTask}, plan.Tasks...)
-		}
-
 		if o.uiHub != nil {
-			o.uiHub.Broadcast("objective_update", plan.Objective)
+			o.uiHub.Broadcast("objective_update", intent.Rationale)
 		}
 
-		o.logger.Info("New plan generated",
-			slog.String("id", plan.ID),
-			slog.Uint64("state_version", plan.StateVersion),
-			slog.String("objective", plan.Objective),
-			slog.Int("tasks", len(plan.Tasks)))
-
-		o.mu.RLock()
-		freshTM := o.taskManager
-		o.mu.RUnlock()
-
-		if freshTM != nil {
-			o.mu.Lock()
-			if o.currentSnapshot.ActivePlan != nil && o.currentSnapshot.ActivePlan.ID == plan.ID {
-				o.currentSnapshot.ActivePlan.Status = domain.PlanStatusActive
-			}
-			o.mu.Unlock()
-			_ = freshTM.Enqueue(ctx, plan.Tasks...)
-		} else {
-			o.logger.Warn("Dropping generated plan: TaskManager is offline")
-		}
-	}(evalCtx, snap, runID)
+		_ = tm.Enqueue(evalCtx, action)
+	}()
 
 	return nil
 }
@@ -384,7 +288,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 	switch ev.Type {
 	case domain.EventBotDeath:
-		o.logger.Warn("Bot death detected, aborting active plans")
+		o.logger.Warn("Bot death detected, aborting active intents")
 		_ = tm.Halt(ctx, "bot_died")
 
 		o.mu.RLock()
@@ -400,7 +304,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		o.mu.Unlock()
 
 	case domain.EventTypePanic:
-		o.logger.Warn("Bot panicked, halting execution and locking planner")
+		o.logger.Warn("Bot panicked, halting execution and locking curriculum")
 		_ = tm.Halt(ctx, "panic_triggered")
 
 		o.mu.Lock()
@@ -408,7 +312,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		o.mu.Unlock()
 
 	case domain.EventTypePanicResolved:
-		o.logger.Info("Bot survival reflex resolved, unlocking planner")
+		o.logger.Info("Bot survival reflex resolved, unlocking curriculum")
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
@@ -420,97 +324,52 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 			Cause     string `json:"cause"`
 			Action    string `json:"action"`
 		}
+
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			success := payload.Status == "COMPLETED"
+			o.mu.Lock()
+			intent := o.activeIntent
+			before := o.beforeState
+			after := o.currentSnapshot.State.State
+			o.activeIntent = nil
+			o.mu.Unlock()
 
-			if !success && payload.Cause != "" {
-				o.logger.Warn("Task execution failed natively, injecting feedback", slog.String("cause", payload.Cause))
+			if intent != nil && intent.ID == payload.CommandID {
+				success, critique := o.critic.Evaluate(*intent, before, after)
 
-				hint := "Execution failed. Adjust plan and avoid repeating the same sequence."
-				switch payload.Cause {
-				case "PATH_FAILED":
-					hint = "Target unreachable. Try explore first or choose a closer target."
-				case "TIMEOUT":
-					hint = "Task stalled. Retry once; if recurs, choose a different approach."
-				case "NO_BLOCKS":
-					hint = "Resource not found nearby. Check POI list or explore first."
-				case "NO_ENTITY":
-					hint = "Entity not found. Check if any are visible in POIs before hunting."
-				case "NO_TOOL":
-					hint = "Missing required tool. Craft it before retrying this action."
+				// Natively verify TS-level failures
+				if payload.Status != "COMPLETED" {
+					success = false
+					critique = fmt.Sprintf("TS Execution Failed: %s. Critic note: %s", payload.Cause, critique)
 				}
+
+				o.logger.Info("Critic Evaluation",
+					slog.Bool("success", success),
+					slog.String("critique", critique),
+				)
 
 				o.mu.Lock()
-				if o.currentSnapshot.ActivePlan != nil && o.currentSnapshot.ActivePlan.Status != domain.PlanStatusFailed {
-					o.currentSnapshot.ActivePlan.Status = domain.PlanStatusFailed
-
-					event := domain.DomainEvent{
-						SessionID: o.sessionID,
-						Trace:     ev.Trace,
-						Type:      domain.EventTypePlanFailed,
-						Payload:   marshalJSON(map[string]string{"plan_id": o.currentSnapshot.ActivePlan.ID, "cause": payload.Cause}),
-					}
-
-					o.mu.Unlock()
-					o.IngestEvent(ctx, event)
-					o.mu.Lock()
-				}
-
-				o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-					Type:   "TASK_FAILED",
-					Action: payload.Action,
-					Cause:  payload.Cause,
-					Hint:   hint,
+				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
+					Intent:   *intent,
+					Success:  success,
+					Critique: critique,
 				})
 				o.mu.Unlock()
 
-			} else if success {
-				parts := strings.SplitN(payload.Action, " ", 2)
-				if len(parts) == 2 {
-					actionType := parts[0]
-					targetName := parts[1]
-
-					if (actionType == "gather" || actionType == "mine") && o.memory != nil {
-						o.mu.RLock()
-						pos := o.currentSnapshot.State.State.Position
-						o.mu.RUnlock()
-						_ = o.memory.MarkWorldNode(ctx, targetName, "resource", pos)
-					}
-
-					if actionType == "mark_location" && o.memory != nil {
-						o.mu.RLock()
-						pos := o.currentSnapshot.State.State.Position
-						o.mu.RUnlock()
-
-						_ = o.memory.MarkWorldNode(ctx, targetName, "user_marked", pos)
-						o.logger.Info("Location marked", slog.String("name", targetName))
-
-						o.mu.Lock()
-						o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-							Type:  "SYSTEM",
-							Cause: fmt.Sprintf("Successfully marked location as '%s'", targetName),
-						})
-						o.mu.Unlock()
-
-					} else if actionType == "recall_location" && o.memory != nil {
-						o.mu.RLock()
-						pos := o.currentSnapshot.State.State.Position
-						o.mu.RUnlock()
-
-						knownWorld, _ := o.memory.GetKnownWorld(ctx, pos)
-						o.logger.Info("Location recalled", slog.String("world", knownWorld))
-
-						o.mu.Lock()
-						o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-							Type:  "SYSTEM",
-							Cause: "RECALL: " + knownWorld,
-						})
-						o.mu.Unlock()
+				if success && o.memory != nil {
+					parts := strings.SplitN(payload.Action, " ", 2)
+					if len(parts) == 2 {
+						actionType := parts[0]
+						if actionType == "gather" || actionType == "mine" {
+							_ = o.memory.MarkWorldNode(ctx, intent.Target, "resource", after.Position)
+						}
 					}
 				}
 			}
 
-			_ = tm.Complete(ctx, payload.CommandID, success)
+			_ = tm.Complete(ctx, payload.CommandID, payload.Status == "COMPLETED")
+
+			// Immediately trigger the curriculum for the next move
+			go o.evaluateNextTask(context.Background())
 		}
 	}
 }

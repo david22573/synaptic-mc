@@ -17,23 +17,21 @@ import (
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
-	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
-	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/orchestrator"
-	"david22573/synaptic-mc/internal/policy"
-	"david22573/synaptic-mc/internal/strategy"
+	"david22573/synaptic-mc/internal/voyager"
 )
 
 type Config struct {
 	HTTPAddr     string
 	EventStoreDB string
 	MemoryDB     string
+	VectorDB     string
 	UIPath       string
 	LLMURL       string
 	LLMKey       string
@@ -60,6 +58,7 @@ func main() {
 
 	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
 	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
+	vectorStorePath := filepath.Join(cfg.DataDir, cfg.VectorDB)
 
 	eventStore, err := eventstore.NewSQLiteEventStore(eventStorePath)
 	if err != nil {
@@ -75,6 +74,13 @@ func main() {
 	}
 	defer memoryStore.Close()
 
+	vectorStore, err := voyager.NewSQLiteVectorStore(vectorStorePath)
+	if err != nil {
+		logger.Error("Failed to create vector store", slog.String("path", vectorStorePath), slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer vectorStore.Close()
+
 	llmClient := llm.NewClient(llm.Config{
 		APIURL:     cfg.LLMURL,
 		APIKey:     cfg.LLMKey,
@@ -82,20 +88,14 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	strategyEvaluator := strategy.NewEvaluator()
-	policyExtractor := learning.NewPolicyExtractor(eventStore, logger)
+	// Wire up the new Voyager multi-agent loop
+	critic := voyager.NewStateCritic()
+	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore)
 
-	// Switch to the Phase 7 Advanced Planner
-	planner := decision.NewAdvancedPlanner(llmClient, strategyEvaluator, policyExtractor, memoryStore, eventStore)
-
-	survivalPolicy := policy.NewSurvivalPolicy()
-	intelligencePolicy := policy.NewIntelligencePolicy(eventStore, cfg.SessionID)
-	policyEngine := policy.NewCompositePolicy(survivalPolicy, intelligencePolicy)
-
-	decisionEngine := decision.NewPipeline(planner, policyEngine)
 	uiHub := observability.NewHub(logger)
 
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, decisionEngine, &noopController{}, uiHub, logger)
+	// Inject the Voyager components into the Orchestrator
+	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, &noopController{}, uiHub, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
 
@@ -165,6 +165,7 @@ func parseConfig() Config {
 	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
 	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
 	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
+	vectorDB := flag.String("vector", getEnvOrDefault("VECTOR_DB", "skills.db"), "Vector skill database filename")
 	uiPath := flag.String("ui", getEnvOrDefault("UI_PATH", "ui/dist"), "UI static files path")
 	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
 	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
@@ -178,6 +179,7 @@ func parseConfig() Config {
 		HTTPAddr:     *httpAddr,
 		EventStoreDB: *eventsDB,
 		MemoryDB:     *memoryDB,
+		VectorDB:     *vectorDB,
 		UIPath:       *uiPath,
 		LLMURL:       *llmURL,
 		LLMKey:       *llmKey,

@@ -3,7 +3,7 @@ import { log } from "../logger.js";
 import * as models from "../models.js";
 
 export interface ControlPlaneEvents {
-    onCommand: (decision: models.IncomingDecision) => void;
+    onCommand: (intent: models.ActionIntent) => void;
     onUnlock: () => void;
 }
 
@@ -46,23 +46,28 @@ export class ControlPlaneClient {
                 const msg = JSON.parse(data.toString());
 
                 if (msg.type === "command") {
-                    const decision = msg.payload as models.IncomingDecision;
+                    const intent = msg.payload as models.ActionIntent;
 
-                    if (!decision || !decision.action) {
-                        log.error("Received malformed command payload", {
+                    if (!intent || !intent.action) {
+                        log.error("Received malformed intent payload", {
                             payload: msg.payload,
                         });
-
                         this.callbacks.onUnlock();
                         return;
                     }
 
-                    decision.trace = msg.trace || {
+                    // Ensure trace is populated for deterministic logging
+                    intent.trace = msg.trace || {
                         trace_id: "unknown",
-                        action_id: decision.id,
+                        action_id: intent.id,
                     };
 
-                    this.callbacks.onCommand(decision);
+                    // Fallback to 1 if Go sent a zero-value count by mistake
+                    if (!intent.count || intent.count <= 0) {
+                        intent.count = 1;
+                    }
+
+                    this.callbacks.onCommand(intent);
                     return;
                 }
 
@@ -71,10 +76,7 @@ export class ControlPlaneClient {
                     msg.type === "noop" ||
                     msg.type === "abort_task"
                 ) {
-                    log.debug("Control plane unlocked bot", {
-                        type: msg.type,
-                        payload: msg.payload,
-                    });
+                    log.debug("Control plane unlocked bot", { type: msg.type });
                     this.callbacks.onUnlock();
                 }
             } catch (err) {
@@ -130,9 +132,10 @@ export class ControlPlaneClient {
         startTime = 0,
     ): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
 
+        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
         let msgType = "TASK_END";
+
         if (event === "death") msgType = "BOT_DEATH";
         if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
         if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";

@@ -13,7 +13,6 @@ const LOG_TO_PLANK_MAP: Record<string, string> = {
     cherry_log: "cherry_planks",
 };
 
-// Map common LLM shorthand/misspellings to strict Minecraft registry names
 const TARGET_ALIASES: Record<string, string> = {
     // Farming Aliases
     carrot: "carrots",
@@ -32,20 +31,18 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
-    // Note: The validator heavily relies on "wood" mapping to logs for redundancy
-    // and vision checks. Do not remove or change these without updating validator.go.
     tree: "wood",
     log: "wood",
     timber: "wood",
 };
 
-export function normalizeDecision(
+export function normalizeIntent(
     bot: Bot,
-    decision: models.IncomingDecision,
-): models.IncomingDecision {
-    const normalized: models.IncomingDecision = {
-        ...decision,
-        target: { ...decision.target },
+    intent: models.ActionIntent,
+): models.ActionIntent {
+    const normalized: models.ActionIntent = {
+        ...intent,
+        target: { ...intent.target },
     };
 
     const action = normalized.action;
@@ -55,7 +52,7 @@ export function normalizeDecision(
 
     let targetName = originalTargetName;
 
-    // 1. Apply static dictionary aliases first (fixes farm/mine targets)
+    // 1. Apply static dictionary aliases first
     if (TARGET_ALIASES[targetName]) {
         targetName = TARGET_ALIASES[targetName]!;
     }
@@ -100,7 +97,7 @@ export function normalizeDecision(
     // 3. Log and apply changes if a normalization occurred
     if (targetName !== originalTargetName) {
         normalized.target.name = targetName;
-        log.debug("Decision normalized", {
+        log.debug("Intent normalized", {
             original_target: originalTargetName,
             normalized_target: targetName,
             action,

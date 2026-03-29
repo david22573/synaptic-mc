@@ -35,10 +35,12 @@ export interface DecisionTarget {
     name: string;
 }
 
-export interface IncomingDecision {
+// Replaces IncomingDecision
+export interface ActionIntent {
     id: string;
     action: ActionType;
     target: DecisionTarget;
+    count: number;
     rationale?: string;
     trace?: TraceContext;
 }
@@ -47,6 +49,7 @@ export interface ActiveTask {
     id: string;
     action: ActionType;
     target: DecisionTarget;
+    count: number;
     startTime: number;
     trace: TraceContext;
 }

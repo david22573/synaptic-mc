@@ -15,12 +15,10 @@ const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
 
-// Aggressively filter out protodef noise
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err.stack || err);
     const name = String(err.name || "");
-
     return (
         name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
@@ -57,7 +55,6 @@ console.warn = (...args: any[]) => {
         firstArg.includes("Read error for undefined")
     )
         return;
-
     originalConsoleWarn.apply(console, args);
 };
 
@@ -126,7 +123,6 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -151,7 +147,6 @@ function normalizeFailureCause(err: any): string {
     )
         return "NO_ENTITY";
 
-    // 2.3 FIX: Catch specific errors before falling back to NO_BLOCKS
     if (msg.includes("no_pickaxe_equipped") || msg.includes("no_tool"))
         return "NO_TOOL";
 
@@ -180,18 +175,18 @@ function normalizeFailureCause(err: any): string {
     return "UNKNOWN";
 }
 
-async function executeDecision(decision: models.IncomingDecision) {
-    if (!decision?.action) return;
+async function executeIntent(intent: models.ActionIntent) {
+    if (!intent?.action) return;
     if (isShuttingDown) return;
 
     if (survival?.isPanickingNow()) {
-        if (decision.action === "retreat") {
+        if (intent.action === "retreat") {
             survival.reset();
         } else {
             client.sendEvent(
                 "task_aborted",
                 "lock",
-                decision.id,
+                intent.id,
                 "panic",
                 Date.now(),
             );
@@ -200,19 +195,19 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 
     abortActiveTask("preempted");
-
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
 
     currentTask = {
-        id: decision.id,
-        action: decision.action,
-        target: decision.target || { type: "none", name: "none" },
+        id: intent.id,
+        action: intent.action,
+        target: intent.target || { type: "none", name: "none" },
+        count: intent.count || 1,
         startTime: Date.now(),
-        trace: decision.trace || {
+        trace: intent.trace || {
             trace_id: "unknown",
-            action_id: decision.id,
+            action_id: intent.id,
         },
     };
 
@@ -222,12 +217,12 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-        const timeoutMs = timeouts[decision.action] || 15000;
+        const timeoutMs = timeouts[intent.action] || 15000;
 
         await Promise.race([
             runTask(
                 bot,
-                decision,
+                intent,
                 signal,
                 timeouts,
                 () => getThreats(bot),
@@ -242,8 +237,7 @@ async function executeDecision(decision: models.IncomingDecision) {
             }),
         ]);
 
-        if (!signal.aborted) {
-            // Give server half a second to sync inventory over the network before evaluating next step
+        if (!signal.aborted && activeTask) {
             await new Promise((r) => setTimeout(r, 500));
             pushState();
             completeTask(activeTask, "task_completed");
@@ -251,22 +245,21 @@ async function executeDecision(decision: models.IncomingDecision) {
     } catch (err: any) {
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
-
             log.error("Task execution failed natively", {
-                action: decision.action,
-                target: decision.target?.name,
+                action: intent.action,
+                target: intent.target?.name,
                 raw_error: err.message,
                 normalized_cause: normalizedCause,
             });
 
-            pushState(); // Force state update on fail too
-            completeTask(activeTask, "task_failed", normalizedCause);
+            pushState();
+            if (activeTask)
+                completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-
-        if (currentTask?.id === activeTask.id) currentTask = null;
+        if (currentTask?.id === activeTask?.id) currentTask = null;
         if (taskAbortController === localController) taskAbortController = null;
     }
 }
@@ -281,6 +274,7 @@ function pushState() {
     });
 
     const offhandItem = bot.inventory.slots[45];
+
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -348,7 +342,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
     if (!client) {
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
-            onCommand: (d) => void executeDecision(d),
+            onCommand: (i) => void executeIntent(i),
             onUnlock: () => abortActiveTask("unlock"),
         });
     }
@@ -409,15 +403,13 @@ async function connectWithRetry(maxAttempts = 10) {
             .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-
-        // Give pathfinder more breathing room to stop timeout spam
         bot.pathfinder.thinkTimeout = 20000;
 
-        // Safe to attach inventory listeners now
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
 
         if (!client.isConnected()) client.connect();
+
         survival.start();
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
@@ -446,6 +438,8 @@ async function connectWithRetry(maxAttempts = 10) {
 
     bot.on("health", pushState);
     bot.on("experience", pushState);
+
+    // @ts-ignore - Supress missing typing for this event in older versions
     bot.on("heldItemChanged", pushState);
 
     if (stateInterval) clearInterval(stateInterval);

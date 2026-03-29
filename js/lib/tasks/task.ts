@@ -13,14 +13,14 @@ import { handleSmelt } from "./handlers/smelt.js";
 import { handleMine } from "./handlers/mine.js";
 import { handleFarm } from "./handlers/farm.js";
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
-import { normalizeDecision } from "./normalize.js";
+import { normalizeIntent } from "./normalize.js";
 import { handleInteract } from "./handlers/interact.js";
 
 const { goals } = pkg;
 
 export async function runTask(
     bot: Bot,
-    rawDecision: models.IncomingDecision,
+    rawIntent: models.ActionIntent,
     signal: AbortSignal,
     timeouts: Record<string, number>,
     getThreats: () => models.ThreatInfo[],
@@ -30,11 +30,11 @@ export async function runTask(
     },
     stopMovement: () => void,
 ): Promise<void> {
-    const decision = normalizeDecision(bot, rawDecision);
+    const intent = normalizeIntent(bot, rawIntent);
 
     const taskCtx: TaskContext = {
         bot,
-        decision,
+        intent,
         signal,
         timeouts,
         getThreats,
@@ -46,7 +46,7 @@ export async function runTask(
         throw new Error("aborted");
     }
 
-    switch (decision.action) {
+    switch (intent.action) {
         case "hunt":
             await handleHunt(taskCtx);
             return;
@@ -74,11 +74,11 @@ export async function runTask(
         case "eat": {
             const food = bot.inventory
                 .items()
-                .find((i) => i.name === decision.target.name);
-            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
+                .find((i) => i.name === intent.target.name);
+
+            if (!food) throw new Error(`NO_FOOD: ${intent.target.name}`);
 
             try {
-                // Must pass .type to equip safely in all contexts
                 await bot.equip(food.type, "hand");
                 await bot.consume();
             } catch (err) {
@@ -112,8 +112,6 @@ export async function runTask(
                 { signal, timeoutMs: 20000, stopMovement },
             );
 
-            // 2.4 FIX: Setup wake listener first to prevent race condition, then
-            // race the combined sleep+wake promise against a graceful 12s timeout.
             let onWake: (() => void) | undefined;
             let onAbort: (() => void) | undefined;
 
@@ -160,6 +158,6 @@ export async function runTask(
             await waitForMs(500, signal);
             return;
         default:
-            throw new Error(`unsupported: ${decision.action}`);
+            throw new Error(`unsupported: ${intent.action}`);
     }
 }
