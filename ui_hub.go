@@ -1,4 +1,4 @@
-package engine
+package main
 
 import (
 	"context"
@@ -11,14 +11,6 @@ import (
 )
 
 const writeWait = 10 * time.Second
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
 
 type UIClient struct {
 	hub  *UIHub

@@ -16,7 +16,7 @@ const (
 type ResilientBrain struct {
 	primary   Brain
 	fallback  Brain
-	validator *PlanValidator
+	validator *Validator
 	simulator *InternalSimulator
 	logger    *slog.Logger
 	telemetry *Telemetry
@@ -26,7 +26,7 @@ func NewResilientBrain(primary Brain, fallback Brain, logger *slog.Logger, tel *
 	return &ResilientBrain{
 		primary:   primary,
 		fallback:  fallback,
-		validator: NewPlanValidator(),
+		validator: NewValidator(),
 		simulator: NewInternalSimulator(logger),
 		logger:    logger.With(slog.String("component", "ResilientBrain")),
 		telemetry: tel,
@@ -67,14 +67,14 @@ func (r *ResilientBrain) GeneratePlan(ctx context.Context, t Tick, sessionID, sy
 			}
 
 			// Final sanity check validation
-			if valErr := r.validator.ValidatePlan(plan, t.State); valErr != nil {
+			if valErr := r.validator.ValidateLLMPlan(plan, t.State); valErr != nil {
 				r.telemetry.RecordValidationFailure()
 				err = fmt.Errorf("validation failed on chosen variant: %w", valErr)
 			} else {
 				r.logger.Debug("Simulator selected optimal variant", slog.Int("steps", len(plan.Tasks)))
 				if plan.Milestone != nil && plan.Milestone.ID != "" {
 					if milestone == nil || plan.Milestone.ID != milestone.ID {
-						r.telemetry.RecordMilestoneGenerated() // FIX BUG 6
+						r.telemetry.RecordMilestoneGenerated()
 					}
 				}
 				return plan, nil

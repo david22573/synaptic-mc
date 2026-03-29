@@ -9,11 +9,11 @@ import (
 
 type Routine interface {
 	Name() string
-	Check(state GameState, inFlight *Action, queue []Action) *Action
+	Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action
 }
 
 type RoutineManager interface {
-	Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action
+	Evaluate(state GameState, inFlightTask *Action, queueSnapshot []Action) []Action
 	RecordFailure(action, target string)
 }
 
@@ -50,10 +50,10 @@ func (r *DefaultRoutineManager) isCoolingDown(action, target string) bool {
 	return ok && time.Since(t) < 30*time.Second
 }
 
-func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, taskQueue []Action) []Action {
+func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, queueSnapshot []Action) []Action {
 	var results []Action
 	for _, routine := range r.routines {
-		if task := routine.Check(state, inFlightTask, taskQueue); task != nil {
+		if task := routine.Check(state, inFlightTask, queueSnapshot); task != nil {
 			if !r.isCoolingDown(task.Action, task.Target.Name) {
 				results = append(results, *task)
 			}
@@ -62,11 +62,11 @@ func (r *DefaultRoutineManager) Evaluate(state GameState, inFlightTask *Action, 
 	return results
 }
 
-func isTaskActive(action, targetName string, inFlight *Action, queue []Action) bool {
+func isTaskActive(action, targetName string, inFlight *Action, queueSnapshot []Action) bool {
 	if inFlight != nil && inFlight.Action == action && inFlight.Target.Name == targetName {
 		return true
 	}
-	for _, t := range queue {
+	for _, t := range queueSnapshot {
 		if t.Action == action && t.Target.Name == targetName {
 			return true
 		}
@@ -79,7 +79,7 @@ func isTaskActive(action, targetName string, inFlight *Action, queue []Action) b
 type CombatRoutine struct{}
 
 func (c *CombatRoutine) Name() string { return "combat" }
-func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+func (c *CombatRoutine) Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action {
 	if len(state.Threats) > 0 {
 		topThreat := state.Threats[0].Name
 
@@ -93,11 +93,11 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 
 		minHealth := 10.0
 		if topThreat == "skeleton" {
-			minHealth = 14.0 // FIX BUG 4
+			minHealth = 14.0
 		}
 
 		if len(state.Threats) == 1 && hasWeapon && state.Health > minHealth && topThreat != "creeper" && topThreat != "warden" {
-			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queue) {
+			if !isTaskActive(string(ActionHunt), topThreat, inFlight, queueSnapshot) {
 				return &Action{
 					ID:        fmt.Sprintf("routine-combat-%d", time.Now().UnixNano()),
 					Source:    string(SourceRoutine),
@@ -115,9 +115,9 @@ func (c *CombatRoutine) Check(state GameState, inFlight *Action, queue []Action)
 type EatingRoutine struct{}
 
 func (e *EatingRoutine) Name() string { return "eating" }
-func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+func (e *EatingRoutine) Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action {
 	// 15 = 7.5 drumsticks
-	if state.Food >= 15 || isTaskActive(string(ActionEat), "food", inFlight, queue) {
+	if state.Food >= 15 || isTaskActive(string(ActionEat), "food", inFlight, queueSnapshot) {
 		return nil
 	}
 	foodPriority := []string{"cooked_beef", "cooked_porkchop", "bread", "apple", "beef", "porkchop", "rotten_flesh"}
@@ -141,9 +141,9 @@ func (e *EatingRoutine) Check(state GameState, inFlight *Action, queue []Action)
 type SleepRoutine struct{}
 
 func (s *SleepRoutine) Name() string { return "sleep" }
-func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+func (s *SleepRoutine) Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action {
 	if state.TimeOfDay > 12541 && state.TimeOfDay < 23000 && state.HasBedNearby {
-		if !isTaskActive(string(ActionSleep), "bed", inFlight, queue) {
+		if !isTaskActive(string(ActionSleep), "bed", inFlight, queueSnapshot) {
 			return &Action{
 				ID:        fmt.Sprintf("routine-sleep-%d", time.Now().UnixNano()),
 				Source:    string(SourceRoutine),
@@ -160,7 +160,7 @@ func (s *SleepRoutine) Check(state GameState, inFlight *Action, queue []Action) 
 type ProgressionRoutine struct{}
 
 func (p *ProgressionRoutine) Name() string { return "progression" }
-func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action {
 	inv := make(map[string]int)
 	var logName string
 	hasWeapon := false
@@ -191,7 +191,7 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 	}
 
 	isActive := func(target string) bool {
-		return isTaskActive(string(ActionCraft), target, inFlight, queue)
+		return isTaskActive(string(ActionCraft), target, inFlight, queueSnapshot)
 	}
 
 	craft := func(target, rationale string) *Action {
@@ -272,7 +272,7 @@ func (p *ProgressionRoutine) Check(state GameState, inFlight *Action, queue []Ac
 type CookingRoutine struct{}
 
 func (c *CookingRoutine) Name() string { return "cooking" }
-func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
+func (c *CookingRoutine) Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action {
 	hasFurnace, hasRaw, hasFuel := false, false, false
 	rawFood := map[string]bool{"beef": true, "porkchop": true, "mutton": true, "chicken": true, "rabbit": true, "cod": true, "salmon": true}
 	fuelTypes := map[string]bool{"coal": true, "charcoal": true}
@@ -289,7 +289,7 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 		}
 	}
 
-	if hasFurnace && hasRaw && hasFuel && !isTaskActive(string(ActionSmelt), "food", inFlight, queue) {
+	if hasFurnace && hasRaw && hasFuel && !isTaskActive(string(ActionSmelt), "food", inFlight, queueSnapshot) {
 		return &Action{
 			ID:        fmt.Sprintf("routine-smelt-%d", time.Now().UnixNano()),
 			Source:    string(SourceRoutine),
@@ -305,8 +305,8 @@ func (c *CookingRoutine) Check(state GameState, inFlight *Action, queue []Action
 type WanderRoutine struct{}
 
 func (w *WanderRoutine) Name() string { return "wander" }
-func (w *WanderRoutine) Check(state GameState, inFlight *Action, queue []Action) *Action {
-	if inFlight == nil && len(queue) == 0 {
+func (w *WanderRoutine) Check(state GameState, inFlight *Action, queueSnapshot []Action) *Action {
+	if inFlight == nil && len(queueSnapshot) == 0 {
 		return &Action{
 			ID:        fmt.Sprintf("routine-wander-%d", time.Now().UnixNano()),
 			Source:    string(SourceRoutine),

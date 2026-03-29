@@ -7,13 +7,13 @@ import (
 )
 
 type InternalSimulator struct {
-	validator *PlanValidator
+	validator *Validator
 	logger    *slog.Logger
 }
 
 func NewInternalSimulator(logger *slog.Logger) *InternalSimulator {
 	return &InternalSimulator{
-		validator: NewPlanValidator(),
+		validator: NewValidator(),
 		logger:    logger.With(slog.String("component", "InternalSimulator")),
 	}
 }
@@ -36,7 +36,7 @@ func (s *InternalSimulator) RankCandidates(candidates [][]Action, rawState json.
 	for _, plan := range candidates {
 		// 1. Hard Feasibility Check
 		mockPlan := &LLMPlan{Tasks: plan}
-		if err := s.validator.ValidatePlan(mockPlan, rawState); err != nil {
+		if err := s.validator.ValidateLLMPlan(mockPlan, rawState); err != nil {
 			continue // Plan is impossible based on game rules, discard immediately
 		}
 

@@ -53,6 +53,7 @@ type Engine struct {
 	learning   *LearningSystem
 	telemetry  *Telemetry
 	uiHub      *UIHub
+	validator  *Validator
 	logger     *slog.Logger
 
 	eventCh chan EngineEvent
@@ -104,6 +105,7 @@ func NewEngine(
 		learning:       learning,
 		telemetry:      tel,
 		uiHub:          uiHub,
+		validator:      NewValidator(),
 		logger:         baseLogger.With(slog.String("session_id", sessionID)),
 		eventCh:        make(chan EngineEvent, 100),
 		queue:          NewTaskQueue(),
@@ -111,6 +113,24 @@ func NewEngine(
 		lastHealth:     20.0,
 		sessionID:      sessionID,
 		actionFailures: make(map[string]int),
+	}
+}
+
+// safeGo wraps a goroutine in the engine's WaitGroup for lifecycle tracking.
+func (e *Engine) safeGo(fn func()) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		fn()
+	}()
+}
+
+// safeSendEvent ensures we don't block indefinitely on a full channel
+// if the engine is shutting down, preventing wait group deadlocks.
+func (e *Engine) safeSendEvent(ctx context.Context, ev EngineEvent) {
+	select {
+	case <-ctx.Done():
+	case e.eventCh <- ev:
 	}
 }
 
@@ -123,10 +143,11 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 		_ = e.exec.Close()
 	}()
 
-	e.wg.Add(1)
-	go e.loop(runCtx)
+	e.safeGo(func() {
+		e.loop(runCtx)
+	})
 
-	go func() {
+	e.safeGo(func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -137,7 +158,7 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 				_ = e.memory.ConsolidateSession(runCtx, e.sessionID)
 			}
 		}
-	}()
+	})
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -157,12 +178,12 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 			var state GameState
 			if err := json.Unmarshal(msg.Payload, &state); err == nil {
 				state.POIs = e.learning.PenalizePOIs(state.POIs)
-				e.eventCh <- EventClientState{State: state, RawPayload: msg.Payload}
+				e.safeSendEvent(runCtx, EventClientState{State: state, RawPayload: msg.Payload})
 			}
 		case "event":
 			var act EventClientAction
 			if err := json.Unmarshal(msg.Payload, &act); err == nil {
-				e.eventCh <- act
+				e.safeSendEvent(runCtx, act)
 				e.uiHub.Broadcast(map[string]interface{}{"type": "event_stream", "payload": act})
 			}
 		default:
@@ -172,7 +193,6 @@ func (e *Engine) Run(ctx context.Context, conn *websocket.Conn) {
 }
 
 func (e *Engine) loop(ctx context.Context) {
-	defer e.wg.Done()
 	defer e.cancelPlanning()
 
 	for {
@@ -199,7 +219,7 @@ func (e *Engine) processEvent(ctx context.Context, event EngineEvent) {
 	case EventPlanError:
 		e.handlePlanError(ctx, ev)
 	case EventProcessNext:
-		e.processNextTask()
+		e.processNextTask(ctx)
 	}
 }
 
@@ -217,23 +237,24 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		topThreat = ev.State.Threats[0].Name
 	}
 
-	healthDropped := ev.State.Health < e.lastHealth && ev.State.Health < 5
-	criticalOverride := healthDropped && time.Since(e.lastReplan) > 15*time.Second
-
 	e.lastHealth = ev.State.Health
 	e.lastThreat = topThreat
 
 	for _, poi := range ev.State.POIs {
 		if poi.Name == "crafting_table" || poi.Name == "furnace" || strings.Contains(poi.Name, "bed") {
-			go e.memory.MarkWorldNode(context.Background(), poi.Name, "structure", poi.Position.X, poi.Position.Y, poi.Position.Z)
+			poiName, pX, pY, pZ := poi.Name, poi.Position.X, poi.Position.Y, poi.Position.Z
+			e.safeGo(func() { e.memory.MarkWorldNode(context.Background(), poiName, "structure", pX, pY, pZ) })
 		} else if poi.Name == "water" || poi.Name == "lava" {
-			go e.memory.MarkWorldNode(context.Background(), poi.Name, "environment", poi.Position.X, poi.Position.Y, poi.Position.Z)
+			poiName, pX, pY, pZ := poi.Name, poi.Position.X, poi.Position.Y, poi.Position.Z
+			e.safeGo(func() { e.memory.MarkWorldNode(context.Background(), poiName, "environment", pX, pY, pZ) })
 		} else if strings.Contains(poi.Name, "ore") {
-			go e.memory.MarkWorldNode(context.Background(), poi.Name, "resource", poi.Position.X, poi.Position.Y, poi.Position.Z)
+			poiName, pX, pY, pZ := poi.Name, poi.Position.X, poi.Position.Y, poi.Position.Z
+			e.safeGo(func() { e.memory.MarkWorldNode(context.Background(), poiName, "resource", pX, pY, pZ) })
 		}
 	}
 
-	strat := e.strategy.Evaluate(ev.State)
+	directive := e.strategy.Evaluate(ev.State, time.Since(e.lastReplan))
+	strat := directive.Strategy
 	stratChanged := false
 
 	overrideActive := strat.IsAutonomous && e.isAutonomousMode && e.currentStrategy != strat.PrimaryGoal
@@ -245,7 +266,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		stratChanged = true
 		e.planner.ClearMilestone()
 		e.resetExecutionState()
-		go e.setSummaryAsync("Current Strategy", strat.PrimaryGoal)
+		e.safeGo(func() { e.setSummary("Current Strategy", strat.PrimaryGoal) })
 	} else if !strat.IsAutonomous {
 		e.isAutonomousMode = false
 	}
@@ -286,19 +307,19 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 		HasThreat:     topThreat != "",
 	}
 
-	newRoutines := e.routine.Evaluate(ev.State, e.inFlightTask, e.queue.items)
+	newRoutines := e.routine.Evaluate(ev.State, e.inFlightTask, e.queue.Snapshot())
 	if len(newRoutines) > 0 {
 		e.queue.Push(newRoutines...)
 
 		if e.inFlightTask != nil && e.inFlightTask.Priority > newRoutines[0].Priority {
 			e.logger.Info("Routine interrupting in-flight task", slog.String("routine", newRoutines[0].Action))
-			go e.exec.SendControl("abort_task", "routine interrupt")
+			e.safeGo(func() { e.exec.SendControl("abort_task", "routine interrupt") })
 			e.inFlightTask = nil
 			e.lastReplan = time.Time{}
 		}
 
 		if e.inFlightTask == nil {
-			e.processNextTask()
+			e.processNextTask(ctx)
 		}
 	}
 
@@ -307,7 +328,7 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	if e.planning {
-		if criticalOverride {
+		if directive.InterruptCurrent {
 			e.cancelPlanning()
 		} else {
 			return
@@ -323,24 +344,24 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	timeSinceReplan := time.Since(e.lastReplan)
 	queueExhausted := e.inFlightTask == nil && e.queue.Len() == 0
 
-	needsReplan := e.lastReplan.IsZero() || criticalOverride || e.systemOverride != "" || stateChanged || stratChanged || e.planner.GetActiveMilestone() == nil || queueExhausted
+	needsReplan := e.lastReplan.IsZero() || directive.TriggerReplan || e.systemOverride != "" || stateChanged || stratChanged || e.planner.GetActiveMilestone() == nil || queueExhausted
 
-	if isExecutingTactics && !criticalOverride && !stratChanged {
-		if e.systemOverride == "" {
+	if isExecutingTactics && !directive.TriggerReplan && !stratChanged {
+		if e.systemOverride == "" && directive.CriticalOverride == "" {
 			return
 		}
 	}
 
-	if criticalOverride && isExecutingTactics {
+	if directive.InterruptCurrent && isExecutingTactics {
 		e.resetExecutionState()
-		go e.exec.SendControl("noop", "critical state interrupt")
+		e.safeGo(func() { e.exec.SendControl("noop", "critical state interrupt") })
 	}
 
 	if !needsReplan {
 		return
 	}
 
-	if timeSinceReplan < 5*time.Second && !criticalOverride && !stratChanged && e.systemOverride == "" && e.inFlightTask != nil {
+	if timeSinceReplan < 5*time.Second && !directive.TriggerReplan && !stratChanged && e.systemOverride == "" && directive.CriticalOverride == "" && e.inFlightTask != nil {
 		return
 	}
 
@@ -354,7 +375,13 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	}
 
 	learnedRules := e.learning.GetRules()
-	sysOverride := fmt.Sprintf("PRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\n%s\nAll milestones and tasks MUST align with these strategies.\n\n%s", primaryForPrompt, secondaryForPrompt, learnedRules, e.systemOverride)
+
+	finalOverride := e.systemOverride
+	if directive.CriticalOverride != "" {
+		finalOverride = directive.CriticalOverride + "\n" + finalOverride
+	}
+
+	sysOverride := fmt.Sprintf("PRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\n%s\nAll milestones and tasks MUST align with these strategies.\n\n%s", primaryForPrompt, secondaryForPrompt, learnedRules, finalOverride)
 	e.systemOverride = ""
 
 	updatedPayload, _ := json.Marshal(ev.State)
@@ -367,16 +394,16 @@ func (e *Engine) handleStateUpdate(ctx context.Context, ev EventClientState) {
 	e.telemetry.RecordReplan()
 	traceID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
 
-	go func() {
+	e.safeGo(func() {
 		plan, err := e.planner.GeneratePlan(planCtx, updatedPayload, e.sessionID, sysOverride)
 		if err != nil {
 			if planCtx.Err() != context.Canceled {
-				e.eventCh <- EventPlanError{Epoch: epochAtStart, Error: err}
+				e.safeSendEvent(ctx, EventPlanError{Epoch: epochAtStart, Error: err})
 			}
 			return
 		}
-		e.eventCh <- EventPlanReady{Epoch: epochAtStart, TraceID: traceID, Plan: plan}
-	}()
+		e.safeSendEvent(ctx, EventPlanReady{Epoch: epochAtStart, TraceID: traceID, Plan: plan})
+	})
 }
 
 func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
@@ -399,7 +426,7 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 		e.logger.Warn("LLM plan contained zero actionable tasks. Recording stall.")
 		e.planner.RecordStall()
 		e.lastReplan = time.Time{}
-		go e.exec.SendControl("noop", "No actionable tasks generated")
+		e.safeGo(func() { e.exec.SendControl("noop", "No actionable tasks generated") })
 		return
 	}
 
@@ -408,11 +435,11 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 			e.logger.Info("LLM Autonomous Strategy Override", slog.String("new_strategy", ev.Plan.ProposedStrategy))
 			e.currentStrategy = ev.Plan.ProposedStrategy
 			e.planner.ClearMilestone()
-			go e.setSummaryAsync("Current Strategy", ev.Plan.ProposedStrategy)
+			e.safeGo(func() { e.setSummary("Current Strategy", ev.Plan.ProposedStrategy) })
 		}
 	}
 
-	planRes := ValidatePlan(ev.Plan.Tasks, e.lastState)
+	planRes := e.validator.ValidateActionChain(ev.Plan.Tasks, e.lastState)
 	if !planRes.Valid {
 		e.logger.Warn("Plan validation failed pre-flight", slog.String("reason", planRes.Reason))
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Plan rejected. %s. %s", planRes.Reason, planRes.FixHint)
@@ -436,7 +463,7 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	}
 
 	e.uiHub.Broadcast(map[string]interface{}{"type": "objective_update", "payload": ev.Plan.Objective})
-	go e.setSummaryAsync("Current Objective", ev.Plan.Objective)
+	e.safeGo(func() { e.setSummary("Current Objective", ev.Plan.Objective) })
 
 	e.queue.ClearBySource(SourceLLM)
 	e.queue.Push(ev.Plan.Tasks...)
@@ -453,7 +480,7 @@ func (e *Engine) handlePlanReady(ctx context.Context, ev EventPlanReady) {
 	})
 
 	e.tasksCompletedSinceReplan = 0
-	e.processNextTask()
+	e.processNextTask(ctx)
 }
 
 func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
@@ -467,7 +494,7 @@ func (e *Engine) handlePlanError(ctx context.Context, ev EventPlanError) {
 		"error": ev.Error.Error(),
 	})
 	e.logger.Error("Planning failed", slog.Any("error", ev.Error))
-	go e.exec.SendControl("planning_error", "Failed to generate valid plan")
+	e.safeGo(func() { e.exec.SendControl("planning_error", "Failed to generate valid plan") })
 
 	e.lastReplan = time.Now()
 }
@@ -510,9 +537,12 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.tsEmergencyLock = false
 
 		meta.Status = string(StatusFailed)
-		go e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta)
+		e.safeGo(func() { e.memory.LogEvent("death", "Died due to: "+ev.Cause, meta) })
 
-		go e.memory.MarkWorldNode(context.Background(), fmt.Sprintf("death_zone_%d", time.Now().Unix()), "hazard", e.lastPos.X, e.lastPos.Y, e.lastPos.Z)
+		pX, pY, pZ := e.lastPos.X, e.lastPos.Y, e.lastPos.Z
+		e.safeGo(func() {
+			e.memory.MarkWorldNode(context.Background(), fmt.Sprintf("death_zone_%d", time.Now().Unix()), "hazard", pX, pY, pZ)
+		})
 
 		e.eventStore.Append(ctx, e.sessionID, "", "Death", map[string]interface{}{
 			"position": e.lastPos,
@@ -526,7 +556,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		e.tsEmergencyLock = true
 
 		meta.Status = string(StatusPanic)
-		go e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta)
+		e.safeGo(func() { e.memory.LogEvent("evasion", "Fled from threat: "+ev.Cause, meta) })
 		e.logger.Warn("Emergency Lock ENGAGED", append(logCtx, slog.String("cause", ev.Cause))...)
 
 	case "panic_retreat_end":
@@ -545,13 +575,13 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		e.telemetry.RecordTaskStatus(StatusCompleted)
 		meta.Status = string(StatusCompleted)
-		go e.memory.LogEvent(ev.Action, "Finished successfully", meta)
+		e.safeGo(func() { e.memory.LogEvent(ev.Action, "Finished successfully", meta) })
 		e.logger.Info("Task completed", logCtx...)
 		e.inFlightTask = nil
 
 		e.tasksCompletedSinceReplan++
 		e.planner.ResetStall()
-		e.processNextTask()
+		e.processNextTask(ctx)
 
 	case "task_failed", "task_aborted":
 		if !e.matchesInFlight(ev.CommandID) {
@@ -569,7 +599,7 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 
 		e.telemetry.RecordTaskStatus(status)
 		meta.Status = string(status)
-		go e.memory.LogEvent(ev.Action, "Task "+string(status)+": "+failCause, meta)
+		e.safeGo(func() { e.memory.LogEvent(ev.Action, "Task "+string(status)+": "+failCause, meta) })
 		e.logger.Warn("Task incomplete", append(logCtx, slog.String("event", ev.Event), slog.String("cause", failCause))...)
 
 		if e.inFlightTask != nil && e.inFlightTask.Source == string(SourceRoutine) {
@@ -614,11 +644,11 @@ func (e *Engine) handleClientAction(ctx context.Context, ev EventClientAction) {
 		}
 
 		e.systemOverride = fmt.Sprintf("CRITICAL OVERRIDE: Task '%s' %s. Cause: %s. %s", ev.Action, string(status), failCause, advice)
-		go e.setSummaryAsync("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause)
+		e.safeGo(func() { e.setSummary("Last Failure", ev.Action+" ("+ev.Event+"): "+failCause) })
 	}
 }
 
-func (e *Engine) processNextTask() {
+func (e *Engine) processNextTask(ctx context.Context) {
 	if e.inFlightTask != nil || e.queue.Len() == 0 {
 		return
 	}
@@ -626,13 +656,13 @@ func (e *Engine) processNextTask() {
 	e.inFlightTask = e.queue.Pop()
 	task := e.inFlightTask
 
-	res := ValidateAction(*task, e.lastState)
+	res := e.validator.ValidateAction(*task, e.lastState)
 	if !res.Valid {
 		switch res.Severity {
 		case SeverityAdvisory:
 			e.logger.Info("Task skipped (Advisory)", slog.String("reason", res.Reason))
 			e.inFlightTask = nil
-			go func() { e.eventCh <- EventProcessNext{} }()
+			e.safeGo(func() { e.safeSendEvent(ctx, EventProcessNext{}) })
 			return
 		case SeverityBlocking:
 			e.logger.Warn("Task blocked", slog.String("reason", res.Reason))
@@ -650,34 +680,35 @@ func (e *Engine) processNextTask() {
 
 	if task.Action == string(ActionMarkLocation) {
 		locName := task.Target.Name
-		e.wg.Add(1)
-		go func(name string, x, y, z float64, tID string) {
-			defer e.wg.Done()
-			err := e.memory.MarkWorldNode(context.Background(), name, "user_marked", x, y, z)
+		pX, pY, pZ := e.lastPos.X, e.lastPos.Y, e.lastPos.Z
+		tID := task.Trace.TraceID
+		cID := task.ID
+		e.safeGo(func() {
+			err := e.memory.MarkWorldNode(context.Background(), locName, "user_marked", pX, pY, pZ)
 			if err == nil {
-				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", name, x, y, z)
-				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: x, Y: y, Z: z, Status: "COMPLETED"})
-				e.logger.Info("World node mapped", slog.String("name", name))
+				msg := fmt.Sprintf("Marked %s at X:%.1f, Y:%.1f, Z:%.1f", locName, pX, pY, pZ)
+				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, X: pX, Y: pY, Z: pZ, Status: "COMPLETED"})
+				e.logger.Info("World node mapped", slog.String("name", locName))
 			}
-			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionMarkLocation), CommandID: task.ID}
-		}(locName, e.lastPos.X, e.lastPos.Y, e.lastPos.Z, task.Trace.TraceID)
+			e.safeSendEvent(ctx, EventClientAction{Event: "task_completed", Action: string(ActionMarkLocation), CommandID: cID})
+		})
 		return
 	}
 
 	if task.Action == string(ActionRecallLocation) {
 		locName := task.Target.Name
-		e.wg.Add(1)
-		go func(name string, tID string) {
-			defer e.wg.Done()
-			node, err := e.memory.GetNode(context.Background(), name)
+		tID := task.Trace.TraceID
+		cID := task.ID
+		e.safeGo(func() {
+			node, err := e.memory.GetNode(context.Background(), locName)
 			if err == nil {
-				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", name, node.X, node.Y, node.Z)
+				msg := fmt.Sprintf("Recalled %s at X:%.1f, Y:%.1f, Z:%.1f", locName, node.X, node.Y, node.Z)
 				e.memory.LogEvent("world_model", msg, EventMeta{SessionID: e.sessionID, TraceID: tID, Status: "COMPLETED"})
-				e.setSummaryAsync("Target Node: "+name, msg)
+				e.setSummary("Target Node: "+locName, msg)
 			}
 			time.Sleep(1 * time.Second)
-			e.eventCh <- EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: task.ID}
-		}(locName, task.Trace.TraceID)
+			e.safeSendEvent(ctx, EventClientAction{Event: "task_completed", Action: string(ActionRecallLocation), CommandID: cID})
+		})
 		return
 	}
 
@@ -713,7 +744,7 @@ func (e *Engine) cancelPlanning() {
 	e.planning = false
 }
 
-func (e *Engine) setSummaryAsync(key, value string) {
+func (e *Engine) setSummary(key, value string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = e.memory.SetSummary(ctx, e.sessionID, key, value)

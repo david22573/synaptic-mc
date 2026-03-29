@@ -33,7 +33,8 @@ func (q *TaskQueue) Push(tasks ...Action) {
 	})
 }
 
-// Pop removes and returns the highest priority task. Returns nil if empty.
+// Pop removes and returns the highest priority task.
+// Returns nil if empty.
 func (q *TaskQueue) Pop() *Action {
 	if len(q.items) == 0 {
 		return nil
@@ -82,4 +83,12 @@ func (q *TaskQueue) HasRoutineTarget(action, targetName string) bool {
 
 func (q *TaskQueue) Len() int {
 	return len(q.items)
+}
+
+// Snapshot returns a copy of the current queue state.
+// This prevents routines from holding or mutating the engine's internal slice.
+func (q *TaskQueue) Snapshot() []Action {
+	snap := make([]Action, len(q.items))
+	copy(snap, q.items)
+	return snap
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"david22573/synaptic-mc/engine"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -91,7 +92,7 @@ func main() {
 		modelName = DefaultModel
 	}
 
-	memory, err := NewSQLiteMemory(DatabasePath, logger)
+	memory, err := engine.NewSQLiteMemory(DatabasePath, logger)
 	if err != nil {
 		logger.Error("Fatal: could not initialize database", slog.Any("error", err))
 		os.Exit(1)
@@ -99,7 +100,7 @@ func main() {
 	defer memory.Close()
 	logger.Info("Database initialized", slog.String("path", DatabasePath))
 
-	eventStore, err := NewSQLiteEventStore("./events.db")
+	eventStore, err := engine.NewSQLiteEventStore("./events.db")
 	if err != nil {
 		logger.Error("Fatal: could not initialize event store", slog.Any("error", err))
 		os.Exit(1)
@@ -107,14 +108,14 @@ func main() {
 	defer eventStore.Close()
 	logger.Info("Event Store initialized", slog.String("path", "./events.db"))
 
-	telemetry := NewTelemetry(logger, 5.00)
+	telemetry := engine.NewTelemetry(logger, 5.00)
 	go telemetry.StartReporting(ctx)
 
-	rawBrain := NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
-	fallbackBrain := NewFallbackBrain()
-	brain := NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
+	rawBrain := engine.NewLLMBrain(apiURL, modelName, apiKey, memory, telemetry)
+	fallbackBrain := engine.NewFallbackBrain()
+	brain := engine.NewResilientBrain(rawBrain, fallbackBrain, logger, telemetry)
 
-	uiHub := NewUIHub(logger)
+	uiHub := engine.NewUIHub(logger)
 	go uiHub.Run(ctx)
 
 	config, err := LoadConfig("./config.json")
@@ -145,14 +146,14 @@ func main() {
 
 		sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 
-		learningSystem := NewLearningSystem(logger)
+		learningSystem := engine.NewLearningSystem(logger)
 		learningSystem.LoadEpisodicMemory(ctx, eventStore) // Load trauma
 
-		planner := NewTacticalPlanner(brain, memory, sessionID, logger)
-		routine := NewDefaultRoutineManager()
-		exec := NewWSExecutor(conn)
+		planner := engine.NewTacticalPlanner(brain, memory, sessionID, logger)
+		routine := engine.NewDefaultRoutineManager()
+		exec := engine.NewWSExecutor(conn)
 
-		engine := NewEngine(planner, routine, exec, memory, telemetry, uiHub, learningSystem, logger, sessionID, eventStore)
+		engine := engine.NewEngine(planner, routine, exec, memory, telemetry, uiHub, learningSystem, logger, sessionID, eventStore)
 		engine.Run(ctx, conn)
 
 		logger.Info("Bot disconnected", slog.String("remote_addr", r.RemoteAddr))
