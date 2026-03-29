@@ -20,6 +20,7 @@ type GameState struct {
 	Hotbar       []*Item  `json:"hotbar"`
 	Offhand      *Item    `json:"offhand"`
 	ActiveSlot   int      `json:"active_slot"`
+	Feedback     []string `json:"feedback,omitempty"` // Short-term memory for pipeline rejections
 }
 
 type Threat struct {

@@ -31,6 +31,7 @@ type Orchestrator struct {
 	mu               sync.RWMutex
 	lastState        domain.GameState
 	reflexLock       bool
+	lastPlannerError string // Tracks immediate validation/policy rejections
 	uiHub            *observability.Hub
 	planningInFlight atomic.Bool
 
@@ -162,6 +163,7 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
+	lastErr := o.lastPlannerError
 	o.mu.RUnlock()
 
 	if tm == nil {
@@ -180,6 +182,11 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 		return nil // Already planning
 	}
 
+	// Inject the short-term feedback loop
+	if lastErr != "" {
+		state.Feedback = append(state.Feedback, "PREVIOUS PLAN REJECTED: "+lastErr)
+	}
+
 	trace := domain.TraceContext{
 		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
 		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
@@ -192,13 +199,23 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 	default:
 	}
 
-	go func() {
+	go func(evalState domain.GameState) {
 		defer o.planningInFlight.Store(false)
-		plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
+
+		plan, err := o.decision.Evaluate(ctx, o.sessionID, evalState, trace)
 		if err != nil {
 			o.logger.Error("decision evaluation failed", slog.Any("error", err))
+			// Store the failure so the LLM knows it messed up on the next tick
+			o.mu.Lock()
+			o.lastPlannerError = err.Error()
+			o.mu.Unlock()
 			return
 		}
+
+		// Clear the error state once a valid plan goes through
+		o.mu.Lock()
+		o.lastPlannerError = ""
+		o.mu.Unlock()
 
 		if plan == nil || len(plan.Tasks) == 0 {
 			return
@@ -213,7 +230,7 @@ func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState
 			slog.Int("tasks", len(plan.Tasks)))
 
 		_ = tm.Enqueue(ctx, plan.Tasks...)
-	}()
+	}(state)
 
 	return nil
 }

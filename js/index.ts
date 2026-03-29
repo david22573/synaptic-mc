@@ -19,6 +19,7 @@ const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err);
     const name = String(err.name || "");
+
     return (
         name === "PartialReadError" ||
         msg.includes("Read error for undefined") ||
@@ -119,6 +120,7 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
+
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -157,6 +159,7 @@ function normalizeFailureCause(err: any): string {
 
 async function executeDecision(decision: models.IncomingDecision) {
     if (!decision?.action) return;
+
     if (isShuttingDown) {
         log.warn("Ignoring decision during shutdown", {
             action: decision.action,
@@ -180,6 +183,7 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 
     abortActiveTask("preempted");
+
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
@@ -227,6 +231,14 @@ async function executeDecision(decision: models.IncomingDecision) {
     } catch (err: any) {
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
+
+            log.error("Task execution failed natively", {
+                action: decision.action,
+                target: decision.target?.name,
+                raw_error: err.message,
+                normalized_cause: normalizedCause,
+            });
+
             completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
@@ -244,7 +256,6 @@ async function executeDecision(decision: models.IncomingDecision) {
 function pushState() {
     if (!bot?.entity || !client) return;
 
-    // Extract exact hotbar and offhand slots from Mineflayer memory
     const hotbarStart = bot.inventory.hotbarStart || 36;
     const hotbar = Array.from({ length: 9 }, (_, i) => {
         const item = bot.inventory.slots[hotbarStart + i];
@@ -253,7 +264,6 @@ function pushState() {
 
     const offhandItem = bot.inventory.slots[45];
 
-    // Added bot.quickBarSlot to the signature so UI updates instantly when switching items
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -313,6 +323,7 @@ async function connectWithRetry(maxAttempts = 10) {
     }
 
     log.info(`Connecting bot (Attempt ${reconnectAttempt}/${maxAttempts})...`);
+
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
@@ -327,6 +338,7 @@ async function connectWithRetry(maxAttempts = 10) {
             ws_url: runtimeConfig.ws_url,
             attempt: reconnectAttempt,
         });
+
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (d) => void executeDecision(d),
             onUnlock: () => abortActiveTask("unlock"),

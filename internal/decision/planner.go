@@ -34,13 +34,16 @@ func NewLLMPlanner(client LLMClient, evaluator *strategy.Evaluator, extractor Ru
 	}
 }
 
-// Enhanced System Rules to explicitly block invalid food/combat loops
+// Enhanced System Rules with stricter naming conventions to stop TS rejections
+// and an explicit command to heed validation feedback loops.
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
+
 CRITICAL GAME MECHANIC RULES:
 1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2. You CANNOT gather stone or coal without a wooden_pickaxe.
 3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM.
-4. SURVIVAL: You CANNOT 'eat' if your inventory has no food. You CANNOT 'hunt' if health is under 12.
+4. SURVIVAL: You CANNOT 'eat' if your inventory has no food. 
+   You CANNOT 'hunt' if health is under 12.
 5. CRAFTING RECIPES:
    - oak_planks: requires 1 oak_log (yields 4)
    - stick: requires 2 oak_planks (yields 4)
@@ -48,8 +51,13 @@ CRITICAL GAME MECHANIC RULES:
    - wooden_pickaxe: requires 3 oak_planks + 2 stick
    - stone_pickaxe: requires 3 cobblestone + 2 stick
 6. If you lack the prerequisites for an item, your plan MUST include gathering or crafting those prerequisites first.
+7. FEEDBACK LOOP: If the state contains 'feedback' showing a previous plan was rejected, YOU MUST NOT REPEAT THE EXACT SAME PLAN. Fix the validation errors (e.g., gather prerequisites first).
+
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
 VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
+
+CRITICAL NAMING RULE: Target names MUST be exact Minecraft IDs (e.g., "pig", "cow", "cobblestone", "dirt"). DO NOT use generic or abstract terms like "animal", "shelter_hole", "passive_animals", or "food".
+
 Response format (JSON only):
 {
   "objective": "Sub-goal description",
