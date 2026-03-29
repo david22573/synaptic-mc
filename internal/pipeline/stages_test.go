@@ -18,18 +18,20 @@ func TestPipelineStages_Integration(t *testing.T) {
 		},
 	}
 
-	state := &PipelineState{
+	// Initialize by value, not pointer
+	state := PipelineState{
 		GameState: domain.GameState{
 			Inventory: []domain.Item{{Name: "wooden_pickaxe", Count: 1}},
 			POIs:      []domain.POI{{Name: "stone", Distance: 5.0}},
 		},
-		Trace: domain.TraceContext{TraceID: "tr-123"},
+		Trace: domain.TraceContext{TraceID: "tr-123", ActionID: "act-1"},
 		Plan:  rawPlan,
 	}
 
 	// 1. Normalize
 	normStage := NewNormalizeStage()
-	if err := normStage.Process(ctx, state); err != nil {
+	state, err := normStage.Process(ctx, state) // Capture returned state
+	if err != nil {
 		t.Fatalf("Normalize failed: %v", err)
 	}
 
@@ -42,7 +44,8 @@ func TestPipelineStages_Integration(t *testing.T) {
 
 	// 2. Validate
 	valStage := NewValidateStage()
-	if err := valStage.Process(ctx, state); err != nil {
+	state, err = valStage.Process(ctx, state) // Pass the newly normalized state
+	if err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
 
@@ -52,7 +55,8 @@ func TestPipelineStages_Integration(t *testing.T) {
 
 	// 3. Simulate
 	simStage := NewSimulateStage()
-	if err := simStage.Process(ctx, state); err != nil {
+	state, err = simStage.Process(ctx, state) // Pass the validated state
+	if err != nil {
 		t.Fatalf("Simulate failed: %v", err)
 	}
 
