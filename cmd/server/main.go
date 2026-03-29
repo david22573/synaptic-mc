@@ -1,3 +1,4 @@
+// cmd/server/main.go
 package main
 
 import (
@@ -49,14 +50,12 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	// 2. Build the Pure Decision Pipeline (Phase 3 & 4)
+	// 2. Build the Pure Decision Pipeline (Phase 1)
 	evaluator := strategy.NewEvaluator()
 	planner := decision.NewLLMPlanner(llmClient, evaluator)
-	validator := decision.NewRuleValidator()
-	simulator := decision.NewCostSimulator()
 	policy := decision.NewHardGuardrails()
 
-	decisionEngine := decision.NewPipeline(planner, validator, simulator, policy)
+	decisionEngine := decision.NewPipeline(planner, policy)
 
 	// 3. Network & Orchestration Binding
 	mux := http.NewServeMux()
@@ -70,7 +69,7 @@ func main() {
 		sessionID := "sess-" + time.Now().Format("20060102150405")
 		logger.Info("Agent Connected", slog.String("session", sessionID))
 
-		// 4. Execution layer with Idempotency (Phase 5)
+		// 4. Execution layer with Idempotency
 		baseController := execution.NewWSController(conn)
 		safeController := execution.NewIdempotentController(baseController, 100)
 
@@ -83,7 +82,7 @@ func main() {
 		// Serve static UI files if needed
 		mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
 
-		// 5. Run Orchestrator (Phase 1 & 2)
+		// 5. Run Orchestrator
 		orch := orchestrator.New(sessionID, store, decisionEngine, safeController, uiHub, logger)
 
 		// Create a session-specific context

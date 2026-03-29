@@ -1,46 +1,60 @@
+// internal/decision/pipeline.go
 package decision
 
 import (
 	"context"
-	"david22573/synaptic-mc/internal/domain"
 	"fmt"
+
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/pipeline"
+	"david22573/synaptic-mc/internal/policy"
 )
 
 type Stage interface {
 	Process(ctx context.Context, frame EvaluationFrame, plan *domain.Plan) (*domain.Plan, error)
 }
 
+// Pipeline implements the DecisionEngine with a strict multi-step process.
 type Pipeline struct {
-	planner Planner // Special first stage
-	stages  []Stage
+	planner Planner
+	stages  []pipeline.Stage
 }
 
-func NewPipeline(planner Planner, stages ...Stage) *Pipeline {
+func NewPipeline(p Planner, policyEngine policy.Engine) *Pipeline {
 	return &Pipeline{
-		planner: planner,
-		stages:  stages,
+		planner: p,
+		stages: []pipeline.Stage{
+			pipeline.NewNormalizeStage(),
+			pipeline.NewValidateStage(),
+			pipeline.NewSimulateStage(),
+			pipeline.NewPolicyStage(policyEngine), // Policy is now officially in the pipeline
+		},
 	}
 }
 
-func (p *Pipeline) Evaluate(ctx context.Context, frame EvaluationFrame) (*Outcome, error) {
-	// 1. Generate Candidate (Planner)
-	plan, err := p.planner.Generate(ctx, frame)
+func (p *Pipeline) Evaluate(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) (*domain.Plan, error) {
+	rawPlan, err := p.planner.Generate(ctx, sessionID, state)
 	if err != nil {
-		return nil, fmt.Errorf("planning failed: %w", err)
+		return nil, fmt.Errorf("planning phase failed: %w", err)
 	}
 
-	// 2. Linear Transformation (The Pipeline)
-	// Stages: Normalize -> Validate -> Simulate -> Policy
+	pipeState := &pipeline.PipelineState{
+		SessionID: sessionID,
+		GameState: state,
+		Trace:     trace,
+		Plan:      rawPlan,
+	}
+
+	// Execute Pure Stages: Normalize -> Validate -> Simulate -> Policy
 	for _, stage := range p.stages {
-		plan, err = stage.Process(ctx, frame, plan)
-		if err != nil {
-			// If a stage fails, it returns a "Hard Rejection" error.
-			return nil, err
+		if err := stage.Process(ctx, pipeState); err != nil {
+			return nil, fmt.Errorf("pipeline stage failed: %w", err)
 		}
 	}
 
-	return &Outcome{
-		Plan:     plan,
-		Priority: 100, // Default priority
-	}, nil
+	if pipeState.Validation != nil && !pipeState.Validation.IsValid {
+		return nil, fmt.Errorf("validation phase failed: %v", pipeState.Validation.Errors)
+	}
+
+	return pipeState.FinalPlan, nil
 }

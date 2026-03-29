@@ -1,3 +1,4 @@
+// internal/pipeline/normalize.go
 package pipeline
 
 import (

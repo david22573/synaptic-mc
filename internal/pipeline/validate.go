@@ -1,3 +1,4 @@
+// internal/pipeline/validate.go
 package pipeline
 
 import (
