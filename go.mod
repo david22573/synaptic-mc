@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/joho/godotenv v1.5.1
+	golang.org/x/sync v0.19.0
 	modernc.org/sqlite v1.47.0
 )
 
