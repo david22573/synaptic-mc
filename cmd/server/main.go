@@ -18,6 +18,7 @@ import (
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/orchestrator"
+	"david22573/synaptic-mc/internal/policy"
 	"david22573/synaptic-mc/internal/strategy"
 
 	"github.com/gorilla/websocket"
@@ -50,12 +51,15 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	// 2. Build the Pure Decision Pipeline (Phase 1)
+	// 2. Build the Pure Decision Pipeline (Phase 2)
 	evaluator := strategy.NewEvaluator()
 	planner := decision.NewLLMPlanner(llmClient, evaluator)
-	policy := decision.NewHardGuardrails()
 
-	decisionEngine := decision.NewPipeline(planner, policy)
+	// Chain policies
+	survivalPolicy := policy.NewSurvivalPolicy()
+	compositePolicy := policy.NewCompositePolicy(survivalPolicy)
+
+	decisionEngine := decision.NewPipeline(planner, compositePolicy)
 
 	// 3. Network & Orchestration Binding
 	mux := http.NewServeMux()
