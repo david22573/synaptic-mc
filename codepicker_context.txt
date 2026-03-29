@@ -1,15 +1,13 @@
-Project Context Dump (28 Mar 26 21:17 PDT)
+Project Context Dump (28 Mar 26 21:27 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 26
+Total Files: 37
 
 # Project Structure
 <file_tree>
-- cmd\server\main.go
 - internal\decision\engine.go
 - internal\decision\pipeline.go
 - internal\decision\planner.go
-- internal\decision\policy.go
 - internal\decision\simulator.go
 - internal\decision\types.go
 - internal\domain\events.go
@@ -25,167 +23,28 @@ Total Files: 26
 - internal\orchestrator\loop.go
 - internal\orchestrator\task_manager.go
 - internal\pipeline\normalize.go
+- internal\pipeline\policy.go
 - internal\pipeline\simulate.go
 - internal\pipeline\stage.go
 - internal\pipeline\stage_test.go
 - internal\pipeline\stages_test.go
 - internal\pipeline\validate.go
+- internal\policy\composite.go
+- internal\policy\engine.go
+- internal\policy\survival.go
+- internal\policy\survival_test.go
 - internal\strategy\evaluator.go
+- ui\index.html
+- ui\src\App.svelte
+- ui\src\app.css
+- ui\src\components\ItemIcon.svelte
+- ui\src\lib\Counter.svelte
+- ui\src\main.ts
+- ui\svelte.config.js
+- ui\vite.config.ts
 </file_tree>
 
 # File Contents
-<file path="cmd\server\main.go">
-// cmd/server/main.go
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"log/slog"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"david22573/synaptic-mc/internal/decision"
-	"david22573/synaptic-mc/internal/domain"
-	"david22573/synaptic-mc/internal/eventstore"
-	"david22573/synaptic-mc/internal/execution"
-	"david22573/synaptic-mc/internal/llm"
-	"david22573/synaptic-mc/internal/observability"
-	"david22573/synaptic-mc/internal/orchestrator"
-	"david22573/synaptic-mc/internal/strategy"
-
-	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
-)
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func main() {
-	_ = godotenv.Load()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// 1. Storage & API Clients
-	store, err := eventstore.NewSQLiteEventStore("./events.db")
-	if err != nil {
-		logger.Error("Failed to init event store", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer store.Close()
-
-	llmClient := llm.NewClient(llm.Config{
-		APIURL:     "https://openrouter.ai/api/v1/chat/completions",
-		APIKey:     os.Getenv("OPENROUTER_API_KEY"),
-		Model:      "deepseek/deepseek-v3.2",
-		MaxRetries: 3,
-	})
-
-	// 2. Build the Pure Decision Pipeline (Phase 1)
-	evaluator := strategy.NewEvaluator()
-	planner := decision.NewLLMPlanner(llmClient, evaluator)
-	policy := decision.NewHardGuardrails()
-
-	decisionEngine := decision.NewPipeline(planner, policy)
-
-	// 3. Network & Orchestration Binding
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
-			return
-		}
-
-		sessionID := "sess-" + time.Now().Format("20060102150405")
-		logger.Info("Agent Connected", slog.String("session", sessionID))
-
-		// 4. Execution layer with Idempotency
-		baseController := execution.NewWSController(conn)
-		safeController := execution.NewIdempotentController(baseController, 100)
-
-		uiHub := observability.NewHub(logger)
-		go uiHub.Run(ctx)
-
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ui/ws", uiHub.HandleConnections) // Mount the UI websocket
-
-		// Serve static UI files if needed
-		mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
-
-		// 5. Run Orchestrator
-		orch := orchestrator.New(sessionID, store, decisionEngine, safeController, uiHub, logger)
-
-		// Create a session-specific context
-		sessCtx, sessCancel := context.WithCancel(ctx)
-		defer sessCancel()
-
-		// Start the Orchestrator lifecycle in the background
-		go func() {
-			if err := orch.Run(sessCtx); err != nil && err != context.Canceled {
-				logger.Error("Orchestrator failed", slog.Any("error", err))
-			}
-		}()
-
-		// WebSocket Read Loop: Ingests state and events into the Orchestrator
-		for {
-			var msg struct {
-				Type    string              `json:"type"`
-				Payload json.RawMessage     `json:"payload"`
-				Trace   domain.TraceContext `json:"trace"`
-			}
-
-			if err := conn.ReadJSON(&msg); err != nil {
-				logger.Warn("Bot disconnected", slog.Any("error", err))
-				break // Exits loop, fires defer sessCancel() shutting down Orchestrator
-			}
-
-			switch msg.Type {
-			case "state":
-				var state domain.GameState
-				if err := json.Unmarshal(msg.Payload, &state); err == nil {
-					orch.IngestState(sessCtx, state)
-				}
-			case "event":
-				orch.IngestEvent(sessCtx, domain.DomainEvent{
-					SessionID: sessionID,
-					Trace:     msg.Trace,
-					Type:      domain.EventType(msg.Type),
-					Payload:   msg.Payload,
-					CreatedAt: time.Now(),
-				})
-			}
-		}
-	})
-
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
-	}
-
-	go func() {
-		logger.Info("Listening on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("Server crashed", slog.Any("error", err))
-		}
-	}()
-
-	<-ctx.Done()
-	logger.Info("Shutting down...")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
-}
-
-</file>
-
 <file path="internal\decision\engine.go">
 // internal/decision/engine.go
 package decision
@@ -214,13 +73,16 @@ type PolicyEnforcer interface {
 </file>
 
 <file path="internal\decision\pipeline.go">
+// internal/decision/pipeline.go
 package decision
 
 import (
 	"context"
+	"fmt"
+
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/pipeline"
-	"fmt"
+	"david22573/synaptic-mc/internal/policy"
 )
 
 type Stage interface {
@@ -230,30 +92,27 @@ type Stage interface {
 // Pipeline implements the DecisionEngine with a strict multi-step process.
 type Pipeline struct {
 	planner Planner
-	policy  PolicyEnforcer // Retained temporarily until Phase 2
 	stages  []pipeline.Stage
 }
 
-func NewPipeline(p Planner, pe PolicyEnforcer) *Pipeline {
+func NewPipeline(p Planner, policyEngine policy.Engine) *Pipeline {
 	return &Pipeline{
 		planner: p,
-		policy:  pe,
 		stages: []pipeline.Stage{
 			pipeline.NewNormalizeStage(),
 			pipeline.NewValidateStage(),
 			pipeline.NewSimulateStage(),
+			pipeline.NewPolicyStage(policyEngine), // Policy is now officially in the pipeline
 		},
 	}
 }
 
 func (p *Pipeline) Evaluate(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) (*domain.Plan, error) {
-	// 1. Plan: Generate raw candidate plans (Side effect boundary: LLM API Call)
 	rawPlan, err := p.planner.Generate(ctx, sessionID, state)
 	if err != nil {
 		return nil, fmt.Errorf("planning phase failed: %w", err)
 	}
 
-	// 2. Initialize the immutable pipeline state
 	pipeState := &pipeline.PipelineState{
 		SessionID: sessionID,
 		GameState: state,
@@ -261,30 +120,16 @@ func (p *Pipeline) Evaluate(ctx context.Context, sessionID string, state domain.
 		Plan:      rawPlan,
 	}
 
-	// 3. Execute Pure Stages (Normalize -> Validate -> Simulate)
+	// Execute Pure Stages: Normalize -> Validate -> Simulate -> Policy
 	for _, stage := range p.stages {
 		if err := stage.Process(ctx, pipeState); err != nil {
 			return nil, fmt.Errorf("pipeline stage failed: %w", err)
 		}
 	}
 
-	// 4. Evaluate Pipeline Artifacts
 	if pipeState.Validation != nil && !pipeState.Validation.IsValid {
 		return nil, fmt.Errorf("validation phase failed: %v", pipeState.Validation.Errors)
 	}
-
-	// Collapse optimized tasks into a new Plan instance to respect immutability
-	optimalPlan := &domain.Plan{
-		Objective: pipeState.Normalized.Objective,
-		Tasks:     pipeState.Simulation.OptimizedTasks,
-	}
-
-	// 5. Policy: Enforce hard guardrails (Will be migrated to pipeline in Phase 2)
-	if err := p.policy.Enforce(optimalPlan, state); err != nil {
-		return nil, fmt.Errorf("policy rejection: %w", err)
-	}
-
-	pipeState.FinalPlan = optimalPlan
 
 	return pipeState.FinalPlan, nil
 }
@@ -371,53 +216,6 @@ func cleanJSON(raw string) string {
 	cleaned = strings.TrimPrefix(cleaned, "```")
 	cleaned = strings.TrimSuffix(cleaned, "```")
 	return strings.TrimSpace(cleaned)
-}
-
-</file>
-
-<file path="internal\decision\policy.go">
-package decision
-
-import (
-	"david22573/synaptic-mc/internal/domain"
-	"errors"
-)
-
-// HardGuardrails enforces absolute survival rules that override any LLM hallucination.
-type HardGuardrails struct{}
-
-func NewHardGuardrails() *HardGuardrails {
-	return &HardGuardrails{}
-}
-
-func (p *HardGuardrails) Enforce(plan *domain.Plan, state domain.GameState) error {
-	// 1. Critical Health Override [cite: 165]
-	if state.Health < 6.0 {
-		isRetreatingOrEating := false
-		for _, t := range plan.Tasks {
-			if t.Action == "retreat" || t.Action == "eat" {
-				isRetreatingOrEating = true
-				break
-			}
-		}
-		if !isRetreatingOrEating {
-			return errors.New("POLICY VIOLATION: Health is critical. Plan must include 'retreat' or 'eat'")
-		}
-	}
-
-	// 2. Combat Avoidance
-	for _, t := range plan.Tasks {
-		if t.Action == "hunt" {
-			if state.Health < 12.0 {
-				return errors.New("POLICY VIOLATION: Cannot initiate hunt with health under 12")
-			}
-			if t.Target.Name == "creeper" || t.Target.Name == "warden" || t.Target.Name == "iron_golem" {
-				return errors.New("POLICY VIOLATION: Target is on the absolute do-not-engage list")
-			}
-		}
-	}
-
-	return nil
 }
 
 </file>
@@ -1765,6 +1563,60 @@ func (s *NormalizeStage) Process(ctx context.Context, state *PipelineState) erro
 
 </file>
 
+<file path="internal\pipeline\policy.go">
+// internal/pipeline/policy.go
+package pipeline
+
+import (
+	"context"
+	"fmt"
+
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/policy"
+)
+
+// PolicyStage applies the authoritative policy engine against the optimized plan.
+type PolicyStage struct {
+	engine policy.Engine
+}
+
+func NewPolicyStage(engine policy.Engine) *PolicyStage {
+	return &PolicyStage{engine: engine}
+}
+
+func (s *PolicyStage) Process(ctx context.Context, state *PipelineState) error {
+	if state.Simulation == nil {
+		return fmt.Errorf("cannot run policy stage without simulation artifact")
+	}
+
+	candidatePlan := &domain.Plan{
+		Objective: state.Normalized.Objective,
+		Tasks:     state.Simulation.OptimizedTasks,
+	}
+
+	input := policy.DecisionInput{
+		Plan:  candidatePlan,
+		State: state.GameState,
+	}
+
+	decision := s.engine.Decide(ctx, input)
+
+	state.Policy = &PolicyDecision{
+		IsApproved: decision.IsApproved,
+		Reason:     decision.Reason,
+	}
+
+	if !decision.IsApproved {
+		return fmt.Errorf("policy rejection: %s", decision.Reason)
+	}
+
+	// The plan survives the entire pipeline. Lock it in.
+	state.FinalPlan = candidatePlan
+	return nil
+}
+
+</file>
+
 <file path="internal\pipeline\simulate.go">
 // internal/pipeline/simulate.go
 package pipeline
@@ -2132,6 +1984,181 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 
 </file>
 
+<file path="internal\policy\composite.go">
+// internal/policy/composite.go
+package policy
+
+import "context"
+
+// CompositePolicy allows chaining multiple rule engines (e.g., Survival -> Progression -> Ethical).
+type CompositePolicy struct {
+	policies []Engine
+}
+
+func NewCompositePolicy(policies ...Engine) *CompositePolicy {
+	return &CompositePolicy{policies: policies}
+}
+
+func (c *CompositePolicy) Decide(ctx context.Context, input DecisionInput) Decision {
+	for _, p := range c.policies {
+		decision := p.Decide(ctx, input)
+		if !decision.IsApproved {
+			return decision // Fast fail on the first policy rejection
+		}
+	}
+	return Decision{IsApproved: true}
+}
+
+</file>
+
+<file path="internal\policy\engine.go">
+// internal/policy/engine.go
+package policy
+
+import (
+	"context"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// DecisionInput encapsulates everything the policy engine needs to make a ruling.
+type DecisionInput struct {
+	Plan  *domain.Plan
+	State domain.GameState
+}
+
+// Decision represents the authoritative ruling from the policy engine.
+type Decision struct {
+	IsApproved   bool
+	Reason       string
+	OverridePlan *domain.Plan // Optional: A fallback plan if the original is rejected
+}
+
+// Engine defines the contract for all behavioral guardrails.
+type Engine interface {
+	Decide(ctx context.Context, input DecisionInput) Decision
+}
+
+</file>
+
+<file path="internal\policy\survival.go">
+// internal/policy/survival.go
+package policy
+
+import (
+	"context"
+)
+
+// SurvivalPolicy replaces the old HardGuardrails. It strictly enforces
+// biological and physical bot safety invariants.
+type SurvivalPolicy struct{}
+
+func NewSurvivalPolicy() *SurvivalPolicy {
+	return &SurvivalPolicy{}
+}
+
+func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decision {
+	if input.Plan == nil {
+		return Decision{IsApproved: true}
+	}
+
+	// 1. Critical Health Override
+	if input.State.Health < 6.0 {
+		isRetreatingOrEating := false
+		for _, t := range input.Plan.Tasks {
+			if t.Action == "retreat" || t.Action == "eat" {
+				isRetreatingOrEating = true
+				break
+			}
+		}
+		if !isRetreatingOrEating {
+			return Decision{
+				IsApproved: false,
+				Reason:     "POLICY VIOLATION: Health is critical. Plan must include 'retreat' or 'eat'",
+			}
+		}
+	}
+
+	// 2. Combat Avoidance
+	for _, t := range input.Plan.Tasks {
+		if t.Action == "hunt" {
+			if input.State.Health < 12.0 {
+				return Decision{
+					IsApproved: false,
+					Reason:     "POLICY VIOLATION: Cannot initiate hunt with health under 12",
+				}
+			}
+			if t.Target.Name == "creeper" || t.Target.Name == "warden" || t.Target.Name == "iron_golem" {
+				return Decision{
+					IsApproved: false,
+					Reason:     "POLICY VIOLATION: Target is on the absolute do-not-engage list",
+				}
+			}
+		}
+	}
+
+	return Decision{IsApproved: true}
+}
+
+</file>
+
+<file path="internal\policy\survival_test.go">
+// internal/policy/survival_test.go
+package policy
+
+import (
+	"context"
+	"testing"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+func TestSurvivalPolicy_Decide(t *testing.T) {
+	p := NewSurvivalPolicy()
+	ctx := context.Background()
+
+	t.Run("Rejects low health without retreat", func(t *testing.T) {
+		input := DecisionInput{
+			State: domain.GameState{Health: 5.0},
+			Plan: &domain.Plan{
+				Tasks: []domain.Action{{Action: "mine"}},
+			},
+		}
+		decision := p.Decide(ctx, input)
+		if decision.IsApproved {
+			t.Errorf("Expected rejection due to critical health")
+		}
+	})
+
+	t.Run("Approves low health with eat", func(t *testing.T) {
+		input := DecisionInput{
+			State: domain.GameState{Health: 5.0},
+			Plan: &domain.Plan{
+				Tasks: []domain.Action{{Action: "eat"}},
+			},
+		}
+		decision := p.Decide(ctx, input)
+		if !decision.IsApproved {
+			t.Errorf("Expected approval for life-saving action")
+		}
+	})
+
+	t.Run("Rejects hunting dangerous targets", func(t *testing.T) {
+		input := DecisionInput{
+			State: domain.GameState{Health: 20.0},
+			Plan: &domain.Plan{
+				Tasks: []domain.Action{{Action: "hunt", Target: domain.Target{Name: "warden"}}},
+			},
+		}
+		decision := p.Decide(ctx, input)
+		if decision.IsApproved {
+			t.Errorf("Expected rejection for hunting a warden")
+		}
+	})
+}
+
+</file>
+
 <file path="internal\strategy\evaluator.go">
 package strategy
 
@@ -2231,14 +2258,828 @@ func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 
 </file>
 
+<file path="ui\index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ui</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+
+</file>
+
+<file path="ui\src\App.svelte">
+<script lang="ts">
+    import { onMount, onDestroy } from "svelte";
+    import ItemIcon from "./components/ItemIcon.svelte";
+
+    type Vec3 = { x: number; y: number; z: number };
+    type Threat = { name: string };
+    type InventoryItem = { name: string; count: number };
+
+    type BotState = {
+        health: number;
+        food: number;
+        time_of_day: number;
+        has_bed_nearby: boolean;
+        position: Vec3;
+        threats: Threat[];
+        inventory: InventoryItem[];
+    };
+
+    let botState: BotState = $state({
+        health: 20,
+        food: 20,
+        time_of_day: 0,
+        has_bed_nearby: false,
+        position: { x: 0, y: 0, z: 0 },
+        threats: [],
+        inventory: [],
+    });
+
+    let ws: WebSocket;
+    let connected = $state(false);
+
+    onMount(() => {
+        connect();
+    });
+
+    onDestroy(() => {
+        if (ws) ws.close();
+    });
+
+    function connect() {
+        ws = new WebSocket("ws://localhost:8080/ui/ws");
+
+        ws.onopen = () => {
+            connected = true;
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === "state_update") {
+                    botState = msg.payload;
+                }
+            } catch (err) {
+                console.error("Failed to parse WS message:", err);
+            }
+        };
+
+        ws.onclose = () => {
+            connected = false;
+            setTimeout(connect, 2000);
+        };
+    }
+
+    let isNight = $derived(
+        botState.time_of_day >= 12000 && botState.time_of_day <= 24000,
+    );
+    let darkness = $derived(
+        isNight
+            ? Math.sin(((botState.time_of_day - 12000) / 12000) * Math.PI) * 0.6
+            : 0,
+    );
+
+    let hotbarItems = $derived(
+        Array.from({ length: 9 }, (_, i) => botState.inventory[i] || null),
+    );
+    let sideInventory = $derived(botState.inventory.slice(9));
+
+    function formatName(name: string) {
+        return name
+            .split("_")
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(" ");
+    }
+</script>
+
+<svelte:head>
+    <link
+        href="https://fonts.googleapis.com/css2?family=VT323&display=swap"
+        rel="stylesheet"
+    />
+</svelte:head>
+
+<main class="dashboard">
+    <iframe src="http://localhost:3000" title="Prismarine Viewer"></iframe>
+
+    <div
+        class="night-tint"
+        style="background-color: rgba(5, 5, 20, {darkness});"
+    ></div>
+
+    <div class="hud">
+        <div class="top-left">
+            <div class="coord-box">
+                XYZ: {Math.floor(botState.position.x)}, {Math.floor(
+                    botState.position.y,
+                )}, {Math.floor(botState.position.z)}
+            </div>
+            <div class="status-box {connected ? 'online' : 'offline'}">
+                {connected ? "LINK ESTABLISHED" : "SEARCHING FOR SIGNAL..."}
+            </div>
+        </div>
+
+        <div class="side-inventory">
+            {#each sideInventory as item}
+                <div class="side-item">
+                    <ItemIcon name={item.name} size={24} />
+                    <span class="item-count">{item.count}</span>
+                    <span class="item-name">{formatName(item.name)}</span>
+                </div>
+            {/each}
+        </div>
+
+        <div class="bottom-center">
+            {#if botState.threats && botState.threats.length > 0}
+                <div class="threat-warning">
+                    HOSTILES NEARBY: {botState.threats
+                        .map((t) => formatName(t.name))
+                        .join(", ")}
+                </div>
+            {/if}
+
+            <div class="stat-bars">
+                <div class="bar-wrapper">
+                    <div
+                        class="bar-fill health-fill"
+                        style="width: {(botState.health / 20) * 100}%"
+                    ></div>
+                    <span class="bar-text">HP {botState.health}/20</span>
+                </div>
+                <div class="bar-wrapper">
+                    <div
+                        class="bar-fill food-fill"
+                        style="width: {(botState.food / 20) * 100}%"
+                    ></div>
+                    <span class="bar-text">HUNGER {botState.food}/20</span>
+                </div>
+            </div>
+
+            <div class="hotbar">
+                {#each hotbarItems as item, i}
+                    <div class="hotbar-slot">
+                        <span class="slot-number">{i + 1}</span>
+                        {#if item}
+                            <div class="slot-content">
+                                <ItemIcon name={item.name} size={32} />
+                                {#if item.count > 1}
+                                    <span class="slot-count">{item.count}</span>
+                                {/if}
+                            </div>
+                        {/if}
+                    </div>
+                {/each}
+            </div>
+        </div>
+    </div>
+</main>
+
+<style>
+    :global(body) {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+    }
+
+    .dashboard {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        font-family: "VT323", monospace;
+        font-size: 20px;
+        color: white;
+        text-shadow: 2px 2px 0px #3f3f3f;
+        user-select: none;
+    }
+
+    iframe {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        border: none;
+        z-index: 1;
+    }
+
+    .night-tint {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 2;
+        transition: background-color 1s linear;
+    }
+
+    .hud {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 3;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+
+    .top-left {
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+    }
+
+    .coord-box,
+    .status-box {
+        background: rgba(0, 0, 0, 0.4);
+        display: inline-block;
+        padding: 2px 8px;
+        border: 2px solid rgba(0, 0, 0, 0.6);
+        width: fit-content;
+    }
+
+    .status-box.online {
+        color: #55ff55;
+    }
+    .status-box.offline {
+        color: #ff5555;
+    }
+
+    .side-inventory {
+        position: absolute;
+        left: 10px;
+        top: 30%;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        background: rgba(0, 0, 0, 0.2);
+        padding: 10px;
+        border-radius: 4px;
+    }
+
+    .side-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .item-count {
+        color: #ffff55;
+        min-width: 25px;
+        text-align: right;
+    }
+
+    .item-name {
+        color: #ffffff;
+    }
+
+    .bottom-center {
+        position: absolute;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .threat-warning {
+        color: #ff5555;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 4px 12px;
+        border: 2px solid #ff5555;
+        animation: blink 1s infinite;
+    }
+
+    @keyframes blink {
+        0%,
+        100% {
+            opacity: 1;
+        }
+        50% {
+            opacity: 0.5;
+        }
+    }
+
+    .stat-bars {
+        display: flex;
+        gap: 20px;
+        width: 100%;
+        justify-content: center;
+    }
+
+    .bar-wrapper {
+        position: relative;
+        width: 160px;
+        height: 20px;
+        background: rgba(0, 0, 0, 0.5);
+        border: 2px solid #222;
+        border-top-color: #555;
+        border-left-color: #555;
+    }
+
+    .bar-fill {
+        height: 100%;
+        transition: width 0.2s;
+    }
+
+    .health-fill {
+        background: #ff5555;
+        border-right: 2px solid #aa0000;
+    }
+    .food-fill {
+        background: #ffaa00;
+        border-right: 2px solid #cc6600;
+    }
+
+    .bar-text {
+        position: absolute;
+        top: -2px;
+        left: 0;
+        width: 100%;
+        text-align: center;
+        font-size: 18px;
+        text-shadow: 1px 1px 0px #000;
+    }
+
+    .hotbar {
+        display: flex;
+        background: rgba(0, 0, 0, 0.4);
+        padding: 2px;
+        border: 2px solid #222;
+        border-top-color: #555;
+        border-left-color: #555;
+    }
+
+    .hotbar-slot {
+        position: relative;
+        width: 40px;
+        height: 40px;
+        background: rgba(139, 139, 139, 0.4);
+        border: 2px solid #373737;
+        border-bottom-color: #fff;
+        border-right-color: #fff;
+        margin: 2px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .slot-number {
+        position: absolute;
+        top: 2px;
+        left: 4px;
+        font-size: 14px;
+        color: rgba(255, 255, 255, 0.5);
+        text-shadow: none;
+        z-index: 10;
+    }
+
+    .slot-content {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        position: relative;
+    }
+
+    .slot-count {
+        position: absolute;
+        bottom: -2px;
+        right: 2px;
+        font-size: 18px;
+        color: #fff;
+        text-shadow: 2px 2px 0px #000;
+        z-index: 10;
+    }
+</style>
+
+</file>
+
+<file path="ui\src\app.css">
+/* :root {
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --border: #e5e4e7;
+  --code-bg: #f4f3ec;
+  --accent: #aa3bff;
+  --accent-bg: rgba(170, 59, 255, 0.1);
+  --accent-border: rgba(170, 59, 255, 0.5);
+  --social-bg: rgba(244, 243, 236, 0.5);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #9ca3af;
+    --text-h: #f3f4f6;
+    --bg: #16171d;
+    --border: #2e303a;
+    --code-bg: #1f2028;
+    --accent: #c084fc;
+    --accent-bg: rgba(192, 132, 252, 0.15);
+    --accent-border: rgba(192, 132, 252, 0.5);
+    --social-bg: rgba(47, 48, 58, 0.5);
+    --shadow:
+      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+  }
+
+  #social .button-icon {
+    filter: invert(1) brightness(2);
+  }
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code,
+.counter {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}
+
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
+      scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
+      scale(0.8);
+  }
+}
+
+#app {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  & > div {
+    flex: 1 1 0;
+    padding: 32px;
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+} */
+
+</file>
+
+<file path="ui\src\components\ItemIcon.svelte">
+<script lang="ts">
+    let { name, size = 32 } = $props<{ name: string; size?: number }>();
+
+    let hasError = $state(false);
+
+    let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
+    let formattedTitle = $derived(cleanName.replace(/_/g, " "));
+    let imageSource = $derived(`../../public/assets/items/${cleanName}.png`);
+
+    function handleError() {
+        hasError = true;
+    }
+</script>
+
+{#if hasError}
+    <div
+        class="fallback-icon"
+        style="width: {size}px; height: {size}px; font-size: {size * 0.4}px;"
+        title="Missing texture: {cleanName}"
+    >
+        ?
+    </div>
+{:else}
+    <img
+        src={imageSource}
+        alt={cleanName}
+        title={formattedTitle}
+        width={size}
+        height={size}
+        onerror={handleError}
+        class="mc-icon"
+    />
+{/if}
+
+<style>
+    .mc-icon {
+        image-rendering: pixelated; /* Keeps 16x16 pixel art crispy */
+        object-fit: contain;
+    }
+
+    .fallback-icon {
+        background-color: #ff00ff; /* Magenta missing texture vibe */
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        box-shadow: inset 0 0 0 2px #000000;
+        cursor: help;
+        font-family: monospace;
+    }
+</style>
+
+</file>
+
+<file path="ui\src\lib\Counter.svelte">
+<script lang="ts">
+  let count: number = $state(0)
+  const increment = () => {
+    count += 1
+  }
+</script>
+
+<button class="counter" onclick={increment}>
+  Count is {count}
+</button>
+
+</file>
+
+<file path="ui\src\main.ts">
+import { mount } from 'svelte'
+import './app.css'
+import App from './App.svelte'
+
+const app = mount(App, {
+  target: document.getElementById('app')!,
+})
+
+export default app
+
+</file>
+
+<file path="ui\svelte.config.js">
+/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
+export default {}
+
+</file>
+
+<file path="ui\vite.config.ts">
+import { defineConfig } from 'vite'
+import { svelte } from '@sveltejs/vite-plugin-svelte'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [svelte()],
+})
+
+</file>
+
 
 
 ```json
 {
-  "total_bytes": 57319,
-  "file_count": 26,
-  "estimated_tokens": 14905,
+  "total_bytes": 73520,
+  "file_count": 37,
+  "estimated_tokens": 19155,
   "mode": "full",
-  "generated_at": "2026-03-28T21:17:39.4463973-07:00"
+  "generated_at": "2026-03-28T21:27:16.124233-07:00"
 }
 ```

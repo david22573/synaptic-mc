@@ -28,6 +28,8 @@
 
     let ws: WebSocket;
     let connected = $state(false);
+    let reconnectAttempts = 0;
+    const maxReconnectDelay = 30000;
 
     onMount(() => {
         connect();
@@ -38,17 +40,30 @@
     });
 
     function connect() {
-        ws = new WebSocket("ws://localhost:8080/ui/ws");
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${protocol}//${window.location.host}/ui/ws`;
+
+        ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
             connected = true;
+            reconnectAttempts = 0;
+            console.log("UI connected to orchestrator");
         };
 
         ws.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                if (msg.type === "state_update") {
-                    botState = msg.payload;
+                switch (msg.type) {
+                    case "state_update":
+                        botState = { ...botState, ...msg.payload };
+                        break;
+                    case "objective_update":
+                        console.log("Objective:", msg.payload);
+                        break;
+                    case "event_stream":
+                        console.debug("Event:", msg.payload);
+                        break;
                 }
             } catch (err) {
                 console.error("Failed to parse WS message:", err);
@@ -57,7 +72,14 @@
 
         ws.onclose = () => {
             connected = false;
-            setTimeout(connect, 2000);
+            reconnectAttempts++;
+            const delay = Math.min(reconnectAttempts * 1000, maxReconnectDelay);
+            console.warn(`WebSocket closed, reconnecting in ${delay}ms...`);
+            setTimeout(connect, delay);
+        };
+
+        ws.onerror = (error) => {
+            console.error("WebSocket error:", error);
         };
     }
 

@@ -5,7 +5,7 @@
 
     let cleanName = $derived(name.replace("minecraft:", "").toLowerCase());
     let formattedTitle = $derived(cleanName.replace(/_/g, " "));
-    let imageSource = $derived(`../../public/assets/items/${cleanName}.png`);
+    let imageSource = $derived(`/assets/items/${cleanName}.png`);
 
     function handleError() {
         hasError = true;
@@ -34,12 +34,12 @@
 
 <style>
     .mc-icon {
-        image-rendering: pixelated; /* Keeps 16x16 pixel art crispy */
+        image-rendering: pixelated;
         object-fit: contain;
     }
 
     .fallback-icon {
-        background-color: #ff00ff; /* Magenta missing texture vibe */
+        background-color: #ff00ff;
         display: flex;
         align-items: center;
         justify-content: center;

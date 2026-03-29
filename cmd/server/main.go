@@ -1,106 +1,222 @@
-// cmd/server/main.go
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 
 	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/llm"
+	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/orchestrator"
 	"david22573/synaptic-mc/internal/policy"
 	"david22573/synaptic-mc/internal/strategy"
-
-	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+type Config struct {
+	HTTPAddr     string
+	EventStoreDB string
+	MemoryDB     string
+	UIPath       string
+	LLMURL       string
+	LLMKey       string
+	LLMModel     string
+	SessionID    string
+	DataDir      string
 }
 
 func main() {
-	_ = godotenv.Load()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Load .env file (optional - will log debug if missing)
+	if err := godotenv.Load(); err != nil {
+		slog.Debug("Could not load .env file", slog.Any("error", err))
+	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	cfg := parseConfig()
 
-	// 1. Storage & API Clients
-	store, err := eventstore.NewSQLiteEventStore("./events.db")
-	if err != nil {
-		logger.Error("Failed to init event store", slog.Any("error", err))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		logger.Error("Failed to create data directory", slog.String("path", cfg.DataDir), slog.Any("error", err))
 		os.Exit(1)
 	}
-	defer store.Close()
+
+	// Use absolute paths for SQLite databases
+	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
+	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
+
+	eventStore, err := eventstore.NewSQLiteEventStore(eventStorePath)
+	if err != nil {
+		logger.Error("Failed to create event store", slog.String("path", eventStorePath), slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer eventStore.Close()
+
+	memoryStore, err := memory.NewSQLiteStore(memoryStorePath)
+	if err != nil {
+		logger.Error("Failed to create memory store", slog.String("path", memoryStorePath), slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer memoryStore.Close()
 
 	llmClient := llm.NewClient(llm.Config{
-		APIURL:     "https://openrouter.ai/api/v1/chat/completions",
-		APIKey:     os.Getenv("OPENROUTER_API_KEY"),
-		Model:      "deepseek/deepseek-v3.2",
+		APIURL:     cfg.LLMURL,
+		APIKey:     cfg.LLMKey,
+		Model:      cfg.LLMModel,
 		MaxRetries: 3,
 	})
 
-	// 2. Build the Pure Decision Pipeline (Phase 2)
-	evaluator := strategy.NewEvaluator()
-	planner := decision.NewLLMPlanner(llmClient, evaluator)
-
-	// Chain policies
+	strategyEvaluator := strategy.NewEvaluator()
+	planner := decision.NewLLMPlanner(llmClient, strategyEvaluator)
 	survivalPolicy := policy.NewSurvivalPolicy()
-	compositePolicy := policy.NewCompositePolicy(survivalPolicy)
+	policyEngine := policy.NewCompositePolicy(survivalPolicy)
+	decisionEngine := decision.NewPipeline(planner, policyEngine)
+	uiHub := observability.NewHub(logger)
+	orch := orchestrator.New(cfg.SessionID, eventStore, decisionEngine, &noopController{}, uiHub, logger)
 
-	decisionEngine := decision.NewPipeline(planner, compositePolicy)
-
-	// 3. Network & Orchestration Binding
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
+	mux.HandleFunc("/bot/ws", handleBotConnection(orch, logger))
+
+	// Resolve UI path to absolute
+	uiPath := cfg.UIPath
+	if !filepath.IsAbs(uiPath) {
+		uiPath = filepath.Join(".", uiPath)
+	}
+	mux.Handle("/", http.FileServer(http.Dir(uiPath)))
+
+	server := &http.Server{
+		Addr:         cfg.HTTPAddr,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	g.Go(func() error {
+		logger.Info("Starting UI hub")
+		uiHub.Run(ctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting orchestrator")
+		return orch.Run(ctx)
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting HTTP server", slog.String("addr", cfg.HTTPAddr))
+		return server.ListenAndServe()
+	})
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	logger.Info("Shutdown signal received")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("HTTP server shutdown error", slog.Any("error", err))
+	}
+
+	if err := g.Wait(); err != nil {
+		logger.Error("Service error", slog.Any("error", err))
+	}
+}
+
+func parseConfig() Config {
+	// Define flags with environment variable defaults
+	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
+	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
+	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
+	uiPath := flag.String("ui", getEnvOrDefault("UI_PATH", "ui/dist"), "UI static files path")
+	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
+	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
+	llmModel := flag.String("llm-model", getEnvOrDefault("LLM_MODEL", "llama3.2"), "LLM model name")
+	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
+	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
+
+	flag.Parse()
+
+	return Config{
+		HTTPAddr:     *httpAddr,
+		EventStoreDB: *eventsDB,
+		MemoryDB:     *memoryDB,
+		UIPath:       *uiPath,
+		LLMURL:       *llmURL,
+		LLMKey:       *llmKey,
+		LLMModel:     *llmModel,
+		SessionID:    *sessionID,
+		DataDir:      *dataDir,
+	}
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+type noopController struct{}
+
+func (n *noopController) Dispatch(ctx context.Context, action domain.Action) error {
+	slog.Warn("Dispatch called with no bot connected", slog.String("action", action.Action))
+	return nil
+}
+
+func (n *noopController) AbortCurrent(ctx context.Context, reason string) error {
+	slog.Warn("Abort called with no bot connected", slog.String("reason", reason))
+	return nil
+}
+
+func (n *noopController) Close() error {
+	return nil
+}
+
+func handleBotConnection(orch *orchestrator.Orchestrator, logger *slog.Logger) http.HandlerFunc {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			logger.Error("WebSocket upgrade failed", slog.Any("error", err))
+			logger.Error("Bot WS upgrade failed", slog.Any("error", err))
 			return
 		}
 
-		sessionID := "sess-" + time.Now().Format("20060102150405")
-		logger.Info("Agent Connected", slog.String("session", sessionID))
+		botController := execution.NewWSController(conn)
+		idempotentController := execution.NewIdempotentController(botController, 1000)
+		orch.SetController(idempotentController)
 
-		// 4. Execution layer with Idempotency
-		baseController := execution.NewWSController(conn)
-		safeController := execution.NewIdempotentController(baseController, 100)
+		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()))
 
-		uiHub := observability.NewHub(logger)
-		go uiHub.Run(ctx)
-
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ui/ws", uiHub.HandleConnections) // Mount the UI websocket
-
-		// Serve static UI files if needed
-		mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./public"))))
-
-		// 5. Run Orchestrator
-		orch := orchestrator.New(sessionID, store, decisionEngine, safeController, uiHub, logger)
-
-		// Create a session-specific context
-		sessCtx, sessCancel := context.WithCancel(ctx)
-		defer sessCancel()
-
-		// Start the Orchestrator lifecycle in the background
-		go func() {
-			if err := orch.Run(sessCtx); err != nil && err != context.Canceled {
-				logger.Error("Orchestrator failed", slog.Any("error", err))
-			}
-		}()
-
-		// WebSocket Read Loop: Ingests state and events into the Orchestrator
 		for {
 			var msg struct {
 				Type    string              `json:"type"`
@@ -109,44 +225,38 @@ func main() {
 			}
 
 			if err := conn.ReadJSON(&msg); err != nil {
-				logger.Warn("Bot disconnected", slog.Any("error", err))
-				break // Exits loop, fires defer sessCancel() shutting down Orchestrator
+				logger.Warn("Bot connection closed", slog.Any("error", err))
+				conn.Close()
+				return
 			}
 
-			switch msg.Type {
-			case "state":
+			ctx := context.Background()
+
+			switch domain.EventType(msg.Type) {
+			case domain.EventTypeStateTick:
 				var state domain.GameState
-				if err := json.Unmarshal(msg.Payload, &state); err == nil {
-					orch.IngestState(sessCtx, state)
+				if err := json.Unmarshal(msg.Payload, &state); err != nil {
+					logger.Error("Failed to unmarshal state", slog.Any("error", err))
+					continue
 				}
-			case "event":
-				orch.IngestEvent(sessCtx, domain.DomainEvent{
-					SessionID: sessionID,
+				orch.IngestState(ctx, state)
+
+			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic:
+				var payload any
+				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+					logger.Error("Failed to unmarshal event", slog.Any("error", err))
+					continue
+				}
+				orch.IngestEvent(ctx, domain.DomainEvent{
+					SessionID: orch.SessionID(),
 					Trace:     msg.Trace,
 					Type:      domain.EventType(msg.Type),
 					Payload:   msg.Payload,
-					CreatedAt: time.Now(),
 				})
+
+			default:
+				logger.Warn("Unknown bot message type", slog.String("type", msg.Type))
 			}
 		}
-	})
-
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
 	}
-
-	go func() {
-		logger.Info("Listening on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("Server crashed", slog.Any("error", err))
-		}
-	}()
-
-	<-ctx.Done()
-	logger.Info("Shutting down...")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
 }

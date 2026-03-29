@@ -14,8 +14,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Orchestrator manages the lifecycle, concurrency, and routing.
-// It is the ONLY component allowed to spawn goroutines for the core loop.
 type Orchestrator struct {
 	sessionID  string
 	store      domain.EventStore
@@ -23,7 +21,6 @@ type Orchestrator struct {
 	controller execution.Controller
 	logger     *slog.Logger
 
-	// Channels for managing incoming telemetry and execution events
 	stateCh chan domain.GameState
 	eventCh chan domain.DomainEvent
 
@@ -52,18 +49,15 @@ func New(
 	}
 }
 
-// Run starts the core loop with guaranteed lifecycle teardown via errgroup.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("Starting orchestrator lifecycle")
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	// Sub-routine: State Processing Loop
 	g.Go(func() error {
 		return o.processStateLoop(gCtx)
 	})
 
-	// Sub-routine: Event Processing Loop
 	g.Go(func() error {
 		return o.processEventLoop(gCtx)
 	})
@@ -71,7 +65,6 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
-// IngestState is called by the network layer when the TS bot pushes a tick.
 func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) {
 	select {
 	case <-ctx.Done():
@@ -81,12 +74,24 @@ func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) 
 	}
 }
 
-// IngestEvent is called by the network layer for explicit bot actions (deaths, task completion).
 func (o *Orchestrator) IngestEvent(ctx context.Context, event domain.DomainEvent) {
 	select {
 	case <-ctx.Done():
 	case o.eventCh <- event:
 	}
+}
+
+// SessionID returns the current session identifier
+func (o *Orchestrator) SessionID() string {
+	return o.sessionID
+}
+
+// SetController updates the execution controller when bot connects
+func (o *Orchestrator) SetController(ctrl execution.Controller) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.controller = ctrl
+	o.logger.Info("Execution controller updated")
 }
 
 func (o *Orchestrator) processStateLoop(ctx context.Context) error {
@@ -102,8 +107,7 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 			if o.uiHub != nil {
 				o.uiHub.Broadcast("state_update", state)
 			}
-			// Check routines / reflexes immediately (Phase 1: Fast Path)
-			// Trigger replan if necessary (Phase 1: Slow Path)
+
 			if err := o.evaluateState(ctx, state); err != nil {
 				o.logger.Error("Failed to evaluate state", slog.Any("error", err))
 			}
@@ -117,7 +121,6 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case ev := <-o.eventCh:
-			// 1. Commit to ground truth EventStore
 			if err := o.store.Append(ctx, o.sessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
 				o.logger.Error("Failed to append event to store", slog.Any("error", err))
 				continue
@@ -127,46 +130,61 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 				o.uiHub.Broadcast("event_stream", ev)
 			}
 
-			// 2. React to specific domain events
 			o.handleDomainEvent(ctx, ev)
 		}
 	}
 }
 
 func (o *Orchestrator) evaluateState(ctx context.Context, state domain.GameState) error {
-	// E.g., if we are actively executing, skip replanning unless interrupted.
-	// For this refactor, we mock the trace generation.
-	trace := domain.TraceContext{
-		TraceID: fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+	o.mu.RLock()
+	controller := o.controller
+	o.mu.RUnlock()
+
+	if controller == nil {
+		o.logger.Debug("No controller available, skipping evaluation")
+		return nil
 	}
 
-	// This is the clean handoff to the pure decision pipeline
+	trace := domain.TraceContext{
+		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
+	}
+
 	plan, err := o.decision.Evaluate(ctx, o.sessionID, state, trace)
 	if err != nil {
-		return err
+		return fmt.Errorf("decision evaluation failed: %w", err)
 	}
 
 	if plan == nil || len(plan.Tasks) == 0 {
-		return nil // No action required
+		return nil
 	}
 
 	if o.uiHub != nil {
 		o.uiHub.Broadcast("objective_update", plan.Objective)
 	}
 
-	o.logger.Info("New plan generated", slog.String("objective", plan.Objective), slog.Int("tasks", len(plan.Tasks)))
+	o.logger.Info("New plan generated",
+		slog.String("objective", plan.Objective),
+		slog.Int("tasks", len(plan.Tasks)))
 
-	// Dispatch the first task. Queueing logic will be moved to a dedicated ExecutionManager in Phase 2.
-	return o.controller.Dispatch(ctx, plan.Tasks[0])
+	return controller.Dispatch(ctx, plan.Tasks[0])
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {
+	o.mu.RLock()
+	controller := o.controller
+	o.mu.RUnlock()
+
+	if controller == nil {
+		return
+	}
+
 	switch ev.Type {
 	case domain.EventBotDeath:
 		o.logger.Warn("Bot death detected, aborting active plans")
-		_ = o.controller.AbortCurrent(ctx, "bot_died")
+		_ = controller.AbortCurrent(ctx, "bot_died")
 	case domain.EventTypePanic:
 		o.logger.Warn("Bot panicked, halting execution")
-		_ = o.controller.AbortCurrent(ctx, "panic_triggered")
+		_ = controller.AbortCurrent(ctx, "panic_triggered")
 	}
 }

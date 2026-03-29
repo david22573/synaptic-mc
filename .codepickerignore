@@ -9,6 +9,5 @@ Dockerfile
 *.json
 *.yaml
 *.yml
-ui
 js/scripts
 *.db*
