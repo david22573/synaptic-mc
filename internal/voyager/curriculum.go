@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 )
@@ -32,22 +33,22 @@ func NewAutonomousCurriculum(client LLMClient, vector VectorStore) *AutonomousCu
 
 const SystemPrompt = `You are the Curriculum Agent for an autonomous Minecraft bot.
 Your job is to evaluate the current Game State, review recent task history, and propose EXACTLY ONE optimal next intent to advance the bot's progression or ensure its survival.
-CRITICAL RULES:
 
+CRITICAL RULES:
 1.  SURVIVAL FIRST: If health < 10, your intent MUST be 'eat' or 'retreat'.
 2.  PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
-3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable.
+3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable (1-10).
 4.  STORAGE: If inventory is full, use the 'store' action to put items in a chest.
 5.  RETRIEVAL: If you need an item and it is in a known chest, use the 'retrieve' action.
-6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker around yourself. You need at least 20 blocks (dirt, planks, or cobblestone) to do this.
-    AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build"
+6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker. You need at least 20 blocks (dirt, planks, or cobblestone).
+AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build", "farm"
 
 OUTPUT FORMAT (Strict JSON):
 {
-"rationale": "Brief explanation of why this is the best next step based on state and history.",
-"action": "gather",
-"target": "oak_log",
-"count": 4
+	"rationale": "Brief explanation of why this is the best next step based on state and history.",
+	"action": "gather",
+	"target": "oak_log",
+	"count": 4
 }`
 
 func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error) {
@@ -70,13 +71,31 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		historyContext = strings.Join(historyStrs, "\n")
 	}
 
-	stateContext := formatStateForLLM(state)
+	// 1. Asynchronously save previous successful skill to vector memory
+	if len(recentHistory) > 0 {
+		lastTask := recentHistory[len(recentHistory)-1]
+		if lastTask.Success && c.vector != nil {
+			// Detach from request context so save completes even if evaluation context cancels
+			go func(task domain.TaskHistory, finalState domain.GameState) {
+				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
 
-	queryText := fmt.Sprintf("Health: %.0f, Biome/POIs: %v", state.Health, state.POIs)
+				desc := fmt.Sprintf("Successfully executed '%s %d %s' when health was %.0f and time was %d", task.Intent.Action, task.Intent.Count, task.Intent.Target, finalState.Health, finalState.TimeOfDay)
+				descEmb, err := c.client.CreateEmbedding(saveCtx, desc)
+				if err == nil && len(descEmb) > 0 {
+					_ = c.vector.SaveSkill(saveCtx, desc, task.Intent, descEmb)
+				}
+			}(lastTask, state)
+		}
+	}
+
+	// 2. Fetch Relevant Skills via Semantic Search
+	stateContext := formatStateForLLM(state)
+	queryText := fmt.Sprintf("Current Goal: Progression. Health: %.0f. Inventory focus: Tools and Food.", state.Health)
 	queryEmb, err := c.client.CreateEmbedding(ctx, queryText)
 
 	skillContext := ""
-	if err == nil && c.vector != nil {
+	if err == nil && c.vector != nil && len(queryEmb) > 0 {
 		skills, _ := c.vector.RetrieveSkills(ctx, queryEmb, 3)
 		if len(skills) > 0 {
 			var skillStrs []string
@@ -89,25 +108,27 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 
 	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\nRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.", stateContext, historyContext, skillContext)
 
-	rawResponse, err := c.client.Generate(ctx, SystemPrompt, userContent)
-	if err != nil {
-		return nil, fmt.Errorf("llm api failure: %w", err)
-	}
-
+	// 3. LLM Generation with Schema Retry Loop
 	var intent domain.ActionIntent
-	if err := json.Unmarshal([]byte(cleanJSON(rawResponse)), &intent); err != nil {
-		return nil, fmt.Errorf("llm schema violation: %w\nResponse was: %s", err, rawResponse)
+	var parseErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		rawResponse, genErr := c.client.Generate(ctx, SystemPrompt, userContent)
+		if genErr != nil {
+			return nil, fmt.Errorf("llm api failure: %w", genErr)
+		}
+
+		parseErr = json.Unmarshal([]byte(cleanJSON(rawResponse)), &intent)
+		if parseErr == nil && intent.Action != "" {
+			break
+		}
+
+		// Append error to user content for self-correction
+		userContent += fmt.Sprintf("\n\nSYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
-	if len(recentHistory) > 0 {
-		lastTask := recentHistory[len(recentHistory)-1]
-		if lastTask.Success && c.vector != nil {
-			desc := fmt.Sprintf("Health %.0f, needed %s", state.Health, lastTask.Intent.Target)
-			descEmb, _ := c.client.CreateEmbedding(ctx, desc)
-			if len(descEmb) > 0 {
-				_ = c.vector.SaveSkill(context.Background(), desc, lastTask.Intent, descEmb)
-			}
-		}
+	if parseErr != nil || intent.Action == "" {
+		return nil, fmt.Errorf("failed to generate valid intent after 3 attempts: %w", parseErr)
 	}
 
 	return &intent, nil

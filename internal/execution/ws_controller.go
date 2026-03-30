@@ -3,80 +3,186 @@ package execution
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
-	"david22573/synaptic-mc/internal/domain"
-
 	"github.com/gorilla/websocket"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
-// WSController implements Controller for WebSocket-connected agents.
-// It handles wire serialization and thread-safe socket writes.
-type WSController struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 15 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 512000
+)
+
+type WSMessage struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
 }
 
-func NewWSController(conn *websocket.Conn) *WSController {
-	return &WSController{
-		conn: conn,
+type WSController struct {
+	conn      *websocket.Conn
+	logger    *slog.Logger
+	sendCh    chan WSMessage
+	onMessage func(msgType string, payload []byte)
+	onClose   func()
+	closeOnce sync.Once
+	mu        sync.Mutex
+	isClosed  bool
+}
+
+func NewWSController(
+	conn *websocket.Conn,
+	logger *slog.Logger,
+	onMessage func(msgType string, payload []byte),
+	onClose func(),
+) *WSController {
+	c := &WSController{
+		conn:      conn,
+		logger:    logger.With(slog.String("component", "ws_controller")),
+		sendCh:    make(chan WSMessage, 256),
+		onMessage: onMessage,
+		onClose:   onClose,
 	}
+
+	c.conn.SetReadLimit(maxMessageSize)
+
+	// Start the pumps
+	go c.readPump()
+	go c.writePump()
+
+	return c
 }
 
 func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error {
-	payload, err := json.Marshal(map[string]any{
-		"id":        action.ID,
-		"action":    action.Action,
-		"target":    action.Target,
-		"count":     action.Count,
-		"rationale": action.Rationale,
-	})
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return errors.New("websocket closed")
+	}
+	c.mu.Unlock()
+
+	payload, err := json.Marshal(action)
 	if err != nil {
-		return fmt.Errorf("failed to marshal action: %w", err)
-	}
-
-	msg := map[string]any{
-		"type":    "command",
-		"trace":   action.Trace,
-		"payload": json.RawMessage(payload),
-	}
-
-	return c.writeJSON(ctx, msg)
-}
-
-func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
-	payload, err := json.Marshal(map[string]string{"reason": reason})
-	if err != nil {
-		return fmt.Errorf("failed to marshal abort payload: %w", err)
-	}
-
-	msg := map[string]any{
-		"type":    "abort_task",
-		"payload": json.RawMessage(payload),
-	}
-
-	return c.writeJSON(ctx, msg)
-}
-
-func (c *WSController) Close() error {
-	return c.conn.Close()
-}
-
-func (c *WSController) writeJSON(ctx context.Context, v any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	// Honor context cancellation or fallback to a hard 5-second deadline
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(5 * time.Second)
-	}
-
-	if err := c.conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 
-	return c.conn.WriteJSON(v)
+	msg := WSMessage{
+		Type:    "DISPATCH_TASK",
+		Payload: payload,
+	}
+
+	select {
+	case c.sendCh <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return errors.New("send channel full")
+	}
+}
+
+func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
+	payload, _ := json.Marshal(map[string]string{"reason": reason})
+
+	msg := WSMessage{
+		Type:    "ABORT_TASK",
+		Payload: payload,
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.isClosed {
+		return errors.New("websocket closed")
+	}
+
+	select {
+	case c.sendCh <- msg:
+		return nil
+	default:
+		return errors.New("send channel full")
+	}
+}
+
+func (c *WSController) Close() error {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.isClosed = true
+		c.mu.Unlock()
+
+		close(c.sendCh)
+		c.conn.Close()
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return nil
+}
+
+func (c *WSController) readPump() {
+	defer c.Close()
+
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	for {
+		_, msgData, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				c.logger.Error("Unexpected websocket close", slog.Any("error", err))
+			} else {
+				c.logger.Info("Websocket read pump closed gracefully")
+			}
+			break
+		}
+
+		var msg WSMessage
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			c.logger.Warn("Failed to unmarshal websocket message", slog.Any("error", err))
+			continue
+		}
+
+		if c.onMessage != nil {
+			c.onMessage(msg.Type, msg.Payload)
+		}
+	}
+}
+
+func (c *WSController) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.Close()
+	}()
+
+	for {
+		select {
+		case msg, ok := <-c.sendCh:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			if err := c.conn.WriteJSON(msg); err != nil {
+				c.logger.Error("Failed to write JSON to websocket", slog.Any("error", err))
+				return
+			}
+
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }

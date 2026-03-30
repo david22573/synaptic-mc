@@ -2,6 +2,7 @@ import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
 import { plugin as collectBlock } from "mineflayer-collectblock";
+
 import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
@@ -12,6 +13,7 @@ import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 import { getPOIs } from "./lib/utils/perception.js";
 
 const { pathfinder, Movements, goals } = pkg;
+
 let viewerStarted = false;
 
 const isIgnorableError = (err: Error | any): boolean => {
@@ -81,7 +83,9 @@ let lastStatePushTime = 0;
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
+
 const knownChests: Record<string, { name: string; count: number }[]> = {};
+
 let lastVelocity = { x: 0, y: 0, z: 0 };
 
 function stopMovement() {
@@ -186,6 +190,7 @@ async function executeIntent(intent: models.ActionIntent) {
     }
 
     abortActiveTask("preempted");
+
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
@@ -199,6 +204,15 @@ async function executeIntent(intent: models.ActionIntent) {
         trace: intent.trace || { trace_id: "unknown", action_id: intent.id },
     };
 
+    // NEW: Notify Go Engine that the task has physically begun
+    client.sendEvent(
+        "task_start",
+        `${intent.action} ${intent.target?.name || "none"}`,
+        intent.id,
+        "",
+        Date.now(),
+    );
+
     const activeTask = currentTask;
     let timeoutId: NodeJS.Timeout | undefined;
 
@@ -210,17 +224,19 @@ async function executeIntent(intent: models.ActionIntent) {
         "retreat",
         "explore",
     ];
+
     if (highStakes.includes(intent.action)) {
         const jitterMs = 50 + Math.random() * 100;
         await new Promise((r) => setTimeout(r, jitterMs));
     }
 
-    // Native fallback for Curiosity Explore loops to prevent promise-hangs
     if (intent.action === "explore") {
         log.info("Executing native curiosity exploration");
+
         const goalX = Math.round(
             bot.entity.position.x + (Math.random() - 0.5) * 30,
         );
+
         const goalZ = Math.round(
             bot.entity.position.z + (Math.random() - 0.5) * 30,
         );
@@ -230,7 +246,7 @@ async function executeIntent(intent: models.ActionIntent) {
         }
 
         await new Promise((r) => {
-            timeoutId = setTimeout(r, 12000); // Wander for 12 seconds
+            timeoutId = setTimeout(r, 12000);
         });
 
         if (!signal.aborted && activeTask) {
@@ -239,6 +255,7 @@ async function executeIntent(intent: models.ActionIntent) {
         }
         if (timeoutId) clearTimeout(timeoutId);
         if (currentTask?.id === activeTask?.id) currentTask = null;
+
         if (taskAbortController === localController) taskAbortController = null;
         return;
     }
@@ -273,18 +290,21 @@ async function executeIntent(intent: models.ActionIntent) {
     } catch (err: any) {
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
+
             log.error("Task execution failed natively", {
                 action: intent.action,
                 target: intent.target?.name,
                 raw_error: err.message,
                 normalized_cause: normalizedCause,
             });
+
             pushState();
             if (activeTask)
                 completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
+
         if (currentTask?.id === activeTask?.id) currentTask = null;
         if (taskAbortController === localController) taskAbortController = null;
     }
@@ -347,7 +367,11 @@ function pushState() {
                   trace: currentTask.trace,
               }
             : null,
-        task_progress: currentTask ? 0.5 : 0.0,
+        task_progress: currentTask
+            ? bot.pathfinder?.isMoving()
+                ? 0.5
+                : 0.0
+            : 0.0,
     });
 }
 
@@ -384,7 +408,6 @@ async function connectWithRetry(maxAttempts = 10) {
             onCommand: (i) => void executeIntent(i),
             onUnlock: () => abortActiveTask("unlock"),
         });
-
         client.connect();
 
         // Immediately push a zero-state to prevent the Go TS_Supervisor from killing us

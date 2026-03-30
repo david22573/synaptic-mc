@@ -1,127 +1,122 @@
 import WebSocket from "ws";
-import { log } from "../logger.js";
-import * as models from "../models.js";
+import { EventEmitter } from "events";
 
-export interface ControlPlaneEvents {
-    onCommand: (intent: models.ActionIntent) => void;
-    onUnlock: () => void;
+interface ClientConfig {
+    url: string;
+    reconnectIntervalMs: number;
+    maxReconnectIntervalMs: number;
+    pingIntervalMs: number;
 }
 
-export class ControlPlaneClient {
+export class SynapticClient extends EventEmitter {
     private ws: WebSocket | null = null;
-    private readonly url: string;
-    private readonly callbacks: ControlPlaneEvents;
-    private reconnectTimer: NodeJS.Timeout | null = null;
-    private reconnectAttempts: number = 0;
+    private config: ClientConfig;
+    private reconnectAttempts = 0;
+    private isIntentionallyClosed = false;
+    private pingTimeout: NodeJS.Timeout | null = null;
 
-    constructor(url: string, callbacks: ControlPlaneEvents) {
-        this.url = url;
-        this.callbacks = callbacks;
-    }
-
-    public isConnected(): boolean {
-        return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    constructor(config: Partial<ClientConfig> = {}) {
+        super();
+        this.config = {
+            url: config.url || "ws://127.0.0.1:8080/bot/ws",
+            reconnectIntervalMs: config.reconnectIntervalMs || 1000,
+            maxReconnectIntervalMs: config.maxReconnectIntervalMs || 15000,
+            pingIntervalMs: config.pingIntervalMs || 30000,
+        };
     }
 
     public connect(): void {
-        if (this.ws) {
-            this.ws.removeAllListeners();
-            this.ws.terminate();
-            this.ws = null;
+        this.isIntentionallyClosed = false;
+        if (
+            this.ws &&
+            (this.ws.readyState === WebSocket.OPEN ||
+                this.ws.readyState === WebSocket.CONNECTING)
+        ) {
+            return;
         }
 
-        this.ws = new WebSocket(this.url);
+        console.log(`[Network] Connecting to ${this.config.url}...`);
+        this.ws = new WebSocket(this.config.url);
 
         this.ws.on("open", () => {
-            log.info("Connected to Go Control Plane", { ws_url: this.url });
+            console.log("[Network] WebSocket connected.");
             this.reconnectAttempts = 0;
-            if (this.reconnectTimer) {
-                clearTimeout(this.reconnectTimer);
-                this.reconnectTimer = null;
-            }
+            this.emit("connected");
+            this.heartbeat();
         });
 
-        this.ws.on("message", (data: Buffer) => {
+        this.ws.on("ping", () => {
+            this.heartbeat();
+        });
+
+        this.ws.on("message", (data: WebSocket.Data) => {
             try {
                 const msg = JSON.parse(data.toString());
+                this.emit("message", msg);
 
-                if (msg.type === "command") {
-                    const intent = msg.payload as models.ActionIntent;
-
-                    if (!intent || !intent.action) {
-                        log.error("Received malformed intent payload", {
-                            payload: msg.payload,
-                        });
-                        this.callbacks.onUnlock();
-                        return;
-                    }
-
-                    // Ensure trace is populated for deterministic logging
-                    intent.trace = msg.trace || {
-                        trace_id: "unknown",
-                        action_id: intent.id,
-                    };
-
-                    // Fallback to 1 if Go sent a zero-value count by mistake
-                    if (!intent.count || intent.count <= 0) {
-                        intent.count = 1;
-                    }
-
-                    this.callbacks.onCommand(intent);
-                    return;
-                }
-
-                if (
-                    msg.type === "planning_error" ||
-                    msg.type === "noop" ||
-                    msg.type === "abort_task"
-                ) {
-                    log.debug("Control plane unlocked bot", { type: msg.type });
-                    this.callbacks.onUnlock();
+                if (msg.type === "DISPATCH_TASK") {
+                    this.emit("dispatch", msg.payload);
+                } else if (msg.type === "ABORT_TASK") {
+                    this.emit("abort", msg.payload);
                 }
             } catch (err) {
-                log.error("Failed to parse control-plane message", {
-                    err: err instanceof Error ? err.message : String(err),
-                });
-                this.callbacks.onUnlock();
+                console.error("[Network] Failed to parse message:", err);
             }
         });
 
         this.ws.on("close", () => {
-            log.error("Disconnected from Control Plane. Reconnecting...");
-            this.callbacks.onUnlock();
-            this.scheduleReconnect();
+            this.clearHeartbeat();
+            this.ws = null;
+            this.emit("disconnected");
+            if (!this.isIntentionallyClosed) {
+                this.scheduleReconnect();
+            }
         });
 
         this.ws.on("error", (err) => {
-            log.error("WebSocket error", {
-                err: err instanceof Error ? err.message : String(err),
-            });
+            console.error("[Network] WebSocket error:", err.message);
+            this.ws?.close();
         });
     }
 
+    private heartbeat(): void {
+        this.clearHeartbeat();
+        this.pingTimeout = setTimeout(() => {
+            console.warn("[Network] Heartbeat timeout. Closing connection.");
+            this.ws?.terminate();
+        }, this.config.pingIntervalMs + 5000); // Allow 5s buffer over Go's ping period
+    }
+
+    private clearHeartbeat(): void {
+        if (this.pingTimeout) {
+            clearTimeout(this.pingTimeout);
+            this.pingTimeout = null;
+        }
+    }
+
     private scheduleReconnect(): void {
-        if (this.reconnectTimer) return;
+        const backoff = Math.min(
+            this.config.reconnectIntervalMs *
+                Math.pow(1.5, this.reconnectAttempts),
+            this.config.maxReconnectIntervalMs,
+        );
+        this.reconnectAttempts++;
+        console.log(`[Network] Reconnecting in ${Math.round(backoff)}ms...`);
+        setTimeout(() => this.connect(), backoff);
+    }
 
-        const baseDelay = 2000;
-        const maxDelay = 30000;
-        let delay = baseDelay * Math.pow(2, this.reconnectAttempts);
+    public disconnect(): void {
+        this.isIntentionallyClosed = true;
+        this.clearHeartbeat();
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+    }
 
-        if (delay > maxDelay) delay = maxDelay;
-
-        const jitter = delay * 0.2 * (Math.random() * 2 - 1);
-        const finalDelay = Math.max(1000, delay + jitter);
-
-        log.info("Scheduling reconnect", {
-            delay_ms: Math.round(finalDelay),
-            attempt: this.reconnectAttempts + 1,
-        });
-
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectAttempts++;
-            this.reconnectTimer = null;
-            this.connect();
-        }, finalDelay);
+    public sendState(state: any): void {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        this.ws.send(JSON.stringify({ type: "STATE_UPDATE", payload: state }));
     }
 
     public sendEvent(
@@ -134,14 +129,16 @@ export class ControlPlaneClient {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
         const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
-        let msgType = "TASK_END";
 
+        let msgType = "TASK_END";
+        if (event === "task_start") msgType = "TASK_START";
         if (event === "death") msgType = "BOT_DEATH";
         if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
         if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
         if (event === "task_aborted") msgType = "TASK_END";
 
         let status = event;
+        if (event === "task_start") status = "STARTED";
         if (event === "task_completed") status = "COMPLETED";
         if (event === "task_failed") status = "FAILED";
         if (event === "task_aborted") status = "ABORTED";
@@ -158,10 +155,5 @@ export class ControlPlaneClient {
                 },
             }),
         );
-    }
-
-    public sendState(state: Record<string, unknown>): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this.ws.send(JSON.stringify({ type: "STATE_TICK", payload: state }));
     }
 }

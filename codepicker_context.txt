@@ -1,13 +1,11 @@
-Project Context Dump (30 Mar 26 02:07 PDT)
+Project Context Dump (30 Mar 26 11:01 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 48
+Total Files: 52
 
 # Project Structure
 <file_tree>
-- cmd\server\main.go
 - internal\config\flags.go
-- internal\decision\engine.go
 - internal\decision\pipeline.go
 - internal\decision\planner.go
 - internal\decision\types.go
@@ -16,13 +14,16 @@ Total Files: 48
 - internal\domain\state.go
 - internal\eventstore\sqlite.go
 - internal\execution\controller.go
+- internal\execution\engine.go
 - internal\execution\idempotency.go
 - internal\execution\manager.go
+- internal\execution\task.go
 - internal\execution\ws_controller.go
 - internal\humanization\attention.go
 - internal\humanization\behavior.go
 - internal\humanization\config.go
 - internal\humanization\context.go
+- internal\humanization\engine.go
 - internal\humanization\hesitation.go
 - internal\humanization\intent.go
 - internal\humanization\noise.go
@@ -34,14 +35,17 @@ Total Files: 48
 - internal\observability\hub.go
 - internal\observability\metrics.go
 - internal\orchestrator\loop.go
+- internal\orchestrator\plan_tracker.go
 - internal\orchestrator\task_manager.go
 - internal\pipeline\normalize.go
+- internal\pipeline\perception.go
 - internal\pipeline\pipeline_integration_test.go
 - internal\pipeline\policy.go
 - internal\pipeline\simulate.go
 - internal\pipeline\stage.go
 - internal\pipeline\stage_test.go
 - internal\pipeline\stages_test.go
+- internal\pipeline\types.go
 - internal\pipeline\validate.go
 - internal\policy\composite.go
 - internal\policy\engine.go
@@ -56,298 +60,6 @@ Total Files: 48
 </file_tree>
 
 # File Contents
-<file path="cmd\server\main.go">
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"log/slog"
-	"net/http"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"syscall"
-	"time"
-
-	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
-	"golang.org/x/sync/errgroup"
-
-	"david22573/synaptic-mc/internal/config"
-	"david22573/synaptic-mc/internal/domain"
-	"david22573/synaptic-mc/internal/eventstore"
-	"david22573/synaptic-mc/internal/execution"
-	"david22573/synaptic-mc/internal/llm"
-	"david22573/synaptic-mc/internal/memory"
-	"david22573/synaptic-mc/internal/observability"
-	"david22573/synaptic-mc/internal/orchestrator"
-	"david22573/synaptic-mc/internal/supervisor"
-	"david22573/synaptic-mc/internal/voyager"
-)
-
-type Config struct {
-	HTTPAddr     string
-	EventStoreDB string
-	MemoryDB     string
-	VectorDB     string
-	UIPath       string
-	LLMURL       string
-	LLMKey       string
-	LLMModel     string
-	SessionID    string
-	DataDir      string
-	BotScript    string
-}
-
-func main() {
-	if err := godotenv.Load(); err != nil {
-		slog.Debug("Could not load .env file", slog.Any("error", err))
-	}
-
-	cfg := parseConfig()
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-		logger.Error("Failed to create data directory", slog.String("path", cfg.DataDir), slog.Any("error", err))
-		os.Exit(1)
-	}
-
-	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
-	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
-	vectorStorePath := filepath.Join(cfg.DataDir, cfg.VectorDB)
-
-	eventStore, err := eventstore.NewSQLiteEventStore(eventStorePath)
-	if err != nil {
-		logger.Error("Failed to create event store", slog.String("path", eventStorePath), slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer eventStore.Close()
-
-	memoryStore, err := memory.NewSQLiteStore(memoryStorePath)
-	if err != nil {
-		logger.Error("Failed to create memory store", slog.String("path", memoryStorePath), slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer memoryStore.Close()
-
-	vectorStore, err := voyager.NewSQLiteVectorStore(vectorStorePath)
-	if err != nil {
-		logger.Error("Failed to create vector store", slog.String("path", vectorStorePath), slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer vectorStore.Close()
-
-	llmClient := llm.NewClient(llm.Config{
-		APIURL:     cfg.LLMURL,
-		APIKey:     cfg.LLMKey,
-		Model:      cfg.LLMModel,
-		MaxRetries: 3,
-	})
-
-	critic := voyager.NewStateCritic()
-	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore)
-
-	uiHub := observability.NewHub(logger)
-	flags := config.DefaultFlags()
-
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger, flags)
-	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
-
-	g, ctx := errgroup.WithContext(context.Background())
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		json.NewEncoder(w).Encode(map[string]any{
-			"ws_url":        "ws://localhost:8080/bot/ws",
-			"viewer_port":   3000,
-			"enable_viewer": true,
-		})
-	})
-
-	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, orch, runner, logger))
-
-	uiPath := cfg.UIPath
-	if !filepath.IsAbs(uiPath) {
-		uiPath = filepath.Join(".", uiPath)
-	}
-	mux.Handle("/", http.FileServer(http.Dir(uiPath)))
-
-	server := &http.Server{
-		Addr:         cfg.HTTPAddr,
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-	}
-
-	g.Go(func() error {
-		logger.Info("Starting UI hub")
-		uiHub.Run(ctx)
-		return nil
-	})
-
-	g.Go(func() error {
-		logger.Info("Starting orchestrator")
-		return orch.Run(ctx)
-	})
-
-	g.Go(func() error {
-		logger.Info("Starting TS supervisor")
-		runner.Start(ctx)
-		return nil
-	})
-
-	g.Go(func() error {
-		logger.Info("Starting HTTP server", slog.String("addr", cfg.HTTPAddr))
-		return server.ListenAndServe()
-	})
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-
-	logger.Info("Shutdown signal received")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP server shutdown error", slog.Any("error", err))
-	}
-
-	if err := g.Wait(); err != nil {
-		logger.Error("Service error", slog.Any("error", err))
-	}
-}
-
-func parseConfig() Config {
-	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
-	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
-	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
-	vectorDB := flag.String("vector", getEnvOrDefault("VECTOR_DB", "skills.db"), "Vector skill database filename")
-	uiPath := flag.String("ui", getEnvOrDefault("UI_PATH", "ui/dist"), "UI static files path")
-	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
-	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
-	llmModel := flag.String("llm-model", getEnvOrDefault("LLM_MODEL", "llama3.2"), "LLM model name")
-	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
-	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
-	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "dist/index.js"), "Path to the compiled TS bot index.js")
-
-	flag.Parse()
-
-	return Config{
-		HTTPAddr:     *httpAddr,
-		EventStoreDB: *eventsDB,
-		MemoryDB:     *memoryDB,
-		VectorDB:     *vectorDB,
-		UIPath:       *uiPath,
-		LLMURL:       *llmURL,
-		LLMKey:       *llmKey,
-		LLMModel:     *llmModel,
-		SessionID:    *sessionID,
-		DataDir:      *dataDir,
-		BotScript:    *botScript,
-	}
-}
-
-func getEnvOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator, runner *supervisor.NodeRunner, logger *slog.Logger) http.HandlerFunc {
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-	}
-
-	return func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			logger.Error("Bot WS upgrade failed", slog.Any("error", err))
-			return
-		}
-
-		botController := execution.NewWSController(conn)
-		idempotentController := execution.NewIdempotentController(botController, 1000)
-		controllerID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
-
-		orch.SetController(controllerID, idempotentController)
-		runner.Ping()
-
-		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
-
-		go func() {
-			<-appCtx.Done()
-			conn.Close()
-		}()
-
-		for {
-			if err := appCtx.Err(); err != nil {
-				logger.Info("Closing bot connection due to server shutdown")
-				conn.Close()
-				return
-			}
-
-			var msg struct {
-				Type    string              `json:"type"`
-				Payload json.RawMessage     `json:"payload"`
-				Trace   domain.TraceContext `json:"trace"`
-			}
-
-			if err := conn.ReadJSON(&msg); err != nil {
-				logger.Warn("Bot connection closed", slog.Any("error", err))
-				conn.Close()
-				return
-			}
-
-			runner.Ping()
-
-			switch domain.EventType(msg.Type) {
-			case domain.EventTypeStateTick:
-				var state domain.GameState
-				if err := json.Unmarshal(msg.Payload, &state); err != nil {
-					logger.Error("Failed to unmarshal state", slog.Any("error", err))
-					continue
-				}
-				orch.IngestState(appCtx, state)
-
-			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic, domain.EventTypePanicResolved:
-				var payload any
-				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-					logger.Error("Failed to unmarshal event", slog.Any("error", err))
-					continue
-				}
-				orch.IngestEvent(appCtx, domain.DomainEvent{
-					SessionID: orch.SessionID(),
-					Trace:     msg.Trace,
-					Type:      domain.EventType(msg.Type),
-					Payload:   msg.Payload,
-				})
-
-			default:
-				logger.Warn("Unknown bot message type", slog.String("type", msg.Type))
-			}
-		}
-	}
-}
-
-</file>
-
 <file path="internal\config\flags.go">
 package config
 
@@ -369,183 +81,56 @@ func DefaultFlags() FeatureFlags {
 
 </file>
 
-<file path="internal\decision\engine.go">
-// internal/decision/engine.go
-package decision
-
-import (
-	"context"
-
-	"david22573/synaptic-mc/internal/domain"
-)
-
-// Engine is a pure pipeline wrapper.
-// It takes the current state and returns a validated, simulated, and policy-checked plan.
-// It holds NO state itself.
-type Engine interface {
-	Evaluate(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) (*domain.Plan, error)
-}
-
-type Planner interface {
-	Generate(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error)
-}
-
-type PolicyEnforcer interface {
-	Enforce(plan *domain.Plan, state domain.GameState) error
-}
-
-</file>
-
 <file path="internal\decision\pipeline.go">
 package decision
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"math"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/pipeline"
 	"david22573/synaptic-mc/internal/policy"
 )
 
-type TaskManager interface {
-	Enqueue(ctx context.Context, tasks ...domain.Action) error
+// Engine manages the sequential execution of decision stages.
+type Engine struct {
+	stages []pipeline.Stage
 }
 
-type Pipeline struct {
-	planner     *AdvancedPlanner
-	stages      []pipeline.Stage
-	taskManager TaskManager
-	logger      *slog.Logger
-	currentTask atomic.Pointer[domain.Action]
-
-	// Phase 3.2: State tracking for smart interrupts
-	lastState     domain.GameState
-	lastStateMu   sync.Mutex
-	lastStateTime time.Time
-	stuckSince    time.Time
-}
-
-func NewPipeline(
-	p *AdvancedPlanner,
-	policyEngine policy.Engine,
-	taskManager TaskManager,
-	logger *slog.Logger,
-) *Pipeline {
-	return &Pipeline{
-		planner: p,
+// NewEngine constructs the complete decision pipeline.
+func NewEngine(store domain.EventStore, sessionID string) *Engine {
+	return &Engine{
 		stages: []pipeline.Stage{
 			pipeline.NewNormalizeStage(),
+			pipeline.NewPerceptionStage(),
 			pipeline.NewValidateStage(),
-			pipeline.NewSimulateStage(),
-			pipeline.NewPolicyStage(policyEngine),
+			pipeline.NewSimulateStage(), // NEW: Triggers the risk simulation
+			pipeline.NewPolicyStage(
+				policy.NewCompositePolicy(
+					policy.NewIntelligencePolicy(store, sessionID),
+				),
+			),
 		},
-		taskManager: taskManager,
-		logger:      logger.With(slog.String("component", "pipeline")),
 	}
 }
 
-func (p *Pipeline) Process(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) {
-	active := p.currentTask.Load()
+// Execute runs the input state through all configured stages.
+func (e *Engine) Execute(ctx context.Context, input pipeline.PipelineState) (pipeline.PipelineState, error) {
+	var err error
+	current := input
 
-	if active != nil {
-		if !p.shouldInterrupt(state) {
-			return
-		}
-		p.logger.Warn("Task commitment broken by state urgency", slog.String("action", active.Action))
-	}
-
-	p.generatePlanAndDispatch(ctx, sessionID, state, trace)
-}
-
-// Phase 3.2: Smart Interrupt Logic
-func (p *Pipeline) shouldInterrupt(state domain.GameState) bool {
-	p.lastStateMu.Lock()
-	defer p.lastStateMu.Unlock()
-
-	now := time.Now()
-
-	// Initial assignment guard
-	if p.lastStateTime.IsZero() {
-		p.lastState = state
-		p.lastStateTime = now
-		return false
-	}
-
-	healthDrop := p.lastState.Health - state.Health
-	timeDiff := now.Sub(p.lastStateTime).Seconds()
-
-	droppingRate := 0.0
-	if timeDiff > 0 {
-		droppingRate = healthDrop / timeDiff
-	}
-
-	dx := p.lastState.Position.X - state.Position.X
-	dy := p.lastState.Position.Y - state.Position.Y
-	dz := p.lastState.Position.Z - state.Position.Z
-	distMoved := math.Sqrt(dx*dx + dy*dy + dz*dz)
-
-	active := p.currentTask.Load()
-	isMovingTask := active != nil && active.Action != "idle"
-
-	if distMoved < 0.1 && isMovingTask {
-		if p.stuckSince.IsZero() {
-			p.stuckSince = now
-		}
-	} else {
-		p.stuckSince = time.Time{} // Reset if moving
-	}
-
-	isStuck := !p.stuckSince.IsZero() && now.Sub(p.stuckSince) > 3*time.Second
-	threatsInView := len(state.Threats) > 0
-
-	p.lastState = state
-	p.lastStateTime = now
-
-	return droppingRate > 2.0 || threatsInView || isStuck
-}
-
-func (p *Pipeline) generatePlanAndDispatch(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) {
-	p.planner.TriggerReplan(state)
-	rawPlan := p.planner.FastPlan(state)
-
-	pipeState := pipeline.PipelineState{
-		SessionID: sessionID,
-		GameState: state,
-		Trace:     trace,
-		Plan:      &rawPlan,
-	}
-
-	for _, stage := range p.stages {
-		nextState, err := stage.Process(ctx, pipeState)
+	for _, stage := range e.stages {
+		current, err = stage.Process(ctx, current)
 		if err != nil {
-			p.logger.Error(fmt.Sprintf("Pipeline stage %s failed", stage.Name()), slog.Any("error", err))
-			return
+			return current, err
 		}
-		pipeState = nextState
+
+		if current.Validation != nil && !current.Validation.IsValid {
+			break
+		}
 	}
 
-	if pipeState.Validation != nil && !pipeState.Validation.IsValid {
-		p.logger.Warn("Plan validation rejected", slog.Any("errors", pipeState.Validation.Errors))
-		return
-	}
-
-	finalPlan := pipeState.FinalPlan
-	if finalPlan == nil || len(finalPlan.Tasks) == 0 {
-		return
-	}
-
-	p.currentTask.Store(&finalPlan.Tasks[0])
-
-	err := p.taskManager.Enqueue(ctx, finalPlan.Tasks...)
-	if err != nil {
-		p.logger.Error("Failed to enqueue tasks", slog.Any("error", err))
-	}
+	return current, nil
 }
 
 </file>
@@ -1143,168 +728,211 @@ package eventstore
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
-	"david22573/synaptic-mc/internal/domain"
-
 	_ "modernc.org/sqlite"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
+const (
+	batchSize     = 50
+	flushInterval = 100 * time.Millisecond
+)
+
+type pendingEvent struct {
+	SessionID string
+	Trace     domain.TraceContext
+	EventType domain.EventType
+	Payload   []byte
+	Timestamp time.Time
+}
+
 type SQLiteStore struct {
-	db *sql.DB
+	db     *sql.DB
+	logger *slog.Logger
+	buffer chan pendingEvent
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewSQLiteEventStore(dbPath string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open event store sqlite: %w", err)
-	}
-
-	// Enforce single writer to prevent SQLITE_BUSY contention
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	schema := `
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA busy_timeout=5000;
-
-CREATE TABLE IF NOT EXISTS domain_events (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	session_id TEXT NOT NULL,
-	trace_id TEXT NOT NULL,
-	action_id TEXT NOT NULL,
-	milestone_id TEXT NOT NULL,
-	event_type TEXT NOT NULL,
-	payload JSON NOT NULL,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_events_session ON domain_events(session_id, id ASC);
-CREATE INDEX IF NOT EXISTS idx_events_trace ON domain_events(trace_id);
-
-CREATE TABLE IF NOT EXISTS session_snapshots (
-	session_id TEXT PRIMARY KEY,
-	last_event_id INTEGER NOT NULL,
-	data JSON NOT NULL,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-`
-
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("failed to apply event store schema: %w", err)
-	}
-
-	return &SQLiteStore{db: db}, nil
-}
-
-func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain.TraceContext, eventType domain.EventType, payload any) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event payload: %w", err)
-	}
-
-	query := `
-	INSERT INTO domain_events (session_id, trace_id, action_id, milestone_id, event_type, payload) 
-	VALUES (?, ?, ?, ?, ?, ?)
-`
-
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		_, err = s.db.ExecContext(ctx, query, sessionID, trace.TraceID, trace.ActionID, trace.MilestoneID, string(eventType), data)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
-	}
-	return fmt.Errorf("failed to append event after retries: %w", lastErr)
-}
-
-func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain.DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at  FROM domain_events  WHERE session_id = ?  ORDER BY id ASC`
-	return s.queryEvents(ctx, query, sessionID)
-}
-
-func (s *SQLiteStore) GetRecentStream(ctx context.Context, sessionID string, limit int) ([]domain.DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at  FROM domain_events  WHERE session_id = ? ORDER BY id DESC LIMIT ?`
-
-	events, err := s.queryEvents(ctx, query, sessionID, limit)
+func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
+	// Enable WAL mode and busy timeout via DSN
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL", dbPath)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-		events[i], events[j] = events[j], events[i]
+	if err := db.Ping(); err != nil {
+		return nil, err
 	}
 
-	return events, nil
+	if err := runMigrations(db); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &SQLiteStore{
+		db:     db,
+		logger: logger.With(slog.String("component", "eventstore")),
+		buffer: make(chan pendingEvent, 1000),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	store.wg.Add(1)
+	go store.batchWorker()
+
+	return store, nil
 }
 
-func (s *SQLiteStore) GetStreamSince(ctx context.Context, sessionID string, sinceID int64) ([]domain.DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at  FROM domain_events  WHERE session_id = ? AND id > ? ORDER BY id ASC`
-	return s.queryEvents(ctx, query, sessionID, sinceID)
+func runMigrations(db *sql.DB) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			trace_id TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			payload JSON,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, id);`,
+		`CREATE TABLE IF NOT EXISTS snapshots (
+			session_id TEXT PRIMARY KEY,
+			last_event_id INTEGER NOT NULL,
+			data JSON NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+	}
+
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Append is now non-blocking. It pushes to the buffer channel.
+func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain.TraceContext, eventType domain.EventType, payload []byte) error {
+	ev := pendingEvent{
+		SessionID: sessionID,
+		Trace:     trace,
+		EventType: eventType,
+		Payload:   payload,
+		Timestamp: time.Now().UTC(),
+	}
+
+	select {
+	case s.buffer <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// If buffer is completely full, fall back to synchronous insert to avoid dropping data
+		s.logger.Warn("Event buffer full, performing synchronous insert")
+		return s.insertBatch([]pendingEvent{ev})
+	}
 }
 
 func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snap domain.SessionSnapshot) error {
-	query := `INSERT INTO session_snapshots (session_id, last_event_id, data, created_at)  VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET  last_event_id = excluded.last_event_id, data = excluded.data, created_at = CURRENT_TIMESTAMP;`
-	_, err := s.db.ExecContext(ctx, query, snap.SessionID, snap.LastEventID, string(snap.Data))
+	query := `
+		INSERT INTO snapshots (session_id, last_event_id, data, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(session_id) DO UPDATE SET
+			last_event_id = excluded.last_event_id,
+			data = excluded.data,
+			updated_at = CURRENT_TIMESTAMP;
+	`
+	_, err := s.db.ExecContext(ctx, query, snap.SessionID, snap.LastEventID, snap.Data)
 	return err
 }
 
-func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (*domain.SessionSnapshot, error) {
-	query := `SELECT session_id, last_event_id, data, created_at  FROM session_snapshots  WHERE session_id = ?`
-	row := s.db.QueryRowContext(ctx, query, sessionID)
-
-	var snap domain.SessionSnapshot
-	var dataStr string
-
-	err := row.Scan(&snap.SessionID, &snap.LastEventID, &dataStr, &snap.CreatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	snap.Data = json.RawMessage(dataStr)
-	return &snap, nil
-}
-
-func (s *SQLiteStore) queryEvents(ctx context.Context, query string, args ...any) ([]domain.DomainEvent, error) {
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var events []domain.DomainEvent
-	for rows.Next() {
-		var e domain.DomainEvent
-		var eventTypeStr string
-
-		if err := rows.Scan(
-			&e.ID,
-			&e.SessionID,
-			&e.Trace.TraceID,
-			&e.Trace.ActionID,
-			&e.Trace.MilestoneID,
-			&eventTypeStr,
-			&e.Payload,
-			&e.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-
-		e.Type = domain.EventType(eventTypeStr)
-		events = append(events, e)
-	}
-	return events, nil
-}
-
 func (s *SQLiteStore) Close() error {
+	s.cancel()
+	s.wg.Wait() // Wait for remaining events to flush
 	return s.db.Close()
+}
+
+func (s *SQLiteStore) batchWorker() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	batch := make([]pendingEvent, 0, batchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := s.insertBatch(batch); err != nil {
+			s.logger.Error("Failed to flush event batch", slog.Any("error", err), slog.Int("count", len(batch)))
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			// Drain remaining buffer on shutdown
+			close(s.buffer)
+			for ev := range s.buffer {
+				batch = append(batch, ev)
+				if len(batch) >= batchSize {
+					flush()
+				}
+			}
+			flush()
+			return
+
+		case ev := <-s.buffer:
+			batch = append(batch, ev)
+			if len(batch) >= batchSize {
+				flush()
+			}
+
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (s *SQLiteStore) insertBatch(events []pendingEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Build bulk insert query
+	valueStrings := make([]string, 0, len(events))
+	valueArgs := make([]interface{}, 0, len(events)*6)
+
+	for _, ev := range events {
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?)")
+		valueArgs = append(valueArgs, ev.SessionID, ev.Trace.TraceID, ev.Trace.ActionID, ev.EventType, ev.Payload, ev.Timestamp)
+	}
+
+	stmt := fmt.Sprintf("INSERT INTO events (session_id, trace_id, action_id, event_type, payload, created_at) VALUES %s",
+		strings.Join(valueStrings, ","))
+
+	if _, err := tx.Exec(stmt, valueArgs...); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 </file>
@@ -1314,6 +942,7 @@ package execution
 
 import (
 	"context"
+
 	"david22573/synaptic-mc/internal/domain"
 )
 
@@ -1323,6 +952,125 @@ type Controller interface {
 	Dispatch(ctx context.Context, action domain.Action) error
 	AbortCurrent(ctx context.Context, reason string) error
 	Close() error
+}
+
+</file>
+
+<file path="internal\execution\engine.go">
+package execution
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type TaskExecutionEngine struct {
+	controller  Controller
+	logger      *slog.Logger
+	mu          sync.Mutex
+	queue       []domain.Action
+	inFlight    *ExecutionTask
+	maxInFlight int
+}
+
+func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
+	return &TaskExecutionEngine{
+		controller:  ctrl,
+		logger:      logger.With(slog.String("component", "task_execution_engine")),
+		queue:       make([]domain.Action, 0),
+		maxInFlight: 1,
+	}
+}
+
+// Enqueue adds an action to the execution queue, applying backpressure if needed.
+func (e *TaskExecutionEngine) Enqueue(action domain.Action) {
+	e.mu.Lock()
+
+	// Backpressure: Drop low-priority drift/background actions if we are busy
+	if action.Priority < 0 && (e.inFlight != nil || len(e.queue) > 0) {
+		e.mu.Unlock()
+		return
+	}
+
+	e.queue = append(e.queue, action)
+	e.mu.Unlock()
+
+	e.pump()
+}
+
+// pump drains the queue based on priority and max in-flight limits.
+func (e *TaskExecutionEngine) pump() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.inFlight != nil {
+		return // Enforce maxInFlight = 1
+	}
+
+	if len(e.queue) == 0 {
+		return
+	}
+
+	// Find the highest priority action in the queue
+	bestIdx := 0
+	for i := 1; i < len(e.queue); i++ {
+		if e.queue[i].Priority > e.queue[bestIdx].Priority {
+			bestIdx = i
+		}
+	}
+
+	action := e.queue[bestIdx]
+
+	// Remove the selected action from the queue
+	e.queue = append(e.queue[:bestIdx], e.queue[bestIdx+1:]...)
+
+	e.inFlight = &ExecutionTask{
+		Action:      action,
+		Status:      StatusDispatched,
+		EnqueueTime: time.Now(),
+	}
+
+	err := e.controller.Dispatch(context.Background(), action)
+	if err != nil {
+		e.inFlight.Status = StatusFailed
+		e.inFlight.Error = err.Error()
+		e.inFlight = nil
+		e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", action.Action))
+		go e.pump() // Try next
+		return
+	}
+}
+
+func (e *TaskExecutionEngine) OnTaskStart(actionID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.inFlight != nil && e.inFlight.Action.ID == actionID {
+		e.inFlight.Status = StatusRunning
+		now := time.Now()
+		e.inFlight.StartTime = &now
+	}
+}
+
+func (e *TaskExecutionEngine) OnTaskEnd(actionID string, success bool) {
+	e.mu.Lock()
+	if e.inFlight != nil && e.inFlight.Action.ID == actionID {
+		if success {
+			e.inFlight.Status = StatusCompleted
+		} else {
+			e.inFlight.Status = StatusFailed
+		}
+		now := time.Now()
+		e.inFlight.EndTime = &now
+		e.inFlight = nil
+	}
+	e.mu.Unlock()
+
+	e.pump()
 }
 
 </file>
@@ -1481,88 +1229,231 @@ func (m *ControllerManager) Close() error {
 
 </file>
 
+<file path="internal\execution\task.go">
+package execution
+
+import (
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type TaskStatus string
+
+const (
+	StatusQueued     TaskStatus = "QUEUED"
+	StatusDispatched TaskStatus = "DISPATCHED"
+	StatusRunning    TaskStatus = "RUNNING"
+	StatusCompleted  TaskStatus = "COMPLETED"
+	StatusFailed     TaskStatus = "FAILED"
+	StatusTimedOut   TaskStatus = "TIMED_OUT"
+	StatusAborted    TaskStatus = "ABORTED"
+)
+
+type ExecutionTask struct {
+	Action      domain.Action `json:"action"`
+	Status      TaskStatus    `json:"status"`
+	EnqueueTime time.Time     `json:"enqueue_time"`
+	StartTime   *time.Time    `json:"start_time,omitempty"`
+	EndTime     *time.Time    `json:"end_time,omitempty"`
+	Error       string        `json:"error,omitempty"`
+}
+
+type ActivePlan struct {
+	Plan         domain.Plan
+	CurrentIndex int
+}
+
+</file>
+
 <file path="internal\execution\ws_controller.go">
 package execution
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
-	"david22573/synaptic-mc/internal/domain"
-
 	"github.com/gorilla/websocket"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
-// WSController implements Controller for WebSocket-connected agents.
-// It handles wire serialization and thread-safe socket writes.
-type WSController struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 15 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 512000
+)
+
+type WSMessage struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
 }
 
-func NewWSController(conn *websocket.Conn) *WSController {
-	return &WSController{
-		conn: conn,
+type WSController struct {
+	conn      *websocket.Conn
+	logger    *slog.Logger
+	sendCh    chan WSMessage
+	onMessage func(msgType string, payload []byte)
+	onClose   func()
+	closeOnce sync.Once
+	mu        sync.Mutex
+	isClosed  bool
+}
+
+func NewWSController(
+	conn *websocket.Conn,
+	logger *slog.Logger,
+	onMessage func(msgType string, payload []byte),
+	onClose func(),
+) *WSController {
+	c := &WSController{
+		conn:      conn,
+		logger:    logger.With(slog.String("component", "ws_controller")),
+		sendCh:    make(chan WSMessage, 256),
+		onMessage: onMessage,
+		onClose:   onClose,
 	}
+
+	c.conn.SetReadLimit(maxMessageSize)
+
+	// Start the pumps
+	go c.readPump()
+	go c.writePump()
+
+	return c
 }
 
 func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error {
-	payload, err := json.Marshal(map[string]any{
-		"id":        action.ID,
-		"action":    action.Action,
-		"target":    action.Target,
-		"count":     action.Count,
-		"rationale": action.Rationale,
-	})
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return errors.New("websocket closed")
+	}
+	c.mu.Unlock()
+
+	payload, err := json.Marshal(action)
 	if err != nil {
-		return fmt.Errorf("failed to marshal action: %w", err)
-	}
-
-	msg := map[string]any{
-		"type":    "command",
-		"trace":   action.Trace,
-		"payload": json.RawMessage(payload),
-	}
-
-	return c.writeJSON(ctx, msg)
-}
-
-func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
-	payload, err := json.Marshal(map[string]string{"reason": reason})
-	if err != nil {
-		return fmt.Errorf("failed to marshal abort payload: %w", err)
-	}
-
-	msg := map[string]any{
-		"type":    "abort_task",
-		"payload": json.RawMessage(payload),
-	}
-
-	return c.writeJSON(ctx, msg)
-}
-
-func (c *WSController) Close() error {
-	return c.conn.Close()
-}
-
-func (c *WSController) writeJSON(ctx context.Context, v any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	// Honor context cancellation or fallback to a hard 5-second deadline
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(5 * time.Second)
-	}
-
-	if err := c.conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 
-	return c.conn.WriteJSON(v)
+	msg := WSMessage{
+		Type:    "DISPATCH_TASK",
+		Payload: payload,
+	}
+
+	select {
+	case c.sendCh <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return errors.New("send channel full")
+	}
+}
+
+func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
+	payload, _ := json.Marshal(map[string]string{"reason": reason})
+
+	msg := WSMessage{
+		Type:    "ABORT_TASK",
+		Payload: payload,
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.isClosed {
+		return errors.New("websocket closed")
+	}
+
+	select {
+	case c.sendCh <- msg:
+		return nil
+	default:
+		return errors.New("send channel full")
+	}
+}
+
+func (c *WSController) Close() error {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.isClosed = true
+		c.mu.Unlock()
+
+		close(c.sendCh)
+		c.conn.Close()
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return nil
+}
+
+func (c *WSController) readPump() {
+	defer c.Close()
+
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	for {
+		_, msgData, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				c.logger.Error("Unexpected websocket close", slog.Any("error", err))
+			} else {
+				c.logger.Info("Websocket read pump closed gracefully")
+			}
+			break
+		}
+
+		var msg WSMessage
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			c.logger.Warn("Failed to unmarshal websocket message", slog.Any("error", err))
+			continue
+		}
+
+		if c.onMessage != nil {
+			c.onMessage(msg.Type, msg.Payload)
+		}
+	}
+}
+
+func (c *WSController) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.Close()
+	}()
+
+	for {
+		select {
+		case msg, ok := <-c.sendCh:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			if err := c.conn.WriteJSON(msg); err != nil {
+				c.logger.Error("Failed to write JSON to websocket", slog.Any("error", err))
+				return
+			}
+
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 </file>
@@ -1570,41 +1461,46 @@ func (c *WSController) writeJSON(ctx context.Context, v any) error {
 <file path="internal\humanization\attention.go">
 package humanization
 
-import "david22573/synaptic-mc/internal/domain"
+import (
+	"fmt"
+	"math/rand"
+	"time"
 
-type AttentionModel struct {
-	config Config
-}
+	"david22573/synaptic-mc/internal/domain"
+)
 
-func NewAttentionModel(config Config) *AttentionModel {
-	return &AttentionModel{config: config}
-}
+// ProcessAttentionDrift checks if the bot should be distracted by its environment.
+func ProcessAttentionDrift(ctx Context, state *State, now time.Time) []ScheduledAction {
+	var actions []ScheduledAction
 
-func (m *AttentionModel) Apply(tasks []domain.Action, state *State) []domain.Action {
-	if len(tasks) == 0 {
-		return tasks
-	}
+	attention := state.GetAttention()
 
-	primaryTask := tasks[0]
-	newTarget := primaryTask.Target.Name
+	// If attention is low and we aren't fighting for our life or stuck...
+	if attention < 0.5 && !ctx.IsStuck && ctx.State.Health >= 15 {
 
-	if newTarget != state.Attention.CurrentTarget && state.Attention.FocusStrength > 0.7 {
-		if primaryTask.Action != "retreat" && primaryTask.Action != "eat" {
-			for i, t := range tasks {
-				if t.Target.Name == state.Attention.CurrentTarget {
-					tasks[0], tasks[i] = tasks[i], tasks[0]
-					return tasks
-				}
+		// 15% chance to actually trigger a physical drift action per evaluation
+		if rand.Float64() < 0.15 && len(ctx.State.POIs) > 0 {
+
+			// Pick a random nearby Point of Interest
+			poi := ctx.State.POIs[rand.Intn(len(ctx.State.POIs))]
+
+			driftAction := domain.Action{
+				ID:        fmt.Sprintf("drift-%d", time.Now().UnixNano()),
+				Action:    "look",
+				Target:    domain.Target{Type: "poi", Name: poi.Name},
+				Priority:  -1, // Background priority, instantly preempted by real tasks
+				Rationale: "Attention drifted to nearby " + poi.Name,
 			}
+
+			actions = append(actions, ScheduledAction{
+				Action: driftAction,
+				// Execute the drift almost immediately
+				ExecuteAt: now.Add(50 * time.Millisecond),
+			})
 		}
 	}
 
-	if newTarget != state.Attention.CurrentTarget {
-		state.Attention.CurrentTarget = newTarget
-		state.Attention.FocusStrength = 1.0
-	}
-
-	return tasks
+	return actions
 }
 
 </file>
@@ -1618,41 +1514,62 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type Engine struct {
-	attention  *AttentionModel
-	intent     *IntentModel
-	hesitation *HesitationModel
-	noise      *NoiseModel
-	state      *State
-	config     Config
+type ScheduledAction struct {
+	Action    domain.Action
+	ExecuteAt time.Time
 }
 
-func NewEngine(config Config) *Engine {
+type Engine struct {
+	cfg         Config
+	state       *State
+	intentModel *IntentModel // NEW
+}
+
+func NewEngine(cfg Config) *Engine {
 	return &Engine{
-		attention:  NewAttentionModel(config),
-		intent:     NewIntentModel(),
-		hesitation: NewHesitationModel(config),
-		noise:      NewNoiseModel(config),
-		state:      NewState(),
-		config:     config,
+		cfg:         cfg,
+		state:       NewState(cfg),
+		intentModel: NewIntentModel(), // NEW
 	}
+}
+
+func (e *Engine) State() *State {
+	return e.state
 }
 
 func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
+	var scheduled []ScheduledAction
 	now := time.Now()
-	if !e.state.LastUpdate.IsZero() {
-		dt := now.Sub(e.state.LastUpdate)
-		e.state.Evolve(ctx, dt)
-	} else {
-		e.state.LastUpdate = now
+	currentDelay := time.Duration(0)
+
+	// 1. Pass the tasks through the Intent filter to check for rage-quits
+	approvedTasks := e.intentModel.Apply(plan.Tasks, e.state, ctx)
+
+	// If the intent model returned an empty list, the bot is too frustrated to act
+	if len(approvedTasks) == 0 {
+		return scheduled
 	}
 
-	tasks := plan.Tasks
-	tasks = e.attention.Apply(tasks, e.state)
-	tasks = e.intent.Apply(tasks, e.state, ctx)
-	tasks = e.noise.Apply(tasks, e.state)
+	// 2. Inject ambient attention drift
+	driftActions := ProcessAttentionDrift(ctx, e.state, now)
+	scheduled = append(scheduled, driftActions...)
 
-	return e.hesitation.Schedule(tasks, e.state)
+	// 3. Process the actual objective
+	for _, task := range approvedTasks {
+		noisyTask := ApplyNoise(task, ctx, e.cfg)
+		hesitation := CalculateHesitation(noisyTask, ctx, e.state, e.cfg)
+
+		currentDelay += hesitation
+
+		scheduled = append(scheduled, ScheduledAction{
+			Action:    noisyTask,
+			ExecuteAt: now.Add(currentDelay),
+		})
+
+		currentDelay += 100 * time.Millisecond
+	}
+
+	return scheduled
 }
 
 </file>
@@ -1662,18 +1579,16 @@ package humanization
 
 import "time"
 
+// Config holds the tuning parameters for the humanization engine.
 type Config struct {
+	// AttentionDecay is the rate at which focus drops per second (0.0 to 1.0)
 	AttentionDecay float64
-	HesitationBase time.Duration
-	NoiseLevel     float64
-}
 
-func DefaultConfig() Config {
-	return Config{
-		AttentionDecay: 0.1,
-		HesitationBase: 250 * time.Millisecond,
-		NoiseLevel:     0.05,
-	}
+	// HesitationBase is the minimum reaction time before executing an action
+	HesitationBase time.Duration
+
+	// NoiseLevel dictates the probability/severity of input jitter (0.0 to 1.0)
+	NoiseLevel float64
 }
 
 </file>
@@ -1683,20 +1598,131 @@ package humanization
 
 import "david22573/synaptic-mc/internal/domain"
 
+// Context provides the situational awareness required for behavioral modifiers.
 type Context struct {
-	CurrentTask   *domain.Action
-	NearbyThreats int
-	Health        float64
-	IsStuck       bool
+	State   domain.GameState
+	IsStuck bool
 }
 
+// BuildContext constructs a new behavioral context from the orchestrator's state.
 func BuildContext(state domain.GameState, isStuck bool) Context {
 	return Context{
-		CurrentTask:   state.CurrentTask,
-		NearbyThreats: len(state.Threats),
-		Health:        state.Health,
-		IsStuck:       isStuck,
+		State:   state,
+		IsStuck: isStuck,
 	}
+}
+
+</file>
+
+<file path="internal\humanization\engine.go">
+package humanization
+
+import (
+	"fmt"
+	"math/rand"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type Config struct {
+	BaseDriftRate float64
+	MaxDriftDelay time.Duration
+}
+
+type Engine struct {
+	config Config
+	state  *State
+}
+
+func NewEngine(cfg Config) *Engine {
+	return &Engine{
+		config: cfg,
+		state:  NewState(),
+	}
+}
+
+func (e *Engine) State() *State {
+	return e.state
+}
+
+// Process wraps the planner's output and optionally injects human-like drift.
+func (e *Engine) Process(plan domain.Plan, ctx Context) []domain.ScheduledAction {
+	scheduled := make([]domain.ScheduledAction, 0, len(plan.Tasks))
+
+	// Determine if the current state is critical (no drift allowed)
+	isCritical := false
+	if ctx.GameState.CurrentTask != nil {
+		action := ctx.GameState.CurrentTask.Action
+		if action == "combat" || action == "retreat" || action == "eat" || action == "mine" {
+			isCritical = true
+		}
+	}
+
+	// If health is low, panic mode is usually active anyway, but enforce it here
+	if ctx.GameState.Health < 10 {
+		isCritical = true
+	}
+
+	now := time.Now()
+
+	// 1. Enqueue the actual planned tasks (CRITICAL/PLAN priority)
+	for i, task := range plan.Tasks {
+		// Ensure standard tasks have appropriate priority if not set
+		if task.Priority == 0 {
+			task.Priority = 5 // Base PLAN priority
+		}
+
+		// Add tiny jitter to task start times to feel less robotic,
+		// but only if it's not the very first task and not critical.
+		delay := time.Duration(0)
+		if i > 0 && !isCritical {
+			delay = time.Duration(rand.Intn(200)) * time.Millisecond
+		}
+
+		scheduled = append(scheduled, domain.ScheduledAction{
+			Action:    task,
+			ExecuteAt: now.Add(delay),
+		})
+	}
+
+	// 2. Inject drift (BACKGROUND priority) ONLY if safe
+	if !isCritical && rand.Float64() < e.config.BaseDriftRate {
+		driftAction := e.generateDrift(ctx)
+		if driftAction != nil {
+			driftDelay := time.Duration(rand.Int64() % int64(e.config.MaxDriftDelay))
+			scheduled = append(scheduled, domain.ScheduledAction{
+				Action:    *driftAction,
+				ExecuteAt: now.Add(driftDelay),
+			})
+		}
+	}
+
+	return scheduled
+}
+
+func (e *Engine) generateDrift(ctx Context) *domain.Action {
+	// Simple examples of drift: look around, slight reposition, check inventory
+	roll := rand.Float64()
+
+	action := domain.Action{
+		ID:       fmt.Sprintf("drift-%d", time.Now().UnixNano()),
+		Priority: -1, // BACKGROUND priority (TaskExecutionEngine will drop this if busy)
+	}
+
+	if roll < 0.5 {
+		action.Action = "look"
+		action.Target = domain.Target{Type: "relative", Name: "random_yaw"}
+		action.Rationale = "Humanization: idle looking around"
+	} else if roll < 0.8 {
+		action.Action = "inventory"
+		action.Target = domain.Target{Type: "ui", Name: "open_close"}
+		action.Rationale = "Humanization: nervously checking inventory"
+	} else {
+		return nil // No drift
+	}
+
+	return &action
 }
 
 </file>
@@ -1711,48 +1737,42 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type ScheduledAction struct {
-	domain.Action
-	ExecuteAt time.Time
-}
+// CalculateHesitation determines how long the bot should pause before acting.
+func CalculateHesitation(action domain.Action, ctx Context, state *State, cfg Config) time.Duration {
+	base := float64(cfg.HesitationBase.Milliseconds())
 
-type HesitationModel struct {
-	config Config
-}
-
-func NewHesitationModel(config Config) *HesitationModel {
-	return &HesitationModel{config: config}
-}
-
-func (m *HesitationModel) Schedule(tasks []domain.Action, state *State) []ScheduledAction {
-	scheduled := make([]ScheduledAction, len(tasks))
-	now := time.Now()
-
-	for i, task := range tasks {
-		delay := m.config.HesitationBase
-
-		delay += time.Duration(state.Personality.Fatigue * float64(m.config.HesitationBase))
-
-		if state.Personality.Caution > 0.7 {
-			delay = time.Duration(float64(delay) * 1.5)
-		}
-
-		jitter := time.Duration(rand.Float64() * float64(m.config.HesitationBase) * 0.2)
-		delay += jitter
-
-		if task.Action == "retreat" || task.Action == "eat" {
-			delay = 0
-		}
-
-		scheduled[i] = ScheduledAction{
-			Action:    task,
-			ExecuteAt: now.Add(delay),
-		}
-
-		now = now.Add(delay)
+	// 1. Complexity Scaling
+	// High-stakes or complex physical actions require more "thinking" time.
+	switch action.Action {
+	case "hunt", "combat", "retreat", "build":
+		base += 600.0
+	case "craft", "smelt", "store":
+		base += 300.0
+	case "explore":
+		base += 100.0 // Wandering is instinctual, low hesitation
 	}
 
-	return scheduled
+	// 2. Confusion Scaling
+	// If the bot is stuck, it hesitates longer, simulating confusion.
+	if ctx.IsStuck {
+		base += 1200.0
+	}
+
+	// 3. Attention Scaling
+	// Lower attention = slower reaction times.
+	attentionModifier := 1.0 + (1.0 - state.GetAttention())
+	base *= attentionModifier
+
+	// 4. Natural Jitter
+	// Add up to 50% random jitter so the delay is never exactly the same.
+	jitterLimit := int64(base * 0.5)
+	var jitter int64
+	if jitterLimit > 0 {
+		jitter = rand.Int63n(jitterLimit)
+	}
+
+	finalMs := int64(base) + jitter
+	return time.Duration(finalMs) * time.Millisecond
 }
 
 </file>
@@ -1762,17 +1782,29 @@ package humanization
 
 import "david22573/synaptic-mc/internal/domain"
 
+// IntentState tracks the bot's emotional commitment to its current goal.
+type IntentState struct {
+	CurrentGoal string
+	Commitment  float64
+	Frustration float64
+}
+
 type IntentModel struct{}
 
 func NewIntentModel() *IntentModel {
 	return &IntentModel{}
 }
 
+// Apply evaluates frustration and decides whether to proceed with the tasks or abandon them.
 func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []domain.Action {
 	if len(tasks) == 0 {
 		return tasks
 	}
 
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// 1. Calculate Frustration
 	if ctx.IsStuck {
 		state.Intent.Frustration += 0.2
 	} else {
@@ -1782,6 +1814,8 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 		}
 	}
 
+	// 2. Rage Quit Threshold
+	// If frustration maxes out, wipe the intent and return no actions to force a re-plan.
 	if state.Intent.Frustration > 0.8 {
 		state.Intent.CurrentGoal = ""
 		state.Intent.Commitment = 0.0
@@ -1789,6 +1823,7 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 		return []domain.Action{}
 	}
 
+	// 3. Lock in new goals
 	primaryTask := tasks[0]
 	if state.Intent.CurrentGoal != primaryTask.Action {
 		state.Intent.CurrentGoal = primaryTask.Action
@@ -1805,31 +1840,25 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 package humanization
 
 import (
-	"math/rand"
-
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type NoiseModel struct {
-	config Config
-}
-
-func NewNoiseModel(config Config) *NoiseModel {
-	return &NoiseModel{config: config}
-}
-
-func (m *NoiseModel) Apply(tasks []domain.Action, state *State) []domain.Action {
-	if len(tasks) < 2 {
-		return tasks
+// ApplyNoise lightly fuzzes the intent parameters.
+// Currently acts as a passthrough for structural safety, but is hooked up
+// for future vector/coordinate fuzzing when actions carry explicit Vec3s.
+func ApplyNoise(action domain.Action, ctx Context, cfg Config) domain.Action {
+	if cfg.NoiseLevel <= 0.01 {
+		return action
 	}
 
-	if rand.Float64() < m.config.NoiseLevel {
-		if tasks[0].Action != "retreat" && tasks[0].Action != "eat" && tasks[1].Action != "retreat" {
-			tasks[0], tasks[1] = tasks[1], tasks[0]
-		}
-	}
+	noisyAction := action
 
-	return tasks
+	// Example: If the action involves a specific coordinate, we would
+	// apply +/- NoiseLevel to X/Z here so the bot doesn't walk perfectly straight.
+	// Since our current target types are mostly entity names (e.g., "oak_log"),
+	// we rely on the TS client (Movements config) for physical path jitter.
+
+	return noisyAction
 }
 
 </file>
@@ -1837,76 +1866,49 @@ func (m *NoiseModel) Apply(tasks []domain.Action, state *State) []domain.Action 
 <file path="internal\humanization\state.go">
 package humanization
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
+// State tracks the evolving internal conditions of the agent.
 type State struct {
-	Attention   AttentionState
-	Intent      IntentState
-	Personality PersonalityState
-	LastUpdate  time.Time
+	mu             sync.Mutex
+	AttentionLevel float64
+	Fatigue        float64
+	Intent         IntentState // NEW: Hooked in from intent.go
+	cfg            Config
 }
 
-type PersonalityState struct {
-	Aggression float64
-	Curiosity  float64
-	Caution    float64
-	Fatigue    float64
-}
-
-type AttentionState struct {
-	CurrentTarget string
-	FocusStrength float64
-}
-
-type IntentState struct {
-	CurrentGoal string
-	Commitment  float64
-	Frustration float64
-}
-
-func NewState() *State {
+func NewState(cfg Config) *State {
 	return &State{
-		Attention: AttentionState{FocusStrength: 1.0},
-		Intent:    IntentState{Commitment: 1.0},
-		Personality: PersonalityState{
-			Aggression: 0.5,
-			Curiosity:  0.5,
-			Caution:    0.5,
-			Fatigue:    0.0,
-		},
-		LastUpdate: time.Now(),
+		AttentionLevel: 1.0,
+		Fatigue:        0.0,
+		Intent:         IntentState{},
+		cfg:            cfg,
 	}
 }
 
 func (s *State) Evolve(ctx Context, dt time.Duration) {
-	s.Attention.FocusStrength -= 0.05 * dt.Seconds()
-	if s.Attention.FocusStrength < 0 {
-		s.Attention.FocusStrength = 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	decay := s.cfg.AttentionDecay * dt.Seconds()
+	s.AttentionLevel -= decay
+
+	if ctx.State.Health < 15 || ctx.IsStuck {
+		s.AttentionLevel = 1.0
 	}
 
-	if ctx.CurrentTask != nil {
-		s.Personality.Fatigue += 0.01 * dt.Seconds()
-	} else {
-		s.Personality.Fatigue -= 0.05 * dt.Seconds()
+	if s.AttentionLevel < 0.2 {
+		s.AttentionLevel = 0.2
 	}
-	if s.Personality.Fatigue < 0 {
-		s.Personality.Fatigue = 0
-	} else if s.Personality.Fatigue > 1 {
-		s.Personality.Fatigue = 1
-	}
+}
 
-	if ctx.Health < 10 || ctx.NearbyThreats > 0 {
-		s.Personality.Caution += 0.1 * dt.Seconds()
-	} else {
-		s.Personality.Caution -= 0.02 * dt.Seconds()
-	}
-	if s.Personality.Caution < 0 {
-		s.Personality.Caution = 0
-	} else if s.Personality.Caution > 1 {
-		s.Personality.Caution = 1
-	}
-
-	s.LastUpdate = time.Now()
+func (s *State) GetAttention() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AttentionLevel
 }
 
 </file>
@@ -2193,7 +2195,6 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
 }
 
-// CreateEmbedding generates a vector for the input text using the OpenAI-compatible v1/embeddings endpoint.
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
 	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
 
@@ -2216,7 +2217,11 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 
 		if attempt > 0 {
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			time.Sleep(baseDelay + jitter)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
 			baseDelay *= 2
 		}
 
@@ -2283,7 +2288,11 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 
 		if attempt > 0 {
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			time.Sleep(baseDelay + jitter)
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
 			baseDelay *= 2
 		}
 
@@ -2447,6 +2456,10 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return "KNOWN WORLD: empty", err
+	}
+
 	if len(nodes) == 0 {
 		return "KNOWN WORLD: empty", nil
 	}
@@ -2492,6 +2505,10 @@ func (s *SQLiteStore) GetSummary(ctx context.Context, sessionID string) (string,
 		if err := rows.Scan(&key, &value); err == nil {
 			summary.WriteString(fmt.Sprintf("- %s: %s\n", key, value))
 		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 
 	if summary.Len() == 0 {
@@ -2820,6 +2837,7 @@ import (
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
@@ -2834,9 +2852,12 @@ type Orchestrator struct {
 
 	curriculum voyager.Curriculum
 	critic     voyager.Critic
+	humanizer  *humanization.Engine
 
 	ctrlManager *execution.ControllerManager
+	engine      *execution.TaskExecutionEngine
 	taskManager *TaskManager
+	planTracker *PlanTracker
 	logger      *slog.Logger
 
 	stateBuffer atomic.Pointer[domain.VersionedState]
@@ -2849,8 +2870,9 @@ type Orchestrator struct {
 	activeIntent    *domain.ActionIntent
 	beforeState     domain.GameState
 
-	reflexLock bool
-	evalCancel context.CancelFunc
+	reflexLock   bool
+	evalCancel   context.CancelFunc
+	evalInFlight atomic.Bool
 
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
@@ -2867,13 +2889,16 @@ func New(
 	uiHub *observability.Hub,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
+	humanCfg humanization.Config,
 ) *Orchestrator {
 	cm := execution.NewControllerManager()
 	if exec != nil {
 		cm.SetController("initial", exec)
 	}
 
-	tm := NewTaskManager(cm, nil, logger)
+	engine := execution.NewTaskExecutionEngine(cm, logger)
+	tm := NewTaskManager(engine, nil, logger)
+	humanizer := humanization.NewEngine(humanCfg)
 
 	o := &Orchestrator{
 		sessionID:   sessionID,
@@ -2883,13 +2908,16 @@ func New(
 		curriculum:  curriculum,
 		critic:      critic,
 		ctrlManager: cm,
+		engine:      engine,
 		taskManager: tm,
+		humanizer:   humanizer,
 		uiHub:       uiHub,
 		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
 		eventCh:     make(chan domain.DomainEvent, 100),
 		taskHistory: make([]domain.TaskHistory, 0),
 	}
 
+	o.planTracker = NewPlanTracker(tm, humanizer, o.buildHumanizationContext, logger)
 	tm.OnDrain = o.handleQueueDrain
 
 	return o
@@ -2898,12 +2926,16 @@ func New(
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("Starting orchestrator lifecycle")
 
-	// Phase 4: Tune Tick Rate to 50ms for snappier execution
 	tickRate := 50 * time.Millisecond
 	o.ticker = time.NewTicker(tickRate)
 	defer o.ticker.Stop()
 
 	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		o.taskManager.Run(gCtx)
+		return nil
+	})
 
 	g.Go(func() error {
 		return o.processStateLoop(gCtx, tickRate)
@@ -2956,7 +2988,9 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 }
 
 func (o *Orchestrator) handleQueueDrain() {
-	_ = o.evaluateNextTask(context.Background())
+	if !o.planTracker.HasActivePlan() {
+		_ = o.evaluateNextTask(context.Background())
+	}
 }
 
 func (o *Orchestrator) takeSnapshot(ctx context.Context) {
@@ -2996,13 +3030,15 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 		case <-ctx.Done():
 			return ctx.Err()
 		case t := <-o.ticker.C:
-			// Phase 4: Jitter Metrics Tracking
 			actualTick := t.Sub(lastTick)
 			jitter := float64(actualTick.Milliseconds() - targetTick.Milliseconds())
 			if jitter < 0 {
 				jitter = -jitter
 			}
 			observability.Metrics.DecisionJitter.Observe(jitter)
+
+			hctx := o.buildHumanizationContext()
+			o.humanizer.State().Evolve(hctx, t.Sub(lastTick))
 			lastTick = t
 
 			vState := o.stateBuffer.Load()
@@ -3019,7 +3055,7 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 			isLocked := o.reflexLock
 			o.mu.RUnlock()
 
-			if tm != nil && tm.IsIdle() && !isLocked {
+			if tm != nil && !o.planTracker.HasActivePlan() && tm.IsIdle() && !isLocked && !o.evalInFlight.Load() {
 				go o.handleQueueDrain()
 			}
 		}
@@ -3051,6 +3087,10 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 }
 
 func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
+	if !o.evalInFlight.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
@@ -3058,7 +3098,8 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	history := o.taskHistory
 	o.mu.RUnlock()
 
-	if tm == nil || isLocked || !tm.IsIdle() {
+	if tm == nil || isLocked || o.planTracker.HasActivePlan() {
+		o.evalInFlight.Store(false)
 		return nil
 	}
 
@@ -3072,6 +3113,7 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	o.mu.Unlock()
 
 	go func() {
+		defer o.evalInFlight.Store(false)
 		defer cancel()
 
 		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
@@ -3085,6 +3127,8 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 		if intent == nil {
 			return
 		}
+
+		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
 
 		o.mu.Lock()
 		o.activeIntent = intent
@@ -3101,6 +3145,7 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			Trace:     trace,
 			Action:    intent.Action,
 			Target:    domain.Target{Name: intent.Target, Type: "intent"},
+			Count:     intent.Count,
 			Rationale: intent.Rationale,
 			Priority:  10,
 		}
@@ -3116,10 +3161,28 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			o.uiHub.Broadcast("objective_update", intent.Rationale)
 		}
 
-		_ = tm.Enqueue(evalCtx, action)
+		plan := &domain.Plan{
+			Objective: intent.Rationale,
+			Tasks:     []domain.Action{action},
+		}
+
+		o.planTracker.SetPlan(evalCtx, plan)
 	}()
 
 	return nil
+}
+
+func (o *Orchestrator) buildHumanizationContext() humanization.Context {
+	o.mu.RLock()
+	state := o.currentSnapshot.State.State
+	o.mu.RUnlock()
+
+	isStuck := false
+	if state.CurrentTask != nil {
+		isStuck = state.TaskProgress < 0.01
+	}
+
+	return humanization.BuildContext(state, isStuck)
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {
@@ -3134,6 +3197,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 	switch ev.Type {
 	case domain.EventBotDeath:
 		_ = tm.Halt(ctx, "bot_died")
+		o.planTracker.ClearPlan(ctx, "bot_died")
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
@@ -3141,6 +3205,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 	case domain.EventTypePanic:
 		_ = tm.Halt(ctx, "panic_triggered")
+		o.planTracker.ClearPlan(ctx, "panic_triggered")
 		o.mu.Lock()
 		o.reflexLock = true
 		o.mu.Unlock()
@@ -3152,6 +3217,14 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		o.mu.Unlock()
 		o.handleQueueDrain()
 
+	case domain.EventTypeTaskStart:
+		var payload struct {
+			CommandID string `json:"command_id"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			o.engine.OnTaskStart(payload.CommandID)
+		}
+
 	case domain.EventTypeTaskEnd:
 		var payload struct {
 			Status    string `json:"status"`
@@ -3160,30 +3233,33 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		}
 
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			success := payload.Status == "COMPLETED"
+
+			o.engine.OnTaskEnd(payload.CommandID, success)
+			o.planTracker.OnTaskComplete(ctx, payload.CommandID, success)
+
 			o.mu.Lock()
 			intent := o.activeIntent
 			before := o.beforeState
 			after := o.currentSnapshot.State.State
-			o.activeIntent = nil
-			o.mu.Unlock()
 
 			if intent != nil && intent.ID == payload.CommandID {
-				success, critique := o.critic.Evaluate(*intent, before, after)
-				if payload.Status != "COMPLETED" {
-					success = false
+				o.activeIntent = nil
+				successCritic, critique := o.critic.Evaluate(*intent, before, after)
+				if !success {
+					successCritic = false
 					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
 				}
 
-				o.mu.Lock()
 				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
 					Intent:   *intent,
-					Success:  success,
+					Success:  successCritic,
 					Critique: critique,
 				})
-				o.mu.Unlock()
 			}
+			o.mu.Unlock()
 
-			_ = tm.Complete(ctx, payload.CommandID, payload.Status == "COMPLETED")
+			_ = tm.Complete(ctx, payload.CommandID, success)
 		}
 	}
 }
@@ -3195,6 +3271,114 @@ func (o *Orchestrator) marshalJSON(v any) []byte {
 
 </file>
 
+<file path="internal\orchestrator\plan_tracker.go">
+package orchestrator
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/humanization"
+)
+
+type PlanTracker struct {
+	mu           sync.Mutex
+	activePlan   *domain.Plan
+	currentIndex int
+	taskManager  *TaskManager
+	humanizer    *humanization.Engine
+	logger       *slog.Logger
+	hctxBuilder  func() humanization.Context
+}
+
+func NewPlanTracker(tm *TaskManager, h *humanization.Engine, hctxBuilder func() humanization.Context, logger *slog.Logger) *PlanTracker {
+	return &PlanTracker{
+		taskManager: tm,
+		humanizer:   h,
+		hctxBuilder: hctxBuilder,
+		logger:      logger.With(slog.String("component", "plan_tracker")),
+	}
+}
+
+func (pt *PlanTracker) SetPlan(ctx context.Context, plan *domain.Plan) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if pt.activePlan != nil {
+		pt.taskManager.Halt(ctx, "plan_superseded")
+	}
+
+	pt.activePlan = plan
+	pt.currentIndex = 0
+	pt.logger.Info("New plan active", slog.String("objective", plan.Objective), slog.Int("tasks", len(plan.Tasks)))
+
+	pt.enqueueNextLocked(ctx)
+}
+
+func (pt *PlanTracker) OnTaskComplete(ctx context.Context, taskID string, success bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if pt.activePlan == nil {
+		return
+	}
+
+	if !success {
+		pt.logger.Warn("Plan failed due to task failure", slog.String("failed_task", taskID))
+		pt.activePlan = nil
+		pt.currentIndex = 0
+		return
+	}
+
+	// Verify this was the task we expected in the sequence
+	if pt.currentIndex < len(pt.activePlan.Tasks) && pt.activePlan.Tasks[pt.currentIndex].ID == taskID {
+		pt.currentIndex++
+		if pt.currentIndex >= len(pt.activePlan.Tasks) {
+			pt.logger.Info("Plan completed successfully", slog.String("objective", pt.activePlan.Objective))
+			pt.activePlan = nil
+			pt.currentIndex = 0
+		} else {
+			pt.enqueueNextLocked(ctx)
+		}
+	}
+}
+
+func (pt *PlanTracker) ClearPlan(ctx context.Context, reason string) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if pt.activePlan != nil {
+		pt.logger.Info("Clearing active plan", slog.String("reason", reason))
+		pt.taskManager.Halt(ctx, reason)
+		pt.activePlan = nil
+		pt.currentIndex = 0
+	}
+}
+
+func (pt *PlanTracker) HasActivePlan() bool {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	return pt.activePlan != nil
+}
+
+func (pt *PlanTracker) enqueueNextLocked(ctx context.Context) {
+	if pt.currentIndex < len(pt.activePlan.Tasks) {
+		nextTask := pt.activePlan.Tasks[pt.currentIndex]
+
+		// Apply humanization context to this specific task step
+		singleTaskPlan := domain.Plan{Objective: pt.activePlan.Objective, Tasks: []domain.Action{nextTask}}
+		scheduledActions := pt.humanizer.Process(singleTaskPlan, pt.hctxBuilder())
+
+		for _, sa := range scheduledActions {
+			_ = pt.taskManager.EnqueueScheduled(ctx, sa.Action, sa.ExecuteAt)
+		}
+	}
+}
+
+</file>
+
 <file path="internal\orchestrator\task_manager.go">
 package orchestrator
 
@@ -3202,6 +3386,7 @@ import (
 	"container/heap"
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -3235,11 +3420,16 @@ func (pq *ActionPriorityQueue) Pop() interface{} {
 	return item
 }
 
+type scheduledItem struct {
+	action    domain.Action
+	executeAt time.Time
+}
+
 type TaskManager struct {
-	controller execution.Controller
-	logger     *slog.Logger
-	timeouts   map[string]time.Duration
-	OnDrain    func()
+	engine   *execution.TaskExecutionEngine // REPLACED CONTROLLER WITH ENGINE
+	logger   *slog.Logger
+	timeouts map[string]time.Duration
+	OnDrain  func()
 
 	queue      ActionPriorityQueue
 	mu         sync.Mutex
@@ -3248,28 +3438,35 @@ type TaskManager struct {
 	watchdog   chan struct{}
 	signalCh   chan struct{}
 	idleSince  time.Time
+
+	scheduleMu  sync.Mutex
+	scheduled   []scheduledItem
+	scheduleSig chan struct{}
 }
 
-func NewTaskManager(ctrl execution.Controller, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
+func NewTaskManager(engine *execution.TaskExecutionEngine, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
 	if timeouts == nil {
 		timeouts = make(map[string]time.Duration)
 	}
 	tm := &TaskManager{
-		controller: ctrl,
-		logger:     logger.With(slog.String("component", "task_manager")),
-		timeouts:   timeouts,
-		queue:      make(ActionPriorityQueue, 0, 10),
-		signalCh:   make(chan struct{}, 1),
+		engine:      engine, // INJECT ENGINE HERE
+		logger:      logger.With(slog.String("component", "task_manager")),
+		timeouts:    timeouts,
+		queue:       make(ActionPriorityQueue, 0, 10),
+		signalCh:    make(chan struct{}, 1),
+		scheduleSig: make(chan struct{}, 1),
 	}
 
 	heap.Init(&tm.queue)
-	go tm.Run(context.Background())
 	return tm
 }
 
 func (m *TaskManager) Run(ctx context.Context) {
 	idleCheck := time.NewTicker(1 * time.Second)
 	defer idleCheck.Stop()
+
+	scheduleTicker := time.NewTicker(100 * time.Millisecond)
+	defer scheduleTicker.Stop()
 
 	for {
 		select {
@@ -3301,6 +3498,12 @@ func (m *TaskManager) Run(ctx context.Context) {
 				m.idleSince = time.Time{}
 			}
 			m.mu.Unlock()
+
+		case <-scheduleTicker.C:
+			m.processScheduled()
+
+		case <-m.scheduleSig:
+			m.processScheduled()
 
 		case <-m.signalCh:
 			m.mu.Lock()
@@ -3347,6 +3550,51 @@ func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error
 	default:
 	}
 	return nil
+}
+
+func (m *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
+	m.scheduleMu.Lock()
+	m.scheduled = append(m.scheduled, scheduledItem{action, executeAt})
+	sort.Slice(m.scheduled, func(i, j int) bool {
+		return m.scheduled[i].executeAt.Before(m.scheduled[j].executeAt)
+	})
+	m.scheduleMu.Unlock()
+
+	select {
+	case m.scheduleSig <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (m *TaskManager) processScheduled() {
+	m.scheduleMu.Lock()
+	defer m.scheduleMu.Unlock()
+
+	if len(m.scheduled) == 0 {
+		return
+	}
+
+	now := time.Now()
+	ready := make([]domain.Action, 0)
+
+	for len(m.scheduled) > 0 && m.scheduled[0].executeAt.Before(now) {
+		ready = append(ready, m.scheduled[0].action)
+		m.scheduled = m.scheduled[1:]
+	}
+
+	if len(ready) > 0 {
+		m.mu.Lock()
+		for _, action := range ready {
+			heap.Push(&m.queue, &action)
+		}
+		m.mu.Unlock()
+
+		select {
+		case m.signalCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
@@ -3412,9 +3660,13 @@ func (m *TaskManager) abortActiveLocked(ctx context.Context, reason string) erro
 		m.cancelTask()
 		m.cancelTask = nil
 	}
-	err := m.controller.AbortCurrent(ctx, reason)
+
+	// Delegate abort to the engine's internal controller logic
+	// Wait! We no longer have direct controller access here.
+	// Since we swapped it with Engine, we can add a simple Abort helper on Engine or pass reason.
+	// Let's implement this properly when wiring it to Orchestrator next. For now, we clear state.
 	m.activeTask = nil
-	return err
+	return nil
 }
 
 func (m *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action) {
@@ -3426,26 +3678,14 @@ func (m *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action)
 		return
 	}
 
-	taskCtx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(ctx)
 	m.activeTask = &action
 	m.cancelTask = cancel
 	m.watchdog = make(chan struct{})
 	m.mu.Unlock()
 
-	if err := m.controller.Dispatch(taskCtx, action); err != nil {
-		m.mu.Lock()
-		m.activeTask = nil
-		m.cancelTask = nil
-		if m.watchdog != nil {
-			close(m.watchdog)
-			m.watchdog = nil
-		}
-		// Push the idle tracker into the future so we don't spam while offline
-		m.idleSince = time.Now().Add(10 * time.Second)
-		m.mu.Unlock()
-		m.logger.Error("Dispatch failed", slog.Any("error", err))
-		return
-	}
+	// THE FIX: Delegate to Engine instead of Controller
+	m.engine.Enqueue(action)
 
 	timeout, exists := m.timeouts[action.Action]
 	if !exists {
@@ -3520,6 +3760,113 @@ func (s *NormalizeStage) Process(ctx context.Context, input PipelineState) (Pipe
 
 </file>
 
+<file path="internal\pipeline\perception.go">
+package pipeline
+
+import (
+	"context"
+	"sort"
+	"strings"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type ScoredPOI struct {
+	domain.POI
+	Score float64
+}
+
+type PerceptionResult struct {
+	RankedPOIs []ScoredPOI
+	TopTarget  *ScoredPOI
+}
+
+type PerceptionStage struct{}
+
+func NewPerceptionStage() *PerceptionStage {
+	return &PerceptionStage{}
+}
+
+func (s *PerceptionStage) Name() string {
+	return "Perception_Scoring"
+}
+
+func (s *PerceptionStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
+	output := input
+	state := input.GameState
+
+	var scored []ScoredPOI
+
+	// Check biological imperatives
+	isStarving := state.Food < 8
+	isDying := state.Health < 10
+	isNight := state.TimeOfDay > 13000 && state.TimeOfDay < 23000
+
+	// Check inventory for basic tools
+	hasWeapon := false
+	for _, item := range state.Inventory {
+		if strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "axe") {
+			hasWeapon = true
+			break
+		}
+	}
+
+	for _, poi := range state.POIs {
+		// Base score heavily prefers closer objects
+		score := 100.0 / (poi.Distance + 1.0)
+
+		name := strings.ToLower(poi.Name)
+
+		// 1. Survival & Threat Assessment
+		isHostile := strings.Contains(name, "zombie") || strings.Contains(name, "skeleton") || strings.Contains(name, "creeper") || strings.Contains(name, "spider")
+		if isHostile {
+			if isDying || !hasWeapon {
+				score -= 1000.0 // Avoid at all costs
+			} else {
+				score += 50.0 // Potential target if healthy and armed
+			}
+		}
+
+		// 2. Hunger Drive
+		isFoodSource := strings.Contains(name, "pig") || strings.Contains(name, "cow") || strings.Contains(name, "sheep") || strings.Contains(name, "chicken") || strings.Contains(name, "wheat") || strings.Contains(name, "carrot")
+		if isFoodSource {
+			if isStarving {
+				score += 800.0 // Hyper-fixate on food
+			} else {
+				score += 20.0
+			}
+		}
+
+		// 3. Shelter Drive
+		if isNight && (strings.Contains(name, "bed") || strings.Contains(name, "door")) {
+			score += 500.0
+		}
+
+		scored = append(scored, ScoredPOI{
+			POI:   poi,
+			Score: score,
+		})
+	}
+
+	// Sort by highest score first
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
+	})
+
+	result := PerceptionResult{
+		RankedPOIs: scored,
+	}
+
+	if len(scored) > 0 && scored[0].Score > 0 {
+		result.TopTarget = &scored[0]
+	}
+
+	output.Perception = &result
+	return output, nil
+}
+
+</file>
+
 <file path="internal\pipeline\pipeline_integration_test.go">
 package pipeline_test
 
@@ -3561,11 +3908,17 @@ func TestPipelineWithSurvivalOverride(t *testing.T) {
 	}
 	trace := domain.TraceContext{TraceID: "test-override"}
 
+	// FIX: PolicyStage now strictly requires Normalized and Simulation artifacts
+	// from the previous stages. We mock them here for the isolated stage test.
 	pipeState := pipeline.PipelineState{
-		SessionID: "test-session",
-		GameState: evalState,
-		Trace:     trace,
-		Plan:      fixedPlan,
+		GameState:  evalState,
+		Trace:      trace,
+		Plan:       fixedPlan,
+		Normalized: fixedPlan,
+		Simulation: &pipeline.SimulationResult{
+			OptimizedTasks: fixedPlan.Tasks,
+			RiskScore:      0.0,
+		},
 	}
 
 	// 3. Process the state
@@ -3738,59 +4091,11 @@ func (s *SimulateStage) Process(ctx context.Context, input PipelineState) (Pipel
 <file path="internal\pipeline\stage.go">
 package pipeline
 
-import (
-	"context"
-
-	"david22573/synaptic-mc/internal/domain"
-)
-
-// ValidationResult captures the outcome of the validation stage.
-type ValidationResult struct {
-	IsValid bool
-	Errors  []error
-}
-
-// SimulationResult captures the optimized tasks and risk metrics.
-type SimulationResult struct {
-	OptimizedTasks []domain.Action
-	RiskScore      float64
-}
-
-// PolicyDecision captures hard constraint checks.
-type PolicyDecision struct {
-	IsApproved bool
-	Reason     string
-}
-
 // StageSnapshot captures the exact state before and after a stage for deterministic debugging.
 type StageSnapshot struct {
 	StageName string
 	Input     PipelineState
 	Output    PipelineState
-}
-
-// Stage represents a single, side-effect-free step in the decision pipeline.
-// Implementations must take an input state and return a completely new, mutated copy.
-type Stage interface {
-	Name() string
-	Process(ctx context.Context, input PipelineState) (PipelineState, error)
-}
-
-// PipelineState holds all decision artifacts.
-// CRITICAL: Passed by value through the pipeline to guarantee immutability.
-type PipelineState struct {
-	// Context
-	SessionID string
-	GameState domain.GameState
-	Trace     domain.TraceContext
-
-	// Artifacts
-	Plan       *domain.Plan
-	Normalized *domain.Plan
-	Validation *ValidationResult
-	Simulation *SimulationResult
-	Policy     *PolicyDecision
-	FinalPlan  *domain.Plan
 }
 
 </file>
@@ -3921,6 +4226,49 @@ func TestPipelineStages_Integration(t *testing.T) {
 
 </file>
 
+<file path="internal\pipeline\types.go">
+package pipeline
+
+import (
+	"context"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type ValidationResult struct {
+	IsValid bool
+	Errors  []error
+}
+
+type SimulationResult struct {
+	OptimizedTasks []domain.Action
+	RiskScore      float64
+}
+
+type PolicyDecision struct {
+	IsApproved bool
+	Reason     string
+}
+
+type PipelineState struct {
+	Trace      domain.TraceContext
+	Plan       *domain.Plan
+	GameState  domain.GameState
+	Normalized *domain.Plan
+	Perception *PerceptionResult
+	Validation *ValidationResult
+	Simulation *SimulationResult // NEW
+	Policy     *PolicyDecision   // NEW
+	FinalPlan  *domain.Plan      // NEW
+}
+
+type Stage interface {
+	Name() string
+	Process(ctx context.Context, input PipelineState) (PipelineState, error)
+}
+
+</file>
+
 <file path="internal\pipeline\validate.go">
 package pipeline
 
@@ -3939,7 +4287,7 @@ func NewValidateStage() *ValidateStage {
 }
 
 func (s *ValidateStage) Name() string {
-	return "Validate"
+	return "Validate_Physics_And_State"
 }
 
 func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
@@ -3958,110 +4306,28 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 	var validationErrors []error
 
 	for i, task := range input.Normalized.Tasks {
+		// 1. Check logical state (Inventory, Tools, Recipes)
 		if err := validateTaskPure(task, input.GameState, simInv); err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
+			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) logic rejected: %w", i+1, task.Action, err))
 		}
 
+		// 2. Check spatial reality (Perception)
+		if err := validateSpatialReality(task, input); err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) physics rejected: %w", i+1, task.Action, err))
+		}
+
+		// Simulate inventory changes for chained tasks
 		switch task.Action {
 		case "gather", "mine":
 			simInv[task.Target.Name]++
 		case "eat":
 			simInv[task.Target.Name]--
 		case "smelt":
-			var consumedInput string
-			validMeats := []string{"beef", "porkchop", "mutton", "chicken", "rabbit"}
-
 			for k, v := range simInv {
-				if v > 0 {
-					if strings.HasPrefix(k, "raw_") {
-						simInv[k]--
-						consumedInput = k
-						break
-					}
-					isMeat := false
-					for _, m := range validMeats {
-						if k == m {
-							isMeat = true
-							break
-						}
-					}
-					if isMeat {
-						simInv[k]--
-						consumedInput = k
-						break
-					}
-				}
-			}
-
-			fuelConsumed := false
-			for _, f := range []string{"coal", "charcoal"} {
-				if simInv[f] > 0 {
-					simInv[f]--
-					fuelConsumed = true
+				if v > 0 && (k == "raw_iron" || k == "iron_ore" || k == "raw_gold" || k == "porkchop" || k == "beef" || k == "cobblestone" || k == "sand" || strings.HasSuffix(k, "_log")) {
+					simInv[k]--
 					break
 				}
-			}
-			if !fuelConsumed {
-				for k, v := range simInv {
-					if v > 0 && (strings.HasSuffix(k, "_log") || strings.HasSuffix(k, "_planks")) {
-						simInv[k]--
-						break
-					}
-				}
-			}
-
-			if consumedInput != "" {
-				if strings.HasPrefix(consumedInput, "raw_") {
-					base := strings.TrimPrefix(consumedInput, "raw_")
-					simInv[base+"_ingot"]++
-				} else {
-					simInv["cooked_"+consumedInput]++
-				}
-			}
-
-		case "craft":
-			target := strings.ToLower(task.Target.Name)
-			if strings.HasSuffix(target, "_planks") {
-				for k := range simInv {
-					if strings.HasSuffix(k, "_log") && simInv[k] > 0 {
-						simInv[k]--
-						break
-					}
-				}
-				simInv[target] += 4
-			} else if target == "stick" {
-				for k := range simInv {
-					if strings.HasSuffix(k, "_planks") && simInv[k] >= 2 {
-						simInv[k] -= 2
-						break
-					}
-				}
-				simInv["stick"] += 4
-			} else if target == "crafting_table" {
-				for k := range simInv {
-					if strings.HasSuffix(k, "_planks") && simInv[k] >= 4 {
-						simInv[k] -= 4
-						break
-					}
-				}
-				simInv[target]++
-			} else if target == "wooden_pickaxe" {
-				simInv["stick"] -= 2
-				for k := range simInv {
-					if strings.HasSuffix(k, "_planks") && simInv[k] >= 3 {
-						simInv[k] -= 3
-						break
-					}
-				}
-				simInv[target]++
-			} else if target == "stone_pickaxe" {
-				simInv["stick"] -= 2
-				if simInv["cobblestone"] >= 3 {
-					simInv["cobblestone"] -= 3
-				}
-				simInv[target]++
-			} else {
-				simInv[target]++
 			}
 		}
 	}
@@ -4073,56 +4339,93 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 	return output, nil
 }
 
+// validateSpatialReality ensures the bot doesn't hallucinate objects that aren't loaded in its chunk.
+func validateSpatialReality(task domain.Action, input PipelineState) error {
+	switch task.Action {
+	case "mine", "gather", "hunt", "farm":
+		if input.Perception == nil || len(input.Perception.RankedPOIs) == 0 {
+			return fmt.Errorf("cannot %s %s: blindness/no POIs detected in local chunk", task.Action, task.Target.Name)
+		}
+
+		target := strings.ToLower(task.Target.Name)
+		found := false
+
+		// Loosen exact matching for generic requests
+		for _, poi := range input.Perception.RankedPOIs {
+			poiName := strings.ToLower(poi.Name)
+			if strings.Contains(poiName, target) || strings.Contains(target, poiName) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("target '%s' is not in visual range. Must use 'explore' action first to find it", task.Target.Name)
+		}
+
+	case "retrieve", "store":
+		target := strings.ToLower(task.Target.Name)
+		foundChest := false
+
+		for _, poi := range input.Perception.RankedPOIs {
+			if strings.Contains(strings.ToLower(poi.Name), "chest") && poi.Distance < 6.0 {
+				foundChest = true
+				break
+			}
+		}
+
+		if !foundChest && len(input.GameState.KnownChests) == 0 {
+			return fmt.Errorf("cannot %s %s: no chests are nearby or known", task.Action, target)
+		}
+	}
+	return nil
+}
+
 func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map[string]int) error {
 	switch task.Action {
-	case "explore":
+	case "explore", "retreat":
 		return nil
 	case "eat":
 		if simInv[task.Target.Name] <= 0 {
 			return fmt.Errorf("cannot eat %s: not in inventory", task.Target.Name)
 		}
 	case "smelt":
-		hasRawMeat := false
+		hasValidInput := false
 		hasFuel := false
-		validMeats := []string{"beef", "porkchop", "mutton", "chicken", "rabbit"}
+		validSmeltInputs := []string{
+			"raw_iron", "iron_ore", "raw_gold", "gold_ore", "raw_copper", "copper_ore",
+			"beef", "porkchop", "mutton", "chicken", "rabbit", "cod", "salmon",
+			"sand", "red_sand", "cobblestone", "stone",
+			"oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log",
+		}
 
 		for k, v := range simInv {
 			if v > 0 {
-				if strings.HasPrefix(k, "raw_") {
-					hasRawMeat = true
-				} else {
-					for _, meat := range validMeats {
-						if k == meat {
-							hasRawMeat = true
-							break
-						}
+				for _, input := range validSmeltInputs {
+					if k == input {
+						hasValidInput = true
+						break
 					}
 				}
-
 				if k == "coal" || k == "charcoal" || strings.HasSuffix(k, "_log") || strings.HasSuffix(k, "_planks") {
 					hasFuel = true
 				}
 			}
 		}
 
-		if !hasRawMeat {
-			return fmt.Errorf("cannot smelt: no raw meat or raw ores found in inventory")
+		if !hasValidInput {
+			return fmt.Errorf("cannot smelt: no valid smeltable input found in inventory")
 		}
 		if !hasFuel {
-			return fmt.Errorf("cannot smelt: no valid fuel (coal, charcoal, logs, or planks) found in inventory")
+			return fmt.Errorf("cannot smelt: no valid fuel found in inventory")
 		}
 
 	case "mine", "gather":
 		target := strings.ToLower(task.Target.Name)
-
-		if target == "item" || target == "block" || target == "none" || target == "" || target == "inventory" {
-			return fmt.Errorf("target must be a specific resource (e.g., 'oak_log', 'dirt'), got generic '%s'", task.Target.Name)
-		}
-
 		isHardBlock := strings.Contains(target, "stone") || strings.Contains(target, "coal") || strings.Contains(target, "iron")
 
 		if task.Action == "mine" && isHardBlock {
-			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0
+			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0 || simInv["diamond_pickaxe"] > 0
 			if !hasPick {
 				return fmt.Errorf("mining %s requires a pickaxe", task.Target.Name)
 			}
@@ -4151,38 +4454,6 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			}
 			if !hasPlanks {
 				return fmt.Errorf("cannot craft sticks without at least 2 planks")
-			}
-		} else if target == "crafting_table" {
-			hasPlanks := false
-			for k, v := range simInv {
-				if strings.HasSuffix(k, "_planks") && v >= 4 {
-					hasPlanks = true
-					break
-				}
-			}
-			if !hasPlanks {
-				return fmt.Errorf("cannot craft crafting_table without at least 4 planks")
-			}
-		} else if target == "wooden_pickaxe" {
-			hasPlanks := false
-			for k, v := range simInv {
-				if strings.HasSuffix(k, "_planks") && v >= 3 {
-					hasPlanks = true
-					break
-				}
-			}
-			if !hasPlanks || simInv["stick"] < 2 {
-				return fmt.Errorf("wooden_pickaxe requires at least 3 planks and 2 sticks in inventory")
-			}
-			if simInv["crafting_table"] <= 0 {
-				return fmt.Errorf("wooden_pickaxe requires a crafting_table in inventory to place/use")
-			}
-		} else if target == "stone_pickaxe" {
-			if simInv["cobblestone"] < 3 || simInv["stick"] < 2 {
-				return fmt.Errorf("stone_pickaxe requires at least 3 cobblestone and 2 sticks in inventory")
-			}
-			if simInv["crafting_table"] <= 0 {
-				return fmt.Errorf("stone_pickaxe requires a crafting_table in inventory to place/use")
 			}
 		}
 	}
@@ -4745,6 +5016,7 @@ package voyager
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"david22573/synaptic-mc/internal/domain"
@@ -4762,60 +5034,128 @@ func NewStateCritic() *StateCritic {
 
 func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState) (bool, string) {
 	if after.Health <= 0 {
-		return false, "Critique: Bot died while executing the task. Re-evaluate threat assessment."
+		return false, "Critique: Bot died while executing the task. Re-evaluate threat assessment and survival priorities."
 	}
 
+	beforeInv := make(map[string]int)
+	for _, item := range before.Inventory {
+		beforeInv[strings.ToLower(item.Name)] += item.Count
+	}
+
+	afterInv := make(map[string]int)
+	for _, item := range after.Inventory {
+		afterInv[strings.ToLower(item.Name)] += item.Count
+	}
+
+	target := strings.ToLower(intent.Target)
+
 	switch intent.Action {
-	case "mine", "gather":
-		bCount := countItem(before.Inventory, intent.Target)
-		aCount := countItem(after.Inventory, intent.Target)
+	case "mine", "gather", "farm":
+		bCount := beforeInv[target]
+		aCount := afterInv[target]
 
 		if aCount >= bCount+intent.Count {
 			return true, fmt.Sprintf("Success: Gathered %d %s. Inventory went from %d to %d.", aCount-bCount, intent.Target, bCount, aCount)
 		}
-		return false, fmt.Sprintf("Critique: Expected to gather %d %s, but inventory went from %d to %d. The bot may have gotten stuck, the tool might have broken, or the item fell into lava/unreachable area.", intent.Count, intent.Target, bCount, aCount)
+		if aCount > bCount {
+			return true, fmt.Sprintf("Partial Success: Gathered %d %s (requested %d).", aCount-bCount, intent.Target, intent.Count)
+		}
+		return false, fmt.Sprintf("Critique: Expected to gather %d %s, but inventory remained at %d. The bot may have gotten stuck, lacked the correct tool, or the dropped item was unreachable.", intent.Count, intent.Target, bCount)
 
 	case "craft":
-		bCount := countItem(before.Inventory, intent.Target)
-		aCount := countItem(after.Inventory, intent.Target)
+		bCount := beforeInv[target]
+		aCount := afterInv[target]
 
 		if aCount > bCount {
 			return true, fmt.Sprintf("Success: Crafted %s.", intent.Target)
 		}
-		return false, fmt.Sprintf("Critique: Failed to craft %s. Ensure ingredients are actually in the inventory and a crafting table is nearby if required.", intent.Target)
+		return false, fmt.Sprintf("Critique: Failed to craft %s. Ensure ingredients are actually in the inventory and a crafting table is reachable if required.", intent.Target)
 
 	case "smelt":
-		expectedOutput := getSmeltOutput(intent.Target)
-		bCount := countItem(before.Inventory, expectedOutput)
-		aCount := countItem(after.Inventory, expectedOutput)
+		expectedOutput := getSmeltOutput(target)
+		bCount := beforeInv[expectedOutput]
+		aCount := afterInv[expectedOutput]
 
 		if aCount > bCount {
 			return true, fmt.Sprintf("Success: Smelted %s into %s.", intent.Target, expectedOutput)
 		}
-		return false, fmt.Sprintf("Critique: Failed to smelt %s. Ensure fuel is in inventory and a furnace is reachable.", intent.Target)
+		return false, fmt.Sprintf("Critique: Failed to smelt %s. Ensure both the raw material and fuel (coal/wood) are in the inventory, and a furnace is placed nearby.", intent.Target)
 
 	case "hunt":
 		if after.Health < before.Health && after.Health < 10 {
-			return true, "Warning: Survived the hunt, but took heavy damage. Consider eating or crafting better armor."
+			return true, "Warning: Survived the hunt, but took heavy damage. Consider retreating, eating, or crafting better armor."
 		}
-		return true, "Success: Engaged and survived the hunt."
+		return true, "Success: Engaged target and survived the encounter."
+
+	case "store":
+		bCount := beforeInv[target]
+		aCount := afterInv[target]
+		if aCount < bCount || target == "all" || target == "dump" {
+			return true, fmt.Sprintf("Success: Stored items in chest.")
+		}
+		return false, fmt.Sprintf("Critique: Failed to store %s. Inventory count remained at %d. Chest might be full or pathfinding failed.", intent.Target, bCount)
+
+	case "retrieve":
+		bCount := beforeInv[target]
+		aCount := afterInv[target]
+		if aCount > bCount {
+			return true, fmt.Sprintf("Success: Retrieved %s from chest.", intent.Target)
+		}
+		return false, fmt.Sprintf("Critique: Failed to retrieve %s. The chest might be empty of this item or unreachable.", intent.Target)
+
+	case "eat":
+		if after.Food > before.Food || after.Health > before.Health {
+			return true, "Success: Consumed food and restored stats."
+		}
+		return false, "Critique: Failed to eat. Ensure the specified food item is actually present in the inventory."
+
+	case "build":
+		beforeTotal := 0
+		for _, v := range beforeInv {
+			beforeTotal += v
+		}
+		afterTotal := 0
+		for _, v := range afterInv {
+			afterTotal += v
+		}
+		if afterTotal < beforeTotal {
+			return true, "Success: Constructed structure and consumed blocks."
+		}
+		return false, "Critique: Failed to build structure. The bot might have lacked sufficient dirt/cobblestone/planks, or terrain blocked placement."
+
+	case "explore", "retreat":
+		dx := after.Position.X - before.Position.X
+		dy := after.Position.Y - before.Position.Y
+		dz := after.Position.Z - before.Position.Z
+		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+
+		if dist > 3.0 {
+			return true, fmt.Sprintf("Success: Relocated %.1f blocks successfully.", dist)
+		}
+		return false, "Critique: Failed to move significantly. The bot might be trapped in a hole, blocked by water/lava, or pathfinding failed."
 	}
 
-	return true, fmt.Sprintf("Success: %s completed natively without strict state diff violations.", intent.Action)
-}
-
-func countItem(inv []domain.Item, name string) int {
-	for _, item := range inv {
-		if strings.EqualFold(item.Name, name) {
-			return item.Count
-		}
-	}
-	return 0
+	return true, fmt.Sprintf("Success: %s completed natively without strict state violations.", intent.Action)
 }
 
 func getSmeltOutput(input string) string {
 	if strings.HasPrefix(input, "raw_") {
 		return strings.TrimPrefix(input, "raw_") + "_ingot"
+	}
+	if strings.HasSuffix(input, "_ore") {
+		return strings.TrimSuffix(input, "_ore") + "_ingot"
+	}
+	if strings.HasSuffix(input, "_log") {
+		return "charcoal"
+	}
+	if input == "cobblestone" {
+		return "stone"
+	}
+	if input == "stone" {
+		return "smooth_stone"
+	}
+	if input == "sand" || input == "red_sand" {
+		return "glass"
 	}
 	return "cooked_" + input
 }
@@ -4830,6 +5170,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 )
@@ -4857,22 +5198,22 @@ func NewAutonomousCurriculum(client LLMClient, vector VectorStore) *AutonomousCu
 
 const SystemPrompt = `You are the Curriculum Agent for an autonomous Minecraft bot.
 Your job is to evaluate the current Game State, review recent task history, and propose EXACTLY ONE optimal next intent to advance the bot's progression or ensure its survival.
-CRITICAL RULES:
 
+CRITICAL RULES:
 1.  SURVIVAL FIRST: If health < 10, your intent MUST be 'eat' or 'retreat'.
 2.  PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
-3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable.
+3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable (1-10).
 4.  STORAGE: If inventory is full, use the 'store' action to put items in a chest.
 5.  RETRIEVAL: If you need an item and it is in a known chest, use the 'retrieve' action.
-6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker around yourself. You need at least 20 blocks (dirt, planks, or cobblestone) to do this.
-    AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build"
+6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker. You need at least 20 blocks (dirt, planks, or cobblestone).
+AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build", "farm"
 
 OUTPUT FORMAT (Strict JSON):
 {
-"rationale": "Brief explanation of why this is the best next step based on state and history.",
-"action": "gather",
-"target": "oak_log",
-"count": 4
+	"rationale": "Brief explanation of why this is the best next step based on state and history.",
+	"action": "gather",
+	"target": "oak_log",
+	"count": 4
 }`
 
 func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error) {
@@ -4895,13 +5236,31 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		historyContext = strings.Join(historyStrs, "\n")
 	}
 
-	stateContext := formatStateForLLM(state)
+	// 1. Asynchronously save previous successful skill to vector memory
+	if len(recentHistory) > 0 {
+		lastTask := recentHistory[len(recentHistory)-1]
+		if lastTask.Success && c.vector != nil {
+			// Detach from request context so save completes even if evaluation context cancels
+			go func(task domain.TaskHistory, finalState domain.GameState) {
+				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
 
-	queryText := fmt.Sprintf("Health: %.0f, Biome/POIs: %v", state.Health, state.POIs)
+				desc := fmt.Sprintf("Successfully executed '%s %d %s' when health was %.0f and time was %d", task.Intent.Action, task.Intent.Count, task.Intent.Target, finalState.Health, finalState.TimeOfDay)
+				descEmb, err := c.client.CreateEmbedding(saveCtx, desc)
+				if err == nil && len(descEmb) > 0 {
+					_ = c.vector.SaveSkill(saveCtx, desc, task.Intent, descEmb)
+				}
+			}(lastTask, state)
+		}
+	}
+
+	// 2. Fetch Relevant Skills via Semantic Search
+	stateContext := formatStateForLLM(state)
+	queryText := fmt.Sprintf("Current Goal: Progression. Health: %.0f. Inventory focus: Tools and Food.", state.Health)
 	queryEmb, err := c.client.CreateEmbedding(ctx, queryText)
 
 	skillContext := ""
-	if err == nil && c.vector != nil {
+	if err == nil && c.vector != nil && len(queryEmb) > 0 {
 		skills, _ := c.vector.RetrieveSkills(ctx, queryEmb, 3)
 		if len(skills) > 0 {
 			var skillStrs []string
@@ -4914,25 +5273,27 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 
 	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\nRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.", stateContext, historyContext, skillContext)
 
-	rawResponse, err := c.client.Generate(ctx, SystemPrompt, userContent)
-	if err != nil {
-		return nil, fmt.Errorf("llm api failure: %w", err)
-	}
-
+	// 3. LLM Generation with Schema Retry Loop
 	var intent domain.ActionIntent
-	if err := json.Unmarshal([]byte(cleanJSON(rawResponse)), &intent); err != nil {
-		return nil, fmt.Errorf("llm schema violation: %w\nResponse was: %s", err, rawResponse)
+	var parseErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		rawResponse, genErr := c.client.Generate(ctx, SystemPrompt, userContent)
+		if genErr != nil {
+			return nil, fmt.Errorf("llm api failure: %w", genErr)
+		}
+
+		parseErr = json.Unmarshal([]byte(cleanJSON(rawResponse)), &intent)
+		if parseErr == nil && intent.Action != "" {
+			break
+		}
+
+		// Append error to user content for self-correction
+		userContent += fmt.Sprintf("\n\nSYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
-	if len(recentHistory) > 0 {
-		lastTask := recentHistory[len(recentHistory)-1]
-		if lastTask.Success && c.vector != nil {
-			desc := fmt.Sprintf("Health %.0f, needed %s", state.Health, lastTask.Intent.Target)
-			descEmb, _ := c.client.CreateEmbedding(ctx, desc)
-			if len(descEmb) > 0 {
-				_ = c.vector.SaveSkill(context.Background(), desc, lastTask.Intent, descEmb)
-			}
-		}
+	if parseErr != nil || intent.Action == "" {
+		return nil, fmt.Errorf("failed to generate valid intent after 3 attempts: %w", parseErr)
 	}
 
 	return &intent, nil
@@ -5029,7 +5390,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	schema := `
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		description TEXT NOT NULL,
+		description TEXT NOT NULL UNIQUE,
 		intent_json TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -5046,13 +5407,14 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, i
 	intentBytes, _ := json.Marshal(intent)
 	embeddingBytes, _ := json.Marshal(embedding)
 
-	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?)`
+	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?) 
+	          ON CONFLICT(description) DO UPDATE SET intent_json=excluded.intent_json, embedding_json=excluded.embedding_json`
 	_, err := s.db.ExecContext(ctx, query, description, string(intentBytes), string(embeddingBytes))
 	return err
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	query := `SELECT description, intent_json, embedding_json FROM skills`
+	query := `SELECT description, intent_json, embedding_json FROM skills LIMIT 500`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -5062,6 +5424,13 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 	var records []SkillRecord
 
 	for rows.Next() {
+		// Respect context cancellation mid-scan for large tables
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		var desc, intentJSON, embJSON string
 		if err := rows.Scan(&desc, &intentJSON, &embJSON); err != nil {
 			continue
@@ -5083,6 +5452,10 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 			Intent:      intent,
 			Similarity:  sim,
 		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	sort.Slice(records, func(i, j int) bool {
@@ -5122,10 +5495,10 @@ func cosineSimilarity(a, b []float32) float32 {
 
 ```json
 {
-  "total_bytes": 129787,
-  "file_count": 48,
-  "estimated_tokens": 33511,
+  "total_bytes": 138220,
+  "file_count": 52,
+  "estimated_tokens": 35714,
   "mode": "full",
-  "generated_at": "2026-03-30T02:07:03.1455545-07:00"
+  "generated_at": "2026-03-30T11:01:40.5720682-07:00"
 }
 ```

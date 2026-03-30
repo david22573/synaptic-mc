@@ -57,6 +57,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+	slog.SetDefault(logger)
 
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		logger.Error("Failed to create data directory", slog.String("path", cfg.DataDir), slog.Any("error", err))
@@ -67,7 +68,8 @@ func main() {
 	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
 	vectorStorePath := filepath.Join(cfg.DataDir, cfg.VectorDB)
 
-	eventStore, err := eventstore.NewSQLiteEventStore(eventStorePath)
+	// Updated to the Phase 3 non-blocking SQLite WAL store
+	eventStore, err := eventstore.NewSQLiteStore(eventStorePath, logger)
 	if err != nil {
 		logger.Error("Failed to create event store", slog.String("path", eventStorePath), slog.Any("error", err))
 		os.Exit(1)
@@ -101,11 +103,13 @@ func main() {
 	uiHub := observability.NewHub(logger)
 	flags := config.DefaultFlags()
 
-	// Initialize humanization config
+	// Initialize humanization config with the new drift variables
 	humanCfg := humanization.Config{
 		AttentionDecay: 0.1,
 		HesitationBase: time.Duration(cfg.HesitationMs) * time.Millisecond,
 		NoiseLevel:     cfg.NoiseLevel,
+		BaseDriftRate:  0.15,
+		MaxDriftDelay:  3 * time.Second,
 	}
 
 	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger, flags, humanCfg)
@@ -256,66 +260,43 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 			return
 		}
 
-		botController := execution.NewWSController(conn)
-		idempotentController := execution.NewIdempotentController(botController, 1000)
 		controllerID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
-
-		orch.SetController(controllerID, idempotentController)
-		runner.Ping()
-
 		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
 
-		go func() {
-			<-appCtx.Done()
-			conn.Close()
-		}()
+		runner.Ping()
 
-		for {
-			if err := appCtx.Err(); err != nil {
-				logger.Info("Closing bot connection due to server shutdown")
-				conn.Close()
-				return
-			}
-
-			var msg struct {
-				Type    string              `json:"type"`
-				Payload json.RawMessage     `json:"payload"`
-				Trace   domain.TraceContext `json:"trace"`
-			}
-
-			if err := conn.ReadJSON(&msg); err != nil {
-				logger.Warn("Bot connection closed", slog.Any("error", err))
-				conn.Close()
-				return
-			}
-
+		onMessage := func(msgType string, payload []byte) {
+			// Keep supervisor watchdog alive
 			runner.Ping()
 
-			switch domain.EventType(msg.Type) {
-			case domain.EventTypeStateTick:
+			if msgType == "STATE_TICK" || msgType == "STATE_UPDATE" {
 				var state domain.GameState
-				if err := json.Unmarshal(msg.Payload, &state); err != nil {
+				if err := json.Unmarshal(payload, &state); err != nil {
 					logger.Error("Failed to unmarshal state", slog.Any("error", err))
-					continue
+					return
 				}
 				orch.IngestState(appCtx, state)
-
-			case domain.EventTypeTaskStart, domain.EventTypeTaskEnd, domain.EventBotDeath, domain.EventTypePanic, domain.EventTypePanicResolved:
-				var payload any
-				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-					logger.Error("Failed to unmarshal event", slog.Any("error", err))
-					continue
-				}
+			} else {
+				// Everything else goes to the event stream
 				orch.IngestEvent(appCtx, domain.DomainEvent{
 					SessionID: orch.SessionID(),
-					Trace:     msg.Trace,
-					Type:      domain.EventType(msg.Type),
-					Payload:   msg.Payload,
+					Type:      domain.EventType(msgType),
+					Payload:   payload,
+					CreatedAt: time.Now(),
 				})
-
-			default:
-				logger.Warn("Unknown bot message type", slog.String("type", msg.Type))
 			}
 		}
+
+		onClose := func() {
+			logger.Warn("Bot connection closed", slog.String("controller_id", controllerID))
+		}
+
+		// The new WSController starts its own read/write pump goroutines immediately
+		botController := execution.NewWSController(conn, logger, onMessage, onClose)
+
+		// Wrap to drop duplicate dispatches (ghost loops)
+		idempotentController := execution.NewIdempotentController(botController, 1000)
+
+		orch.SetController(controllerID, idempotentController)
 	}
 }

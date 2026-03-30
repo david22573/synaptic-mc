@@ -38,11 +38,17 @@ func TestPipelineWithSurvivalOverride(t *testing.T) {
 	}
 	trace := domain.TraceContext{TraceID: "test-override"}
 
+	// FIX: PolicyStage now strictly requires Normalized and Simulation artifacts
+	// from the previous stages. We mock them here for the isolated stage test.
 	pipeState := pipeline.PipelineState{
-		SessionID: "test-session",
-		GameState: evalState,
-		Trace:     trace,
-		Plan:      fixedPlan,
+		GameState:  evalState,
+		Trace:      trace,
+		Plan:       fixedPlan,
+		Normalized: fixedPlan,
+		Simulation: &pipeline.SimulationResult{
+			OptimizedTasks: fixedPlan.Tasks,
+			RiskScore:      0.0,
+		},
 	}
 
 	// 3. Process the state

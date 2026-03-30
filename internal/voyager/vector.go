@@ -38,7 +38,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	schema := `
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		description TEXT NOT NULL,
+		description TEXT NOT NULL UNIQUE,
 		intent_json TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -55,13 +55,14 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, i
 	intentBytes, _ := json.Marshal(intent)
 	embeddingBytes, _ := json.Marshal(embedding)
 
-	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?)`
+	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?) 
+	          ON CONFLICT(description) DO UPDATE SET intent_json=excluded.intent_json, embedding_json=excluded.embedding_json`
 	_, err := s.db.ExecContext(ctx, query, description, string(intentBytes), string(embeddingBytes))
 	return err
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	query := `SELECT description, intent_json, embedding_json FROM skills`
+	query := `SELECT description, intent_json, embedding_json FROM skills LIMIT 500`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -71,6 +72,13 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 	var records []SkillRecord
 
 	for rows.Next() {
+		// Respect context cancellation mid-scan for large tables
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		var desc, intentJSON, embJSON string
 		if err := rows.Scan(&desc, &intentJSON, &embJSON); err != nil {
 			continue
@@ -92,6 +100,10 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 			Intent:      intent,
 			Similarity:  sim,
 		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	sort.Slice(records, func(i, j int) bool {

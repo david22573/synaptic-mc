@@ -48,7 +48,6 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
 }
 
-// CreateEmbedding generates a vector for the input text using the OpenAI-compatible v1/embeddings endpoint.
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
 	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
 
@@ -71,7 +70,11 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 
 		if attempt > 0 {
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			time.Sleep(baseDelay + jitter)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
 			baseDelay *= 2
 		}
 
@@ -138,7 +141,11 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 
 		if attempt > 0 {
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			time.Sleep(baseDelay + jitter)
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
 			baseDelay *= 2
 		}
 

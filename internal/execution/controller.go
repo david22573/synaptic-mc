@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+
 	"david22573/synaptic-mc/internal/domain"
 )
 

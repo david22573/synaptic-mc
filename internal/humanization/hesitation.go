@@ -7,46 +7,40 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type ScheduledAction struct {
-	domain.Action
-	ExecuteAt time.Time
-}
+// CalculateHesitation determines how long the bot should pause before acting.
+func CalculateHesitation(action domain.Action, ctx Context, state *State, cfg Config) time.Duration {
+	base := float64(cfg.HesitationBase.Milliseconds())
 
-type HesitationModel struct {
-	config Config
-}
-
-func NewHesitationModel(config Config) *HesitationModel {
-	return &HesitationModel{config: config}
-}
-
-func (m *HesitationModel) Schedule(tasks []domain.Action, state *State) []ScheduledAction {
-	scheduled := make([]ScheduledAction, len(tasks))
-	now := time.Now()
-
-	for i, task := range tasks {
-		delay := m.config.HesitationBase
-
-		delay += time.Duration(state.Personality.Fatigue * float64(m.config.HesitationBase))
-
-		if state.Personality.Caution > 0.7 {
-			delay = time.Duration(float64(delay) * 1.5)
-		}
-
-		jitter := time.Duration(rand.Float64() * float64(m.config.HesitationBase) * 0.2)
-		delay += jitter
-
-		if task.Action == "retreat" || task.Action == "eat" {
-			delay = 0
-		}
-
-		scheduled[i] = ScheduledAction{
-			Action:    task,
-			ExecuteAt: now.Add(delay),
-		}
-
-		now = now.Add(delay)
+	// 1. Complexity Scaling
+	// High-stakes or complex physical actions require more "thinking" time.
+	switch action.Action {
+	case "hunt", "combat", "retreat", "build":
+		base += 600.0
+	case "craft", "smelt", "store":
+		base += 300.0
+	case "explore":
+		base += 100.0 // Wandering is instinctual, low hesitation
 	}
 
-	return scheduled
+	// 2. Confusion Scaling
+	// If the bot is stuck, it hesitates longer, simulating confusion.
+	if ctx.IsStuck {
+		base += 1200.0
+	}
+
+	// 3. Attention Scaling
+	// Lower attention = slower reaction times.
+	attentionModifier := 1.0 + (1.0 - state.GetAttention())
+	base *= attentionModifier
+
+	// 4. Natural Jitter
+	// Add up to 50% random jitter so the delay is never exactly the same.
+	jitterLimit := int64(base * 0.5)
+	var jitter int64
+	if jitterLimit > 0 {
+		jitter = rand.Int63n(jitterLimit)
+	}
+
+	finalMs := int64(base) + jitter
+	return time.Duration(finalMs) * time.Millisecond
 }

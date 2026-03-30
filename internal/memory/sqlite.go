@@ -103,6 +103,10 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return "KNOWN WORLD: empty", err
+	}
+
 	if len(nodes) == 0 {
 		return "KNOWN WORLD: empty", nil
 	}
@@ -148,6 +152,10 @@ func (s *SQLiteStore) GetSummary(ctx context.Context, sessionID string) (string,
 		if err := rows.Scan(&key, &value); err == nil {
 			summary.WriteString(fmt.Sprintf("- %s: %s\n", key, value))
 		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 
 	if summary.Len() == 0 {

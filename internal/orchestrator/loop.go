@@ -29,10 +29,12 @@ type Orchestrator struct {
 
 	curriculum voyager.Curriculum
 	critic     voyager.Critic
-	humanizer  *humanization.Engine // NEW: Humanization engine
+	humanizer  *humanization.Engine
 
 	ctrlManager *execution.ControllerManager
+	engine      *execution.TaskExecutionEngine
 	taskManager *TaskManager
+	planTracker *PlanTracker
 	logger      *slog.Logger
 
 	stateBuffer atomic.Pointer[domain.VersionedState]
@@ -45,8 +47,9 @@ type Orchestrator struct {
 	activeIntent    *domain.ActionIntent
 	beforeState     domain.GameState
 
-	reflexLock bool
-	evalCancel context.CancelFunc
+	reflexLock   bool
+	evalCancel   context.CancelFunc
+	evalInFlight atomic.Bool
 
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
@@ -63,14 +66,16 @@ func New(
 	uiHub *observability.Hub,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
-	humanCfg humanization.Config, // NEW: Accept humanization config
+	humanCfg humanization.Config,
 ) *Orchestrator {
 	cm := execution.NewControllerManager()
 	if exec != nil {
 		cm.SetController("initial", exec)
 	}
 
-	tm := NewTaskManager(cm, nil, logger)
+	engine := execution.NewTaskExecutionEngine(cm, logger)
+	tm := NewTaskManager(engine, nil, logger)
+	humanizer := humanization.NewEngine(humanCfg)
 
 	o := &Orchestrator{
 		sessionID:   sessionID,
@@ -80,14 +85,16 @@ func New(
 		curriculum:  curriculum,
 		critic:      critic,
 		ctrlManager: cm,
+		engine:      engine,
 		taskManager: tm,
+		humanizer:   humanizer,
 		uiHub:       uiHub,
 		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
 		eventCh:     make(chan domain.DomainEvent, 100),
 		taskHistory: make([]domain.TaskHistory, 0),
-		humanizer:   humanization.NewEngine(humanCfg), // NEW: Initialize humanizer
 	}
 
+	o.planTracker = NewPlanTracker(tm, humanizer, o.buildHumanizationContext, logger)
 	tm.OnDrain = o.handleQueueDrain
 
 	return o
@@ -96,12 +103,16 @@ func New(
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("Starting orchestrator lifecycle")
 
-	// Phase 4: Tune Tick Rate to 50ms for snappier execution
 	tickRate := 50 * time.Millisecond
 	o.ticker = time.NewTicker(tickRate)
 	defer o.ticker.Stop()
 
 	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		o.taskManager.Run(gCtx)
+		return nil
+	})
 
 	g.Go(func() error {
 		return o.processStateLoop(gCtx, tickRate)
@@ -154,7 +165,9 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 }
 
 func (o *Orchestrator) handleQueueDrain() {
-	_ = o.evaluateNextTask(context.Background())
+	if !o.planTracker.HasActivePlan() {
+		_ = o.evaluateNextTask(context.Background())
+	}
 }
 
 func (o *Orchestrator) takeSnapshot(ctx context.Context) {
@@ -194,7 +207,6 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 		case <-ctx.Done():
 			return ctx.Err()
 		case t := <-o.ticker.C:
-			// Phase 4: Jitter Metrics Tracking
 			actualTick := t.Sub(lastTick)
 			jitter := float64(actualTick.Milliseconds() - targetTick.Milliseconds())
 			if jitter < 0 {
@@ -202,7 +214,6 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 			}
 			observability.Metrics.DecisionJitter.Observe(jitter)
 
-			// NEW: Evolve humanization state
 			hctx := o.buildHumanizationContext()
 			o.humanizer.State().Evolve(hctx, t.Sub(lastTick))
 			lastTick = t
@@ -221,7 +232,7 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 			isLocked := o.reflexLock
 			o.mu.RUnlock()
 
-			if tm != nil && tm.IsIdle() && !isLocked {
+			if tm != nil && !o.planTracker.HasActivePlan() && tm.IsIdle() && !isLocked && !o.evalInFlight.Load() {
 				go o.handleQueueDrain()
 			}
 		}
@@ -253,6 +264,10 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 }
 
 func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
+	if !o.evalInFlight.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
@@ -260,7 +275,8 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	history := o.taskHistory
 	o.mu.RUnlock()
 
-	if tm == nil || isLocked || !tm.IsIdle() {
+	if tm == nil || isLocked || o.planTracker.HasActivePlan() {
+		o.evalInFlight.Store(false)
 		return nil
 	}
 
@@ -274,6 +290,7 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	o.mu.Unlock()
 
 	go func() {
+		defer o.evalInFlight.Store(false)
 		defer cancel()
 
 		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
@@ -287,6 +304,8 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 		if intent == nil {
 			return
 		}
+
+		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
 
 		o.mu.Lock()
 		o.activeIntent = intent
@@ -303,6 +322,7 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			Trace:     trace,
 			Action:    intent.Action,
 			Target:    domain.Target{Name: intent.Target, Type: "intent"},
+			Count:     intent.Count,
 			Rationale: intent.Rationale,
 			Priority:  10,
 		}
@@ -318,31 +338,24 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			o.uiHub.Broadcast("objective_update", intent.Rationale)
 		}
 
-		// NEW: Process through humanization engine
-		plan := domain.Plan{Objective: intent.Rationale, Tasks: []domain.Action{action}}
-		hctx := o.buildHumanizationContext()
-		scheduled := o.humanizer.Process(plan, hctx)
-
-		// Enqueue scheduled actions
-		for _, sa := range scheduled {
-			_ = tm.EnqueueScheduled(evalCtx, sa.Action, sa.ExecuteAt)
+		plan := &domain.Plan{
+			Objective: intent.Rationale,
+			Tasks:     []domain.Action{action},
 		}
+
+		o.planTracker.SetPlan(evalCtx, plan)
 	}()
 
 	return nil
 }
 
-// NEW: Helper to build humanization context
 func (o *Orchestrator) buildHumanizationContext() humanization.Context {
 	o.mu.RLock()
 	state := o.currentSnapshot.State.State
 	o.mu.RUnlock()
 
-	// Check if stuck (from pipeline logic)
 	isStuck := false
-	// This would ideally reference pipeline.stuckSince, but for now we approximate
 	if state.CurrentTask != nil {
-		// Simple stuck detection based on no progress
 		isStuck = state.TaskProgress < 0.01
 	}
 
@@ -361,6 +374,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 	switch ev.Type {
 	case domain.EventBotDeath:
 		_ = tm.Halt(ctx, "bot_died")
+		o.planTracker.ClearPlan(ctx, "bot_died")
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
@@ -368,6 +382,7 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 	case domain.EventTypePanic:
 		_ = tm.Halt(ctx, "panic_triggered")
+		o.planTracker.ClearPlan(ctx, "panic_triggered")
 		o.mu.Lock()
 		o.reflexLock = true
 		o.mu.Unlock()
@@ -379,6 +394,14 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		o.mu.Unlock()
 		o.handleQueueDrain()
 
+	case domain.EventTypeTaskStart:
+		var payload struct {
+			CommandID string `json:"command_id"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			o.engine.OnTaskStart(payload.CommandID)
+		}
+
 	case domain.EventTypeTaskEnd:
 		var payload struct {
 			Status    string `json:"status"`
@@ -387,30 +410,33 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		}
 
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			success := payload.Status == "COMPLETED"
+
+			o.engine.OnTaskEnd(payload.CommandID, success)
+			o.planTracker.OnTaskComplete(ctx, payload.CommandID, success)
+
 			o.mu.Lock()
 			intent := o.activeIntent
 			before := o.beforeState
 			after := o.currentSnapshot.State.State
-			o.activeIntent = nil
-			o.mu.Unlock()
 
 			if intent != nil && intent.ID == payload.CommandID {
-				success, critique := o.critic.Evaluate(*intent, before, after)
-				if payload.Status != "COMPLETED" {
-					success = false
+				o.activeIntent = nil
+				successCritic, critique := o.critic.Evaluate(*intent, before, after)
+				if !success {
+					successCritic = false
 					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
 				}
 
-				o.mu.Lock()
 				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
 					Intent:   *intent,
-					Success:  success,
+					Success:  successCritic,
 					Critique: critique,
 				})
-				o.mu.Unlock()
 			}
+			o.mu.Unlock()
 
-			_ = tm.Complete(ctx, payload.CommandID, payload.Status == "COMPLETED")
+			_ = tm.Complete(ctx, payload.CommandID, success)
 		}
 	}
 }

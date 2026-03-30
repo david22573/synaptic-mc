@@ -15,7 +15,7 @@ func NewValidateStage() *ValidateStage {
 }
 
 func (s *ValidateStage) Name() string {
-	return "Validate"
+	return "Validate_Physics_And_State"
 }
 
 func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
@@ -34,110 +34,28 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 	var validationErrors []error
 
 	for i, task := range input.Normalized.Tasks {
+		// 1. Check logical state (Inventory, Tools, Recipes)
 		if err := validateTaskPure(task, input.GameState, simInv); err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) rejected: %w", i+1, task.Action, err))
+			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) logic rejected: %w", i+1, task.Action, err))
 		}
 
+		// 2. Check spatial reality (Perception)
+		if err := validateSpatialReality(task, input); err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) physics rejected: %w", i+1, task.Action, err))
+		}
+
+		// Simulate inventory changes for chained tasks
 		switch task.Action {
 		case "gather", "mine":
 			simInv[task.Target.Name]++
 		case "eat":
 			simInv[task.Target.Name]--
 		case "smelt":
-			var consumedInput string
-			validMeats := []string{"beef", "porkchop", "mutton", "chicken", "rabbit"}
-
 			for k, v := range simInv {
-				if v > 0 {
-					if strings.HasPrefix(k, "raw_") {
-						simInv[k]--
-						consumedInput = k
-						break
-					}
-					isMeat := false
-					for _, m := range validMeats {
-						if k == m {
-							isMeat = true
-							break
-						}
-					}
-					if isMeat {
-						simInv[k]--
-						consumedInput = k
-						break
-					}
-				}
-			}
-
-			fuelConsumed := false
-			for _, f := range []string{"coal", "charcoal"} {
-				if simInv[f] > 0 {
-					simInv[f]--
-					fuelConsumed = true
+				if v > 0 && (k == "raw_iron" || k == "iron_ore" || k == "raw_gold" || k == "porkchop" || k == "beef" || k == "cobblestone" || k == "sand" || strings.HasSuffix(k, "_log")) {
+					simInv[k]--
 					break
 				}
-			}
-			if !fuelConsumed {
-				for k, v := range simInv {
-					if v > 0 && (strings.HasSuffix(k, "_log") || strings.HasSuffix(k, "_planks")) {
-						simInv[k]--
-						break
-					}
-				}
-			}
-
-			if consumedInput != "" {
-				if strings.HasPrefix(consumedInput, "raw_") {
-					base := strings.TrimPrefix(consumedInput, "raw_")
-					simInv[base+"_ingot"]++
-				} else {
-					simInv["cooked_"+consumedInput]++
-				}
-			}
-
-		case "craft":
-			target := strings.ToLower(task.Target.Name)
-			if strings.HasSuffix(target, "_planks") {
-				for k := range simInv {
-					if strings.HasSuffix(k, "_log") && simInv[k] > 0 {
-						simInv[k]--
-						break
-					}
-				}
-				simInv[target] += 4
-			} else if target == "stick" {
-				for k := range simInv {
-					if strings.HasSuffix(k, "_planks") && simInv[k] >= 2 {
-						simInv[k] -= 2
-						break
-					}
-				}
-				simInv["stick"] += 4
-			} else if target == "crafting_table" {
-				for k := range simInv {
-					if strings.HasSuffix(k, "_planks") && simInv[k] >= 4 {
-						simInv[k] -= 4
-						break
-					}
-				}
-				simInv[target]++
-			} else if target == "wooden_pickaxe" {
-				simInv["stick"] -= 2
-				for k := range simInv {
-					if strings.HasSuffix(k, "_planks") && simInv[k] >= 3 {
-						simInv[k] -= 3
-						break
-					}
-				}
-				simInv[target]++
-			} else if target == "stone_pickaxe" {
-				simInv["stick"] -= 2
-				if simInv["cobblestone"] >= 3 {
-					simInv["cobblestone"] -= 3
-				}
-				simInv[target]++
-			} else {
-				simInv[target]++
 			}
 		}
 	}
@@ -149,56 +67,93 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 	return output, nil
 }
 
+// validateSpatialReality ensures the bot doesn't hallucinate objects that aren't loaded in its chunk.
+func validateSpatialReality(task domain.Action, input PipelineState) error {
+	switch task.Action {
+	case "mine", "gather", "hunt", "farm":
+		if input.Perception == nil || len(input.Perception.RankedPOIs) == 0 {
+			return fmt.Errorf("cannot %s %s: blindness/no POIs detected in local chunk", task.Action, task.Target.Name)
+		}
+
+		target := strings.ToLower(task.Target.Name)
+		found := false
+
+		// Loosen exact matching for generic requests
+		for _, poi := range input.Perception.RankedPOIs {
+			poiName := strings.ToLower(poi.Name)
+			if strings.Contains(poiName, target) || strings.Contains(target, poiName) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("target '%s' is not in visual range. Must use 'explore' action first to find it", task.Target.Name)
+		}
+
+	case "retrieve", "store":
+		target := strings.ToLower(task.Target.Name)
+		foundChest := false
+
+		for _, poi := range input.Perception.RankedPOIs {
+			if strings.Contains(strings.ToLower(poi.Name), "chest") && poi.Distance < 6.0 {
+				foundChest = true
+				break
+			}
+		}
+
+		if !foundChest && len(input.GameState.KnownChests) == 0 {
+			return fmt.Errorf("cannot %s %s: no chests are nearby or known", task.Action, target)
+		}
+	}
+	return nil
+}
+
 func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map[string]int) error {
 	switch task.Action {
-	case "explore":
+	case "explore", "retreat":
 		return nil
 	case "eat":
 		if simInv[task.Target.Name] <= 0 {
 			return fmt.Errorf("cannot eat %s: not in inventory", task.Target.Name)
 		}
 	case "smelt":
-		hasRawMeat := false
+		hasValidInput := false
 		hasFuel := false
-		validMeats := []string{"beef", "porkchop", "mutton", "chicken", "rabbit"}
+		validSmeltInputs := []string{
+			"raw_iron", "iron_ore", "raw_gold", "gold_ore", "raw_copper", "copper_ore",
+			"beef", "porkchop", "mutton", "chicken", "rabbit", "cod", "salmon",
+			"sand", "red_sand", "cobblestone", "stone",
+			"oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log",
+		}
 
 		for k, v := range simInv {
 			if v > 0 {
-				if strings.HasPrefix(k, "raw_") {
-					hasRawMeat = true
-				} else {
-					for _, meat := range validMeats {
-						if k == meat {
-							hasRawMeat = true
-							break
-						}
+				for _, input := range validSmeltInputs {
+					if k == input {
+						hasValidInput = true
+						break
 					}
 				}
-
 				if k == "coal" || k == "charcoal" || strings.HasSuffix(k, "_log") || strings.HasSuffix(k, "_planks") {
 					hasFuel = true
 				}
 			}
 		}
 
-		if !hasRawMeat {
-			return fmt.Errorf("cannot smelt: no raw meat or raw ores found in inventory")
+		if !hasValidInput {
+			return fmt.Errorf("cannot smelt: no valid smeltable input found in inventory")
 		}
 		if !hasFuel {
-			return fmt.Errorf("cannot smelt: no valid fuel (coal, charcoal, logs, or planks) found in inventory")
+			return fmt.Errorf("cannot smelt: no valid fuel found in inventory")
 		}
 
 	case "mine", "gather":
 		target := strings.ToLower(task.Target.Name)
-
-		if target == "item" || target == "block" || target == "none" || target == "" || target == "inventory" {
-			return fmt.Errorf("target must be a specific resource (e.g., 'oak_log', 'dirt'), got generic '%s'", task.Target.Name)
-		}
-
 		isHardBlock := strings.Contains(target, "stone") || strings.Contains(target, "coal") || strings.Contains(target, "iron")
 
 		if task.Action == "mine" && isHardBlock {
-			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0
+			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0 || simInv["diamond_pickaxe"] > 0
 			if !hasPick {
 				return fmt.Errorf("mining %s requires a pickaxe", task.Target.Name)
 			}
@@ -227,38 +182,6 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			}
 			if !hasPlanks {
 				return fmt.Errorf("cannot craft sticks without at least 2 planks")
-			}
-		} else if target == "crafting_table" {
-			hasPlanks := false
-			for k, v := range simInv {
-				if strings.HasSuffix(k, "_planks") && v >= 4 {
-					hasPlanks = true
-					break
-				}
-			}
-			if !hasPlanks {
-				return fmt.Errorf("cannot craft crafting_table without at least 4 planks")
-			}
-		} else if target == "wooden_pickaxe" {
-			hasPlanks := false
-			for k, v := range simInv {
-				if strings.HasSuffix(k, "_planks") && v >= 3 {
-					hasPlanks = true
-					break
-				}
-			}
-			if !hasPlanks || simInv["stick"] < 2 {
-				return fmt.Errorf("wooden_pickaxe requires at least 3 planks and 2 sticks in inventory")
-			}
-			if simInv["crafting_table"] <= 0 {
-				return fmt.Errorf("wooden_pickaxe requires a crafting_table in inventory to place/use")
-			}
-		} else if target == "stone_pickaxe" {
-			if simInv["cobblestone"] < 3 || simInv["stick"] < 2 {
-				return fmt.Errorf("stone_pickaxe requires at least 3 cobblestone and 2 sticks in inventory")
-			}
-			if simInv["crafting_table"] <= 0 {
-				return fmt.Errorf("stone_pickaxe requires a crafting_table in inventory to place/use")
 			}
 		}
 	}

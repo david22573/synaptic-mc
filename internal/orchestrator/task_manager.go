@@ -38,17 +38,16 @@ func (pq *ActionPriorityQueue) Pop() interface{} {
 	return item
 }
 
-// NEW: Scheduled action support
 type scheduledItem struct {
 	action    domain.Action
 	executeAt time.Time
 }
 
 type TaskManager struct {
-	controller execution.Controller
-	logger     *slog.Logger
-	timeouts   map[string]time.Duration
-	OnDrain    func()
+	engine   *execution.TaskExecutionEngine // REPLACED CONTROLLER WITH ENGINE
+	logger   *slog.Logger
+	timeouts map[string]time.Duration
+	OnDrain  func()
 
 	queue      ActionPriorityQueue
 	mu         sync.Mutex
@@ -58,27 +57,25 @@ type TaskManager struct {
 	signalCh   chan struct{}
 	idleSince  time.Time
 
-	// NEW: Scheduled action fields
 	scheduleMu  sync.Mutex
 	scheduled   []scheduledItem
 	scheduleSig chan struct{}
 }
 
-func NewTaskManager(ctrl execution.Controller, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
+func NewTaskManager(engine *execution.TaskExecutionEngine, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
 	if timeouts == nil {
 		timeouts = make(map[string]time.Duration)
 	}
 	tm := &TaskManager{
-		controller:  ctrl,
+		engine:      engine, // INJECT ENGINE HERE
 		logger:      logger.With(slog.String("component", "task_manager")),
 		timeouts:    timeouts,
 		queue:       make(ActionPriorityQueue, 0, 10),
 		signalCh:    make(chan struct{}, 1),
-		scheduleSig: make(chan struct{}, 1), // NEW
+		scheduleSig: make(chan struct{}, 1),
 	}
 
 	heap.Init(&tm.queue)
-	go tm.Run(context.Background())
 	return tm
 }
 
@@ -86,7 +83,7 @@ func (m *TaskManager) Run(ctx context.Context) {
 	idleCheck := time.NewTicker(1 * time.Second)
 	defer idleCheck.Stop()
 
-	scheduleTicker := time.NewTicker(100 * time.Millisecond) // NEW
+	scheduleTicker := time.NewTicker(100 * time.Millisecond)
 	defer scheduleTicker.Stop()
 
 	for {
@@ -120,10 +117,10 @@ func (m *TaskManager) Run(ctx context.Context) {
 			}
 			m.mu.Unlock()
 
-		case <-scheduleTicker.C: // NEW
+		case <-scheduleTicker.C:
 			m.processScheduled()
 
-		case <-m.scheduleSig: // NEW
+		case <-m.scheduleSig:
 			m.processScheduled()
 
 		case <-m.signalCh:
@@ -173,11 +170,9 @@ func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error
 	return nil
 }
 
-// NEW: Enqueue scheduled actions
 func (m *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
 	m.scheduleMu.Lock()
 	m.scheduled = append(m.scheduled, scheduledItem{action, executeAt})
-	// Sort by execution time
 	sort.Slice(m.scheduled, func(i, j int) bool {
 		return m.scheduled[i].executeAt.Before(m.scheduled[j].executeAt)
 	})
@@ -190,7 +185,6 @@ func (m *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action
 	return nil
 }
 
-// NEW: Process scheduled actions
 func (m *TaskManager) processScheduled() {
 	m.scheduleMu.Lock()
 	defer m.scheduleMu.Unlock()
@@ -284,7 +278,10 @@ func (m *TaskManager) abortActiveLocked(ctx context.Context, reason string) erro
 		m.cancelTask()
 		m.cancelTask = nil
 	}
-	err := m.controller.AbortCurrent(ctx, reason)
+
+	// Delegate abort to the engine
+	err := m.engine.AbortCurrent(ctx, reason)
+
 	m.activeTask = nil
 	return err
 }
@@ -298,26 +295,14 @@ func (m *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action)
 		return
 	}
 
-	taskCtx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(ctx)
 	m.activeTask = &action
 	m.cancelTask = cancel
 	m.watchdog = make(chan struct{})
 	m.mu.Unlock()
 
-	if err := m.controller.Dispatch(taskCtx, action); err != nil {
-		m.mu.Lock()
-		m.activeTask = nil
-		m.cancelTask = nil
-		if m.watchdog != nil {
-			close(m.watchdog)
-			m.watchdog = nil
-		}
-		// Push the idle tracker into the future so we don't spam while offline
-		m.idleSince = time.Now().Add(10 * time.Second)
-		m.mu.Unlock()
-		m.logger.Error("Dispatch failed", slog.Any("error", err))
-		return
-	}
+	// THE FIX: Delegate to Engine instead of Controller
+	m.engine.Enqueue(action)
 
 	timeout, exists := m.timeouts[action.Action]
 	if !exists {

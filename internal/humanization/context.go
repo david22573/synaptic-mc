@@ -2,18 +2,16 @@ package humanization
 
 import "david22573/synaptic-mc/internal/domain"
 
+// Context provides the situational awareness required for behavioral modifiers.
 type Context struct {
-	CurrentTask   *domain.Action
-	NearbyThreats int
-	Health        float64
-	IsStuck       bool
+	State   domain.GameState
+	IsStuck bool
 }
 
+// BuildContext constructs a new behavioral context from the orchestrator's state.
 func BuildContext(state domain.GameState, isStuck bool) Context {
 	return Context{
-		CurrentTask:   state.CurrentTask,
-		NearbyThreats: len(state.Threats),
-		Health:        state.Health,
-		IsStuck:       isStuck,
+		State:   state,
+		IsStuck: isStuck,
 	}
 }

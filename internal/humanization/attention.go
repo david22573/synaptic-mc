@@ -1,38 +1,43 @@
 package humanization
 
-import "david22573/synaptic-mc/internal/domain"
+import (
+	"fmt"
+	"math/rand"
+	"time"
 
-type AttentionModel struct {
-	config Config
-}
+	"david22573/synaptic-mc/internal/domain"
+)
 
-func NewAttentionModel(config Config) *AttentionModel {
-	return &AttentionModel{config: config}
-}
+// ProcessAttentionDrift checks if the bot should be distracted by its environment.
+func ProcessAttentionDrift(ctx Context, state *State, now time.Time) []ScheduledAction {
+	var actions []ScheduledAction
 
-func (m *AttentionModel) Apply(tasks []domain.Action, state *State) []domain.Action {
-	if len(tasks) == 0 {
-		return tasks
-	}
+	attention := state.GetAttention()
 
-	primaryTask := tasks[0]
-	newTarget := primaryTask.Target.Name
+	// If attention is low and we aren't fighting for our life or stuck...
+	if attention < 0.5 && !ctx.IsStuck && ctx.State.Health >= 15 {
 
-	if newTarget != state.Attention.CurrentTarget && state.Attention.FocusStrength > 0.7 {
-		if primaryTask.Action != "retreat" && primaryTask.Action != "eat" {
-			for i, t := range tasks {
-				if t.Target.Name == state.Attention.CurrentTarget {
-					tasks[0], tasks[i] = tasks[i], tasks[0]
-					return tasks
-				}
+		// 15% chance to actually trigger a physical drift action per evaluation
+		if rand.Float64() < 0.15 && len(ctx.State.POIs) > 0 {
+
+			// Pick a random nearby Point of Interest
+			poi := ctx.State.POIs[rand.Intn(len(ctx.State.POIs))]
+
+			driftAction := domain.Action{
+				ID:        fmt.Sprintf("drift-%d", time.Now().UnixNano()),
+				Action:    "look",
+				Target:    domain.Target{Type: "poi", Name: poi.Name},
+				Priority:  -1, // Background priority, instantly preempted by real tasks
+				Rationale: "Attention drifted to nearby " + poi.Name,
 			}
+
+			actions = append(actions, ScheduledAction{
+				Action: driftAction,
+				// Execute the drift almost immediately
+				ExecuteAt: now.Add(50 * time.Millisecond),
+			})
 		}
 	}
 
-	if newTarget != state.Attention.CurrentTarget {
-		state.Attention.CurrentTarget = newTarget
-		state.Attention.FocusStrength = 1.0
-	}
-
-	return tasks
+	return actions
 }

@@ -5,131 +5,158 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
-	"david22573/synaptic-mc/internal/domain"
-
 	_ "modernc.org/sqlite"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
+const (
+	batchSize     = 50
+	flushInterval = 100 * time.Millisecond
+)
+
+type pendingEvent struct {
+	SessionID string
+	Trace     domain.TraceContext
+	EventType domain.EventType
+	Payload   []byte
+	Timestamp time.Time
+}
+
 type SQLiteStore struct {
-	db *sql.DB
+	db     *sql.DB
+	logger *slog.Logger
+	buffer chan pendingEvent
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewSQLiteEventStore(dbPath string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
+func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
+	// Enable WAL mode and busy timeout via DSN
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open event store sqlite: %w", err)
+		return nil, err
 	}
 
-	// Enforce single writer to prevent SQLITE_BUSY contention
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	schema := `
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA busy_timeout=5000;
-
-CREATE TABLE IF NOT EXISTS domain_events (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	session_id TEXT NOT NULL,
-	trace_id TEXT NOT NULL,
-	action_id TEXT NOT NULL,
-	milestone_id TEXT NOT NULL,
-	event_type TEXT NOT NULL,
-	payload JSON NOT NULL,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_events_session ON domain_events(session_id, id ASC);
-CREATE INDEX IF NOT EXISTS idx_events_trace ON domain_events(trace_id);
-
-CREATE TABLE IF NOT EXISTS session_snapshots (
-	session_id TEXT PRIMARY KEY,
-	last_event_id INTEGER NOT NULL,
-	data JSON NOT NULL,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-`
-
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("failed to apply event store schema: %w", err)
+	if err := db.Ping(); err != nil {
+		return nil, err
 	}
 
-	return &SQLiteStore{db: db}, nil
+	if err := runMigrations(db); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &SQLiteStore{
+		db:     db,
+		logger: logger.With(slog.String("component", "eventstore")),
+		buffer: make(chan pendingEvent, 1000),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	store.wg.Add(1)
+	go store.batchWorker()
+
+	return store, nil
 }
 
-func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain.TraceContext, eventType domain.EventType, payload any) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event payload: %w", err)
+func runMigrations(db *sql.DB) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			trace_id TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			payload JSON,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, id);`,
+		`CREATE TABLE IF NOT EXISTS snapshots (
+			session_id TEXT PRIMARY KEY,
+			last_event_id INTEGER NOT NULL,
+			data JSON NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 
-	query := `
-	INSERT INTO domain_events (session_id, trace_id, action_id, milestone_id, event_type, payload) 
-	VALUES (?, ?, ?, ?, ?, ?)
-`
-
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		_, err = s.db.ExecContext(ctx, query, sessionID, trace.TraceID, trace.ActionID, trace.MilestoneID, string(eventType), data)
-		if err == nil {
-			return nil
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			return err
 		}
-		lastErr = err
-		time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
 	}
-	return fmt.Errorf("failed to append event after retries: %w", lastErr)
+	return nil
 }
+
+// Append accepts 'any' payload to satisfy domain.EventStore interface, and safely marshals it.
+func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain.TraceContext, eventType domain.EventType, payload any) error {
+	var payloadBytes []byte
+	switch v := payload.(type) {
+	case []byte:
+		payloadBytes = v
+	case json.RawMessage:
+		payloadBytes = []byte(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("failed to marshal event payload: %w", err)
+		}
+		payloadBytes = b
+	}
+
+	ev := pendingEvent{
+		SessionID: sessionID,
+		Trace:     trace,
+		EventType: eventType,
+		Payload:   payloadBytes,
+		Timestamp: time.Now().UTC(),
+	}
+
+	select {
+	case s.buffer <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// If buffer is completely full, fall back to synchronous insert to avoid dropping data
+		s.logger.Warn("Event buffer full, performing synchronous insert")
+		return s.insertBatch([]pendingEvent{ev})
+	}
+}
+
+// Read Methods Restored to Satisfy domain.EventStore
 
 func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain.DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at  FROM domain_events  WHERE session_id = ?  ORDER BY id ASC`
+	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
+	          FROM events WHERE session_id = ? ORDER BY id ASC`
 	return s.queryEvents(ctx, query, sessionID)
 }
 
 func (s *SQLiteStore) GetRecentStream(ctx context.Context, sessionID string, limit int) ([]domain.DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at  FROM domain_events  WHERE session_id = ? ORDER BY id DESC LIMIT ?`
-
-	events, err := s.queryEvents(ctx, query, sessionID, limit)
-	if err != nil {
-		return nil, err
-	}
-
-	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-		events[i], events[j] = events[j], events[i]
-	}
-
-	return events, nil
+	// Subquery limits to recent N, outer query restores chronological order
+	query := `
+		SELECT * FROM (
+			SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
+			FROM events 
+			WHERE session_id = ? 
+			ORDER BY id DESC LIMIT ?
+		) ORDER BY id ASC
+	`
+	return s.queryEvents(ctx, query, sessionID, limit)
 }
 
 func (s *SQLiteStore) GetStreamSince(ctx context.Context, sessionID string, sinceID int64) ([]domain.DomainEvent, error) {
-	query := `SELECT id, session_id, trace_id, action_id, milestone_id, event_type, payload, created_at  FROM domain_events  WHERE session_id = ? AND id > ? ORDER BY id ASC`
+	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
+	          FROM events WHERE session_id = ? AND id > ? ORDER BY id ASC`
 	return s.queryEvents(ctx, query, sessionID, sinceID)
-}
-
-func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snap domain.SessionSnapshot) error {
-	query := `INSERT INTO session_snapshots (session_id, last_event_id, data, created_at)  VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET  last_event_id = excluded.last_event_id, data = excluded.data, created_at = CURRENT_TIMESTAMP;`
-	_, err := s.db.ExecContext(ctx, query, snap.SessionID, snap.LastEventID, string(snap.Data))
-	return err
-}
-
-func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (*domain.SessionSnapshot, error) {
-	query := `SELECT session_id, last_event_id, data, created_at  FROM session_snapshots  WHERE session_id = ?`
-	row := s.db.QueryRowContext(ctx, query, sessionID)
-
-	var snap domain.SessionSnapshot
-	var dataStr string
-
-	err := row.Scan(&snap.SessionID, &snap.LastEventID, &dataStr, &snap.CreatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	snap.Data = json.RawMessage(dataStr)
-	return &snap, nil
 }
 
 func (s *SQLiteStore) queryEvents(ctx context.Context, query string, args ...any) ([]domain.DomainEvent, error) {
@@ -141,28 +168,126 @@ func (s *SQLiteStore) queryEvents(ctx context.Context, query string, args ...any
 
 	var events []domain.DomainEvent
 	for rows.Next() {
-		var e domain.DomainEvent
-		var eventTypeStr string
-
-		if err := rows.Scan(
-			&e.ID,
-			&e.SessionID,
-			&e.Trace.TraceID,
-			&e.Trace.ActionID,
-			&e.Trace.MilestoneID,
-			&eventTypeStr,
-			&e.Payload,
-			&e.CreatedAt,
-		); err != nil {
+		var ev domain.DomainEvent
+		var payloadStr string
+		if err := rows.Scan(&ev.ID, &ev.SessionID, &ev.Trace.TraceID, &ev.Trace.ActionID, &ev.Type, &payloadStr, &ev.CreatedAt); err != nil {
 			return nil, err
 		}
-
-		e.Type = domain.EventType(eventTypeStr)
-		events = append(events, e)
+		ev.Payload = json.RawMessage(payloadStr)
+		events = append(events, ev)
 	}
-	return events, nil
+	return events, rows.Err()
+}
+
+// Snapshot Methods
+
+func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snap domain.SessionSnapshot) error {
+	query := `
+		INSERT INTO snapshots (session_id, last_event_id, data, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(session_id) DO UPDATE SET
+			last_event_id = excluded.last_event_id,
+			data = excluded.data,
+			updated_at = CURRENT_TIMESTAMP;
+	`
+	_, err := s.db.ExecContext(ctx, query, snap.SessionID, snap.LastEventID, snap.Data)
+	return err
+}
+
+func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (*domain.SessionSnapshot, error) {
+	query := `SELECT session_id, last_event_id, data, updated_at FROM snapshots WHERE session_id = ?`
+	row := s.db.QueryRowContext(ctx, query, sessionID)
+
+	var snap domain.SessionSnapshot
+	var dataStr string
+	if err := row.Scan(&snap.SessionID, &snap.LastEventID, &dataStr, &snap.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // No snapshot yet, totally normal
+		}
+		return nil, err
+	}
+	snap.Data = json.RawMessage(dataStr)
+	return &snap, nil
 }
 
 func (s *SQLiteStore) Close() error {
+	s.cancel()
+	s.wg.Wait() // Wait for remaining buffered events to flush
 	return s.db.Close()
+}
+
+// Background Worker
+
+func (s *SQLiteStore) batchWorker() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	batch := make([]pendingEvent, 0, batchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := s.insertBatch(batch); err != nil {
+			s.logger.Error("Failed to flush event batch", slog.Any("error", err), slog.Int("count", len(batch)))
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			// Drain remaining buffer on shutdown
+			close(s.buffer)
+			for ev := range s.buffer {
+				batch = append(batch, ev)
+				if len(batch) >= batchSize {
+					flush()
+				}
+			}
+			flush()
+			return
+
+		case ev := <-s.buffer:
+			batch = append(batch, ev)
+			if len(batch) >= batchSize {
+				flush()
+			}
+
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (s *SQLiteStore) insertBatch(events []pendingEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Build bulk insert query
+	valueStrings := make([]string, 0, len(events))
+	valueArgs := make([]interface{}, 0, len(events)*6)
+
+	for _, ev := range events {
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?)")
+		valueArgs = append(valueArgs, ev.SessionID, ev.Trace.TraceID, ev.Trace.ActionID, ev.EventType, string(ev.Payload), ev.Timestamp)
+	}
+
+	stmt := fmt.Sprintf("INSERT INTO events (session_id, trace_id, action_id, event_type, payload, created_at) VALUES %s",
+		strings.Join(valueStrings, ","))
+
+	if _, err := tx.Exec(stmt, valueArgs...); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
