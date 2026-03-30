@@ -6,11 +6,16 @@
         connectToBot,
         disconnectBot,
     } from "./lib/store.svelte";
+    import { controller } from "./lib/store.svelte"; // Import the Phase 3 controller
     import HUD from "./components/HUD.svelte";
     import Sidebar from "./components/Sidebar.svelte";
 
     let viewerUrl = $state("about:blank");
     let isSidebarOpen = $state(true);
+
+    // 60 FPS Interpolation State
+    let renderPosition = $state({ x: 0, y: 0, z: 0 });
+    let animationFrameId: number;
 
     const position = $derived(
         botStore.gameState?.position || { x: 0, y: 0, z: 0 },
@@ -18,8 +23,12 @@
     const timeOfDay = $derived(botStore.gameState?.time_of_day ?? 0);
 
     const timeDisplay = $derived(formatTimeOfDay(timeOfDay));
-    const coordsDisplay = $derived(
-        `X: ${Math.round(position.x)} Y: ${Math.round(position.y)} Z: ${Math.round(position.z)}`,
+
+    const rawCoordsDisplay = $derived(
+        `Raw X: ${Math.round(position.x)} Y: ${Math.round(position.y)} Z: ${Math.round(position.z)}`,
+    );
+    const smoothCoordsDisplay = $derived(
+        `X: ${renderPosition.x.toFixed(2)} Y: ${renderPosition.y.toFixed(2)} Z: ${renderPosition.z.toFixed(2)}`,
     );
 
     function formatTimeOfDay(time: number): string {
@@ -28,11 +37,20 @@
         return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}`;
     }
 
+    function renderLoop() {
+        controller.update();
+        renderPosition = { ...controller.entityPosition };
+        animationFrameId = requestAnimationFrame(renderLoop);
+    }
+
     onMount(() => {
         viewerUrl = `http://${window.location.hostname}:3000`;
         connectToBot();
+        renderLoop();
+
         return () => {
             disconnectBot();
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
         };
     });
 </script>
@@ -44,7 +62,12 @@
     <div class="floating-header">
         <div class="title-group">
             <h1>Synaptic MC</h1>
-            <span class="coords-badge">{timeDisplay} | {coordsDisplay}</span>
+            <div class="coords-container">
+                <span class="coords-badge"
+                    >{timeDisplay} | {smoothCoordsDisplay} (60 FPS)</span
+                >
+                <span class="raw-coords">{rawCoordsDisplay} (50ms tick)</span>
+            </div>
         </div>
         <div class="status">
             <span class="indicator {botStore.connectionStatus}"></span>
@@ -129,7 +152,7 @@
 
     .title-group {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 1rem;
     }
 
@@ -137,6 +160,13 @@
         margin: 0;
         font-size: 1.25rem;
         color: #38bdf8;
+        line-height: 1.2;
+    }
+
+    .coords-container {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
     }
 
     .coords-badge {
@@ -146,6 +176,14 @@
         font-family: monospace;
         font-size: 0.875rem;
         border: 1px solid rgba(255, 255, 255, 0.1);
+        color: #60a5fa; /* Make smooth coords pop a bit */
+    }
+
+    .raw-coords {
+        font-family: monospace;
+        font-size: 0.7rem;
+        color: #94a3b8;
+        padding-left: 0.25rem;
     }
 
     .status {
@@ -175,7 +213,7 @@
     .sidebar-toggle {
         position: absolute;
         top: 1rem;
-        right: 430px; /* 420px sidebar + 10px spacing */
+        right: 430px;
         z-index: 25;
         background: rgba(15, 23, 42, 0.8);
         color: white;
@@ -202,7 +240,7 @@
     .mc-tooltip {
         position: fixed;
         background: rgba(16, 0, 16, 0.95);
-        border: 2px solid #3700b3; /* Classic minecraft purple border */
+        border: 2px solid #3700b3;
         border-radius: 3px;
         color: #fff;
         padding: 4px 8px;

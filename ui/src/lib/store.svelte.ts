@@ -1,3 +1,7 @@
+import { AgentController } from "./agent-controller";
+import { TaskCommitment } from "./task-commitment";
+import { Prefetcher } from "./prefetcher";
+
 export const botStore = $state({
     gameState: null as any,
     events: [] as any[],
@@ -8,12 +12,15 @@ export const botStore = $state({
         | "disconnected",
 });
 
-// Custom global tooltip state
 export const uiStore = $state({
     tooltip: "",
     mouseX: 0,
     mouseY: 0,
 });
+
+export const controller = new AgentController();
+export const commitment = new TaskCommitment();
+export const prefetcher = new Prefetcher();
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -42,6 +49,7 @@ export function connectToBot() {
             switch (message.type) {
                 case "state_update":
                     botStore.gameState = message.payload;
+                    controller.onStateUpdate(message.payload);
                     break;
                 case "event_stream": {
                     const newEvent = {
@@ -52,6 +60,19 @@ export function connectToBot() {
                         0,
                         maxEvents,
                     );
+
+                    if (
+                        message.payload.event === "task_start" &&
+                        message.payload.task
+                    ) {
+                        if (commitment.shouldCommit(message.payload.task)) {
+                            prefetcher.onTaskStart(message.payload.task);
+                        }
+                    }
+
+                    if (message.payload.event === "task_end") {
+                        commitment.reset();
+                    }
                     break;
                 }
                 case "objective_update":

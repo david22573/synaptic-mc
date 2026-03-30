@@ -14,7 +14,7 @@ install: ## Install Go and JS dependencies
 
 build: ## Compile Go binary and TypeScript bot for optimal performance
 	@echo "==> Compiling TypeScript bot..."
-	cd js && npx tsc
+	cd js && pnpm i && npx tsc
 	@echo "==> Building Go control plane..."
 	go build -ldflags="-s -w" -o bin/synaptic-server ./cmd/server
 

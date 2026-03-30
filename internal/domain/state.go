@@ -79,6 +79,7 @@ type Action struct {
 	Trace        TraceContext `json:"trace"`
 	Action       string       `json:"action"`
 	Target       Target       `json:"target"`
+	Count        int          `json:"count"`
 	Rationale    string       `json:"rationale"`
 	Priority     int          `json:"priority"`
 }

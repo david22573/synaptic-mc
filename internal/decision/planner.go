@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/learning"
@@ -27,6 +30,10 @@ type AdvancedPlanner struct {
 	extractor RuleExtractor
 	memStore  memory.Store
 	store     domain.EventStore
+	logger    *slog.Logger
+
+	currentPlan atomic.Pointer[domain.Plan]
+	replanCh    chan domain.GameState
 }
 
 func NewAdvancedPlanner(
@@ -35,6 +42,7 @@ func NewAdvancedPlanner(
 	extractor RuleExtractor,
 	memStore memory.Store,
 	store domain.EventStore,
+	logger *slog.Logger,
 ) *AdvancedPlanner {
 	return &AdvancedPlanner{
 		client:    client,
@@ -42,6 +50,8 @@ func NewAdvancedPlanner(
 		extractor: extractor,
 		memStore:  memStore,
 		store:     store,
+		logger:    logger.With(slog.String("component", "advanced_planner")),
+		replanCh:  make(chan domain.GameState, 1),
 	}
 }
 
@@ -52,7 +62,7 @@ CRITICAL GAME MECHANIC RULES:
 2.  You CANNOT gather stone or coal without a wooden_pickaxe.
 3.  Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per candidate.
 4.  SURVIVAL: You CANNOT 'eat' if your inventory has no food.
-    You CANNOT 'hunt' if health is under 12.
+You CANNOT 'hunt' if health is under 12.
 5.  CRAFTING RECIPES:
       - oak_planks: requires 1 oak_log (yields 4)
       - stick: requires 2 oak_planks (yields 4)
@@ -60,12 +70,12 @@ CRITICAL GAME MECHANIC RULES:
       - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
       - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
 6.  If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
-    VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
+VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
     VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
-    OUTPUT REQUIREMENT (ADVANCED PLANNING):
+OUTPUT REQUIREMENT (ADVANCED PLANNING):
     You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective.
-    Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
-    Response format (JSON only):
+Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
+Response format (JSON only):
     {
     "objective": "Sub-goal description",
     "candidates": [
@@ -119,7 +129,8 @@ func formatStateForLLM(state domain.GameState) string {
 			if strings.Contains(item.Name, "pickaxe") {
 				compact.HasPickaxe = true
 			}
-			if strings.Contains(item.Name, "sword") || (strings.Contains(item.Name, "axe") && !strings.Contains(item.Name, "pickaxe")) {
+			if strings.Contains(item.Name, "sword") ||
+				(strings.Contains(item.Name, "axe") && !strings.Contains(item.Name, "pickaxe")) {
 				compact.HasWeapon = true
 			}
 		}
@@ -153,7 +164,98 @@ type multiCandidateResponse struct {
 	Candidates [][]domain.Action `json:"candidates"`
 }
 
-func (p *AdvancedPlanner) Generate(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
+func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState) bool {
+	if prev.Health == 0 {
+		return true // Initial state
+	}
+
+	dx := prev.Position.X - curr.Position.X
+	dy := prev.Position.Y - curr.Position.Y
+	dz := prev.Position.Z - curr.Position.Z
+	dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+
+	return dist > 2.0 || prev.Health != curr.Health || prev.Food != curr.Food
+}
+
+func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var latestState domain.GameState
+	var lastPlannedState domain.GameState
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case state := <-p.replanCh:
+			latestState = state
+		case <-ticker.C:
+			if latestState.Health == 0 {
+				continue
+			}
+
+			// Churn Limiter: Skip LLM call if state hasn't meaningfully changed
+			if !p.stateChangedSignificantly(lastPlannedState, latestState) {
+				continue
+			}
+
+			plan, err := p.generateLLMPlan(ctx, sessionID, latestState)
+			if err != nil {
+				p.logger.Error("Background LLM planning failed", slog.Any("error", err))
+				continue
+			}
+
+			p.currentPlan.Store(plan)
+			lastPlannedState = latestState
+		}
+	}
+}
+
+func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
+	select {
+	case p.replanCh <- state:
+	default:
+	}
+}
+
+func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
+	if plan := p.currentPlan.Load(); plan != nil {
+		if len(plan.Tasks) > 0 {
+			return *plan
+		}
+	}
+	return p.reactivePlan(state)
+}
+
+func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
+	var tasks []domain.Action
+
+	if state.Health < 10 {
+		tasks = append(tasks, domain.Action{
+			ID:        fmt.Sprintf("react-heal-%d", time.Now().UnixNano()),
+			Action:    "retreat",
+			Target:    domain.Target{Name: "none", Type: "none"},
+			Priority:  100,
+			Rationale: "Reactive fast-path fallback: Health critical",
+		})
+	} else {
+		tasks = append(tasks, domain.Action{
+			ID:        fmt.Sprintf("react-idle-%d", time.Now().UnixNano()),
+			Action:    "idle",
+			Target:    domain.Target{Name: "none", Type: "none"},
+			Priority:  0,
+			Rationale: "Reactive fast-path fallback: Awaiting LLM instruction",
+		})
+	}
+
+	return domain.Plan{
+		Objective: "Reactive Fallback Plan",
+		Tasks:     tasks,
+	}
+}
+
+func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	directive := p.evaluator.Evaluate(state)
 	learnedRules := ""
 
@@ -193,7 +295,6 @@ func (p *AdvancedPlanner) Generate(ctx context.Context, sessionID string, state 
 		return nil, fmt.Errorf("planner returned zero candidates")
 	}
 
-	// Fix: Provide nil for existing stats to generate a fresh projection
 	events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
 	stats := learning.CalculateActionStats(nil, events)
 

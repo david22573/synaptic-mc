@@ -31,9 +31,10 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
-    tree: "wood",
-    log: "wood",
-    timber: "wood",
+    tree: "oak_log",
+    log: "oak_log",
+    timber: "oak_log",
+    wood: "oak_log",
 };
 
 export function normalizeIntent(
@@ -90,7 +91,10 @@ export function normalizeIntent(
         if (targetName === "table" || targetName === "workbench") {
             targetName = "crafting_table";
         }
-    } else if (action === "gather" && targetName === "wood") {
+    } else if (
+        action === "gather" &&
+        (targetName === "wood" || targetName === "oak_log")
+    ) {
         // Handled naturally by the gather handler
     }
 

@@ -30,6 +30,7 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 		"id":        action.ID,
 		"action":    action.Action,
 		"target":    action.Target,
+		"count":     action.Count,
 		"rationale": action.Rationale,
 	})
 	if err != nil {

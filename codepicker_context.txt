@@ -1,7 +1,7 @@
-Project Context Dump (29 Mar 26 22:38 PDT)
+Project Context Dump (29 Mar 26 23:57 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 78
+Total Files: 74
 
 # Project Structure
 <file_tree>
@@ -67,12 +67,9 @@ Total Files: 78
 - js\lib\tasks\registry.ts
 - js\lib\tasks\task.ts
 - js\lib\tasks\utils.ts
-- js\lib\types.d.ts
 - js\lib\utils\errors.ts
 - js\lib\utils\perception.ts
 - js\lib\utils\threats.ts
-- scripts\find_deprecated_decision_logic.sh
-- scripts\lint_pipeline_immutability.sh
 - ui\index.html
 - ui\src\App.svelte
 - ui\src\app.css
@@ -81,13 +78,12 @@ Total Files: 78
 - ui\src\components\Sidebar.svelte
 - ui\src\lib\store.svelte.ts
 - ui\src\main.ts
-- ui\svelte.config.js
 - ui\vite.config.ts
 </file_tree>
 
 # File Contents
 <file path="Makefile">
-.PHONY: help install run-server run-bot dev clean test-replay
+.PHONY: help install run-server run-bot dev clean test-replay build run-prod
 
 # Default target
 .DEFAULT_GOAL := help
@@ -100,6 +96,16 @@ install: ## Install Go and JS dependencies
 	cd js && npm install
 	@echo "==> Tidying Go modules..."
 	go mod tidy
+
+build: ## Compile Go binary and TypeScript bot for optimal performance
+	@echo "==> Compiling TypeScript bot..."
+	cd js && pnpm i && npx tsc
+	@echo "==> Building Go control plane..."
+	go build -ldflags="-s -w" -o bin/synaptic-server ./cmd/server
+
+run-prod: ## Run the optimized compiled binaries
+	@echo "==> Starting production server..."
+	./bin/synaptic-server -bot-script="js/dist/index.js"
 
 run-server: ## Run the Go control plane directly
 	@echo "==> Starting Go WebSocket Server..."
@@ -123,6 +129,8 @@ test-replay: ## Run the Replay Test Harness
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."
 	rm -rf js/node_modules
+	rm -rf js/dist
+	rm -rf bin
 	go clean
 </file>
 
@@ -964,6 +972,7 @@ type Action struct {
 	Trace        TraceContext `json:"trace"`
 	Action       string       `json:"action"`
 	Target       Target       `json:"target"`
+	Count        int          `json:"count"`
 	Rationale    string       `json:"rationale"`
 	Priority     int          `json:"priority"`
 }
@@ -1364,6 +1373,7 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 		"id":        action.ID,
 		"action":    action.Action,
 		"target":    action.Target,
+		"count":     action.Count,
 		"rationale": action.Rationale,
 	})
 	if err != nil {
@@ -2474,6 +2484,15 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 
 			if o.uiHub != nil {
 				o.uiHub.Broadcast("state_update", vState.State)
+			}
+
+			o.mu.RLock()
+			tm := o.taskManager
+			isLocked := o.reflexLock
+			o.mu.RUnlock()
+
+			if tm != nil && tm.IsIdle() && !isLocked {
+				go o.handleQueueDrain()
 			}
 		}
 	}
@@ -4470,6 +4489,7 @@ func cosineSimilarity(a, b []float32) float32 {
 import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
+import { plugin as collectBlock } from "mineflayer-collectblock";
 
 import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
@@ -4483,12 +4503,10 @@ import { getPOIs } from "./lib/utils/perception.js";
 const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
-
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err.stack || err);
     const name = String(err.name || "");
-
     return (
         name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
@@ -4506,7 +4524,6 @@ console.error = (...args: any[]) => {
         typeof firstArg === "object"
             ? String(firstArg?.err?.message || firstArg?.message || "")
             : String(firstArg);
-
     if (
         isIgnorableError(firstArg) ||
         msg.includes("PartialReadError") ||
@@ -4536,12 +4553,10 @@ process.on("uncaughtException", (err: Error) => {
     });
     process.exit(1);
 });
-
 process.on("unhandledRejection", (reason: any) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
 });
-
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
@@ -4554,10 +4569,8 @@ let lastStatePushTime = 0;
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
-
 // Global cache for discovered chests
 const knownChests: Record<string, { name: string; count: number }[]> = {};
-
 function stopMovement() {
     if (!bot) return;
     bot.clearControlStates();
@@ -4595,7 +4608,6 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -4604,14 +4616,12 @@ function normalizeFailureCause(err: any): string {
         msg.includes("collect_failed")
     )
         return "PATH_FAILED";
-
     if (
         msg.includes("timeout") ||
         msg.includes("fsm_global_timeout") ||
         msg.includes("furnace_timeout_or_lag")
     )
         return "TIMEOUT";
-
     if (msg.includes("stuck")) return "STUCK";
 
     if (
@@ -4621,19 +4631,17 @@ function normalizeFailureCause(err: any): string {
         msg.includes("no_interactable_found")
     )
         return "NO_ENTITY";
-
     if (msg.includes("no_pickaxe_equipped") || msg.includes("no_tool"))
         return "NO_TOOL";
-
     if (
         msg.includes("no_furnace_available") ||
         msg.includes("failed_to_reach_furnace") ||
         msg.includes("no_chest")
     )
-        return "NO_FURNACE"; // Generic missing block error
+        return "NO_FURNACE";
+    // Generic missing block error
 
     if (msg.includes("no_mature_")) return "NO_MATURE_CROP";
-
     if (
         msg.includes("missing_ingredients") ||
         msg.includes("missing_crafting_table") ||
@@ -4641,7 +4649,6 @@ function normalizeFailureCause(err: any): string {
         msg.includes("not_in_inventory")
     )
         return "MISSING_INGREDIENTS";
-
     if (
         msg.includes("exhausted") ||
         msg.includes("no_") ||
@@ -4649,14 +4656,12 @@ function normalizeFailureCause(err: any): string {
         msg.includes("unknown_")
     )
         return "NO_BLOCKS";
-
     return "UNKNOWN";
 }
 
 async function executeIntent(intent: models.ActionIntent) {
     if (!intent?.action) return;
     if (isShuttingDown) return;
-
     if (survival?.isPanickingNow()) {
         if (intent.action === "retreat") {
             survival.reset();
@@ -4676,7 +4681,6 @@ async function executeIntent(intent: models.ActionIntent) {
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
-
     currentTask = {
         id: intent.id,
         action: intent.action,
@@ -4688,11 +4692,9 @@ async function executeIntent(intent: models.ActionIntent) {
             action_id: intent.id,
         },
     };
-
     stopMovement();
     const activeTask = currentTask;
     let timeoutId: NodeJS.Timeout | undefined;
-
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
         const timeoutMs = timeouts[intent.action] || 15000;
@@ -4714,7 +4716,6 @@ async function executeIntent(intent: models.ActionIntent) {
                 }, timeoutMs);
             }),
         ]);
-
         if (!signal.aborted && activeTask) {
             await new Promise((r) => setTimeout(r, 500));
             pushState();
@@ -4729,7 +4730,6 @@ async function executeIntent(intent: models.ActionIntent) {
                 raw_error: err.message,
                 normalized_cause: normalizedCause,
             });
-
             pushState();
             if (activeTask)
                 completeTask(activeTask, "task_failed", normalizedCause);
@@ -4750,7 +4750,6 @@ function pushState() {
         const item = bot.inventory.slots[hotbarStart + i];
         return item ? { name: item.name, count: item.count } : null;
     });
-
     const offhandItem = bot.inventory.slots[45];
 
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
@@ -4758,7 +4757,6 @@ function pushState() {
         .map((i) => `${i.name}:${i.count}`)
         .sort()
         .join(",")}|${Object.keys(knownChests).length}`;
-
     const now = Date.now();
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
@@ -4816,8 +4814,8 @@ async function connectWithRetry(maxAttempts = 10) {
         username: "CraftBot",
         version: "1.19",
     });
-
     bot.loadPlugin(pathfinder);
+    bot.loadPlugin(collectBlock);
 
     if (!client) {
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
@@ -4841,7 +4839,6 @@ async function connectWithRetry(maxAttempts = 10) {
         if (isIgnorableError(err)) return;
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
-
     bot.on("end", (reason) => {
         abortActiveTask("bot_disconnected");
         survival.stop();
@@ -4854,7 +4851,6 @@ async function connectWithRetry(maxAttempts = 10) {
             backoffMs + Math.random() * 1000,
         );
     });
-
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
@@ -4886,7 +4882,6 @@ async function connectWithRetry(maxAttempts = 10) {
 
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
-
         if (!client.isConnected()) client.connect();
 
         survival.start();
@@ -4902,19 +4897,16 @@ async function connectWithRetry(maxAttempts = 10) {
             } catch (err) {}
         }
     });
-
     bot.on("message", (msg) => {
         const text = msg.toString();
         if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
     });
-
     bot.on("death", () => {
         abortActiveTask("bot_died");
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
     });
-
     // Spy on chests to update the global memory cache
     bot.on("windowOpen", (window) => {
         if (
@@ -4934,7 +4926,6 @@ async function connectWithRetry(maxAttempts = 10) {
             }
         }
     });
-
     bot.on("health", pushState);
     bot.on("experience", pushState);
 
@@ -4961,7 +4952,6 @@ process.on("SIGINT", () => {
         process.exit(0);
     }
 });
-
 bootstrap().catch((err) => {
     log.error("Fatal startup", {
         err: err instanceof Error ? err.message : String(err),
@@ -5351,6 +5341,7 @@ export class ControlPlaneClient {
         if (event === "death") msgType = "BOT_DEATH";
         if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
         if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
+        if (event === "task_aborted") msgType = "TASK_END";
 
         let status = event;
         if (event === "task_completed") status = "COMPLETED";
@@ -6312,7 +6303,6 @@ class PickDirectionState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
         eCtx.attempts++;
-
         // Reduced from 4 attempts to 2 to prevent hitting global 25s FSM timeout
         if (eCtx.attempts > 2) {
             eCtx.result = {
@@ -6359,7 +6349,7 @@ class PickDirectionState implements FSMState {
 }
 
 export async function handleExplore(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    const { bot, intent, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
     // Bind the history array to the bot instance itself.
@@ -6411,6 +6401,7 @@ const CROP_DATA: Record<string, { matureAge: number; seedName: string }> = {
 };
 
 interface FarmContext extends StateContext {
+    targetCount: number;
     candidatePositions: any[];
     currentIndex: number;
     targetBlock: any;
@@ -6424,7 +6415,6 @@ class ReplantState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const fCtx = ctx as FarmContext;
         const cropInfo = CROP_DATA[fCtx.targetName];
-
         // Find the farmland block directly below the crop we just broke
         const farmlandPos = fCtx.targetBlock.position.offset(0, -1, 0);
         const farmlandBlock = fCtx.bot.blockAt(farmlandPos);
@@ -6457,7 +6447,6 @@ class HarvestState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const fCtx = ctx as FarmContext;
         const cropBlock = fCtx.bot.blockAt(fCtx.targetBlock.position);
-
         if (!cropBlock || cropBlock.name !== fCtx.targetName) {
             return advanceToNextCrop(fCtx, "CROP_MISSING");
         }
@@ -6505,7 +6494,6 @@ class SearchCropState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const fCtx = ctx as FarmContext;
         const cropInfo = CROP_DATA[fCtx.targetName];
-
         if (!cropInfo) {
             fCtx.result = {
                 status: "FAILED",
@@ -6520,7 +6508,6 @@ class SearchCropState implements FSMState {
             maxDistance: 32,
             count: 128,
         });
-
         const botPos = fCtx.bot.entity.position;
 
         // Filter for ONLY fully mature crops using metadata
@@ -6528,7 +6515,6 @@ class SearchCropState implements FSMState {
             const block = fCtx.bot.blockAt(pos);
             return block && block.metadata === cropInfo.matureAge;
         });
-
         if (blocks.length === 0) {
             fCtx.result = {
                 status: "FAILED",
@@ -6540,7 +6526,9 @@ class SearchCropState implements FSMState {
         blocks.sort(
             (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
         );
-        fCtx.candidatePositions = blocks.slice(0, 5);
+
+        // Dynamically slice based on intent targetCount
+        fCtx.candidatePositions = blocks.slice(0, fCtx.targetCount);
         fCtx.currentIndex = 0;
 
         return new NavigateCropState();
@@ -6557,12 +6545,13 @@ function advanceToNextCrop(fCtx: FarmContext, reason: string): FSMState | null {
 }
 
 export async function handleFarm(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    const { bot, intent, signal, timeouts, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
     const fsmCtx: FarmContext = {
         bot,
-        targetName: decision.target?.name || "",
+        targetName: intent.target?.name || "",
+        targetCount: intent.count || 10, // Default to 10 if count isn't specified
         targetEntity: null,
         searchRadius: 32,
         timeoutMs: timeouts.farm ?? 40000,
@@ -6578,6 +6567,7 @@ export async function handleFarm(ctx: TaskContext): Promise<void> {
         new SearchCropState(),
         fsmCtx,
     ).run();
+
     if (result.status === "FAILED") throw new Error(result.reason);
 }
 
@@ -6893,7 +6883,6 @@ export async function handleHunt(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\interact.ts">
-// js/lib/tasks/handlers/interact.ts
 import { type TaskContext } from "../registry.js";
 import { findNearestEntity } from "../primitives.js";
 import { findNearestBlockByName, moveToGoal } from "../utils.js";
@@ -6902,8 +6891,8 @@ import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
 
 export async function handleInteract(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, stopMovement, timeouts } = ctx;
-    const targetName = decision.target?.name;
+    const { bot, intent, signal, stopMovement, timeouts } = ctx;
+    const targetName = intent.target?.name;
 
     if (!targetName || targetName === "none") {
         throw new Error("missing interact target");
@@ -6926,7 +6915,6 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
                 stopMovement,
             },
         );
-
         if (
             targetName.includes("boat") ||
             targetName.includes("minecart") ||
@@ -7461,6 +7449,7 @@ const { goals } = pkg;
 interface StoreContext extends StateContext {
     chestBlock: any | null;
     targetItems: { type: number; count: number }[];
+    targetCount: number;
     stopMovement: () => void;
 }
 
@@ -7596,15 +7585,25 @@ class CheckItemsState implements FSMState {
                 )
                 .map((i) => ({ type: i.type, count: i.count }));
         } else {
-            const item = inventory.find((i: any) => i.name === targetName);
-            if (!item) {
+            const items = inventory.filter((i: any) => i.name === targetName);
+            if (items.length === 0) {
                 sCtx.result = {
                     status: "FAILED",
                     reason: `MISSING_INGREDIENTS: ${targetName} not_in_inventory`,
                 };
                 return null;
             }
-            sCtx.targetItems = [{ type: item.type, count: item.count }];
+
+            // Aggregate all stacks to see how much we actually have
+            const totalInInv = items.reduce((sum, i) => sum + i.count, 0);
+
+            // If targetCount is > 0, bound it by the request. Otherwise store it all.
+            const toStore =
+                sCtx.targetCount > 0
+                    ? Math.min(totalInInv, sCtx.targetCount)
+                    : totalInInv;
+
+            sCtx.targetItems = [{ type: items[0].type, count: toStore }];
         }
 
         if (sCtx.targetItems.length === 0) {
@@ -7623,6 +7622,7 @@ export async function handleStore(ctx: TaskContext): Promise<void> {
     const fsmCtx: StoreContext = {
         bot,
         targetName: intent.target?.name || "",
+        targetCount: intent.count || 0, // Default to 0 (meaning store all available)
         targetEntity: null,
         searchRadius: 0,
         timeoutMs: timeouts.store ?? 20000,
@@ -7677,9 +7677,10 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
-    tree: "wood",
-    log: "wood",
-    timber: "wood",
+    tree: "oak_log",
+    log: "oak_log",
+    timber: "oak_log",
+    wood: "oak_log",
 };
 
 export function normalizeIntent(
@@ -7736,7 +7737,10 @@ export function normalizeIntent(
         if (targetName === "table" || targetName === "workbench") {
             targetName = "crafting_table";
         }
-    } else if (action === "gather" && targetName === "wood") {
+    } else if (
+        action === "gather" &&
+        (targetName === "wood" || targetName === "oak_log")
+    ) {
         // Handled naturally by the gather handler
     }
 
@@ -8362,17 +8366,6 @@ export async function placePortableUtility(
 
 </file>
 
-<file path="js\lib\types.d.ts">
-import { Pathfinder } from "mineflayer-pathfinder";
-
-declare module "mineflayer" {
-    interface Bot {
-        pathfinder: Pathfinder;
-    }
-}
-
-</file>
-
 <file path="js\lib\utils\errors.ts">
 export function getErrorMessage(error: unknown): string {
     if (error instanceof Error) return error.message;
@@ -8685,29 +8678,6 @@ export function computeSafeRetreat(
     };
 }
 
-</file>
-
-<file path="scripts\find_deprecated_decision_logic.sh">
-#!/bin/bash
-echo "Identifying old decision logic for removal..."
-grep -rn "func (.*Validator) Validate" internal/decision/validator.go
-grep -rn "func (.*Simulator) RankAndSelect" internal/decision/simulator.go
-echo "These functions should be deleted after Step 1.3 is complete."
-</file>
-
-<file path="scripts\lint_pipeline_immutability.sh">
-#!/bin/bash
-# scripts/lint_policy_authority.sh
-
-echo "Checking for rogue policy overrides outside policy package..."
-ROGUE=$(grep -r "POLICY VIOLATION" internal/ | grep -v "internal/policy/")
-
-if [ -n "$ROGUE" ]; then
-    echo "ERROR: Hardcoded policy constraints found outside internal/policy/!"
-    echo "$ROGUE"
-    exit 1
-fi
-echo "Policy authority checks passed."
 </file>
 
 <file path="ui\index.html">
@@ -10028,12 +9998,6 @@ export default app;
 
 </file>
 
-<file path="ui\svelte.config.js">
-/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
-export default {}
-
-</file>
-
 <file path="ui\vite.config.ts">
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
@@ -10061,10 +10025,10 @@ export default defineConfig({
 
 ```json
 {
-  "total_bytes": 276438,
-  "file_count": 78,
-  "estimated_tokens": 70710,
+  "total_bytes": 277103,
+  "file_count": 74,
+  "estimated_tokens": 70792,
   "mode": "full",
-  "generated_at": "2026-03-29T22:38:44.5355182-07:00"
+  "generated_at": "2026-03-29T23:57:34.1243272-07:00"
 }
 ```

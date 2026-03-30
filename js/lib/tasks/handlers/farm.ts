@@ -19,6 +19,7 @@ const CROP_DATA: Record<string, { matureAge: number; seedName: string }> = {
 };
 
 interface FarmContext extends StateContext {
+    targetCount: number;
     candidatePositions: any[];
     currentIndex: number;
     targetBlock: any;
@@ -143,7 +144,9 @@ class SearchCropState implements FSMState {
         blocks.sort(
             (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
         );
-        fCtx.candidatePositions = blocks.slice(0, 5);
+
+        // Dynamically slice based on intent targetCount
+        fCtx.candidatePositions = blocks.slice(0, fCtx.targetCount);
         fCtx.currentIndex = 0;
 
         return new NavigateCropState();
@@ -166,6 +169,7 @@ export async function handleFarm(ctx: TaskContext): Promise<void> {
     const fsmCtx: FarmContext = {
         bot,
         targetName: intent.target?.name || "",
+        targetCount: intent.count || 10, // Default to 10 if count isn't specified
         targetEntity: null,
         searchRadius: 32,
         timeoutMs: timeouts.farm ?? 40000,
@@ -176,9 +180,11 @@ export async function handleFarm(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
+
     const result = await new StateMachineRunner(
         new SearchCropState(),
         fsmCtx,
     ).run();
+
     if (result.status === "FAILED") throw new Error(result.reason);
 }

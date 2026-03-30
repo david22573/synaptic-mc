@@ -17,6 +17,7 @@ import (
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
+	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
@@ -94,8 +95,9 @@ func main() {
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore)
 
 	uiHub := observability.NewHub(logger)
+	flags := config.DefaultFlags()
 
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger)
+	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger, flags)
 	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
@@ -226,7 +228,7 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 		controllerID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
 
 		orch.SetController(controllerID, idempotentController)
-		runner.Ping() // Record successful connection as a heartbeat
+		runner.Ping()
 
 		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
 
@@ -254,7 +256,6 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 				return
 			}
 
-			// Heartbeat for the Node supervisor
 			runner.Ping()
 
 			switch domain.EventType(msg.Type) {

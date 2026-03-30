@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/learning"
@@ -23,6 +24,7 @@ type Orchestrator struct {
 	sessionID string
 	store     domain.EventStore
 	memory    memory.Store
+	flags     config.FeatureFlags
 
 	curriculum voyager.Curriculum
 	critic     voyager.Critic
@@ -31,8 +33,9 @@ type Orchestrator struct {
 	taskManager *TaskManager
 	logger      *slog.Logger
 
-	stateCh chan domain.VersionedState
-	eventCh chan domain.DomainEvent
+	stateBuffer atomic.Pointer[domain.VersionedState]
+	ticker      *time.Ticker
+	eventCh     chan domain.DomainEvent
 
 	mu              sync.RWMutex
 	currentSnapshot domain.EvaluationSnapshot
@@ -57,6 +60,7 @@ func New(
 	exec execution.Controller,
 	uiHub *observability.Hub,
 	logger *slog.Logger,
+	flags config.FeatureFlags,
 ) *Orchestrator {
 	cm := execution.NewControllerManager()
 	if exec != nil {
@@ -69,13 +73,13 @@ func New(
 		sessionID:   sessionID,
 		store:       store,
 		memory:      memStore,
+		flags:       flags,
 		curriculum:  curriculum,
 		critic:      critic,
 		ctrlManager: cm,
 		taskManager: tm,
 		uiHub:       uiHub,
 		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
-		stateCh:     make(chan domain.VersionedState, 10),
 		eventCh:     make(chan domain.DomainEvent, 100),
 		taskHistory: make([]domain.TaskHistory, 0),
 	}
@@ -88,10 +92,15 @@ func New(
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("Starting orchestrator lifecycle")
 
+	// Phase 4: Tune Tick Rate to 50ms for snappier execution
+	tickRate := 50 * time.Millisecond
+	o.ticker = time.NewTicker(tickRate)
+	defer o.ticker.Stop()
+
 	g, gCtx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		return o.processStateLoop(gCtx)
+		return o.processStateLoop(gCtx, tickRate)
 	})
 
 	g.Go(func() error {
@@ -109,20 +118,10 @@ func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) 
 		State:   state,
 	}
 
-	select {
-	case <-ctx.Done():
-		return
-	case o.stateCh <- vState:
-		return
-	default:
-		select {
-		case <-o.stateCh:
-		default:
-		}
-		select {
-		case o.stateCh <- vState:
-		default:
-		}
+	o.stateBuffer.Store(&vState)
+
+	if o.uiHub != nil {
+		go o.uiHub.Broadcast("state_update", state)
 	}
 }
 
@@ -183,18 +182,39 @@ func (o *Orchestrator) takeSnapshot(ctx context.Context) {
 	}
 }
 
-func (o *Orchestrator) processStateLoop(ctx context.Context) error {
+func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Duration) error {
+	lastTick := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case vState := <-o.stateCh:
+		case t := <-o.ticker.C:
+			// Phase 4: Jitter Metrics Tracking
+			actualTick := t.Sub(lastTick)
+			jitter := float64(actualTick.Milliseconds() - targetTick.Milliseconds())
+			if jitter < 0 {
+				jitter = -jitter
+			}
+			observability.Metrics.DecisionJitter.Observe(jitter)
+			lastTick = t
+
+			vState := o.stateBuffer.Load()
+			if vState == nil {
+				continue
+			}
+
 			o.mu.Lock()
-			o.currentSnapshot.State = vState
+			o.currentSnapshot.State = *vState
 			o.mu.Unlock()
 
-			if o.uiHub != nil {
-				o.uiHub.Broadcast("state_update", vState.State)
+			o.mu.RLock()
+			tm := o.taskManager
+			isLocked := o.reflexLock
+			o.mu.RUnlock()
+
+			if tm != nil && tm.IsIdle() && !isLocked {
+				go o.handleQueueDrain()
 			}
 		}
 	}
@@ -241,7 +261,6 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 		o.evalCancel()
 	}
 
-	// Fix: Now actually uses the parent context passed in the arguments
 	evalCtx, cancel := context.WithCancel(ctx)
 	o.evalCancel = cancel
 	o.mu.Unlock()
@@ -312,12 +331,14 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
+		observability.Metrics.TaskInterruption.Inc()
 
 	case domain.EventTypePanic:
 		_ = tm.Halt(ctx, "panic_triggered")
 		o.mu.Lock()
 		o.reflexLock = true
 		o.mu.Unlock()
+		observability.Metrics.TaskInterruption.Inc()
 
 	case domain.EventTypePanicResolved:
 		o.mu.Lock()

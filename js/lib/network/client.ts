@@ -139,6 +139,7 @@ export class ControlPlaneClient {
         if (event === "death") msgType = "BOT_DEATH";
         if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
         if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
+        if (event === "task_aborted") msgType = "TASK_END";
 
         let status = event;
         if (event === "task_completed") status = "COMPLETED";

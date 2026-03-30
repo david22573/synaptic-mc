@@ -17,6 +17,7 @@ const { goals } = pkg;
 interface StoreContext extends StateContext {
     chestBlock: any | null;
     targetItems: { type: number; count: number }[];
+    targetCount: number;
     stopMovement: () => void;
 }
 
@@ -152,15 +153,25 @@ class CheckItemsState implements FSMState {
                 )
                 .map((i) => ({ type: i.type, count: i.count }));
         } else {
-            const item = inventory.find((i: any) => i.name === targetName);
-            if (!item) {
+            const items = inventory.filter((i: any) => i.name === targetName);
+            if (items.length === 0) {
                 sCtx.result = {
                     status: "FAILED",
                     reason: `MISSING_INGREDIENTS: ${targetName} not_in_inventory`,
                 };
                 return null;
             }
-            sCtx.targetItems = [{ type: item.type, count: item.count }];
+
+            // Aggregate all stacks to see how much we actually have
+            const totalInInv = items.reduce((sum, i) => sum + i.count, 0);
+
+            // If targetCount is > 0, bound it by the request. Otherwise store it all.
+            const toStore =
+                sCtx.targetCount > 0
+                    ? Math.min(totalInInv, sCtx.targetCount)
+                    : totalInInv;
+
+            sCtx.targetItems = [{ type: items[0].type, count: toStore }];
         }
 
         if (sCtx.targetItems.length === 0) {
@@ -179,6 +190,7 @@ export async function handleStore(ctx: TaskContext): Promise<void> {
     const fsmCtx: StoreContext = {
         bot,
         targetName: intent.target?.name || "",
+        targetCount: intent.count || 0, // Default to 0 (meaning store all available)
         targetEntity: null,
         searchRadius: 0,
         timeoutMs: timeouts.store ?? 20000,
