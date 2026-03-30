@@ -29,16 +29,24 @@ class DepositState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as StoreContext;
         let chestWindow: any = null;
+        let syncFailures = 0;
 
         try {
             chestWindow = await sCtx.bot.openContainer(sCtx.chestBlock);
+            await new Promise((r) => setTimeout(r, 500));
 
             for (const item of sCtx.targetItems) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
                 try {
                     await chestWindow.deposit(item.type, null, item.count);
-                } catch (err) {
-                    // Ignore individual deposit failures if the chest is full
+                    syncFailures = 0;
+                } catch (err: any) {
+                    syncFailures++;
+                    if (syncFailures > 3) {
+                        throw new Error(
+                            `PANIC: Repeated chest sync failures during deposit. Chest UI state corrupted: ${err.message}`,
+                        );
+                    }
                 }
             }
         } catch (err: any) {
@@ -113,7 +121,7 @@ class LocateChestState implements FSMState {
             if (!chest) {
                 sCtx.result = {
                     status: "FAILED",
-                    reason: "NO_CHEST_AVAILABLE", // Handled by normalizeFailureCause
+                    reason: "NO_CHEST_AVAILABLE",
                 };
                 return null;
             }
@@ -132,7 +140,6 @@ class CheckItemsState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as StoreContext;
         const targetName = sCtx.targetName;
-
         const inventory = sCtx.bot.inventory.items();
 
         if (targetName === "all" || targetName === "dump") {
@@ -146,12 +153,12 @@ class CheckItemsState implements FSMState {
             ]);
             sCtx.targetItems = inventory
                 .filter(
-                    (i) =>
+                    (i: any) =>
                         !keepItems.has(i.name) &&
                         !i.name.includes("pickaxe") &&
                         !i.name.includes("sword"),
                 )
-                .map((i) => ({ type: i.type, count: i.count }));
+                .map((i: any) => ({ type: i.type, count: i.count }));
         } else {
             const items = inventory.filter((i: any) => i.name === targetName);
             if (items.length === 0) {
@@ -162,10 +169,10 @@ class CheckItemsState implements FSMState {
                 return null;
             }
 
-            // Aggregate all stacks to see how much we actually have
-            const totalInInv = items.reduce((sum, i) => sum + i.count, 0);
-
-            // If targetCount is > 0, bound it by the request. Otherwise store it all.
+            const totalInInv = items.reduce(
+                (sum: number, i: any) => sum + i.count,
+                0,
+            );
             const toStore =
                 sCtx.targetCount > 0
                     ? Math.min(totalInInv, sCtx.targetCount)
@@ -190,7 +197,7 @@ export async function handleStore(ctx: TaskContext): Promise<void> {
     const fsmCtx: StoreContext = {
         bot,
         targetName: intent.target?.name || "",
-        targetCount: intent.count || 0, // Default to 0 (meaning store all available)
+        targetCount: intent.count || 0,
         targetEntity: null,
         searchRadius: 0,
         timeoutMs: timeouts.store ?? 20000,

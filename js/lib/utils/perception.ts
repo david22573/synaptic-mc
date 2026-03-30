@@ -14,20 +14,39 @@ function getDirectionLabel(
     return crossY > 0 ? "left" : "right";
 }
 
-let lastPOIUpdate = 0;
-let cachedPOIs: any[] = [];
+// Cache 1: Spatial cache for heavy block searches
+let staticBlockCache: Vec3[] = [];
+let lastBlockSearchPos: Vec3 | null = null;
+
+// Cache 2: Dirty-flag cache for final POI vectors and entities
+let poiCache: any[] = [];
+let lastPos: Vec3 | null = null;
+let lastYaw: number = 0;
+let lastUpdate: number = 0;
 
 export function getPOIs(bot: Bot, radius: number = 32): any[] {
+    if (!bot.entity) return [];
+
     const now = Date.now();
-    if (now - lastPOIUpdate < 1000) return cachedPOIs;
-
-    const pois: any[] = [];
-    if (!bot.entity) return pois;
-
     const pos = bot.entity.position;
     const yaw = bot.entity.yaw;
+
+    // Dirty Flag Check: Recompute if we moved > 0.5 blocks, turned our head > ~8.5 degrees,
+    // or if 1 second passed (safety TTL to catch moving entities like zombies).
+    const isDirty =
+        !lastPos ||
+        pos.distanceTo(lastPos) > 0.5 ||
+        Math.abs(yaw - lastYaw) > 0.15 ||
+        now - lastUpdate > 1000;
+
+    if (!isDirty) {
+        return poiCache;
+    }
+
+    const pois: any[] = [];
     const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
 
+    // 1. Process Dynamic Entities (Cheap to iterate)
     for (const id in bot.entities) {
         const e = bot.entities[id];
         if (!e || e === bot.entity || !e.isValid) continue;
@@ -66,28 +85,35 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         });
     }
 
-    const blocks = bot.findBlocks({
-        matching: (b) => {
-            if (!b) return false;
-            return (
-                b.name.endsWith("_log") ||
-                b.name.includes("ore") ||
-                b.name === "stone" ||
-                b.name === "crafting_table" ||
-                b.name.includes("bed") ||
-                b.name === "water" ||
-                b.name === "lava"
-            );
-        },
-        maxDistance: radius,
-        count: 24,
-    });
+    // 2. Process Static Blocks (Expensive, uses spatial caching)
+    // Only re-run findBlocks if the bot physically moves > 3 blocks from the last search center
+    if (!lastBlockSearchPos || pos.distanceTo(lastBlockSearchPos) > 3.0) {
+        staticBlockCache = bot.findBlocks({
+            matching: (b) => {
+                if (!b) return false;
+                return (
+                    b.name.endsWith("_log") ||
+                    b.name.includes("ore") ||
+                    b.name === "stone" ||
+                    b.name === "crafting_table" ||
+                    b.name.includes("bed") ||
+                    b.name === "water" ||
+                    b.name === "lava"
+                );
+            },
+            maxDistance: radius,
+            count: 24,
+        });
+        lastBlockSearchPos = pos.clone();
+    }
 
-    for (const bPos of blocks) {
+    for (const bPos of staticBlockCache) {
         const block = bot.blockAt(bPos);
         if (!block) continue;
 
         const dist = pos.distanceTo(bPos);
+        if (dist > radius) continue; // Skip if it fell out of radius due to bot movement
+
         const dx = bPos.x - pos.x;
         const dz = bPos.z - pos.z;
         const dirToBlock = new Vec3(dx, 0, dz).normalize();
@@ -126,7 +152,11 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         if (diversePOIs.length >= 15) break;
     }
 
-    lastPOIUpdate = now;
-    cachedPOIs = diversePOIs;
+    // Update dirty flags
+    lastPos = pos.clone();
+    lastYaw = yaw;
+    lastUpdate = now;
+    poiCache = diversePOIs;
+
     return diversePOIs;
 }

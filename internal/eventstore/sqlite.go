@@ -96,7 +96,6 @@ func runMigrations(db *sql.DB) error {
 	return nil
 }
 
-// Append accepts 'any' payload to satisfy domain.EventStore interface, and safely marshals it.
 func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain.TraceContext, eventType domain.EventType, payload any) error {
 	var payloadBytes []byte
 	switch v := payload.(type) {
@@ -126,13 +125,10 @@ func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		// If buffer is completely full, fall back to synchronous insert to avoid dropping data
 		s.logger.Warn("Event buffer full, performing synchronous insert")
 		return s.insertBatch([]pendingEvent{ev})
 	}
 }
-
-// Read Methods Restored to Satisfy domain.EventStore
 
 func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain.DomainEvent, error) {
 	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
@@ -141,7 +137,6 @@ func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain
 }
 
 func (s *SQLiteStore) GetRecentStream(ctx context.Context, sessionID string, limit int) ([]domain.DomainEvent, error) {
-	// Subquery limits to recent N, outer query restores chronological order
 	query := `
 		SELECT * FROM (
 			SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
@@ -179,8 +174,6 @@ func (s *SQLiteStore) queryEvents(ctx context.Context, query string, args ...any
 	return events, rows.Err()
 }
 
-// Snapshot Methods
-
 func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snap domain.SessionSnapshot) error {
 	query := `
 		INSERT INTO snapshots (session_id, last_event_id, data, updated_at)
@@ -202,7 +195,7 @@ func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (
 	var dataStr string
 	if err := row.Scan(&snap.SessionID, &snap.LastEventID, &dataStr, &snap.CreatedAt); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil // No snapshot yet, totally normal
+			return nil, nil
 		}
 		return nil, err
 	}
@@ -212,17 +205,15 @@ func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (
 
 func (s *SQLiteStore) Close() error {
 	s.cancel()
-	s.wg.Wait() // Wait for remaining buffered events to flush
+	s.wg.Wait()
 	return s.db.Close()
 }
-
-// Background Worker
 
 func (s *SQLiteStore) batchWorker() {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(flushInterval)
+	defer timer.Stop()
 
 	batch := make([]pendingEvent, 0, batchSize)
 
@@ -239,7 +230,6 @@ func (s *SQLiteStore) batchWorker() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			// Drain remaining buffer on shutdown
 			close(s.buffer)
 			for ev := range s.buffer {
 				batch = append(batch, ev)
@@ -252,12 +242,21 @@ func (s *SQLiteStore) batchWorker() {
 
 		case ev := <-s.buffer:
 			batch = append(batch, ev)
-			if len(batch) >= batchSize {
+			// Adaptive load scaling: flush immediately if batch size is met OR buffer is at >50% pressure
+			if len(batch) >= batchSize || len(s.buffer) > cap(s.buffer)/2 {
 				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(flushInterval)
 			}
 
-		case <-ticker.C:
+		case <-timer.C:
 			flush()
+			timer.Reset(flushInterval)
 		}
 	}
 }
@@ -273,7 +272,6 @@ func (s *SQLiteStore) insertBatch(events []pendingEvent) error {
 	}
 	defer tx.Rollback()
 
-	// Build bulk insert query
 	valueStrings := make([]string, 0, len(events))
 	valueArgs := make([]interface{}, 0, len(events)*6)
 

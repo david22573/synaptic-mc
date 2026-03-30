@@ -45,56 +45,57 @@ class EngageState implements FSMState {
         const bot = sCtx.bot;
         const target = sCtx.targetEntity;
 
+        const combatStartTime = Date.now();
+        const maxCombatDurationMs = 60000;
+
         bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
 
         try {
             while (target && target.isValid && target.health > 0) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
 
-                // 1. Hot-swap check (if weapon broke)
+                if (Date.now() - combatStartTime > maxCombatDurationMs) {
+                    throw new Error(
+                        "PANIC: Combat loop exceeded max duration. Target might be bugged or unreachable.",
+                    );
+                }
+
                 await this.ensureBestEquipment(bot, sCtx);
 
                 const dist = bot.entity.position.distanceTo(target.position);
 
                 if (dist <= 3.5) {
-                    // In striking range
                     await bot.lookAt(
                         target.position.offset(0, target.height * 0.8, 0),
                         true,
                     );
 
                     const weapon = bot.heldItem;
-                    let cooldown = 650; // default to sword timing (~0.625s)
+                    let cooldown = 650;
                     if (weapon && weapon.name.includes("axe")) cooldown = 1050;
 
                     const now = Date.now();
                     if (now - sCtx.lastAttackTime >= cooldown) {
-                        // Drop shield to attack
                         if (sCtx.hasShield && sCtx.isBlocking) {
                             bot.deactivateItem();
                             sCtx.isBlocking = false;
-                            await bot.waitForTicks(2); // Wait for server to register shield down
+                            await bot.waitForTicks(2);
                         }
-
-                        // FIX: Removed manual setControlState("jump", true) to prevent fighting pathfinder
 
                         bot.attack(target);
                         sCtx.lastAttackTime = Date.now();
 
-                        // Raise shield immediately after striking
                         if (sCtx.hasShield) {
-                            bot.activateItem(true); // true = offhand
+                            bot.activateItem(true);
                             sCtx.isBlocking = true;
                         }
                     } else {
-                        // Waiting for cooldown, keep shield up
                         if (sCtx.hasShield && !sCtx.isBlocking) {
                             bot.activateItem(true);
                             sCtx.isBlocking = true;
                         }
                     }
                 } else {
-                    // Out of range, drop shield so we can sprint to catch up
                     if (sCtx.hasShield && sCtx.isBlocking) {
                         bot.deactivateItem();
                         sCtx.isBlocking = false;
@@ -103,6 +104,13 @@ class EngageState implements FSMState {
 
                 await bot.waitForTicks(1);
             }
+        } catch (err: any) {
+            if (err.message !== "aborted") {
+                throw new Error(
+                    `PANIC: Internal error during combat loop: ${err.stack || err.message}`,
+                );
+            }
+            throw err;
         } finally {
             bot.pathfinder.setGoal(null);
             bot.clearControlStates();
@@ -112,16 +120,14 @@ class EngageState implements FSMState {
             }
         }
 
-        // If we get here without throwing, the entity died or despawned
         if (!target.isValid || target.health <= 0) {
             sCtx.killCount++;
 
-            // Move to death location to collect dropped loot
             const deathPos = target.position.clone();
             bot.pathfinder.setGoal(
                 new goals.GoalNear(deathPos.x, deathPos.y, deathPos.z, 1),
             );
-            await bot.waitForTicks(20); // wait 1 second for drops to spawn and fly to bot
+            await bot.waitForTicks(20);
             bot.pathfinder.setGoal(null);
 
             if (sCtx.killCount >= sCtx.targetCount) {
@@ -150,18 +156,23 @@ class EngageState implements FSMState {
             bestWeapon &&
             (!currentWeapon || currentWeapon.type !== bestWeapon.type)
         ) {
-            await bot.equip(bestWeapon.type, "hand");
+            try {
+                await bot.equip(bestWeapon.type, "hand");
+            } catch (e) {}
         }
 
-        // Check for shield in off-hand
         const offhand = bot.inventory.slots[45];
         if (!offhand || offhand.name !== "shield") {
             const shield = bot.inventory
                 .items()
                 .find((i: any) => i.name === "shield");
             if (shield) {
-                await bot.equip(shield.type, "off-hand");
-                sCtx.hasShield = true;
+                try {
+                    await bot.equip(shield.type, "off-hand");
+                    sCtx.hasShield = true;
+                } catch (e) {
+                    sCtx.hasShield = false;
+                }
             } else {
                 sCtx.hasShield = false;
             }
@@ -207,11 +218,8 @@ class PrepareCombatState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as CombatContext;
-
-        // Use the helper on the Engage state class to equip gear initially
         const engager = new EngageState();
         await engager["ensureBestEquipment"](sCtx.bot, sCtx);
-
         return new SearchState();
     }
 }

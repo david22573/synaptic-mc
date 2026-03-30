@@ -13,7 +13,7 @@ interface RetrieveContext extends StateContext {
     targetName: string;
     targetCount: number;
     collectedCount: number;
-    checkedChests: Set<string>; // Set of "x,y,z" to avoid getting stuck in loops
+    checkedChests: Set<string>;
     currentChest: any | null;
     stopMovement: () => void;
 }
@@ -26,11 +26,10 @@ class WithdrawState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as RetrieveContext;
         let chestWindow: any = null;
+        let syncFailures = 0;
 
         try {
             chestWindow = await sCtx.bot.openContainer(sCtx.currentChest);
-
-            // Allow time for the server window to sync
             await new Promise((r) => setTimeout(r, 500));
 
             const items = chestWindow.containerItems();
@@ -47,8 +46,14 @@ class WithdrawState implements FSMState {
                 try {
                     await chestWindow.withdraw(item.type, null, amountToTake);
                     sCtx.collectedCount += amountToTake;
-                } catch (err) {
-                    // Ignore individual stack failures, try the next stack
+                    syncFailures = 0;
+                } catch (err: any) {
+                    syncFailures++;
+                    if (syncFailures > 3) {
+                        throw new Error(
+                            `PANIC: Repeated chest sync failures during withdraw. Chest UI state corrupted: ${err.message}`,
+                        );
+                    }
                 }
             }
         } catch (err: any) {
@@ -73,7 +78,6 @@ class WithdrawState implements FSMState {
             return null;
         }
 
-        // We didn't get enough. Mark this chest as checked and look for another.
         return new LocateChestState();
     }
 }
@@ -102,7 +106,6 @@ class ApproachChestState implements FSMState {
             if (err.message === "aborted") {
                 sCtx.result = { status: "FAILED", reason: "aborted" };
             } else {
-                // If we can't path to this chest, skip it and look for another
                 return new LocateChestState();
             }
             return null;
@@ -120,14 +123,12 @@ class LocateChestState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as RetrieveContext;
 
-        // Find all chests within 32 blocks
         const chests = sCtx.bot.findBlocks({
             matching: sCtx.bot.registry.blocksByName.chest?.id ?? -1,
             maxDistance: 32,
             count: 10,
         });
 
-        // Filter out chests we've already checked
         let nextChestPos = null;
         for (const pos of chests) {
             const key = `${pos.x},${pos.y},${pos.z}`;

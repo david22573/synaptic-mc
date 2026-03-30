@@ -44,7 +44,10 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 		"temperature":     0.2,
 	}
 
-	jsonPayload, _ := json.Marshal(payload)
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal generation payload: %w", err)
+	}
 	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
 }
 
@@ -56,7 +59,10 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 		"input": input,
 	}
 
-	jsonPayload, _ := json.Marshal(payload)
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal embedding payload: %w", err)
+	}
 
 	var lastErr error
 	baseDelay := 500 * time.Millisecond

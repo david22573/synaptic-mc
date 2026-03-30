@@ -1,17 +1,13 @@
-Project Context Dump (30 Mar 26 11:15 PDT)
+Project Context Dump (30 Mar 26 11:37 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 26
+Total Files: 14
 
 # Project Structure
 <file_tree>
-- js\index.ts
-- js\lib\config.ts
-- js\lib\logger.ts
-- js\lib\models.ts
-- js\lib\network\client.ts
-- js\lib\systems\survival.ts
-- js\lib\tasks\fsm.ts
+- internal\eventstore\sqlite.go
+- internal\llm\client.go
+- internal\orchestrator\loop.go
 - js\lib\tasks\handlers\build.ts
 - js\lib\tasks\handlers\craft.ts
 - js\lib\tasks\handlers\explore.ts
@@ -23,1510 +19,959 @@ Total Files: 26
 - js\lib\tasks\handlers\retrieve.ts
 - js\lib\tasks\handlers\smelt.ts
 - js\lib\tasks\handlers\store.ts
-- js\lib\tasks\normalize.ts
-- js\lib\tasks\primitives.ts
-- js\lib\tasks\registry.ts
-- js\lib\tasks\task.ts
-- js\lib\tasks\utils.ts
-- js\lib\utils\errors.ts
-- js\lib\utils\perception.ts
-- js\lib\utils\threats.ts
 </file_tree>
 
 # File Contents
-<file path="js\index.ts">
-import pkg from "mineflayer-pathfinder";
-import mineflayer from "mineflayer";
-import { mineflayer as viewer } from "prismarine-viewer";
-import { plugin as collectBlock } from "mineflayer-collectblock";
+<file path="internal\eventstore\sqlite.go">
+package eventstore
 
-import * as config from "./lib/config.js";
-import { log } from "./lib/logger.js";
-import * as models from "./lib/models.js";
-import { runTask } from "./lib/tasks/task.js";
-import { ControlPlaneClient } from "./lib/network/client.js";
-import { SurvivalSystem } from "./lib/systems/survival.js";
-import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
-import { getPOIs } from "./lib/utils/perception.js";
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
 
-const { pathfinder, Movements, goals } = pkg;
+	_ "modernc.org/sqlite"
 
-let viewerStarted = false;
+	"david22573/synaptic-mc/internal/domain"
+)
 
-const isIgnorableError = (err: Error | any): boolean => {
-    if (!err) return false;
-    const msg = String(err.message || err.stack || err);
-    const name = String(err.name || "");
-    return (
-        name.includes("PartialReadError") ||
-        msg.includes("Read error for undefined") ||
-        msg.includes("Missing characters in string") ||
-        msg.includes("protodef") ||
-        (msg.includes("size is") && msg.includes("expected size")) ||
-        msg.includes("Unexpected server response")
-    );
-};
+const (
+	batchSize     = 50
+	flushInterval = 100 * time.Millisecond
+)
 
-const originalConsoleError = console.error;
-console.error = (...args: any[]) => {
-    const firstArg = args[0];
-    const msg =
-        typeof firstArg === "object"
-            ? String(firstArg?.err?.message || firstArg?.message || "")
-            : String(firstArg);
-    if (
-        isIgnorableError(firstArg) ||
-        msg.includes("PartialReadError") ||
-        msg.includes("protodef")
-    )
-        return;
-    originalConsoleError.apply(console, args);
-};
-
-const originalConsoleWarn = console.warn;
-console.warn = (...args: any[]) => {
-    const firstArg = args[0];
-    if (
-        typeof firstArg === "string" &&
-        firstArg.includes("Read error for undefined")
-    )
-        return;
-    originalConsoleWarn.apply(console, args);
-};
-
-process.on("uncaughtException", (err: Error) => {
-    if (isIgnorableError(err)) return;
-    log.error("Fatal uncaught exception", {
-        err: err.message,
-        stack: err.stack,
-    });
-    process.exit(1);
-});
-
-process.on("unhandledRejection", (reason: any) => {
-    if (isIgnorableError(reason)) return;
-    log.error("Unhandled promise rejection", { reason });
-});
-
-let currentTask: models.ActiveTask | null = null;
-let taskAbortController: AbortController | null = null;
-let bot: mineflayer.Bot;
-let client: ControlPlaneClient;
-let survival: SurvivalSystem;
-let runtimeConfig: config.Config;
-let lastDeathMessage: string = "unknown causes";
-let lastStateSig = "";
-let lastStatePushTime = 0;
-let reconnectAttempt = 1;
-let stateInterval: NodeJS.Timeout | null = null;
-let isShuttingDown = false;
-
-const knownChests: Record<string, { name: string; count: number }[]> = {};
-
-let lastVelocity = { x: 0, y: 0, z: 0 };
-
-function stopMovement() {
-    if (!bot) return;
+type pendingEvent struct {
+	SessionID string
+	Trace     domain.TraceContext
+	EventType domain.EventType
+	Payload   []byte
+	Timestamp time.Time
 }
 
-function completeTask(
-    task: models.ActiveTask | null,
-    status:
-        | "task_completed"
-        | "task_failed"
-        | "task_aborted" = "task_completed",
-    cause: string = "",
-) {
-    if (!task || !client) return;
-    if (currentTask?.id === task.id) currentTask = null;
-    client.sendEvent(
-        status,
-        `${task.action} ${task.target?.name || "none"}`,
-        task.id,
-        cause,
-        task.startTime,
-    );
+type SQLiteStore struct {
+	db     *sql.DB
+	logger *slog.Logger
+	buffer chan pendingEvent
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-function abortActiveTask(reason: string) {
-    if (currentTask && taskAbortController) {
-        taskAbortController.abort(reason);
-        completeTask(currentTask, "task_aborted", reason);
-        currentTask = null;
-        taskAbortController = null;
-    }
+func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
+	// Enable WAL mode and busy timeout via DSN
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+
+	if err := runMigrations(db); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &SQLiteStore{
+		db:     db,
+		logger: logger.With(slog.String("component", "eventstore")),
+		buffer: make(chan pendingEvent, 1000),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	store.wg.Add(1)
+	go store.batchWorker()
+
+	return store, nil
 }
 
-function normalizeFailureCause(err: any): string {
-    const msg = String(err?.message || err).toLowerCase();
-    if (
-        msg.includes("no path") ||
-        msg.includes("path_fail") ||
-        (msg.includes("failed_to_reach") && !msg.includes("furnace")) ||
-        msg.includes("pathfinder_timeout") ||
-        msg.includes("collect_failed")
-    )
-        return "PATH_FAILED";
-    if (
-        msg.includes("timeout") ||
-        msg.includes("fsm_global_timeout") ||
-        msg.includes("furnace_timeout_or_lag")
-    )
-        return "TIMEOUT";
-    if (msg.includes("stuck")) return "STUCK";
-    if (
-        msg.includes("no_entity") ||
-        msg.includes("missing_entity") ||
-        msg.includes("target_lost") ||
-        msg.includes("no_interactable_found")
-    )
-        return "NO_ENTITY";
-    if (msg.includes("no_pickaxe_equipped") || msg.includes("no_tool"))
-        return "NO_TOOL";
-    if (
-        msg.includes("no_furnace_available") ||
-        msg.includes("failed_to_reach_furnace") ||
-        msg.includes("no_chest")
-    )
-        return "NO_FURNACE";
-    if (msg.includes("no_mature_")) return "NO_MATURE_CROP";
-    if (
-        msg.includes("missing_ingredients") ||
-        msg.includes("missing_crafting_table") ||
-        msg.includes("craft_action_failed") ||
-        msg.includes("not_in_inventory")
-    )
-        return "MISSING_INGREDIENTS";
-    if (
-        msg.includes("exhausted") ||
-        msg.includes("no_") ||
-        msg.includes("missing_") ||
-        msg.includes("unknown_")
-    )
-        return "NO_BLOCKS";
-    return "UNKNOWN";
+func runMigrations(db *sql.DB) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			trace_id TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			payload JSON,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, id);`,
+		`CREATE TABLE IF NOT EXISTS snapshots (
+			session_id TEXT PRIMARY KEY,
+			last_event_id INTEGER NOT NULL,
+			data JSON NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+	}
+
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-async function executeIntent(intent: models.ActionIntent) {
-    if (!intent?.action) return;
-    if (isShuttingDown) return;
+// Append accepts 'any' payload to satisfy domain.EventStore interface, and safely marshals it.
+func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain.TraceContext, eventType domain.EventType, payload any) error {
+	var payloadBytes []byte
+	switch v := payload.(type) {
+	case []byte:
+		payloadBytes = v
+	case json.RawMessage:
+		payloadBytes = []byte(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("failed to marshal event payload: %w", err)
+		}
+		payloadBytes = b
+	}
 
-    if (survival?.isPanickingNow()) {
-        if (intent.action === "retreat") {
-            survival.reset();
-        } else {
-            client.sendEvent(
-                "task_aborted",
-                "lock",
-                intent.id,
-                "panic",
-                Date.now(),
-            );
-            return;
-        }
-    }
+	ev := pendingEvent{
+		SessionID: sessionID,
+		Trace:     trace,
+		EventType: eventType,
+		Payload:   payloadBytes,
+		Timestamp: time.Now().UTC(),
+	}
 
-    abortActiveTask("preempted");
-
-    taskAbortController = new AbortController();
-    const signal = taskAbortController.signal;
-    const localController = taskAbortController;
-
-    currentTask = {
-        id: intent.id,
-        action: intent.action,
-        target: intent.target || { type: "none", name: "none" },
-        count: intent.count || 1,
-        startTime: Date.now(),
-        trace: intent.trace || { trace_id: "unknown", action_id: intent.id },
-    };
-
-    // NEW: Notify Go Engine that the task has physically begun
-    client.sendEvent(
-        "task_start",
-        `${intent.action} ${intent.target?.name || "none"}`,
-        intent.id,
-        "",
-        Date.now(),
-    );
-
-    const activeTask = currentTask;
-    let timeoutId: NodeJS.Timeout | undefined;
-
-    const highStakes = [
-        "hunt",
-        "combat",
-        "mine",
-        "build",
-        "retreat",
-        "explore",
-    ];
-
-    if (highStakes.includes(intent.action)) {
-        const jitterMs = 50 + Math.random() * 100;
-        await new Promise((r) => setTimeout(r, jitterMs));
-    }
-
-    if (intent.action === "explore") {
-        log.info("Executing native curiosity exploration");
-
-        const goalX = Math.round(
-            bot.entity.position.x + (Math.random() - 0.5) * 30,
-        );
-
-        const goalZ = Math.round(
-            bot.entity.position.z + (Math.random() - 0.5) * 30,
-        );
-
-        if (bot.pathfinder) {
-            bot.pathfinder.setGoal(new goals.GoalXZ(goalX, goalZ), true);
-        }
-
-        await new Promise((r) => {
-            timeoutId = setTimeout(r, 12000);
-        });
-
-        if (!signal.aborted && activeTask) {
-            pushState();
-            completeTask(activeTask, "task_completed");
-        }
-        if (timeoutId) clearTimeout(timeoutId);
-        if (currentTask?.id === activeTask?.id) currentTask = null;
-
-        if (taskAbortController === localController) taskAbortController = null;
-        return;
-    }
-
-    try {
-        const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-        const timeoutMs = timeouts[intent.action] || 15000;
-
-        await Promise.race([
-            runTask(
-                bot,
-                intent,
-                signal,
-                timeouts,
-                () => getThreats(bot),
-                (t) => computeSafeRetreat(bot, t, 20),
-                stopMovement,
-            ),
-            new Promise((_, r) => {
-                timeoutId = setTimeout(() => {
-                    localController.abort("timeout");
-                    r(new Error("timeout"));
-                }, timeoutMs);
-            }),
-        ]);
-
-        if (!signal.aborted && activeTask) {
-            await new Promise((r) => setTimeout(r, 500));
-            pushState();
-            completeTask(activeTask, "task_completed");
-        }
-    } catch (err: any) {
-        if (!signal.aborted || err.message === "timeout") {
-            const normalizedCause = normalizeFailureCause(err);
-
-            log.error("Task execution failed natively", {
-                action: intent.action,
-                target: intent.target?.name,
-                raw_error: err.message,
-                normalized_cause: normalizedCause,
-            });
-
-            pushState();
-            if (activeTask)
-                completeTask(activeTask, "task_failed", normalizedCause);
-        }
-    } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-
-        if (currentTask?.id === activeTask?.id) currentTask = null;
-        if (taskAbortController === localController) taskAbortController = null;
-    }
+	select {
+	case s.buffer <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// If buffer is completely full, fall back to synchronous insert to avoid dropping data
+		s.logger.Warn("Event buffer full, performing synchronous insert")
+		return s.insertBatch([]pendingEvent{ev})
+	}
 }
 
-function pushState() {
-    if (!bot?.entity || !client) return;
+// Read Methods Restored to Satisfy domain.EventStore
 
-    const hotbarStart = bot.inventory.hotbarStart || 36;
-    const hotbar = Array.from({ length: 9 }, (_, i) => {
-        const item = bot.inventory.slots[hotbarStart + i];
-        return item ? { name: item.name, count: item.count } : null;
-    });
-
-    const offhandItem = bot.inventory.slots[45];
-    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
-        .items()
-        .map((i) => `${i.name}:${i.count}`)
-        .sort()
-        .join(",")}|${Object.keys(knownChests).length}`;
-    const now = Date.now();
-
-    if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
-    lastStateSig = sig;
-    lastStatePushTime = now;
-
-    client.sendState({
-        health: Math.round(bot.health),
-        food: Math.round(bot.food),
-        time_of_day: bot.time.timeOfDay,
-        experience: bot.experience?.progress ?? 0,
-        level: bot.experience?.level ?? 0,
-        position: {
-            x: Math.round(bot.entity.position.x),
-            y: Math.round(bot.entity.position.y),
-            z: Math.round(bot.entity.position.z),
-        },
-        threats: getThreats(bot)
-            .slice(0, 3)
-            .map((t) => ({ name: t.name })),
-        pois: getPOIs(bot),
-        inventory: bot.inventory
-            .items()
-            .map((i) => ({ name: i.name, count: i.count })),
-        hotbar: hotbar,
-        offhand: offhandItem
-            ? { name: offhandItem.name, count: offhandItem.count }
-            : null,
-        active_slot: bot.quickBarSlot,
-        known_chests: knownChests,
-        current_task: currentTask
-            ? {
-                  id: currentTask.id,
-                  action: currentTask.action,
-                  target: currentTask.target,
-                  count: currentTask.count,
-                  priority: 0,
-                  rationale: "",
-                  source: "client",
-                  trace: currentTask.trace,
-              }
-            : null,
-        task_progress: currentTask
-            ? bot.pathfinder?.isMoving()
-                ? 0.5
-                : 0.0
-            : 0.0,
-    });
+func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain.DomainEvent, error) {
+	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
+	          FROM events WHERE session_id = ? ORDER BY id ASC`
+	return s.queryEvents(ctx, query, sessionID)
 }
 
-async function connectWithRetry(maxAttempts = 10) {
-    if (reconnectAttempt > maxAttempts) {
-        log.error("Max reconnection attempts reached. Shutting down.");
-        isShuttingDown = true;
-        process.exit(1);
-    }
-
-    if (bot) {
-        try {
-            if ((bot as any).viewer) {
-                (bot as any).viewer.close();
-                viewerStarted = false;
-            }
-            bot.removeAllListeners();
-            bot.quit();
-        } catch (e) {}
-    }
-
-    bot = mineflayer.createBot({
-        host: "127.0.0.1",
-        port: 25565,
-        username: "CraftBot",
-        version: "1.19",
-    });
-
-    bot.loadPlugin(pathfinder);
-    bot.loadPlugin(collectBlock);
-
-    if (!client) {
-        client = new ControlPlaneClient(runtimeConfig.ws_url, {
-            onCommand: (i) => void executeIntent(i),
-            onUnlock: () => abortActiveTask("unlock"),
-        });
-        client.connect();
-
-        // Immediately push a zero-state to prevent the Go TS_Supervisor from killing us
-        // while Mineflayer takes >15s to resolve DNS, login, and spawn.
-        client.sendState({
-            health: 0,
-            food: 0,
-            time_of_day: 0,
-            experience: 0,
-            level: 0,
-            position: { x: 0, y: 0, z: 0 },
-            threats: [],
-            pois: [],
-            inventory: [],
-            hotbar: [],
-            offhand: null,
-            active_slot: 0,
-            known_chests: {},
-            current_task: null,
-            task_progress: 0,
-        });
-    }
-
-    if (!survival) {
-        survival = new SurvivalSystem(bot, client, {
-            onInterrupt: (r) => {
-                if (r === "panic_flee") abortActiveTask("survival_panic");
-            },
-            stopMovement: () => stopMovement(),
-        });
-    } else {
-        survival.bot = bot;
-    }
-
-    bot.on("error", (err: Error) => {
-        if (isIgnorableError(err)) return;
-        log.warn("Mineflayer bot emitted error", { err: err.message });
-    });
-
-    bot.on("end", (reason) => {
-        abortActiveTask("bot_disconnected");
-        survival.stop();
-        const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
-        setTimeout(
-            () => {
-                reconnectAttempt++;
-                connectWithRetry(maxAttempts);
-            },
-            backoffMs + Math.random() * 1000,
-        );
-    });
-
-    bot.on("spawn", () => {
-        reconnectAttempt = 1;
-        log.info("Bot spawned successfully.");
-
-        const movements = new Movements(bot);
-        movements.canDig = true;
-        movements.allow1by1towers = true;
-        movements.allowParkour = true;
-        movements.allowSprinting = true;
-
-        movements.liquids = new Set(
-            [
-                bot.registry.blocksByName.water?.id,
-                bot.registry.blocksByName.lava?.id,
-            ].filter((id) => id !== undefined) as number[],
-        );
-        movements.digCost = 1.5;
-        movements.scafoldingBlocks = [
-            "dirt",
-            "cobblestone",
-            "netherrack",
-            "stone",
-        ]
-            .map((name) => bot.registry.blocksByName[name]?.id)
-            .filter((id) => id !== undefined);
-
-        bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 20000;
-
-        bot.inventory.removeAllListeners("updateSlot");
-        bot.inventory.on("updateSlot", pushState);
-
-        if (!client.isConnected()) client.connect();
-        survival.start();
-
-        if (runtimeConfig.enable_viewer && !viewerStarted) {
-            try {
-                viewer(bot, {
-                    port: runtimeConfig.viewer_port,
-                    firstPerson: true,
-                    viewDistance: 4,
-                });
-                viewerStarted = true;
-            } catch (err) {}
-        }
-
-        bot.on("physicsTick", () => {
-            if (bot.entity.velocity) {
-                lastVelocity = {
-                    x: bot.entity.velocity.x,
-                    y: bot.entity.velocity.y,
-                    z: bot.entity.velocity.z,
-                };
-            }
-
-            if (currentTask && bot.pathfinder?.isMoving()) {
-                if (Math.random() < 0.02) {
-                    const noise = (Math.random() - 0.5) * 0.1;
-                    bot.look(
-                        bot.entity.yaw + noise,
-                        bot.entity.pitch,
-                        true,
-                    ).catch(() => {});
-                }
-            }
-
-            if (!currentTask && !bot.pathfinder?.isMoving()) {
-                if (Math.random() < 0.05) {
-                    const entity = bot.nearestEntity(
-                        (e) =>
-                            (e.type === "mob" || e.type === "player") &&
-                            bot.entity.position.distanceTo(e.position) < 16,
-                    );
-                    if (entity) {
-                        bot.lookAt(
-                            entity.position.offset(0, entity.height * 0.8, 0),
-                            true,
-                        ).catch(() => {});
-                    }
-                }
-            }
-        });
-    });
-
-    bot.on("message", (msg) => {
-        const text = msg.toString();
-        if (text.includes(bot.username) && !text.startsWith("<"))
-            lastDeathMessage = text;
-    });
-
-    bot.on("death", () => {
-        abortActiveTask("bot_died");
-        client.sendEvent("death", "death", "", lastDeathMessage, 0);
-        lastDeathMessage = "unknown causes";
-    });
-
-    bot.on("windowOpen", (window) => {
-        if (
-            String(window.type).includes("chest") ||
-            String(window.type).includes("generic")
-        ) {
-            const chestBlock = bot.findBlock({
-                matching: bot.registry.blocksByName.chest?.id ?? -1,
-                maxDistance: 6,
-            });
-            if (chestBlock) {
-                const posKey = `${chestBlock.position.x},${chestBlock.position.y},${chestBlock.position.z}`;
-                knownChests[posKey] = window
-                    .containerItems()
-                    .map((i) => ({ name: i.name, count: i.count }));
-                pushState();
-            }
-        }
-    });
-
-    bot.on("health", pushState);
-    bot.on("experience", pushState);
-    // @ts-ignore
-    bot.on("heldItemChanged", pushState);
-
-    if (stateInterval) clearInterval(stateInterval);
-    stateInterval = setInterval(pushState, 2000);
+func (s *SQLiteStore) GetRecentStream(ctx context.Context, sessionID string, limit int) ([]domain.DomainEvent, error) {
+	// Subquery limits to recent N, outer query restores chronological order
+	query := `
+		SELECT * FROM (
+			SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
+			FROM events 
+			WHERE session_id = ? 
+			ORDER BY id DESC LIMIT ?
+		) ORDER BY id ASC
+	`
+	return s.queryEvents(ctx, query, sessionID, limit)
 }
 
-async function bootstrap() {
-    runtimeConfig = await config.loadConfig();
-    log.info("Bot configuration loaded", { ws_url: runtimeConfig.ws_url });
-    await connectWithRetry();
+func (s *SQLiteStore) GetStreamSince(ctx context.Context, sessionID string, sinceID int64) ([]domain.DomainEvent, error) {
+	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
+	          FROM events WHERE session_id = ? AND id > ? ORDER BY id ASC`
+	return s.queryEvents(ctx, query, sessionID, sinceID)
 }
 
-process.on("SIGINT", () => {
-    isShuttingDown = true;
-    abortActiveTask("shutdown");
-    if (bot) bot.quit();
-    if (client?.isConnected()) {
-        setTimeout(() => process.exit(0), 1000);
-    } else {
-        process.exit(0);
-    }
-});
+func (s *SQLiteStore) queryEvents(ctx context.Context, query string, args ...any) ([]domain.DomainEvent, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-bootstrap().catch((err) => {
-    log.error("Fatal startup", {
-        err: err instanceof Error ? err.message : String(err),
-        stack: err?.stack,
-    });
-    process.exit(1);
-});
-
-</file>
-
-<file path="js\lib\config.ts">
-import * as dotenv from "dotenv";
-import * as fs from "fs";
-import * as path from "path";
-
-function loadEnv(): string {
-    const candidates = [
-        path.resolve(process.cwd(), ".env"),
-        path.resolve(process.cwd(), "../.env"),
-    ];
-
-    for (const envPath of candidates) {
-        if (fs.existsSync(envPath)) {
-            dotenv.config({ path: envPath });
-            return envPath;
-        }
-    }
-
-    dotenv.config();
-    return "default-dotenv-lookup";
+	var events []domain.DomainEvent
+	for rows.Next() {
+		var ev domain.DomainEvent
+		var payloadStr string
+		if err := rows.Scan(&ev.ID, &ev.SessionID, &ev.Trace.TraceID, &ev.Trace.ActionID, &ev.Type, &payloadStr, &ev.CreatedAt); err != nil {
+			return nil, err
+		}
+		ev.Payload = json.RawMessage(payloadStr)
+		events = append(events, ev)
+	}
+	return events, rows.Err()
 }
 
-export const ENV_PATH = loadEnv();
+// Snapshot Methods
 
-export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
-export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
-
-export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-
-// FIX: Correct default WebSocket path from /ws to /bot/ws
-export const WS_URL = process.env.WS_URL || "ws://localhost:8080/bot/ws";
-
-export const TASK_TIMEOUTS: Record<string, number> = {
-    gather: 30000,
-    craft: 20000,
-    hunt: 30000,
-    explore: 20000,
-    build: 20000,
-    smelt: 30000,
-    farm: 40000,
-    mine: 45000,
-    retreat: 15000,
-    sleep: 20000,
-    mark_location: 5000,
-    recall_location: 5000,
-    idle: 3000,
-};
-
-export const THREAT_WEIGHTS: Record<string, number> = {
-    warden: 1000,
-    creeper: 50,
-    skeleton: 20,
-    zombie: 10,
-    spider: 10,
-};
-
-export interface Config {
-    ws_url: string;
-    viewer_port: number;
-    enable_viewer: boolean;
-    debug_chat: boolean;
-    task_timeouts: Record<string, number>;
-    threat_weights: Record<string, number>;
+func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snap domain.SessionSnapshot) error {
+	query := `
+		INSERT INTO snapshots (session_id, last_event_id, data, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(session_id) DO UPDATE SET
+			last_event_id = excluded.last_event_id,
+			data = excluded.data,
+			updated_at = CURRENT_TIMESTAMP;
+	`
+	_, err := s.db.ExecContext(ctx, query, snap.SessionID, snap.LastEventID, snap.Data)
+	return err
 }
 
-let configCache: Config | null = null;
+func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (*domain.SessionSnapshot, error) {
+	query := `SELECT session_id, last_event_id, data, updated_at FROM snapshots WHERE session_id = ?`
+	row := s.db.QueryRowContext(ctx, query, sessionID)
 
-export async function loadConfig(): Promise<Config> {
-    if (configCache) return configCache;
+	var snap domain.SessionSnapshot
+	var dataStr string
+	if err := row.Scan(&snap.SessionID, &snap.LastEventID, &dataStr, &snap.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // No snapshot yet, totally normal
+		}
+		return nil, err
+	}
+	snap.Data = json.RawMessage(dataStr)
+	return &snap, nil
+}
 
-    let timeoutId: NodeJS.Timeout | null = null;
+func (s *SQLiteStore) Close() error {
+	s.cancel()
+	s.wg.Wait() // Wait for remaining buffered events to flush
+	return s.db.Close()
+}
 
-    try {
-        const controller = new AbortController();
-        timeoutId = setTimeout(() => controller.abort(), 3000);
+// Background Worker
 
-        const res = await fetch("http://127.0.0.1:8080/api/config", {
-            signal: controller.signal,
-        });
+func (s *SQLiteStore) batchWorker() {
+	defer s.wg.Done()
 
-        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
 
-        configCache = await res.json();
+	batch := make([]pendingEvent, 0, batchSize)
 
-        if (configCache!.task_timeouts) {
-            Object.assign(TASK_TIMEOUTS, configCache!.task_timeouts);
-        }
-        if (configCache!.threat_weights) {
-            Object.assign(THREAT_WEIGHTS, configCache!.threat_weights);
-        }
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := s.insertBatch(batch); err != nil {
+			s.logger.Error("Failed to flush event batch", slog.Any("error", err), slog.Int("count", len(batch)))
+		}
+		batch = batch[:0]
+	}
 
-        configCache!.task_timeouts = TASK_TIMEOUTS;
-        configCache!.threat_weights = THREAT_WEIGHTS;
+	for {
+		select {
+		case <-s.ctx.Done():
+			// Drain remaining buffer on shutdown
+			close(s.buffer)
+			for ev := range s.buffer {
+				batch = append(batch, ev)
+				if len(batch) >= batchSize {
+					flush()
+				}
+			}
+			flush()
+			return
 
-        return configCache!;
-    } catch (err) {
-        console.warn(
-            "Failed to fetch dynamic config, relying on static defaults",
-            err instanceof Error ? err.message : String(err),
-        );
+		case ev := <-s.buffer:
+			batch = append(batch, ev)
+			if len(batch) >= batchSize {
+				flush()
+			}
 
-        configCache = {
-            ws_url: WS_URL,
-            viewer_port: VIEWER_PORT,
-            enable_viewer: ENABLE_VIEWER,
-            debug_chat: DEBUG_CHAT,
-            task_timeouts: TASK_TIMEOUTS,
-            threat_weights: THREAT_WEIGHTS,
-        };
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
 
-        return configCache;
-    } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-    }
+func (s *SQLiteStore) insertBatch(events []pendingEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Build bulk insert query
+	valueStrings := make([]string, 0, len(events))
+	valueArgs := make([]interface{}, 0, len(events)*6)
+
+	for _, ev := range events {
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?)")
+		valueArgs = append(valueArgs, ev.SessionID, ev.Trace.TraceID, ev.Trace.ActionID, ev.EventType, string(ev.Payload), ev.Timestamp)
+	}
+
+	stmt := fmt.Sprintf("INSERT INTO events (session_id, trace_id, action_id, event_type, payload, created_at) VALUES %s",
+		strings.Join(valueStrings, ","))
+
+	if _, err := tx.Exec(stmt, valueArgs...); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 </file>
 
-<file path="js\lib\logger.ts">
-import { type TraceContext } from "./models.js";
+<file path="internal\llm\client.go">
+package llm
 
-const DEBUG = process.env.DEBUG === "true";
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"strings"
+	"time"
+)
 
-interface LogMeta extends Record<string, unknown> {
-    trace?: TraceContext;
+type Config struct {
+	APIURL     string
+	APIKey     string
+	Model      string
+	MaxRetries int
 }
 
-interface Logger {
-    info: (msg: string, meta?: LogMeta) => void;
-    warn: (msg: string, meta?: LogMeta) => void;
-    error: (msg: string, meta?: LogMeta) => void;
-    debug: (msg: string, meta?: LogMeta) => void;
+type Client struct {
+	config Config
+	http   *http.Client
 }
 
-function formatLog(level: string, msg: string, meta: LogMeta = {}): string {
-    const { trace, ...rest } = meta;
-    return JSON.stringify({
-        level,
-        msg,
-        trace_id: trace?.trace_id,
-        action_id: trace?.action_id,
-        milestone_id: trace?.milestone_id,
-        ...rest,
-        timestamp: new Date().toISOString(),
-    });
+func NewClient(cfg Config) *Client {
+	return &Client{
+		config: cfg,
+		http: &http.Client{
+			Timeout: 45 * time.Second,
+		},
+	}
 }
 
-export const log: Logger = {
-    info: (msg, meta) => console.log(formatLog("INFO", msg, meta)),
-    warn: (msg, meta) => console.warn(formatLog("WARN", msg, meta)),
-    error: (msg, meta) => console.error(formatLog("ERROR", msg, meta)),
-    debug: (msg, meta) => {
-        if (!DEBUG) return;
-        console.log(formatLog("DEBUG", msg, meta));
-    },
-};
+func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	payload := map[string]any{
+		"model": c.config.Model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userContent},
+		},
+		"response_format": map[string]string{"type": "json_object"},
+		"temperature":     0.2,
+	}
 
-</file>
-
-<file path="js\lib\models.ts">
-export enum ActionType {
-    Gather = "gather",
-    Craft = "craft",
-    Hunt = "hunt",
-    Explore = "explore",
-    Build = "build",
-    Smelt = "smelt",
-    Farm = "farm",
-    Mine = "mine",
-    MarkLocation = "mark_location",
-    RecallLocation = "recall_location",
-    Idle = "idle",
-    Sleep = "sleep",
-    Retreat = "retreat",
-    Eat = "eat",
-    Interact = "interact",
-    Store = "store",
-    Retrieve = "retrieve", // New intent
+	jsonPayload, _ := json.Marshal(payload)
+	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
 }
 
-export enum ClientEventType {
-    TaskCompleted = "task_completed",
-    TaskFailed = "task_failed",
-    TaskAborted = "task_aborted",
-    Death = "death",
-    PanicRetreat = "panic_retreat",
+func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
+	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
+
+	payload := map[string]any{
+		"model": c.config.Model,
+		"input": input,
+	}
+
+	jsonPayload, _ := json.Marshal(payload)
+
+	var lastErr error
+	baseDelay := 500 * time.Millisecond
+
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+		default:
+		}
+
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
+			baseDelay *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		}
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			continue
+		}
+
+		var result struct {
+			Data []struct {
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		}
+
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			lastErr = fmt.Errorf("failed to decode response: %w", err)
+			continue
+		}
+
+		if len(result.Data) == 0 {
+			lastErr = fmt.Errorf("empty embedding array returned")
+			continue
+		}
+
+		return result.Data[0].Embedding, nil
+	}
+
+	return nil, fmt.Errorf("max retries exceeded. last error: %w", lastErr)
 }
 
-export interface TraceContext {
-    trace_id: string;
-    action_id: string;
-    milestone_id?: string;
-}
+func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) (string, error) {
+	var lastErr error
+	baseDelay := 500 * time.Millisecond
 
-export interface DecisionTarget {
-    type: string;
-    name: string;
-}
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+		default:
+		}
 
-export interface ActionIntent {
-    id: string;
-    action: ActionType;
-    target: DecisionTarget;
-    count: number;
-    rationale?: string;
-    trace?: TraceContext;
-}
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
+			baseDelay *= 2
+		}
 
-export interface ActiveTask {
-    id: string;
-    action: ActionType;
-    target: DecisionTarget;
-    count: number;
-    startTime: number;
-    trace: TraceContext;
-}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		}
 
-export interface ThreatInfo {
-    id: number;
-    name: string;
-    distance: number;
-    threatScore: number;
-    position: { x: number; y: number; z: number };
-    entity?: any;
-}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-export interface POI {
-    type: string;
-    name: string;
-    position: { x: number; y: number; z: number };
-    distance: number;
-    visibility: number;
-    score: number;
-}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
+		}
 
-</file>
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			continue
+		}
 
-<file path="js\lib\network\client.ts">
-import WebSocket from "ws";
-import { EventEmitter } from "events";
+		var result struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
 
-interface ClientConfig {
-    url: string;
-    reconnectIntervalMs: number;
-    maxReconnectIntervalMs: number;
-    pingIntervalMs: number;
-}
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			lastErr = fmt.Errorf("failed to decode response: %w", err)
+			continue
+		}
 
-export class SynapticClient extends EventEmitter {
-    private ws: WebSocket | null = null;
-    private config: ClientConfig;
-    private reconnectAttempts = 0;
-    private isIntentionallyClosed = false;
-    private pingTimeout: NodeJS.Timeout | null = null;
+		if len(result.Choices) == 0 {
+			lastErr = fmt.Errorf("empty choices array returned")
+			continue
+		}
 
-    constructor(config: Partial<ClientConfig> = {}) {
-        super();
-        this.config = {
-            url: config.url || "ws://127.0.0.1:8080/bot/ws",
-            reconnectIntervalMs: config.reconnectIntervalMs || 1000,
-            maxReconnectIntervalMs: config.maxReconnectIntervalMs || 15000,
-            pingIntervalMs: config.pingIntervalMs || 30000,
-        };
-    }
+		return result.Choices[0].Message.Content, nil
+	}
 
-    public connect(): void {
-        this.isIntentionallyClosed = false;
-        if (
-            this.ws &&
-            (this.ws.readyState === WebSocket.OPEN ||
-                this.ws.readyState === WebSocket.CONNECTING)
-        ) {
-            return;
-        }
-
-        console.log(`[Network] Connecting to ${this.config.url}...`);
-        this.ws = new WebSocket(this.config.url);
-
-        this.ws.on("open", () => {
-            console.log("[Network] WebSocket connected.");
-            this.reconnectAttempts = 0;
-            this.emit("connected");
-            this.heartbeat();
-        });
-
-        this.ws.on("ping", () => {
-            this.heartbeat();
-        });
-
-        this.ws.on("message", (data: WebSocket.Data) => {
-            try {
-                const msg = JSON.parse(data.toString());
-                this.emit("message", msg);
-
-                if (msg.type === "DISPATCH_TASK") {
-                    this.emit("dispatch", msg.payload);
-                } else if (msg.type === "ABORT_TASK") {
-                    this.emit("abort", msg.payload);
-                }
-            } catch (err) {
-                console.error("[Network] Failed to parse message:", err);
-            }
-        });
-
-        this.ws.on("close", () => {
-            this.clearHeartbeat();
-            this.ws = null;
-            this.emit("disconnected");
-            if (!this.isIntentionallyClosed) {
-                this.scheduleReconnect();
-            }
-        });
-
-        this.ws.on("error", (err) => {
-            console.error("[Network] WebSocket error:", err.message);
-            this.ws?.close();
-        });
-    }
-
-    private heartbeat(): void {
-        this.clearHeartbeat();
-        this.pingTimeout = setTimeout(() => {
-            console.warn("[Network] Heartbeat timeout. Closing connection.");
-            this.ws?.terminate();
-        }, this.config.pingIntervalMs + 5000); // Allow 5s buffer over Go's ping period
-    }
-
-    private clearHeartbeat(): void {
-        if (this.pingTimeout) {
-            clearTimeout(this.pingTimeout);
-            this.pingTimeout = null;
-        }
-    }
-
-    private scheduleReconnect(): void {
-        const backoff = Math.min(
-            this.config.reconnectIntervalMs *
-                Math.pow(1.5, this.reconnectAttempts),
-            this.config.maxReconnectIntervalMs,
-        );
-        this.reconnectAttempts++;
-        console.log(`[Network] Reconnecting in ${Math.round(backoff)}ms...`);
-        setTimeout(() => this.connect(), backoff);
-    }
-
-    public disconnect(): void {
-        this.isIntentionallyClosed = true;
-        this.clearHeartbeat();
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
-        }
-    }
-
-    public sendState(state: any): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        this.ws.send(JSON.stringify({ type: "STATE_UPDATE", payload: state }));
-    }
-
-    public sendEvent(
-        event: string,
-        actionStr: string,
-        commandId = "",
-        cause = "",
-        startTime = 0,
-    ): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
-
-        let msgType = "TASK_END";
-        if (event === "task_start") msgType = "TASK_START";
-        if (event === "death") msgType = "BOT_DEATH";
-        if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
-        if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
-        if (event === "task_aborted") msgType = "TASK_END";
-
-        let status = event;
-        if (event === "task_start") status = "STARTED";
-        if (event === "task_completed") status = "COMPLETED";
-        if (event === "task_failed") status = "FAILED";
-        if (event === "task_aborted") status = "ABORTED";
-
-        this.ws.send(
-            JSON.stringify({
-                type: msgType,
-                payload: {
-                    status: status,
-                    action: actionStr,
-                    command_id: commandId,
-                    cause,
-                    duration_ms,
-                },
-            }),
-        );
-    }
+	return "", fmt.Errorf("max retries exceeded. last error: %w", lastErr)
 }
 
 </file>
 
-<file path="js\lib\systems\survival.ts">
-import type { Bot } from "mineflayer";
-import type { ControlPlaneClient } from "../network/client.js";
-import { log } from "../logger.js";
-import { getThreats, computeSafeRetreat } from "../utils/threats.js";
-import pkg from "mineflayer-pathfinder";
-import { Vec3 } from "vec3";
+<file path="internal\orchestrator\loop.go">
+package orchestrator
 
-const { goals } = pkg;
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
 
-export interface SurvivalConfig {
-    onInterrupt: (reason: string) => void;
-    stopMovement: () => void;
+	"golang.org/x/sync/errgroup"
+
+	"david22573/synaptic-mc/internal/config"
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/humanization"
+	"david22573/synaptic-mc/internal/learning"
+	"david22573/synaptic-mc/internal/memory"
+	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/voyager"
+)
+
+type Orchestrator struct {
+	sessionID string
+	store     domain.EventStore
+	memory    memory.Store
+	flags     config.FeatureFlags
+
+	curriculum voyager.Curriculum
+	critic     voyager.Critic
+	humanizer  *humanization.Engine
+
+	ctrlManager *execution.ControllerManager
+	engine      *execution.TaskExecutionEngine
+	taskManager *TaskManager
+	planTracker *PlanTracker
+	logger      *slog.Logger
+
+	stateBuffer atomic.Pointer[domain.VersionedState]
+	ticker      *time.Ticker
+	eventCh     chan domain.DomainEvent
+
+	mu              sync.RWMutex
+	currentSnapshot domain.EvaluationSnapshot
+	taskHistory     []domain.TaskHistory
+	activeIntent    *domain.ActionIntent
+	beforeState     domain.GameState
+
+	reflexLock   bool
+	evalCancel   context.CancelFunc
+	evalInFlight atomic.Bool
+
+	uiHub        *observability.Hub
+	stateVersion atomic.Uint64
+	eventCount   atomic.Int64
 }
 
-export class SurvivalSystem {
-    public bot: Bot;
-    private client: ControlPlaneClient;
-    private config: SurvivalConfig;
+func New(
+	sessionID string,
+	store domain.EventStore,
+	memStore memory.Store,
+	curriculum voyager.Curriculum,
+	critic voyager.Critic,
+	exec execution.Controller,
+	uiHub *observability.Hub,
+	logger *slog.Logger,
+	flags config.FeatureFlags,
+	humanCfg humanization.Config,
+) *Orchestrator {
+	cm := execution.NewControllerManager()
+	if exec != nil {
+		cm.SetController("initial", exec)
+	}
 
-    // 1.4 FIX: Replaced checkInterval with a boolean state flag
-    private running = false;
-    private isPanicking = false;
-    private lastDangerAt = 0;
-    private lastFleeTime = 0;
-    private diggingEscape = false;
-    private pillaringOut = false;
+	engine := execution.NewTaskExecutionEngine(cm, logger)
+	tm := NewTaskManager(engine, nil, logger)
+	humanizer := humanization.NewEngine(humanCfg)
 
-    constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
-        this.bot = bot;
-        this.client = client;
-        this.config = config;
-    }
+	o := &Orchestrator{
+		sessionID:   sessionID,
+		store:       store,
+		memory:      memStore,
+		flags:       flags,
+		curriculum:  curriculum,
+		critic:      critic,
+		ctrlManager: cm,
+		engine:      engine,
+		taskManager: tm,
+		humanizer:   humanizer,
+		uiHub:       uiHub,
+		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
+		eventCh:     make(chan domain.DomainEvent, 100),
+		taskHistory: make([]domain.TaskHistory, 0),
+	}
 
-    public start() {
-        if (this.running) return;
-        this.running = true;
+	o.planTracker = NewPlanTracker(tm, humanizer, o.buildHumanizationContext, logger)
+	tm.OnDrain = o.handleQueueDrain
 
-        // 1.4 FIX: Self-rescheduling async loop guarantees no overlapping executions
-        const tick = async () => {
-            if (!this.running) return;
-
-            try {
-                await this.checkSurvival();
-            } catch (err) {
-                log.error("Error in survival loop tick", {
-                    err: err instanceof Error ? err.message : String(err),
-                });
-            }
-
-            if (this.running) {
-                setTimeout(tick, 1000);
-            }
-        };
-
-        tick();
-    }
-
-    public stop() {
-        this.running = false;
-        this.reset();
-    }
-
-    public reset() {
-        this.isPanicking = false;
-        this.lastDangerAt = 0;
-        this.lastFleeTime = 0;
-        this.diggingEscape = false;
-        this.pillaringOut = false;
-    }
-
-    public isPanickingNow(): boolean {
-        return this.isPanicking;
-    }
-
-    private async checkSurvival() {
-        if (!this.bot?.entity) return;
-        if (this.diggingEscape || this.pillaringOut) return;
-
-        const threats = getThreats(this.bot);
-        const immediateThreats = threats.filter(
-            (t: any) =>
-                t.distance < 24 &&
-                t.threatScore > 5 &&
-                t.name !== "low_health_no_food" &&
-                t.name !== "starvation",
-        );
-
-        if (immediateThreats.length > 0) {
-            const topThreat = immediateThreats[0]!;
-            const hasWeapon = this.bot.inventory
-                .items()
-                .some(
-                    (i) => i.name.includes("axe") || i.name.includes("sword"),
-                );
-
-            const isOneOnOne = immediateThreats.length === 1;
-            const isUnavoidableDeath =
-                topThreat.name === "creeper" || topThreat.name === "warden";
-
-            if (
-                hasWeapon &&
-                isOneOnOne &&
-                this.bot.health > 10 &&
-                !isUnavoidableDeath
-            ) {
-                if (this.isPanicking) {
-                    this.isPanicking = false;
-                    this.config.stopMovement();
-                    this.client.sendEvent(
-                        "panic_retreat_end",
-                        "evasion_complete",
-                        "",
-                        "engaging_in_combat",
-                        0,
-                    );
-                }
-                return;
-            }
-
-            this.lastDangerAt = Date.now();
-
-            if (!this.isPanicking) {
-                this.isPanicking = true;
-                log.warn("Reflex: Critical Flee triggered", {
-                    cause: topThreat.name,
-                    health: Math.round(this.bot.health),
-                    threatCount: immediateThreats.length,
-                });
-
-                this.config.onInterrupt("panic_flee");
-                this.config.stopMovement();
-                this.client.sendEvent(
-                    "panic_retreat_start",
-                    "evasion",
-                    "",
-                    topThreat.name,
-                    0,
-                );
-            }
-
-            if (
-                !this.bot.pathfinder.isMoving() ||
-                Date.now() - this.lastFleeTime > 5000
-            ) {
-                this.lastFleeTime = Date.now();
-                const safePos = computeSafeRetreat(
-                    this.bot,
-                    immediateThreats,
-                    32,
-                );
-                this.fleeTo(safePos);
-            }
-        } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
-            this.isPanicking = false;
-            log.debug(
-                "Survival goal reached; securing exit and releasing reflex lock",
-            );
-
-            this.config.stopMovement();
-
-            this.pillaringOut = true;
-            await this.pillarOut().catch((err) =>
-                log.warn("Pillar out failed", { err }),
-            );
-            this.pillaringOut = false;
-
-            this.client.sendEvent(
-                "panic_retreat_end",
-                "evasion_complete",
-                "",
-                "safe",
-                0,
-            );
-        }
-    }
-
-    private async fleeTo(safePos: { x: number; z: number }) {
-        try {
-            const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
-            const path = this.bot.pathfinder.getPathTo(
-                this.bot.pathfinder.movements,
-                goal,
-            );
-
-            if (path.status === "noPath" || path.status === "timeout") {
-                log.warn(
-                    "Panic pathfinding failed, attempting vertical dig escape",
-                );
-                await this.digEscape();
-                return;
-            }
-
-            this.bot.pathfinder.setGoal(goal);
-        } catch (e) {
-            log.warn(
-                "Pathfinder threw during panic, attempting vertical dig escape",
-            );
-            await this.digEscape();
-        }
-    }
-
-    private async digEscape() {
-        if (this.diggingEscape) return;
-
-        const inWater =
-            this.bot.blockAt(this.bot.entity.position.floored())?.name ===
-            "water";
-
-        if (inWater) {
-            log.warn("Refusing to vertical dig escape while submerged.");
-            return;
-        }
-
-        this.diggingEscape = true;
-        this.config.stopMovement();
-
-        try {
-            for (let i = 0; i < 3; i++) {
-                if (this.bot.health <= 0) break;
-
-                const pos = this.bot.entity.position.floored();
-                const below = this.bot.blockAt(pos.offset(0, -1, 0));
-
-                if (
-                    below &&
-                    below.name !== "air" &&
-                    below.name !== "bedrock" &&
-                    below.name !== "water" &&
-                    below.name !== "lava"
-                ) {
-                    const tool = this.bot.pathfinder.bestHarvestTool(below);
-                    if (tool) await this.bot.equip(tool.type, "hand");
-                    await this.bot.dig(below);
-                }
-            }
-
-            const trashBlock = this.bot.inventory
-                .items()
-                .find((i) =>
-                    [
-                        "dirt",
-                        "cobblestone",
-                        "stone",
-                        "granite",
-                        "diorite",
-                        "andesite",
-                        "netherrack",
-                    ].includes(i.name),
-                );
-
-            if (trashBlock) {
-                await this.bot.equip(trashBlock.type, "hand");
-
-                const pos = this.bot.entity.position.floored();
-                const compassVectors = [
-                    new Vec3(1, 0, 0),
-                    new Vec3(-1, 0, 0),
-                    new Vec3(0, 0, 1),
-                    new Vec3(0, 0, -1),
-                ];
-
-                let placed = false;
-
-                for (const vec of compassVectors) {
-                    const wallBlock = this.bot.blockAt(
-                        pos.offset(vec.x, 2, vec.z),
-                    );
-
-                    if (wallBlock && wallBlock.boundingBox === "block") {
-                        try {
-                            await this.bot.placeBlock(
-                                wallBlock,
-                                vec.scaled(-1),
-                            );
-                            placed = true;
-                            log.debug(
-                                "Successfully sealed roof at surface level.",
-                            );
-                            break;
-                        } catch (e) {}
-                    }
-                }
-
-                if (!placed) {
-                    log.warn(
-                        "Failed to seal roof. Terrain geometry unsupported.",
-                    );
-                }
-            }
-        } catch (err) {
-            log.warn("Vertical dig escape failed", { err });
-        } finally {
-            this.diggingEscape = false;
-        }
-    }
-
-    private async pillarOut() {
-        if (!this.bot.entity || this.bot.health <= 0) return;
-
-        const isEnclosed = (yOffset: number) => {
-            const pos = this.bot.entity.position.floored();
-            const blocks = [
-                this.bot.blockAt(pos.offset(0, yOffset, -1)),
-                this.bot.blockAt(pos.offset(0, yOffset, 1)),
-                this.bot.blockAt(pos.offset(1, yOffset, 0)),
-                this.bot.blockAt(pos.offset(-1, yOffset, 0)),
-            ];
-
-            return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
-        };
-
-        if (!isEnclosed(0) && !isEnclosed(1)) {
-            return;
-        }
-
-        log.info("Trapped in pit. Initiating pillar-out recovery sequence.");
-
-        let jumps = 0;
-        while (jumps < 10) {
-            jumps++;
-
-            if (this.bot.health <= 0) return;
-
-            const pos = this.bot.entity.position.floored();
-            if (!isEnclosed(0) && !isEnclosed(1)) {
-                log.info("Surface reached. Resuming normal operations.");
-                break;
-            }
-
-            const trashBlock = this.bot.inventory
-                .items()
-                .find((i) =>
-                    [
-                        "dirt",
-                        "cobblestone",
-                        "stone",
-                        "netherrack",
-                        "granite",
-                        "diorite",
-                        "andesite",
-                    ].includes(i.name),
-                );
-
-            if (!trashBlock) {
-                log.warn("Out of blocks! Cannot pillar out of hole.");
-                break;
-            }
-
-            const roof = this.bot.blockAt(pos.offset(0, 2, 0));
-
-            if (
-                roof &&
-                roof.name !== "air" &&
-                roof.name !== "water" &&
-                roof.name !== "lava"
-            ) {
-                const tool = this.bot.pathfinder.bestHarvestTool(roof);
-                if (tool) await this.bot.equip(tool.type, "hand");
-                await this.bot.dig(roof).catch(() => {});
-            }
-
-            await this.bot.equip(trashBlock.type, "hand");
-
-            const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
-            if (refBlock && refBlock.name !== "air") {
-                // Look down accurately at the top center of the block
-                await this.bot.lookAt(pos.offset(0.5, 0, 0.5), true);
-                this.bot.setControlState("jump", true);
-
-                // Active polling to ensure physical bounding box clears the block space
-                const startY = this.bot.entity.position.y;
-
-                for (let k = 0; k < 20; k++) {
-                    await new Promise((resolve) => setTimeout(resolve, 20));
-
-                    if (this.bot.entity.position.y >= startY + 1.1) {
-                        break;
-                    }
-                }
-
-                try {
-                    await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                } catch (e: any) {
-                    log.warn("Failed to place block under feet", {
-                        err: e.message || e,
-                    });
-                }
-
-                this.bot.setControlState("jump", false);
-                await new Promise((resolve) => setTimeout(resolve, 200));
-            } else {
-                // Wait out falls if reference block is missing
-                await new Promise((resolve) => setTimeout(resolve, 200));
-            }
-        }
-    }
+	return o
 }
 
-</file>
+func (o *Orchestrator) Run(ctx context.Context) error {
+	o.logger.Info("Starting orchestrator lifecycle")
 
-<file path="js\lib\tasks\fsm.ts">
-import type { Bot } from "mineflayer";
-import type { Entity } from "prismarine-entity";
-import { getErrorMessage } from "../utils/errors.js";
+	tickRate := 50 * time.Millisecond
+	o.ticker = time.NewTicker(tickRate)
+	defer o.ticker.Stop()
 
-export type TaskStatus = "RUNNING" | "SUCCESS" | "FAILED";
+	g, gCtx := errgroup.WithContext(ctx)
 
-export interface TaskResult {
-    status: TaskStatus;
-    reason?: string;
-    data?: any;
+	g.Go(func() error {
+		o.taskManager.Run(gCtx)
+		return nil
+	})
+
+	g.Go(func() error {
+		return o.processStateLoop(gCtx, tickRate)
+	})
+
+	g.Go(func() error {
+		return o.processEventLoop(gCtx)
+	})
+
+	<-gCtx.Done()
+	o.logger.Info("Orchestrator shutting down, waiting for loops...")
+	return g.Wait()
 }
 
-export interface StateContext {
-    bot: Bot;
-    targetName: string;
-    targetEntity: Entity | null;
-    searchRadius: number;
-    timeoutMs: number;
-    startTime: number;
-    signal: AbortSignal;
-    result?: TaskResult;
+func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) {
+	vState := domain.VersionedState{
+		Version: o.stateVersion.Add(1),
+		State:   state,
+	}
+
+	o.stateBuffer.Store(&vState)
+
+	if o.uiHub != nil {
+		go o.uiHub.Broadcast("state_update", state)
+	}
 }
 
-export interface FSMState {
-    name: string;
-    enter(ctx: StateContext): Promise<void> | void;
-    execute(ctx: StateContext): Promise<FSMState | null>;
+func (o *Orchestrator) IngestEvent(ctx context.Context, event domain.DomainEvent) {
+	select {
+	case <-ctx.Done():
+	case o.eventCh <- event:
+	default:
+		o.logger.Warn("Event channel full, dropping event", slog.String("type", string(event.Type)))
+	}
 }
 
-export class StateMachineRunner {
-    private currentState: FSMState | null = null;
-    private context: StateContext;
+func (o *Orchestrator) SessionID() string {
+	return o.sessionID
+}
 
-    constructor(initialState: FSMState, context: StateContext) {
-        this.currentState = initialState;
-        this.context = context;
-    }
+func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
+	o.mu.Lock()
+	if o.taskManager != nil {
+		_ = o.taskManager.Halt(context.Background(), "controller_swapped")
+	}
+	o.mu.Unlock()
 
-    public async run(): Promise<TaskResult> {
-        this.context.startTime = Date.now();
+	o.ctrlManager.SetController(id, ctrl)
+	o.logger.Info("Execution controller updated", slog.String("controller_id", id))
+}
 
-        if (this.currentState) {
-            await this.currentState.enter(this.context);
-        }
+func (o *Orchestrator) handleQueueDrain() {
+	if !o.planTracker.HasActivePlan() {
+		_ = o.evaluateNextTask(context.Background())
+	}
+}
 
-        while (this.currentState !== null) {
-            if (this.context.signal.aborted) {
-                return { status: "FAILED", reason: "aborted" };
-            }
+func (o *Orchestrator) takeSnapshot(ctx context.Context) {
+	stats, lastID, err := learning.GetProjectedStats(ctx, o.store, o.sessionID)
+	if err != nil || lastID == 0 {
+		return
+	}
 
-            if (Date.now() - this.context.startTime > this.context.timeoutMs) {
-                return { status: "FAILED", reason: "FSM_GLOBAL_TIMEOUT" };
-            }
+	data, err := json.Marshal(stats)
+	if err != nil {
+		o.logger.Error("Failed to marshal snapshot data", slog.Any("error", err))
+		return
+	}
 
-            try {
-                const nextState = await this.currentState.execute(this.context);
-                if (nextState !== this.currentState) {
-                    if (nextState) {
-                        await nextState.enter(this.context);
-                    }
-                    this.currentState = nextState;
-                }
-            } catch (err: unknown) {
-                return {
-                    status: "FAILED",
-                    reason: `FSM_CRASH: ${getErrorMessage(err)}`,
-                };
-            }
-        }
+	if s, ok := o.store.(interface {
+		SaveSnapshot(context.Context, domain.SessionSnapshot) error
+	}); ok {
+		err = s.SaveSnapshot(ctx, domain.SessionSnapshot{
+			SessionID:   o.sessionID,
+			LastEventID: lastID,
+			Data:        data,
+		})
 
-        return (
-            this.context.result || {
-                status: "FAILED",
-                reason: "UNKNOWN_TERMINATION",
-            }
-        );
-    }
+		if err != nil {
+			o.logger.Error("Failed to persist background snapshot", slog.Any("error", err))
+		} else {
+			o.logger.Info("CQRS read-model snapshot saved", slog.Int64("last_event_id", lastID))
+		}
+	}
+}
+
+func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Duration) error {
+	lastTick := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case t := <-o.ticker.C:
+			actualTick := t.Sub(lastTick)
+			jitter := float64(actualTick.Milliseconds() - targetTick.Milliseconds())
+			if jitter < 0 {
+				jitter = -jitter
+			}
+			observability.Metrics.DecisionJitter.Observe(jitter)
+
+			hctx := o.buildHumanizationContext()
+			o.humanizer.State().Evolve(hctx, t.Sub(lastTick))
+			lastTick = t
+
+			vState := o.stateBuffer.Load()
+			if vState == nil {
+				continue
+			}
+
+			o.mu.Lock()
+			o.currentSnapshot.State = *vState
+			o.mu.Unlock()
+
+			o.mu.RLock()
+			tm := o.taskManager
+			isLocked := o.reflexLock
+			o.mu.RUnlock()
+
+			if tm != nil && !o.planTracker.HasActivePlan() && tm.IsIdle() && !isLocked && !o.evalInFlight.Load() {
+				go o.handleQueueDrain()
+			}
+		}
+	}
+}
+
+func (o *Orchestrator) processEventLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev := <-o.eventCh:
+			if err := o.store.Append(ctx, o.sessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
+				o.logger.Error("Failed to append event to store", slog.Any("error", err))
+				continue
+			}
+
+			if o.uiHub != nil {
+				o.uiHub.Broadcast("event_stream", ev)
+			}
+
+			o.handleDomainEvent(ctx, ev)
+
+			if count := o.eventCount.Add(1); count%500 == 0 {
+				go o.takeSnapshot(context.Background())
+			}
+		}
+	}
+}
+
+func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
+	if !o.evalInFlight.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	o.mu.RLock()
+	tm := o.taskManager
+	isLocked := o.reflexLock
+	state := o.currentSnapshot.State.State
+	history := o.taskHistory
+	o.mu.RUnlock()
+
+	if tm == nil || isLocked || o.planTracker.HasActivePlan() {
+		o.evalInFlight.Store(false)
+		return nil
+	}
+
+	o.mu.Lock()
+	if o.evalCancel != nil {
+		o.evalCancel()
+	}
+
+	evalCtx, cancel := context.WithCancel(ctx)
+	o.evalCancel = cancel
+	o.mu.Unlock()
+
+	go func() {
+		defer o.evalInFlight.Store(false)
+		defer cancel()
+
+		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
+		if err != nil {
+			if evalCtx.Err() == nil {
+				o.logger.Error("Curriculum failed to propose task", slog.Any("error", err))
+			}
+			return
+		}
+
+		if intent == nil {
+			return
+		}
+
+		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
+
+		o.mu.Lock()
+		o.activeIntent = intent
+		o.beforeState = state
+		o.mu.Unlock()
+
+		trace := domain.TraceContext{
+			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+			ActionID: intent.ID,
+		}
+
+		action := domain.Action{
+			ID:        intent.ID,
+			Trace:     trace,
+			Action:    intent.Action,
+			Target:    domain.Target{Name: intent.Target, Type: "intent"},
+			Count:     intent.Count,
+			Rationale: intent.Rationale,
+			Priority:  10,
+		}
+
+		o.IngestEvent(evalCtx, domain.DomainEvent{
+			SessionID: o.sessionID,
+			Trace:     trace,
+			Type:      domain.EventTypePlanCreated,
+			Payload:   o.marshalJSON(intent),
+		})
+
+		if o.uiHub != nil {
+			o.uiHub.Broadcast("objective_update", intent.Rationale)
+		}
+
+		plan := &domain.Plan{
+			Objective: intent.Rationale,
+			Tasks:     []domain.Action{action},
+		}
+
+		o.planTracker.SetPlan(evalCtx, plan)
+	}()
+
+	return nil
+}
+
+func (o *Orchestrator) buildHumanizationContext() humanization.Context {
+	o.mu.RLock()
+	state := o.currentSnapshot.State.State
+	o.mu.RUnlock()
+
+	isStuck := false
+	if state.CurrentTask != nil {
+		isStuck = state.TaskProgress < 0.01
+	}
+
+	return humanization.BuildContext(state, isStuck)
+}
+
+func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {
+	o.mu.RLock()
+	tm := o.taskManager
+	o.mu.RUnlock()
+
+	if tm == nil {
+		return
+	}
+
+	switch ev.Type {
+	case domain.EventBotDeath:
+		_ = tm.Halt(ctx, "bot_died")
+		o.planTracker.ClearPlan(ctx, "bot_died")
+		o.mu.Lock()
+		o.reflexLock = false
+		o.mu.Unlock()
+		observability.Metrics.TaskInterruption.Inc()
+
+	case domain.EventTypePanic:
+		_ = tm.Halt(ctx, "panic_triggered")
+		o.planTracker.ClearPlan(ctx, "panic_triggered")
+		o.mu.Lock()
+		o.reflexLock = true
+		o.mu.Unlock()
+		observability.Metrics.TaskInterruption.Inc()
+
+	case domain.EventTypePanicResolved:
+		o.mu.Lock()
+		o.reflexLock = false
+		o.mu.Unlock()
+		o.handleQueueDrain()
+
+	case domain.EventTypeTaskStart:
+		var payload struct {
+			CommandID string `json:"command_id"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			o.engine.OnTaskStart(payload.CommandID)
+		}
+
+	case domain.EventTypeTaskEnd:
+		var payload struct {
+			Status    string `json:"status"`
+			CommandID string `json:"command_id"`
+			Cause     string `json:"cause"`
+		}
+
+		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			success := payload.Status == "COMPLETED"
+
+			o.engine.OnTaskEnd(payload.CommandID, success)
+			o.planTracker.OnTaskComplete(ctx, payload.CommandID, success)
+
+			o.mu.Lock()
+			intent := o.activeIntent
+			before := o.beforeState
+			after := o.currentSnapshot.State.State
+
+			if intent != nil && intent.ID == payload.CommandID {
+				o.activeIntent = nil
+				successCritic, critique := o.critic.Evaluate(*intent, before, after)
+				if !success {
+					successCritic = false
+					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
+				}
+
+				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
+					Intent:   *intent,
+					Success:  successCritic,
+					Critique: critique,
+				})
+			}
+			o.mu.Unlock()
+
+			_ = tm.Complete(ctx, payload.CommandID, success)
+		}
+	}
+}
+
+func (o *Orchestrator) marshalJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 </file>
@@ -2380,12 +1825,7 @@ class EngageState implements FSMState {
                             await bot.waitForTicks(2); // Wait for server to register shield down
                         }
 
-                        // Execute jump crit if on the ground
-                        if (bot.entity.onGround) {
-                            bot.setControlState("jump", true);
-                            await bot.waitForTicks(3);
-                            bot.setControlState("jump", false);
-                        }
+                        // FIX: Removed manual setControlState("jump", true) to prevent fighting pathfinder
 
                         bot.attack(target);
                         sCtx.lastAttackTime = Date.now();
@@ -3321,1051 +2761,14 @@ export async function handleStore(ctx: TaskContext): Promise<void> {
 
 </file>
 
-<file path="js\lib\tasks\normalize.ts">
-import type { Bot } from "mineflayer";
-import * as models from "../models.js";
-import { log } from "../logger.js";
-
-const LOG_TO_PLANK_MAP: Record<string, string> = {
-    oak_log: "oak_planks",
-    birch_log: "birch_planks",
-    spruce_log: "spruce_planks",
-    jungle_log: "jungle_planks",
-    acacia_log: "acacia_planks",
-    dark_oak_log: "dark_oak_planks",
-    mangrove_log: "mangrove_planks",
-    cherry_log: "cherry_planks",
-};
-
-const TARGET_ALIASES: Record<string, string> = {
-    // Farming Aliases
-    carrot: "carrots",
-    potato: "potatoes",
-    beetroot: "beetroots",
-
-    // Mining Aliases
-    iron: "iron_ore",
-    gold: "gold_ore",
-    diamond: "diamond_ore",
-    coal: "coal_ore",
-    copper: "copper_ore",
-    lapis: "lapis_ore",
-    redstone: "redstone_ore",
-    emerald: "emerald_ore",
-    cobble: "cobblestone",
-
-    // Gathering Aliases
-    tree: "oak_log",
-    log: "oak_log",
-    timber: "oak_log",
-    wood: "oak_log",
-};
-
-export function normalizeIntent(
-    bot: Bot,
-    intent: models.ActionIntent,
-): models.ActionIntent {
-    const normalized: models.ActionIntent = {
-        ...intent,
-        target: { ...intent.target },
-    };
-
-    const action = normalized.action;
-    const originalTargetName = (normalized.target?.name || "none")
-        .toLowerCase()
-        .trim();
-
-    let targetName = originalTargetName;
-
-    // 1. Apply static dictionary aliases first
-    if (TARGET_ALIASES[targetName]) {
-        targetName = TARGET_ALIASES[targetName]!;
-    }
-
-    // 2. Apply action-specific dynamic normalization
-    if (action === "craft") {
-        if (targetName === "sticks" || targetName === "stick") {
-            targetName = "stick";
-        } else if (targetName === "planks") {
-            const invItems = bot.inventory.items();
-            let foundLog = false;
-            for (const item of invItems) {
-                if (LOG_TO_PLANK_MAP[item.name]) {
-                    targetName = LOG_TO_PLANK_MAP[item.name]!;
-                    foundLog = true;
-                    break;
-                }
-            }
-            if (!foundLog) throw new Error("MISSING_LOGS_FOR_PLANKS");
-        } else if (
-            targetName === "table" ||
-            targetName === "workbench" ||
-            targetName === "crafting_table"
-        ) {
-            targetName = "crafting_table";
-        } else if (
-            targetName.includes("wooden_pickaxe") ||
-            targetName === "pickaxe"
-        ) {
-            targetName = "wooden_pickaxe";
-        } else if (targetName.includes("stone_pickaxe")) {
-            targetName = "stone_pickaxe";
-        }
-    } else if (action === "build") {
-        if (targetName === "table" || targetName === "workbench") {
-            targetName = "crafting_table";
-        }
-    } else if (
-        action === "gather" &&
-        (targetName === "wood" || targetName === "oak_log")
-    ) {
-        // Handled naturally by the gather handler
-    }
-
-    // 3. Log and apply changes if a normalization occurred
-    if (targetName !== originalTargetName) {
-        normalized.target.name = targetName;
-        log.debug("Intent normalized", {
-            original_target: originalTargetName,
-            normalized_target: targetName,
-            action,
-        });
-    }
-
-    return normalized;
-}
-
-</file>
-
-<file path="js\lib\tasks\primitives.ts">
-import type { Bot } from "mineflayer";
-import type { Entity } from "prismarine-entity";
-import pkg from "mineflayer-pathfinder";
-import { moveToGoal, type MoveOptions } from "./utils.js";
-
-const { goals } = pkg;
-
-export async function gotoEntity(
-    bot: Bot,
-    entity: Entity,
-    range: number,
-    opts: MoveOptions,
-): Promise<boolean> {
-    const goal = new goals.GoalFollow(entity, range);
-
-    try {
-        await moveToGoal(bot, goal, {
-            ...opts,
-            dynamic: true,
-            stuckTimeoutMs: 3000, // Chasing shouldn't stall for long
-        });
-
-        return true;
-    } catch (err: any) {
-        if (err.message === "aborted") {
-            throw err;
-            // Bubble up explicit aborts immediately
-        }
-
-        // Suppress general pathing/stuck errors for entity chasing
-        bot.pathfinder.setGoal(null);
-        bot.clearControlStates();
-        return false;
-    }
-}
-
-export async function attackEntity(bot: Bot, entity: Entity): Promise<void> {
-    await bot.lookAt(entity.position.offset(0, entity.height ?? 1.5, 0), true);
-    bot.attack(entity);
-}
-
-export function findNearestEntity(
-    bot: Bot,
-    name: string,
-    radius: number,
-): Entity | null {
-    const isGenericAnimal =
-        name === "animal" || name === "passive_animals" || name === "food";
-    const isGenericMonster =
-        name === "monster" || name === "threat" || name === "hostile";
-
-    return bot.nearestEntity((entity) => {
-        if (bot.entity.position.distanceTo(entity.position) > radius)
-            return false;
-
-        if (isGenericAnimal) {
-            return ["pig", "cow", "sheep", "chicken", "rabbit"].includes(
-                entity.name!,
-            );
-        }
-        if (isGenericMonster) {
-            return entity.type === "hostile" || entity.type === "mob";
-        }
-
-        return entity.name === name;
-    });
-}
-
-</file>
-
-<file path="js\lib\tasks\registry.ts">
-import type { Bot } from "mineflayer";
-import type * as models from "../models.js";
-
-export interface TaskContext {
-    bot: Bot;
-    intent: models.ActionIntent;
-    signal: AbortSignal;
-    timeouts: Record<string, number>;
-    stopMovement: () => void;
-    getThreats: () => any[];
-    computeSafeRetreat: (
-        threats: any[],
-        radius?: number,
-    ) => { x: number; z: number };
-}
-
-export type TaskHandler = (ctx: TaskContext) => Promise<void>;
-
-export const TASK_REGISTRY: Record<string, TaskHandler> = {};
-
-</file>
-
-<file path="js\lib\tasks\task.ts">
-import type { Bot } from "mineflayer";
-import pkg from "mineflayer-pathfinder";
-import * as models from "../models.js";
-import { type TaskContext } from "./registry.js";
-
-// Handlers
-import { handleGather } from "./handlers/gather.js";
-import { handleCraft } from "./handlers/craft.js";
-import { handleHunt } from "./handlers/hunt.js";
-import { handleBuild } from "./handlers/build.js";
-import { handleExplore } from "./handlers/explore.js";
-import { handleSmelt } from "./handlers/smelt.js";
-import { handleMine } from "./handlers/mine.js";
-import { handleFarm } from "./handlers/farm.js";
-import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
-import { normalizeIntent } from "./normalize.js";
-import { handleInteract } from "./handlers/interact.js";
-import { handleStore } from "./handlers/store.js";
-import { handleRetrieve } from "./handlers/retrieve.js"; // New import
-
-const { goals } = pkg;
-
-export async function runTask(
-    bot: Bot,
-    rawIntent: models.ActionIntent,
-    signal: AbortSignal,
-    timeouts: Record<string, number>,
-    getThreats: () => models.ThreatInfo[],
-    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
-        x: number;
-        z: number;
-    },
-    stopMovement: () => void,
-): Promise<void> {
-    const intent = normalizeIntent(bot, rawIntent);
-
-    const taskCtx: TaskContext = {
-        bot,
-        intent,
-        signal,
-        timeouts,
-        getThreats,
-        computeSafeRetreat,
-        stopMovement,
-    };
-
-    if (signal.aborted) {
-        throw new Error("aborted");
-    }
-
-    switch (intent.action) {
-        case "hunt":
-            await handleHunt(taskCtx);
-            return;
-        case "gather":
-            await handleGather(taskCtx);
-            return;
-        case "craft":
-            await handleCraft(taskCtx);
-            return;
-        case "build":
-            await handleBuild(taskCtx);
-            return;
-        case "smelt":
-            await handleSmelt(taskCtx);
-            return;
-        case "mine":
-            await handleMine(taskCtx);
-            return;
-        case "farm":
-            await handleFarm(taskCtx);
-            return;
-        case "explore":
-            await handleExplore(taskCtx);
-            return;
-        case "store":
-            await handleStore(taskCtx);
-            return;
-        case "retrieve":
-            await handleRetrieve(taskCtx);
-            return;
-        case "eat": {
-            const food = bot.inventory
-                .items()
-                .find((i) => i.name === intent.target.name);
-
-            if (!food) throw new Error(`NO_FOOD: ${intent.target.name}`);
-
-            try {
-                await bot.equip(food.type, "hand");
-                await bot.consume();
-            } catch (err) {
-                throw new Error(
-                    `CONSUME_FAILED: ${err instanceof Error ? err.message : String(err)}`,
-                );
-            }
-            return;
-        }
-        case "idle":
-            await waitForMs(1500, signal);
-            return;
-        case "sleep": {
-            await escapeTree(bot, signal);
-
-            const bed = bot.findBlock({
-                maxDistance: 32,
-                matching: (b: any) => b?.name.includes("bed"),
-            });
-
-            if (!bed) throw new Error("no bed found");
-
-            await moveToGoal(
-                bot,
-                new goals.GoalNear(
-                    bed.position.x,
-                    bed.position.y,
-                    bed.position.z,
-                    1.5,
-                ),
-                { signal, timeoutMs: 20000, stopMovement },
-            );
-
-            let onWake: (() => void) | undefined;
-            let onAbort: (() => void) | undefined;
-
-            try {
-                const wakePromise = new Promise<void>((resolve, reject) => {
-                    onWake = () => resolve();
-                    onAbort = () => reject(new Error("aborted"));
-
-                    bot.on("wake", onWake);
-                    signal.addEventListener("abort", onAbort, { once: true });
-                });
-
-                const sleepPromise = bot.sleep(bed).then(() => wakePromise);
-                const timeoutPromise = new Promise<void>((resolve) =>
-                    setTimeout(resolve, 12000),
-                );
-
-                await Promise.race([sleepPromise, timeoutPromise]);
-            } finally {
-                if (onWake) bot.removeListener("wake", onWake);
-                if (onAbort) signal.removeEventListener("abort", onAbort);
-            }
-
-            return;
-        }
-        case "retreat": {
-            await escapeTree(bot, signal);
-
-            const pos = computeSafeRetreat(getThreats());
-            await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
-                signal,
-                timeoutMs: 15000,
-                stopMovement,
-            });
-
-            await waitForMs(1000, signal);
-            return;
-        }
-        case "interact":
-            await handleInteract(taskCtx);
-            return;
-        case "mark_location":
-        case "recall_location":
-            await waitForMs(500, signal);
-            return;
-        default:
-            throw new Error(`unsupported: ${intent.action}`);
-    }
-}
-
-</file>
-
-<file path="js\lib\tasks\utils.ts">
-import type { Bot } from "mineflayer";
-import pkg from "mineflayer-pathfinder";
-import { Vec3 } from "vec3";
-
-const { goals } = pkg;
-
-const TREE_BLOCKS = new Set([
-    "oak_leaves",
-    "birch_leaves",
-    "spruce_leaves",
-    "jungle_leaves",
-    "acacia_leaves",
-    "dark_oak_leaves",
-    "mangrove_leaves",
-    "azalea_leaves",
-    "flowering_azalea_leaves",
-    "cherry_leaves",
-    "oak_log",
-    "birch_log",
-    "spruce_log",
-    "jungle_log",
-    "acacia_log",
-    "dark_oak_log",
-    "mangrove_log",
-]);
-
-const TRASH_ITEMS = new Set([
-    "dirt",
-    "cobblestone",
-    "gravel",
-    "rotten_flesh",
-    "spider_eye",
-    "bone",
-    "string",
-    "andesite",
-    "diorite",
-    "granite",
-    "seeds",
-    "tall_grass",
-    "grass",
-]);
-
-export function isOnSolidGround(bot: any): boolean {
-    if (!bot.entity.onGround) return false;
-    const pos = bot.entity.position.floored();
-    const below = bot.blockAt(pos.offset(0, -1, 0));
-    return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
-}
-
-export function isInFoliage(bot: any): boolean {
-    const pos = bot.entity.position.floored();
-    const at = bot.blockAt(pos);
-    const below = bot.blockAt(pos.offset(0, -1, 0));
-    return (
-        (at && TREE_BLOCKS.has(at.name)) ||
-        (below && TREE_BLOCKS.has(below.name))
-    );
-}
-
-export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
-    if (!isInFoliage(bot)) return;
-
-    try {
-        bot.pathfinder.setGoal(null);
-        bot.clearControlStates();
-    } catch (_err) {}
-
-    const MAX_ATTEMPTS = 30;
-
-    for (let i = 0; i < MAX_ATTEMPTS; i++) {
-        if (signal.aborted) throw new Error("aborted");
-        if (isOnSolidGround(bot)) return;
-
-        const pos = bot.entity.position.floored();
-        const blocksToClear = [
-            bot.blockAt(pos.offset(0, 1, 0)),
-            bot.blockAt(pos),
-            bot.blockAt(pos.offset(0, -1, 0)),
-            bot.blockAt(pos.offset(1, 0, 0)),
-            bot.blockAt(pos.offset(-1, 0, 0)),
-            bot.blockAt(pos.offset(0, 0, 1)),
-            bot.blockAt(pos.offset(0, 0, -1)),
-        ];
-
-        let clearedSomething = false;
-
-        for (const targetBlock of blocksToClear) {
-            if (
-                targetBlock &&
-                TREE_BLOCKS.has(targetBlock.name) &&
-                targetBlock.name !== "air"
-            ) {
-                try {
-                    const tool = bot.pathfinder.bestHarvestTool(targetBlock);
-                    if (tool) await bot.equip(tool, "hand");
-                    else await bot.unequip("hand");
-                    await bot.dig(targetBlock, true, "ignore");
-                    clearedSomething = true;
-                } catch (err) {
-                    // Ignore dig errors
-                }
-            }
-        }
-
-        if (!clearedSomething && !isOnSolidGround(bot)) {
-            const dir = Math.random() > 0.5 ? "forward" : "back";
-            const strafe = Math.random() > 0.5 ? "left" : "right";
-            bot.setControlState(dir, true);
-            bot.setControlState(strafe, true);
-            await new Promise((res) => setTimeout(res, 250));
-            bot.setControlState(dir, false);
-            bot.setControlState(strafe, false);
-        }
-
-        await new Promise<void>((resolve, reject) => {
-            let ticks = 0;
-            const timeout = setTimeout(() => {
-                bot.removeListener("physicsTick", check);
-                resolve();
-            }, 1000);
-
-            const check = () => {
-                ticks++;
-                if (isOnSolidGround(bot) || ticks > 10) {
-                    clearTimeout(timeout);
-                    bot.removeListener("physicsTick", check);
-                    resolve();
-                }
-            };
-            bot.on("physicsTick", check);
-        });
-    }
-
-    if (!isOnSolidGround(bot)) {
-        throw new Error(
-            "EscapeTree - could not reach ground after 30 attempts",
-        );
-    }
-}
-
-export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        const timer = setTimeout(() => {
-            cleanup();
-            resolve();
-        }, ms);
-
-        const onAbort = () => {
-            clearTimeout(timer);
-            cleanup();
-            reject(new Error("aborted"));
-        };
-
-        const cleanup = () => {
-            signal.removeEventListener("abort", onAbort);
-        };
-
-        signal.addEventListener("abort", onAbort, { once: true });
-    });
-}
-
-export interface MoveOptions {
-    signal: AbortSignal;
-    timeoutMs: number;
-    stopMovement: () => void;
-    dynamic?: boolean;
-    stuckTimeoutMs?: number;
-}
-
-export function moveToGoal(
-    bot: any,
-    goal: any,
-    opts: MoveOptions,
-): Promise<void> {
-    const {
-        signal,
-        timeoutMs,
-        stopMovement,
-        dynamic = false,
-        stuckTimeoutMs = 5000,
-    } = opts;
-
-    return new Promise((resolve, reject) => {
-        if (signal.aborted) {
-            reject(new Error("aborted"));
-            return;
-        }
-
-        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
-            return resolve();
-        }
-
-        let settled = false;
-        let lastPos = bot.entity.position.clone();
-        let stuckTimer: NodeJS.Timeout | null = null;
-        const listeners = new Map<string, any>();
-
-        const cleanup = () => {
-            listeners.forEach((handler, event) =>
-                bot.removeListener(event, handler),
-            );
-            listeners.clear();
-            if (stuckTimer) clearInterval(stuckTimer);
-        };
-
-        const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-
-            try {
-                bot.clearControlStates();
-                stopMovement();
-            } catch (_err) {}
-
-            if (err) {
-                reject(err);
-                return;
-            }
-            resolve();
-        };
-
-        const onAbort = () => finish(new Error("aborted"));
-        const onGoalReached = () => finish();
-
-        const onPathUpdate = (results: any) => {
-            if (results.status === "noPath") {
-                setTimeout(() => {
-                    if (!settled) finish(new Error("no_path"));
-                }, 3500);
-            } else if (results.status === "timeout") {
-                finish(new Error("pathfinder_timeout"));
-            }
-        };
-
-        let stuckStrikes = 0;
-
-        stuckTimer = setInterval(() => {
-            const currentPos = bot.entity.position;
-            const dist = lastPos.distanceTo(currentPos);
-            if (dist < 0.5) {
-                stuckStrikes++;
-                if (stuckStrikes >= 2) {
-                    finish(new Error("stuck"));
-                }
-            } else {
-                stuckStrikes = 0;
-                lastPos = currentPos.clone();
-            }
-        }, stuckTimeoutMs);
-
-        listeners.set("goal_reached", onGoalReached);
-        listeners.set("path_update", onPathUpdate);
-
-        signal.addEventListener("abort", onAbort, { once: true });
-        bot.once("goal_reached", onGoalReached);
-        bot.on("path_update", onPathUpdate);
-
-        const timer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
-
-        try {
-            bot.pathfinder.setGoal(goal, dynamic);
-        } catch (err) {
-            clearTimeout(timer);
-            finish(err instanceof Error ? err : new Error(String(err)));
-        }
-    });
-}
-
-export function findNearestBlockByName(bot: Bot, blockName: string): any {
-    return bot.findBlock({
-        maxDistance: 32,
-        matching: (block: any) => block?.name === blockName,
-    });
-}
-
-export async function makeRoomInInventory(
-    bot: any,
-    slotsNeeded: number = 1,
-): Promise<void> {
-    if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
-
-    const inventory = bot.inventory.items();
-
-    // Pre-filter the inventory to only sort and process trash items
-    const trashItems = inventory.filter((i: any) => TRASH_ITEMS.has(i.name));
-    trashItems.sort((a: any, b: any) => a.count - b.count);
-
-    let slotsFreed = 0;
-    for (const item of trashItems) {
-        if (slotsFreed >= slotsNeeded) break;
-        try {
-            await bot.tossStack(item);
-            slotsFreed++;
-        } catch (err) {
-            // Ignore failure, try next item
-        }
-    }
-}
-
-export async function placePortableUtility(
-    bot: any,
-    blockName: string,
-): Promise<any> {
-    const item = bot.inventory.items().find((i: any) => i.name === blockName);
-    if (!item) return null;
-
-    await bot.equip(item, "hand");
-    const pos = bot.entity.position.floored();
-
-    const candidates = [
-        bot.blockAt(pos.offset(1, -1, 0)),
-        bot.blockAt(pos.offset(-1, -1, 0)),
-        bot.blockAt(pos.offset(0, -1, 1)),
-        bot.blockAt(pos.offset(0, -1, -1)),
-    ];
-
-    for (const refBlock of candidates) {
-        if (refBlock && refBlock.name !== "air" && refBlock.name !== "water") {
-            try {
-                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                return findNearestBlockByName(bot, blockName);
-            } catch (err) {
-                // Ignore placement failure
-            }
-        }
-    }
-    return null;
-}
-
-</file>
-
-<file path="js\lib\utils\errors.ts">
-export function getErrorMessage(error: unknown): string {
-    if (error instanceof Error) return error.message;
-    return String(error);
-}
-
-</file>
-
-<file path="js\lib\utils\perception.ts">
-import type { Bot } from "mineflayer";
-import { Vec3 } from "vec3";
-import * as models from "../models.js";
-
-function getDirectionLabel(
-    lookDir: Vec3,
-    targetDir: Vec3,
-    dot: number,
-): string {
-    if (dot > 0.8) return "center";
-    if (dot < -0.2) return "behind";
-
-    const crossY = lookDir.z * targetDir.x - lookDir.x * targetDir.z;
-    return crossY > 0 ? "left" : "right";
-}
-
-let lastPOIUpdate = 0;
-let cachedPOIs: any[] = [];
-
-export function getPOIs(bot: Bot, radius: number = 32): any[] {
-    const now = Date.now();
-    if (now - lastPOIUpdate < 1000) return cachedPOIs;
-
-    const pois: any[] = [];
-    if (!bot.entity) return pois;
-
-    const pos = bot.entity.position;
-    const yaw = bot.entity.yaw;
-    const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
-
-    for (const id in bot.entities) {
-        const e = bot.entities[id];
-        if (!e || e === bot.entity || !e.isValid) continue;
-
-        const dist = pos.distanceTo(e.position);
-        if (dist > radius) continue;
-
-        const dx = e.position.x - pos.x;
-        const dz = e.position.z - pos.z;
-        const dirToEntity = new Vec3(dx, 0, dz).normalize();
-
-        const visibility = parseFloat(lookDir.dot(dirToEntity).toFixed(2));
-        const direction = getDirectionLabel(lookDir, dirToEntity, visibility);
-
-        let type = "entity";
-        if (e.type === "hostile") type = "threat";
-        else if (e.type === "object" || e.type === "orb") type = "resource";
-
-        const baseScore = 100 / Math.max(dist, 1);
-        const scoreMultiplier =
-            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
-        const score = Math.round(baseScore * scoreMultiplier);
-
-        pois.push({
-            type,
-            name: e.name || "unknown",
-            position: {
-                x: Math.round(e.position.x),
-                y: Math.round(e.position.y),
-                z: Math.round(e.position.z),
-            },
-            distance: parseFloat(dist.toFixed(1)),
-            visibility,
-            score,
-            direction,
-        });
-    }
-
-    const blocks = bot.findBlocks({
-        matching: (b) => {
-            if (!b) return false;
-            return (
-                b.name.endsWith("_log") ||
-                b.name.includes("ore") ||
-                b.name === "stone" ||
-                b.name === "crafting_table" ||
-                b.name.includes("bed") ||
-                b.name === "water" ||
-                b.name === "lava"
-            );
-        },
-        maxDistance: radius,
-        count: 24,
-    });
-
-    for (const bPos of blocks) {
-        const block = bot.blockAt(bPos);
-        if (!block) continue;
-
-        const dist = pos.distanceTo(bPos);
-        const dx = bPos.x - pos.x;
-        const dz = bPos.z - pos.z;
-        const dirToBlock = new Vec3(dx, 0, dz).normalize();
-
-        const visibility = parseFloat(lookDir.dot(dirToBlock).toFixed(2));
-        const direction = getDirectionLabel(lookDir, dirToBlock, visibility);
-
-        const baseScore = 100 / Math.max(dist, 1);
-        const scoreMultiplier =
-            visibility > 0.5 ? 1.5 : visibility < 0 ? 0.5 : 1.0;
-        const score = Math.round(baseScore * scoreMultiplier);
-
-        pois.push({
-            type: "resource",
-            name: block.name,
-            position: { x: bPos.x, y: bPos.y, z: bPos.z },
-            distance: parseFloat(dist.toFixed(1)),
-            visibility,
-            score,
-            direction,
-        });
-    }
-
-    pois.sort((a, b) => b.score - a.score);
-
-    const seenCounts: Record<string, number> = {};
-    const diversePOIs: any[] = [];
-
-    for (const poi of pois) {
-        seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
-        if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
-            continue;
-        }
-
-        diversePOIs.push(poi);
-        if (diversePOIs.length >= 15) break;
-    }
-
-    lastPOIUpdate = now;
-    cachedPOIs = diversePOIs;
-    return diversePOIs;
-}
-
-</file>
-
-<file path="js\lib\utils\threats.ts">
-// js/lib/utils/threats.ts
-import { type Bot } from "mineflayer";
-import * as config from "../config.js";
-import * as models from "../models.js";
-
-const HOSTILE_MOBS = new Set([
-    "zombie",
-    "zombie_villager",
-    "husk",
-    "drowned",
-    "skeleton",
-    "stray",
-    "wither_skeleton",
-    "creeper",
-    "spider",
-    "cave_spider",
-    "slime",
-    "magma_cube",
-    "phantom",
-    "blaze",
-    "ghast",
-    "enderman",
-    "silverfish",
-    "witch",
-    "ravager",
-    "pillager",
-    "evoker",
-    "vindicator",
-    "warden",
-]);
-
-export function getThreats(bot: Bot): models.ThreatInfo[] {
-    const threats: models.ThreatInfo[] = [];
-    const botPos = bot.entity.position;
-
-    for (const id in bot.entities) {
-        const e = bot.entities[id];
-        if (!e || !e.isValid || e === bot.entity) continue;
-
-        if (
-            (e.type !== "mob" && e.type !== "hostile") ||
-            !HOSTILE_MOBS.has(e.name!)
-        )
-            continue;
-
-        // Apply a heavy vertical discount to prevent panicking over mobs in caves
-        // when the bot is safely on the surface (and vice versa).
-        const dy = Math.abs(botPos.y - e.position.y);
-        const dx = botPos.x - e.position.x;
-        const dz = botPos.z - e.position.z;
-
-        const horizontalDist = Math.sqrt(dx * dx + dz * dz);
-        let effectiveDistance = horizontalDist;
-
-        if (dy > 3) {
-            effectiveDistance += dy * 2.5;
-        }
-
-        if (effectiveDistance > 16) continue;
-
-        const baseThreat =
-            config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
-
-        const threatScore = baseThreat * (10 / Math.max(effectiveDistance, 1));
-
-        threats.push({
-            id: e.id,
-            name: e.name || "unknown",
-            distance: parseFloat(effectiveDistance.toFixed(1)),
-            threatScore: Math.round(threatScore),
-            position: { x: e.position.x, y: e.position.y, z: e.position.z },
-            entity: e,
-        });
-    }
-
-    return threats.sort((a, b) => b.threatScore! - a.threatScore!);
-}
-
-export function computeSafeRetreat(
-    bot: Bot,
-    threats: models.ThreatInfo[],
-    distance: number = 20,
-) {
-    let cx = 0,
-        cz = 0,
-        totalWeight = 0;
-
-    for (const threat of threats) {
-        cx += threat.position.x * threat.threatScore!;
-        cz += threat.position.z * threat.threatScore!;
-        totalWeight += threat.threatScore!;
-    }
-
-    let baseAngle = 0;
-    const botPos = bot.entity.position.floored();
-
-    if (totalWeight === 0) {
-        baseAngle = Math.random() * Math.PI * 2;
-    } else {
-        cx /= totalWeight;
-        cz /= totalWeight;
-        baseAngle = Math.atan2(botPos.z - cz, botPos.x - cx);
-    }
-
-    // Fan out and test candidate angles to avoid cliffs and water
-    const testAngles = [
-        baseAngle,
-        baseAngle + Math.PI / 6, // 30 deg
-        baseAngle - Math.PI / 6,
-        baseAngle + Math.PI / 3, // 60 deg
-        baseAngle - Math.PI / 3,
-        baseAngle + Math.PI / 2, // 90 deg
-        baseAngle - Math.PI / 2,
-    ];
-
-    for (const angle of testAngles) {
-        const tx = botPos.x + Math.cos(angle) * distance;
-        const tz = botPos.z + Math.sin(angle) * distance;
-
-        let isSafe = false;
-
-        // Check for solid ground from slightly above to slightly below current elevation
-        for (let yOffset = 2; yOffset >= -5; yOffset--) {
-            const block = bot.blockAt(
-                botPos.offset(
-                    Math.cos(angle) * distance,
-                    yOffset,
-                    Math.sin(angle) * distance,
-                ),
-            );
-
-            if (block && (block.name === "water" || block.name === "lava")) {
-                // Liquid hazard detected before solid ground, abort this angle
-                break;
-            }
-
-            if (block && block.boundingBox === "block") {
-                // Found a solid block. Ensure the block above it is air so we don't path into a wall
-                const above = bot.blockAt(
-                    botPos.offset(
-                        Math.cos(angle) * distance,
-                        yOffset + 1,
-                        Math.sin(angle) * distance,
-                    ),
-                );
-                if (
-                    above &&
-                    (above.name === "air" || above.name === "cave_air")
-                ) {
-                    isSafe = true;
-                    break;
-                }
-            }
-        }
-
-        if (isSafe) {
-            return { x: tx, z: tz };
-        }
-    }
-
-    // Fallback: If all angles look like hazards, just return the exact opposite vector and let pathfinder try to sort it out
-    return {
-        x: botPos.x + Math.cos(baseAngle) * distance,
-        z: botPos.z + Math.sin(baseAngle) * distance,
-    };
-}
-
-</file>
-
 
 
 ```json
 {
-  "total_bytes": 132111,
-  "file_count": 26,
-  "estimated_tokens": 33560,
+  "total_bytes": 79456,
+  "file_count": 14,
+  "estimated_tokens": 20194,
   "mode": "full",
-  "generated_at": "2026-03-30T11:15:22.6990789-07:00"
+  "generated_at": "2026-03-30T11:37:20.7775791-07:00"
 }
 ```

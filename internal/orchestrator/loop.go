@@ -21,6 +21,11 @@ import (
 	"david22573/synaptic-mc/internal/voyager"
 )
 
+const (
+	SnapshotEventInterval = 500
+	DefaultTickRate       = 50 * time.Millisecond
+)
+
 type Orchestrator struct {
 	sessionID string
 	store     domain.EventStore
@@ -37,6 +42,9 @@ type Orchestrator struct {
 	planTracker *PlanTracker
 	logger      *slog.Logger
 
+	baseCtx context.Context
+	cancel  context.CancelFunc
+
 	stateBuffer atomic.Pointer[domain.VersionedState]
 	ticker      *time.Ticker
 	eventCh     chan domain.DomainEvent
@@ -44,8 +52,10 @@ type Orchestrator struct {
 	mu              sync.RWMutex
 	currentSnapshot domain.EvaluationSnapshot
 	taskHistory     []domain.TaskHistory
-	activeIntent    *domain.ActionIntent
-	beforeState     domain.GameState
+
+	// Safely scoped pointers to avoid race conditions during read/write
+	activeIntent atomic.Pointer[domain.ActionIntent]
+	beforeState  atomic.Pointer[domain.GameState]
 
 	reflexLock   bool
 	evalCancel   context.CancelFunc
@@ -103,8 +113,11 @@ func New(
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("Starting orchestrator lifecycle")
 
-	tickRate := 50 * time.Millisecond
-	o.ticker = time.NewTicker(tickRate)
+	o.mu.Lock()
+	o.baseCtx, o.cancel = context.WithCancel(ctx)
+	o.mu.Unlock()
+
+	o.ticker = time.NewTicker(DefaultTickRate)
 	defer o.ticker.Stop()
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -115,7 +128,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	})
 
 	g.Go(func() error {
-		return o.processStateLoop(gCtx, tickRate)
+		return o.processStateLoop(gCtx, DefaultTickRate)
 	})
 
 	g.Go(func() error {
@@ -166,7 +179,10 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 
 func (o *Orchestrator) handleQueueDrain() {
 	if !o.planTracker.HasActivePlan() {
-		_ = o.evaluateNextTask(context.Background())
+		// Use the orchestrator's base context to prevent detached goroutine evaluation leaks
+		if o.baseCtx != nil {
+			_ = o.evaluateNextTask(o.baseCtx)
+		}
 	}
 }
 
@@ -256,7 +272,7 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 
 			o.handleDomainEvent(ctx, ev)
 
-			if count := o.eventCount.Add(1); count%500 == 0 {
+			if count := o.eventCount.Add(1); count%SnapshotEventInterval == 0 {
 				go o.takeSnapshot(context.Background())
 			}
 		}
@@ -291,7 +307,7 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 
 	go func() {
 		defer o.evalInFlight.Store(false)
-		defer cancel()
+		defer cancel() // Explicitly chains cancellation to prevent leaking after ProposeTask
 
 		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
 		if err != nil {
@@ -307,10 +323,8 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 
 		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
 
-		o.mu.Lock()
-		o.activeIntent = intent
-		o.beforeState = state
-		o.mu.Unlock()
+		o.activeIntent.Store(intent)
+		o.beforeState.Store(&state)
 
 		trace := domain.TraceContext{
 			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
@@ -381,6 +395,17 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		observability.Metrics.TaskInterruption.Inc()
 
 	case domain.EventTypePanic:
+		// Enhanced recovery logging mechanism captures the TS stack trace correctly
+		var payload struct {
+			Error string `json:"error"`
+			Stack string `json:"stack"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
+			o.logger.Error("TS Handler Panic", slog.String("error", payload.Error), slog.String("stack", payload.Stack))
+		} else {
+			o.logger.Error("TS Handler Panic (unknown payload structure)", slog.String("raw", string(ev.Payload)))
+		}
+
 		_ = tm.Halt(ctx, "panic_triggered")
 		o.planTracker.ClearPlan(ctx, "panic_triggered")
 		o.mu.Lock()
@@ -415,14 +440,17 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 			o.engine.OnTaskEnd(payload.CommandID, success)
 			o.planTracker.OnTaskComplete(ctx, payload.CommandID, success)
 
+			intent := o.activeIntent.Load()
+			beforePtr := o.beforeState.Load()
+
 			o.mu.Lock()
-			intent := o.activeIntent
-			before := o.beforeState
 			after := o.currentSnapshot.State.State
 
-			if intent != nil && intent.ID == payload.CommandID {
-				o.activeIntent = nil
-				successCritic, critique := o.critic.Evaluate(*intent, before, after)
+			if intent != nil && beforePtr != nil && intent.ID == payload.CommandID {
+				o.activeIntent.Store(nil)
+				o.beforeState.Store(nil)
+
+				successCritic, critique := o.critic.Evaluate(*intent, *beforePtr, after)
 				if !success {
 					successCritic = false
 					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
