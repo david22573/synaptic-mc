@@ -1,5 +1,5 @@
 import type { Bot } from "mineflayer";
-import type { ControlPlaneClient } from "../network/client.js";
+import type { SynapticClient } from "../network/client.js";
 import { log } from "../logger.js";
 import { getThreats, computeSafeRetreat } from "../utils/threats.js";
 import pkg from "mineflayer-pathfinder";
@@ -14,10 +14,9 @@ export interface SurvivalConfig {
 
 export class SurvivalSystem {
     public bot: Bot;
-    private client: ControlPlaneClient;
+    private client: SynapticClient;
     private config: SurvivalConfig;
 
-    // 1.4 FIX: Replaced checkInterval with a boolean state flag
     private running = false;
     private isPanicking = false;
     private lastDangerAt = 0;
@@ -25,7 +24,7 @@ export class SurvivalSystem {
     private diggingEscape = false;
     private pillaringOut = false;
 
-    constructor(bot: Bot, client: ControlPlaneClient, config: SurvivalConfig) {
+    constructor(bot: Bot, client: SynapticClient, config: SurvivalConfig) {
         this.bot = bot;
         this.client = client;
         this.config = config;
@@ -35,7 +34,6 @@ export class SurvivalSystem {
         if (this.running) return;
         this.running = true;
 
-        // 1.4 FIX: Self-rescheduling async loop guarantees no overlapping executions
         const tick = async () => {
             if (!this.running) return;
 
@@ -363,11 +361,9 @@ export class SurvivalSystem {
 
             const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
             if (refBlock && refBlock.name !== "air") {
-                // Look down accurately at the top center of the block
                 await this.bot.lookAt(pos.offset(0.5, 0, 0.5), true);
                 this.bot.setControlState("jump", true);
 
-                // Active polling to ensure physical bounding box clears the block space
                 const startY = this.bot.entity.position.y;
 
                 for (let k = 0; k < 20; k++) {
@@ -389,7 +385,6 @@ export class SurvivalSystem {
                 this.bot.setControlState("jump", false);
                 await new Promise((resolve) => setTimeout(resolve, 200));
             } else {
-                // Wait out falls if reference block is missing
                 await new Promise((resolve) => setTimeout(resolve, 200));
             }
         }

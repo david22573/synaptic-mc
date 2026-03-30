@@ -76,12 +76,7 @@ class EngageState implements FSMState {
                             await bot.waitForTicks(2); // Wait for server to register shield down
                         }
 
-                        // Execute jump crit if on the ground
-                        if (bot.entity.onGround) {
-                            bot.setControlState("jump", true);
-                            await bot.waitForTicks(3);
-                            bot.setControlState("jump", false);
-                        }
+                        // FIX: Removed manual setControlState("jump", true) to prevent fighting pathfinder
 
                         bot.attack(target);
                         sCtx.lastAttackTime = Date.now();

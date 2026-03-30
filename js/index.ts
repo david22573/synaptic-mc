@@ -7,7 +7,7 @@ import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
 import { runTask } from "./lib/tasks/task.js";
-import { ControlPlaneClient } from "./lib/network/client.js";
+import { SynapticClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 import { getPOIs } from "./lib/utils/perception.js";
@@ -74,7 +74,7 @@ process.on("unhandledRejection", (reason: any) => {
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
-let client: ControlPlaneClient;
+let client: SynapticClient;
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
@@ -90,6 +90,12 @@ let lastVelocity = { x: 0, y: 0, z: 0 };
 
 function stopMovement() {
     if (!bot) return;
+    try {
+        bot.clearControlStates();
+        if (bot.pathfinder) {
+            bot.pathfinder.setGoal(null);
+        }
+    } catch (e) {}
 }
 
 function completeTask(
@@ -114,6 +120,7 @@ function completeTask(
 function abortActiveTask(reason: string) {
     if (currentTask && taskAbortController) {
         taskAbortController.abort(reason);
+        stopMovement();
         completeTask(currentTask, "task_aborted", reason);
         currentTask = null;
         taskAbortController = null;
@@ -204,7 +211,6 @@ async function executeIntent(intent: models.ActionIntent) {
         trace: intent.trace || { trace_id: "unknown", action_id: intent.id },
     };
 
-    // NEW: Notify Go Engine that the task has physically begun
     client.sendEvent(
         "task_start",
         `${intent.action} ${intent.target?.name || "none"}`,
@@ -277,6 +283,7 @@ async function executeIntent(intent: models.ActionIntent) {
             new Promise((_, r) => {
                 timeoutId = setTimeout(() => {
                     localController.abort("timeout");
+                    stopMovement();
                     r(new Error("timeout"));
                 }, timeoutMs);
             }),
@@ -404,14 +411,11 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(collectBlock);
 
     if (!client) {
-        client = new ControlPlaneClient(runtimeConfig.ws_url, {
-            onCommand: (i) => void executeIntent(i),
-            onUnlock: () => abortActiveTask("unlock"),
-        });
+        client = new SynapticClient({ url: runtimeConfig.ws_url });
+        client.on("dispatch", (i) => void executeIntent(i));
+        client.on("abort", () => abortActiveTask("unlock"));
         client.connect();
 
-        // Immediately push a zero-state to prevent the Go TS_Supervisor from killing us
-        // while Mineflayer takes >15s to resolve DNS, login, and spawn.
         client.sendState({
             health: 0,
             food: 0,
@@ -492,7 +496,7 @@ async function connectWithRetry(maxAttempts = 10) {
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
 
-        if (!client.isConnected()) client.connect();
+        client.connect(); // Safe to call repeatedly, handles its own state check
         survival.start();
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
@@ -594,11 +598,8 @@ process.on("SIGINT", () => {
     isShuttingDown = true;
     abortActiveTask("shutdown");
     if (bot) bot.quit();
-    if (client?.isConnected()) {
-        setTimeout(() => process.exit(0), 1000);
-    } else {
-        process.exit(0);
-    }
+    client?.disconnect();
+    setTimeout(() => process.exit(0), 1000);
 });
 
 bootstrap().catch((err) => {

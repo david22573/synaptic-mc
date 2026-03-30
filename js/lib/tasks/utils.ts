@@ -214,7 +214,7 @@ export function moveToGoal(
             cleanup();
 
             try {
-                bot.clearControlStates();
+                // FIX: Force physical halt via stopMovement so goal actually clears
                 stopMovement();
             } catch (_err) {}
 
