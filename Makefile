@@ -1,4 +1,4 @@
-.PHONY: help install run-server run-bot dev clean test-replay
+.PHONY: help install run-server run-bot dev clean test-replay build run-prod
 
 # Default target
 .DEFAULT_GOAL := help
@@ -11,6 +11,16 @@ install: ## Install Go and JS dependencies
 	cd js && npm install
 	@echo "==> Tidying Go modules..."
 	go mod tidy
+
+build: ## Compile Go binary and TypeScript bot for optimal performance
+	@echo "==> Compiling TypeScript bot..."
+	cd js && npx tsc
+	@echo "==> Building Go control plane..."
+	go build -ldflags="-s -w" -o bin/synaptic-server ./cmd/server
+
+run-prod: ## Run the optimized compiled binaries
+	@echo "==> Starting production server..."
+	./bin/synaptic-server -bot-script="js/dist/index.js"
 
 run-server: ## Run the Go control plane directly
 	@echo "==> Starting Go WebSocket Server..."
@@ -34,4 +44,6 @@ test-replay: ## Run the Replay Test Harness
 clean: ## Clean up Go cache and Node modules
 	@echo "==> Cleaning up environment..."
 	rm -rf js/node_modules
+	rm -rf js/dist
+	rm -rf bin
 	go clean

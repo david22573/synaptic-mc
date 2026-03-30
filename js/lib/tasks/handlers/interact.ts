@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/interact.ts
 import { type TaskContext } from "../registry.js";
 import { findNearestEntity } from "../primitives.js";
 import { findNearestBlockByName, moveToGoal } from "../utils.js";
@@ -7,8 +6,8 @@ import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
 
 export async function handleInteract(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, stopMovement, timeouts } = ctx;
-    const targetName = decision.target?.name;
+    const { bot, intent, signal, stopMovement, timeouts } = ctx;
+    const targetName = intent.target?.name;
 
     if (!targetName || targetName === "none") {
         throw new Error("missing interact target");
@@ -31,7 +30,6 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
                 stopMovement,
             },
         );
-
         if (
             targetName.includes("boat") ||
             targetName.includes("minecart") ||
