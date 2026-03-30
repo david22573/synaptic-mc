@@ -22,14 +22,11 @@ func NewIntelligencePolicy(store domain.EventStore, sessionID string) *Intellige
 }
 
 func (p *IntelligencePolicy) Decide(ctx context.Context, input DecisionInput) Decision {
-	// Grab the event stream to build projections.
-	// In a heavily loaded system, this would be periodically cached rather than computed per-tick.
-	events, err := p.store.GetStream(ctx, p.sessionID)
+	// Directly load the projected snapshot + delta instead of replaying everything.
+	stats, _, err := learning.GetProjectedStats(ctx, p.store, p.sessionID)
 	if err != nil {
 		return Decision{IsApproved: true} // Fail open if event store is unreachable
 	}
-
-	stats := learning.CalculateActionStats(events)
 
 	for _, task := range input.Plan.Tasks {
 		stat, exists := stats[task.Action]

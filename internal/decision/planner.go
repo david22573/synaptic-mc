@@ -47,39 +47,37 @@ func NewAdvancedPlanner(
 
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 CRITICAL GAME MECHANIC RULES:
-1. Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
-2. You CANNOT gather stone or coal without a wooden_pickaxe.
-3. Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per candidate.
-4. SURVIVAL: You CANNOT 'eat' if your inventory has no food.
-   You CANNOT 'hunt' if health is under 12.
-5. CRAFTING RECIPES:
-   - oak_planks: requires 1 oak_log (yields 4)
-   - stick: requires 2 oak_planks (yields 4)
-   - crafting_table: requires 4 oak_planks
-   - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
-   - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
-6. If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
 
-VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
-VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
-
-OUTPUT REQUIREMENT (ADVANCED PLANNING):
-You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective. 
-Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
-
-Response format (JSON only):
-{
-  "objective": "Sub-goal description",
-  "candidates": [
+1.  Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
+2.  You CANNOT gather stone or coal without a wooden_pickaxe.
+3.  Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per candidate.
+4.  SURVIVAL: You CANNOT 'eat' if your inventory has no food.
+    You CANNOT 'hunt' if health is under 12.
+5.  CRAFTING RECIPES:
+      - oak_planks: requires 1 oak_log (yields 4)
+      - stick: requires 2 oak_planks (yields 4)
+      - crafting_table: requires 4 oak_planks
+      - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
+      - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
+6.  If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
+    VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
+    VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
+    OUTPUT REQUIREMENT (ADVANCED PLANNING):
+    You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective.
+    Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
+    Response format (JSON only):
+    {
+    "objective": "Sub-goal description",
+    "candidates": [
     [
-      { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Directly gather wood" }
+    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Directly gather wood" }
     ],
     [
-      { "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
-      { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood safely" }
+    { "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
+    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood safely" }
     ]
-  ]
-}`
+    ]
+    }`
 
 func formatStateForLLM(state domain.GameState) string {
 	type compactPOI struct {
@@ -195,9 +193,9 @@ func (p *AdvancedPlanner) Generate(ctx context.Context, sessionID string, state 
 		return nil, fmt.Errorf("planner returned zero candidates")
 	}
 
-	// Calculate historical action stats for scoring
+	// Fix: Provide nil for existing stats to generate a fresh projection
 	events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
-	stats := learning.CalculateActionStats(events)
+	stats := learning.CalculateActionStats(nil, events)
 
 	bestIdx := 0
 	highestScore := math.Inf(-1)
@@ -222,25 +220,20 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 	score := 100.0
 
 	for _, t := range tasks {
-		// 1. Cost Penalty (longer plans are riskier)
 		score -= 5.0
 
-		// 2. Immediate Risk Penalty
 		if t.Action == "hunt" {
 			score -= 20.0
 		}
 		if t.Action == "mine" {
-			score -= 10.0 // potential lava/mobs
+			score -= 10.0
 		}
 
-		// 3. Historical Probability Modifier
 		if stat, ok := stats[t.Action]; ok && stat.Attempts > 0 {
-			// Boost score if historically highly successful, heavily penalize if mostly failing
 			probability := stat.SuccessRate
 			score += (probability * 30.0)
 			score -= ((1.0 - probability) * 40.0)
 		} else {
-			// Neutral bump for untried actions to encourage exploration
 			score += 5.0
 		}
 	}

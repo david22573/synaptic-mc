@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +13,7 @@ import (
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/voyager"
@@ -45,6 +45,7 @@ type Orchestrator struct {
 
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
+	eventCount   atomic.Int64
 }
 
 func New(
@@ -118,11 +119,9 @@ func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) 
 		case <-o.stateCh:
 		default:
 		}
-
 		select {
 		case o.stateCh <- vState:
 		default:
-			o.logger.Warn("State channel completely backed up, dropping tick")
 		}
 	}
 }
@@ -155,6 +154,35 @@ func (o *Orchestrator) handleQueueDrain() {
 	_ = o.evaluateNextTask(context.Background())
 }
 
+func (o *Orchestrator) takeSnapshot(ctx context.Context) {
+	stats, lastID, err := learning.GetProjectedStats(ctx, o.store, o.sessionID)
+	if err != nil || lastID == 0 {
+		return
+	}
+
+	data, err := json.Marshal(stats)
+	if err != nil {
+		o.logger.Error("Failed to marshal snapshot data", slog.Any("error", err))
+		return
+	}
+
+	if s, ok := o.store.(interface {
+		SaveSnapshot(context.Context, domain.SessionSnapshot) error
+	}); ok {
+		err = s.SaveSnapshot(ctx, domain.SessionSnapshot{
+			SessionID:   o.sessionID,
+			LastEventID: lastID,
+			Data:        data,
+		})
+
+		if err != nil {
+			o.logger.Error("Failed to persist background snapshot", slog.Any("error", err))
+		} else {
+			o.logger.Info("CQRS read-model snapshot saved", slog.Int64("last_event_id", lastID))
+		}
+	}
+}
+
 func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 	for {
 		select {
@@ -167,10 +195,6 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 
 			if o.uiHub != nil {
 				o.uiHub.Broadcast("state_update", vState.State)
-			}
-
-			if err := o.evaluateNextTask(ctx); err != nil {
-				o.logger.Error("Failed to evaluate state", slog.Any("error", err))
 			}
 		}
 	}
@@ -192,13 +216,12 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 			}
 
 			o.handleDomainEvent(ctx, ev)
+
+			if count := o.eventCount.Add(1); count%500 == 0 {
+				go o.takeSnapshot(context.Background())
+			}
 		}
 	}
-}
-
-func marshalJSON(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
 }
 
 func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
@@ -217,6 +240,8 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	if o.evalCancel != nil {
 		o.evalCancel()
 	}
+
+	// Fix: Now actually uses the parent context passed in the arguments
 	evalCtx, cancel := context.WithCancel(ctx)
 	o.evalCancel = cancel
 	o.mu.Unlock()
@@ -226,7 +251,9 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 
 		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
 		if err != nil {
-			o.logger.Error("Curriculum failed to propose task", slog.Any("error", err))
+			if evalCtx.Err() == nil {
+				o.logger.Error("Curriculum failed to propose task", slog.Any("error", err))
+			}
 			return
 		}
 
@@ -234,23 +261,16 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			return
 		}
 
-		if intent.ID == "" {
-			intent.ID = fmt.Sprintf("int-%d", time.Now().UnixNano())
-		}
+		o.mu.Lock()
+		o.activeIntent = intent
+		o.beforeState = state
+		o.mu.Unlock()
 
 		trace := domain.TraceContext{
 			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
 			ActionID: intent.ID,
 		}
 
-		o.mu.Lock()
-		o.activeIntent = intent
-		o.beforeState = state
-		o.mu.Unlock()
-
-		o.logger.Info("New Intent Proposed", slog.String("action", intent.Action), slog.String("target", intent.Target))
-
-		// Map ActionIntent to domain.Action for the TS bridge TaskManager execution constraints
 		action := domain.Action{
 			ID:        intent.ID,
 			Trace:     trace,
@@ -264,7 +284,7 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			SessionID: o.sessionID,
 			Trace:     trace,
 			Type:      domain.EventTypePlanCreated,
-			Payload:   marshalJSON(intent),
+			Payload:   o.marshalJSON(intent),
 		})
 
 		if o.uiHub != nil {
@@ -288,41 +308,28 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 	switch ev.Type {
 	case domain.EventBotDeath:
-		o.logger.Warn("Bot death detected, aborting active intents")
 		_ = tm.Halt(ctx, "bot_died")
-
-		o.mu.RLock()
-		pos := o.currentSnapshot.State.State.Position
-		o.mu.RUnlock()
-
-		if o.memory != nil {
-			_ = o.memory.MarkWorldNode(ctx, "death_site", "hazard", pos)
-		}
-
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
 
 	case domain.EventTypePanic:
-		o.logger.Warn("Bot panicked, halting execution and locking curriculum")
 		_ = tm.Halt(ctx, "panic_triggered")
-
 		o.mu.Lock()
 		o.reflexLock = true
 		o.mu.Unlock()
 
 	case domain.EventTypePanicResolved:
-		o.logger.Info("Bot survival reflex resolved, unlocking curriculum")
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
+		o.handleQueueDrain()
 
 	case domain.EventTypeTaskEnd:
 		var payload struct {
 			Status    string `json:"status"`
 			CommandID string `json:"command_id"`
 			Cause     string `json:"cause"`
-			Action    string `json:"action"`
 		}
 
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
@@ -335,17 +342,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 			if intent != nil && intent.ID == payload.CommandID {
 				success, critique := o.critic.Evaluate(*intent, before, after)
-
-				// Natively verify TS-level failures
 				if payload.Status != "COMPLETED" {
 					success = false
-					critique = fmt.Sprintf("TS Execution Failed: %s. Critic note: %s", payload.Cause, critique)
+					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
 				}
-
-				o.logger.Info("Critic Evaluation",
-					slog.Bool("success", success),
-					slog.String("critique", critique),
-				)
 
 				o.mu.Lock()
 				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
@@ -354,22 +354,14 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 					Critique: critique,
 				})
 				o.mu.Unlock()
-
-				if success && o.memory != nil {
-					parts := strings.SplitN(payload.Action, " ", 2)
-					if len(parts) == 2 {
-						actionType := parts[0]
-						if actionType == "gather" || actionType == "mine" {
-							_ = o.memory.MarkWorldNode(ctx, intent.Target, "resource", after.Position)
-						}
-					}
-				}
 			}
 
 			_ = tm.Complete(ctx, payload.CommandID, payload.Status == "COMPLETED")
-
-			// Immediately trigger the curriculum for the next move
-			go o.evaluateNextTask(context.Background())
 		}
 	}
+}
+
+func (o *Orchestrator) marshalJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }

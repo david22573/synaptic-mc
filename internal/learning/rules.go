@@ -10,24 +10,21 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// PolicyExtractor scans the EventStore for repeated failures and synthesizes hard constraints.
 type PolicyExtractor struct {
 	store      domain.EventStore
 	logger     *slog.Logger
-	windowSize int // 3.2 FIX: Added sliding window size
+	windowSize int
 }
 
 func NewPolicyExtractor(store domain.EventStore, logger *slog.Logger) *PolicyExtractor {
 	return &PolicyExtractor{
 		store:      store,
 		logger:     logger.With(slog.String("component", "policy_extractor")),
-		windowSize: 200, // Look back at the last 200 events
+		windowSize: 200,
 	}
 }
 
-// GenerateRules replays the session history to identify persistent failure loops.
 func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) string {
-	// 3.2 FIX: Use GetRecentStream to prevent early-game failures from permanently constraining late-game behavior
 	events, err := p.store.GetRecentStream(ctx, sessionID, p.windowSize)
 	if err != nil {
 		p.logger.Warn("Failed to extract rules from stream", slog.Any("error", err))
@@ -45,11 +42,13 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 				Cause  string `json:"cause"`
 			}
 			if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-				if payload.Status == "FAILED" || payload.Status == "ABORTED" {
+				// Fix: using a tagged switch
+				switch payload.Status {
+				case "FAILED", "ABORTED":
 					failures[payload.Action]++
 					causes[payload.Action] = payload.Cause
-				} else if payload.Status == "COMPLETED" {
-					failures[payload.Action] = 0 // Reset on success
+				case "COMPLETED":
+					failures[payload.Action] = 0
 				}
 			}
 		}

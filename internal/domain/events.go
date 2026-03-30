@@ -39,10 +39,21 @@ type DomainEvent struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+// SessionSnapshot holds pre-computed projections to prevent heavy event replays.
+type SessionSnapshot struct {
+	SessionID   string          `json:"session_id"`
+	LastEventID int64           `json:"last_event_id"`
+	Data        json.RawMessage `json:"data"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
 // EventStore is the absolute source of truth.
 type EventStore interface {
 	Append(ctx context.Context, sessionID string, trace TraceContext, eventType EventType, payload any) error
 	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)
 	GetRecentStream(ctx context.Context, sessionID string, limit int) ([]DomainEvent, error)
+	GetStreamSince(ctx context.Context, sessionID string, sinceID int64) ([]DomainEvent, error)
+	SaveSnapshot(ctx context.Context, snap SessionSnapshot) error
+	GetLatestSnapshot(ctx context.Context, sessionID string) (*SessionSnapshot, error)
 	Close() error
 }

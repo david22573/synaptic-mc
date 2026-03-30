@@ -19,6 +19,7 @@ const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err.stack || err);
     const name = String(err.name || "");
+
     return (
         name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
@@ -85,6 +86,9 @@ let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 
+// Global cache for discovered chests
+const knownChests: Record<string, { name: string; count: number }[]> = {};
+
 function stopMovement() {
     if (!bot) return;
     bot.clearControlStates();
@@ -100,7 +104,6 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-
     if (currentTask?.id === task.id) currentTask = null;
 
     client.sendEvent(
@@ -123,11 +126,13 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
+
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
         (msg.includes("failed_to_reach") && !msg.includes("furnace")) ||
-        msg.includes("pathfinder_timeout")
+        msg.includes("pathfinder_timeout") ||
+        msg.includes("collect_failed")
     )
         return "PATH_FAILED";
 
@@ -143,7 +148,8 @@ function normalizeFailureCause(err: any): string {
     if (
         msg.includes("no_entity") ||
         msg.includes("missing_entity") ||
-        msg.includes("target_lost")
+        msg.includes("target_lost") ||
+        msg.includes("no_interactable_found")
     )
         return "NO_ENTITY";
 
@@ -152,15 +158,18 @@ function normalizeFailureCause(err: any): string {
 
     if (
         msg.includes("no_furnace_available") ||
-        msg.includes("failed_to_reach_furnace")
+        msg.includes("failed_to_reach_furnace") ||
+        msg.includes("no_chest")
     )
-        return "NO_FURNACE";
+        return "NO_FURNACE"; // Generic missing block error
 
     if (msg.includes("no_mature_")) return "NO_MATURE_CROP";
 
     if (
         msg.includes("missing_ingredients") ||
-        msg.includes("missing_crafting_table")
+        msg.includes("missing_crafting_table") ||
+        msg.includes("craft_action_failed") ||
+        msg.includes("not_in_inventory")
     )
         return "MISSING_INGREDIENTS";
 
@@ -279,7 +288,7 @@ function pushState() {
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
-        .join(",")}`;
+        .join(",")}|${Object.keys(knownChests).length}`;
 
     const now = Date.now();
     if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
@@ -310,6 +319,7 @@ function pushState() {
             ? { name: offhandItem.name, count: offhandItem.count }
             : null,
         active_slot: bot.quickBarSlot,
+        known_chests: knownChests, // Inject the global cache
     });
 }
 
@@ -436,10 +446,30 @@ async function connectWithRetry(maxAttempts = 10) {
         lastDeathMessage = "unknown causes";
     });
 
+    // Spy on chests to update the global memory cache
+    bot.on("windowOpen", (window) => {
+        if (
+            String(window.type).includes("chest") ||
+            String(window.type).includes("generic")
+        ) {
+            const chestBlock = bot.findBlock({
+                matching: bot.registry.blocksByName.chest?.id ?? -1,
+                maxDistance: 6,
+            });
+            if (chestBlock) {
+                const posKey = `${chestBlock.position.x},${chestBlock.position.y},${chestBlock.position.z}`;
+                knownChests[posKey] = window
+                    .containerItems()
+                    .map((i) => ({ name: i.name, count: i.count }));
+                pushState();
+            }
+        }
+    });
+
     bot.on("health", pushState);
     bot.on("experience", pushState);
 
-    // @ts-ignore - Supress missing typing for this event in older versions
+    // @ts-ignore
     bot.on("heldItemChanged", pushState);
 
     if (stateInterval) clearInterval(stateInterval);

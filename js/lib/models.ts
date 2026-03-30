@@ -14,6 +14,8 @@ export enum ActionType {
     Retreat = "retreat",
     Eat = "eat",
     Interact = "interact",
+    Store = "store",
+    Retrieve = "retrieve", // New intent
 }
 
 export enum ClientEventType {
@@ -35,7 +37,6 @@ export interface DecisionTarget {
     name: string;
 }
 
-// Replaces IncomingDecision
 export interface ActionIntent {
     id: string;
     action: ActionType;

@@ -31,21 +31,23 @@ func NewAutonomousCurriculum(client LLMClient, vector VectorStore) *AutonomousCu
 }
 
 const SystemPrompt = `You are the Curriculum Agent for an autonomous Minecraft bot.
-Your job is to evaluate the current Game State, review recent task history (successes/failures), and propose EXACTLY ONE optimal next intent to advance the bot's progression or ensure its survival.
-
+Your job is to evaluate the current Game State, review recent task history, and propose EXACTLY ONE optimal next intent to advance the bot's progression or ensure its survival.
 CRITICAL RULES:
-1. SURVIVAL FIRST: If health < 10, your intent MUST be 'eat' or 'retreat'.
-2. PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
-3. COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable (e.g., 1-4 for tools, 4-16 for basic blocks).
 
-AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat"
+1.  SURVIVAL FIRST: If health < 10, your intent MUST be 'eat' or 'retreat'.
+2.  PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
+3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable.
+4.  STORAGE: If inventory is full, use the 'store' action to put items in a chest.
+5.  RETRIEVAL: If you need an item and it is in a known chest, use the 'retrieve' action.
+6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker around yourself. You need at least 20 blocks (dirt, planks, or cobblestone) to do this.
+    AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build"
 
 OUTPUT FORMAT (Strict JSON):
 {
-  "rationale": "Brief explanation of why this is the best next step based on state and history.",
-  "action": "gather",
-  "target": "oak_log",
-  "count": 4
+"rationale": "Brief explanation of why this is the best next step based on state and history.",
+"action": "gather",
+"target": "oak_log",
+"count": 4
 }`
 
 func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error) {
@@ -127,8 +129,28 @@ func formatStateForLLM(state domain.GameState) string {
 		pois = append(pois, fmt.Sprintf("%s (%.0fm)", p.Name, p.Distance))
 	}
 
-	return fmt.Sprintf("Health: %.0f/20\nFood: %.0f/20\nInventory: %s\nVisible POIs: %s",
-		state.Health, state.Food, strings.Join(inv, ", "), strings.Join(pois, ", "))
+	var chests []string
+	for pos, items := range state.KnownChests {
+		var cInv []string
+		for _, item := range items {
+			if item.Count > 0 {
+				cInv = append(cInv, fmt.Sprintf("%s:%d", item.Name, item.Count))
+			}
+		}
+		if len(cInv) > 0 {
+			chests = append(chests, fmt.Sprintf("Chest at [%s]: %s", pos, strings.Join(cInv, ", ")))
+		} else {
+			chests = append(chests, fmt.Sprintf("Chest at [%s]: EMPTY", pos))
+		}
+	}
+
+	knownChestsContext := "None discovered."
+	if len(chests) > 0 {
+		knownChestsContext = strings.Join(chests, "\n")
+	}
+
+	return fmt.Sprintf("Health: %.0f/20\nFood: %.0f/20\nInventory: %s\nVisible POIs: %s\nKnown Chests:\n%s",
+		state.Health, state.Food, strings.Join(inv, ", "), strings.Join(pois, ", "), knownChestsContext)
 }
 
 func cleanJSON(raw string) string {

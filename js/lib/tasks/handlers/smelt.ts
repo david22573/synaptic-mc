@@ -1,241 +1,233 @@
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import {
-    escapeTree,
-    findNearestBlockByName,
-    placePortableUtility,
-    makeRoomInInventory,
-    waitForMs,
-    moveToGoal,
-} from "../utils.js";
 import pkg from "mineflayer-pathfinder";
+import { log } from "../../logger.js";
 
 const { goals } = pkg;
 
-interface SmeltContext extends StateContext {
-    furnaceBlock: any | null;
-    isPortable: boolean;
-    meatType: number | null;
-    meatCount: number;
-    fuelType: number | null;
-    fuelCount: number;
-    stopMovement: () => void;
-}
+const SMELT_RECIPES: Record<string, string[]> = {
+    iron_ingot: ["raw_iron", "iron_ore"],
+    gold_ingot: ["raw_gold", "gold_ore"],
+    copper_ingot: ["raw_copper", "copper_ore"],
+    cooked_beef: ["beef"],
+    cooked_porkchop: ["porkchop"],
+    cooked_mutton: ["mutton"],
+    cooked_chicken: ["chicken"],
+    cooked_rabbit: ["rabbit"],
+    cooked_cod: ["cod"],
+    cooked_salmon: ["salmon"],
+    glass: ["sand", "red_sand"],
+    stone: ["cobblestone"],
+    smooth_stone: ["stone"],
+    charcoal: [
+        "oak_log",
+        "birch_log",
+        "spruce_log",
+        "jungle_log",
+        "acacia_log",
+        "dark_oak_log",
+        "mangrove_log",
+        "cherry_log",
+    ],
+};
 
-class CleanupState implements FSMState {
-    name = "CLEANUP";
-    async enter() {}
+const FUEL_TYPES = [
+    "lava_bucket",
+    "coal_block",
+    "coal",
+    "charcoal",
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "oak_planks",
+    "birch_planks",
+    "spruce_planks",
+    "stick",
+];
 
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
+export async function handleSmelt(ctx: TaskContext): Promise<void> {
+    const { bot, intent, signal, stopMovement } = ctx;
+    const targetName = intent.target.name.toLowerCase();
+    const targetCount = intent.count || 1;
 
-        if (sCtx.isPortable && sCtx.furnaceBlock) {
-            await makeRoomInInventory(sCtx.bot, 1);
+    const acceptedInputs = SMELT_RECIPES[targetName];
+    if (!acceptedInputs) {
+        throw new Error(
+            `UNKNOWN_RECIPE: Don't know how to smelt into ${targetName}`,
+        );
+    }
 
-            const pickaxe = sCtx.bot.pathfinder.bestHarvestTool(
-                sCtx.furnaceBlock,
+    const inputItem = bot.inventory
+        .items()
+        .find((item) => acceptedInputs.includes(item.name));
+    if (!inputItem || inputItem.count < targetCount) {
+        throw new Error(
+            `MISSING_INGREDIENTS: Need at least ${targetCount} of ${acceptedInputs.join(" or ")}`,
+        );
+    }
+
+    const fuelItem = bot.inventory
+        .items()
+        .find((item) => FUEL_TYPES.includes(item.name));
+    if (!fuelItem) {
+        throw new Error(
+            "MISSING_INGREDIENTS: No valid fuel source in inventory",
+        );
+    }
+
+    let furnaceBlock = bot.findBlock({
+        matching: bot.registry.blocksByName.furnace?.id ?? -1,
+        maxDistance: 16,
+    });
+
+    let placedFurnace = false;
+
+    if (!furnaceBlock) {
+        const furnaceInInv = bot.inventory
+            .items()
+            .find((item) => item.name === "furnace");
+        if (!furnaceInInv) {
+            throw new Error(
+                "NO_FURNACE: No furnace nearby and none in inventory",
             );
-
-            if (pickaxe) await sCtx.bot.equip(pickaxe, "hand");
-
-            try {
-                await sCtx.bot.dig(sCtx.furnaceBlock);
-                await waitForMs(1000, sCtx.signal);
-            } catch (_err) {}
         }
 
-        sCtx.result = { status: "SUCCESS", reason: "SMELTING_COMPLETE" };
-        return null;
-    }
-}
+        const refBlock = bot.findBlock({
+            matching: (b) =>
+                b.name !== "air" && b.name !== "water" && b.name !== "lava",
+            maxDistance: 4,
+        });
 
-class SmeltingState implements FSMState {
-    name = "SMELTING";
-    async enter() {}
+        if (!refBlock) {
+            throw new Error("PATH_FAILED: Nowhere to place the furnace");
+        }
 
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-        let furnaceWindow: any = null;
-
+        await bot.equip(furnaceInInv.type, "hand");
         try {
-            const inputAmount = Math.min(sCtx.meatCount, 64);
-            const fuelAmount = Math.min(sCtx.fuelCount, 64);
-
-            furnaceWindow = await sCtx.bot.openFurnace(sCtx.furnaceBlock);
-            await furnaceWindow.putFuel(sCtx.fuelType, null, fuelAmount);
-            await furnaceWindow.putInput(sCtx.meatType, null, inputAmount);
-
-            let itemsSmelted = 0;
-            const maxWaitMs = Math.min(
-                15000 * inputAmount,
-                sCtx.timeoutMs ?? 30000,
+            await bot.placeBlock(
+                refBlock,
+                bot.entity.position.offset(0, 1, 0).minus(refBlock.position),
             );
-            const pollIntervalMs = 500;
-            let elapsedMs = 0;
+            placedFurnace = true;
+        } catch (err: any) {
+            throw new Error(
+                `PATH_FAILED: Could not place furnace - ${err.message}`,
+            );
+        }
 
-            while (elapsedMs < maxWaitMs && itemsSmelted < inputAmount) {
-                if (sCtx.signal.aborted) throw new Error("aborted");
+        furnaceBlock = bot.findBlock({
+            matching: bot.registry.blocksByName.furnace?.id ?? -1,
+            maxDistance: 6,
+        });
+    }
 
-                const outItem = furnaceWindow.outputItem();
-                if (outItem) {
-                    await makeRoomInInventory(sCtx.bot, 1);
-                    await furnaceWindow.takeOutput();
-                    itemsSmelted += outItem.count;
-                } else {
-                    await waitForMs(pollIntervalMs, sCtx.signal);
-                    elapsedMs += pollIntervalMs;
+    if (!furnaceBlock) {
+        throw new Error("NO_FURNACE: Lost track of furnace after placing it");
+    }
+
+    if (bot.entity.position.distanceTo(furnaceBlock.position) > 3) {
+        bot.pathfinder.setGoal(
+            new goals.GoalBlock(
+                furnaceBlock.position.x,
+                furnaceBlock.position.y,
+                furnaceBlock.position.z,
+            ),
+            true,
+        );
+
+        await new Promise<void>((resolve, reject) => {
+            const onGoal = () => {
+                cleanup();
+                resolve();
+            };
+            const onStop = () => {
+                cleanup();
+                reject(new Error("PATH_FAILED: Navigation interrupted"));
+            };
+            const onAbort = () => {
+                cleanup();
+                reject(new Error("TIMEOUT"));
+            };
+
+            const cleanup = () => {
+                bot.removeListener("goal_reached", onGoal);
+                bot.removeListener("path_update", onStop);
+                signal.removeEventListener("abort", onAbort);
+                stopMovement();
+            };
+
+            bot.once("goal_reached", onGoal);
+            bot.once("path_update", (r: any) => {
+                if (r.status === "noPath") onStop();
+            });
+            signal.addEventListener("abort", onAbort);
+        });
+    }
+
+    const furnace = await bot.openFurnace(furnaceBlock);
+    let collectedCount = 0;
+
+    try {
+        while (collectedCount < targetCount) {
+            if (signal.aborted) throw new Error("TIMEOUT");
+
+            if (!furnace.fuelItem() && furnace.fuel && furnace.fuel === 0) {
+                const currentFuel = bot.inventory
+                    .items()
+                    .find((item) => FUEL_TYPES.includes(item.name));
+                if (!currentFuel)
+                    throw new Error(
+                        "MISSING_INGREDIENTS: Ran out of fuel during smelting",
+                    );
+
+                await furnace.putFuel(currentFuel.type, null, 1);
+            }
+
+            if (!furnace.inputItem()) {
+                const currentInput = bot.inventory
+                    .items()
+                    .find((item) => acceptedInputs.includes(item.name));
+                if (!currentInput)
+                    throw new Error(
+                        "MISSING_INGREDIENTS: Ran out of raw materials during smelting",
+                    );
+
+                const amountToPut = Math.min(
+                    currentInput.count,
+                    targetCount - collectedCount,
+                );
+                await furnace.putInput(currentInput.type, null, amountToPut);
+            }
+
+            const output = furnace.outputItem();
+            if (output && output.name === targetName) {
+                const taken = await furnace.takeOutput();
+                if (taken) {
+                    collectedCount += taken.count;
+                    log.info(
+                        `Smelted ${taken.count} ${targetName}. Total: ${collectedCount}/${targetCount}`,
+                    );
                 }
             }
 
-            if (itemsSmelted === 0) {
-                throw new Error("FURNACE_TIMEOUT_OR_LAG");
-            }
-        } catch (err: any) {
-            sCtx.result = {
-                status: "FAILED",
-                reason:
-                    err.message === "aborted"
-                        ? "aborted"
-                        : `SMELT_INTERACTION_FAILED: ${err.message}`,
-            };
-            return null;
-        } finally {
-            if (furnaceWindow) {
-                try {
-                    furnaceWindow.close();
-                } catch (_err) {}
-            }
+            await new Promise((r) => setTimeout(r, 1000));
         }
+    } finally {
+        furnace.close();
 
-        return new CleanupState();
-    }
-}
-
-class ApproachFurnaceState implements FSMState {
-    name = "APPROACHING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-        const fPos = sCtx.furnaceBlock.position;
-
-        try {
-            await moveToGoal(
-                sCtx.bot,
-                new goals.GoalNear(fPos.x, fPos.y, fPos.z, 2),
-                {
-                    signal: sCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: sCtx.stopMovement,
-                    dynamic: false,
-                },
-            );
-        } catch (err: any) {
-            if (err.message === "aborted") {
-                sCtx.result = { status: "FAILED", reason: "aborted" };
+        if (placedFurnace && !signal.aborted) {
+            const pickType =
+                bot.registry.itemsByName.wooden_pickaxe?.id ||
+                bot.registry.itemsByName.stone_pickaxe?.id;
+            if (pickType) {
+                await bot.equip(pickType, "hand");
             } else {
-                sCtx.result = {
-                    status: "FAILED",
-                    reason: "FAILED_TO_REACH_FURNACE",
-                };
+                await bot.unequip("hand");
             }
-            return null;
-        }
-
-        return new SmeltingState();
-    }
-}
-
-class LocateFurnaceState implements FSMState {
-    name = "LOCATING_FURNACE";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-        let furnace = findNearestBlockByName(sCtx.bot, "furnace");
-
-        if (!furnace) {
-            furnace = await placePortableUtility(sCtx.bot, "furnace");
-            if (!furnace) {
-                sCtx.result = {
-                    status: "FAILED",
-                    reason: "NO_FURNACE_AVAILABLE",
-                };
-                return null;
+            try {
+                await bot.dig(furnaceBlock);
+            } catch (e) {
+                log.warn("Failed to retrieve placed furnace", { err: e });
             }
-            sCtx.isPortable = true;
         }
-
-        sCtx.furnaceBlock = furnace;
-        return new ApproachFurnaceState();
-    }
-}
-
-class CheckResourcesState implements FSMState {
-    name = "CHECKING_RESOURCES";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const sCtx = ctx as SmeltContext;
-
-        const rawMeat = sCtx.bot.inventory
-            .items()
-            .find((i: any) =>
-                ["beef", "porkchop", "mutton", "chicken", "rabbit"].includes(
-                    i.name,
-                ),
-            );
-
-        const fuel = sCtx.bot.inventory
-            .items()
-            .find((i: any) =>
-                ["coal", "charcoal", "oak_planks"].includes(i.name),
-            );
-
-        if (!rawMeat || !fuel) {
-            sCtx.result = { status: "FAILED", reason: "MISSING_MEAT_OR_FUEL" };
-            return null;
-        }
-
-        sCtx.meatType = rawMeat.type;
-        sCtx.meatCount = rawMeat.count;
-        sCtx.fuelType = fuel.type;
-        sCtx.fuelCount = fuel.count;
-
-        return new LocateFurnaceState();
-    }
-}
-
-export async function handleSmelt(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
-    await escapeTree(bot, signal);
-
-    const fsmCtx: SmeltContext = {
-        bot,
-        targetName: "furnace",
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.smelt ?? 30000,
-        startTime: 0,
-        signal,
-        furnaceBlock: null,
-        isPortable: false,
-        meatType: null,
-        meatCount: 0,
-        fuelType: null,
-        fuelCount: 0,
-        stopMovement,
-    };
-
-    const fsm = new StateMachineRunner(new CheckResourcesState(), fsmCtx);
-    const result = await fsm.run();
-
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
     }
 }

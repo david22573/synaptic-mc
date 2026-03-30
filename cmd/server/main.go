@@ -24,6 +24,7 @@ import (
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/orchestrator"
+	"david22573/synaptic-mc/internal/supervisor"
 	"david22573/synaptic-mc/internal/voyager"
 )
 
@@ -38,6 +39,7 @@ type Config struct {
 	LLMModel     string
 	SessionID    string
 	DataDir      string
+	BotScript    string
 }
 
 func main() {
@@ -88,14 +90,13 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	// Wire up the new Voyager multi-agent loop
 	critic := voyager.NewStateCritic()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore)
 
 	uiHub := observability.NewHub(logger)
 
-	// Inject the Voyager components into the Orchestrator
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, &noopController{}, uiHub, logger)
+	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger)
+	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
 
@@ -112,7 +113,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, orch, logger))
+	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, orch, runner, logger))
 
 	uiPath := cfg.UIPath
 	if !filepath.IsAbs(uiPath) {
@@ -136,6 +137,12 @@ func main() {
 	g.Go(func() error {
 		logger.Info("Starting orchestrator")
 		return orch.Run(ctx)
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting TS supervisor")
+		runner.Start(ctx)
+		return nil
 	})
 
 	g.Go(func() error {
@@ -172,6 +179,7 @@ func parseConfig() Config {
 	llmModel := flag.String("llm-model", getEnvOrDefault("LLM_MODEL", "llama3.2"), "LLM model name")
 	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
 	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
+	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "dist/index.js"), "Path to the compiled TS bot index.js")
 
 	flag.Parse()
 
@@ -186,6 +194,7 @@ func parseConfig() Config {
 		LLMModel:     *llmModel,
 		SessionID:    *sessionID,
 		DataDir:      *dataDir,
+		BotScript:    *botScript,
 	}
 }
 
@@ -196,23 +205,7 @@ func getEnvOrDefault(key, fallback string) string {
 	return fallback
 }
 
-type noopController struct{}
-
-func (n *noopController) Dispatch(ctx context.Context, action domain.Action) error {
-	slog.Warn("Dispatch called with no bot connected", slog.String("action", action.Action))
-	return nil
-}
-
-func (n *noopController) AbortCurrent(ctx context.Context, reason string) error {
-	slog.Warn("Abort called with no bot connected", slog.String("reason", reason))
-	return nil
-}
-
-func (n *noopController) Close() error {
-	return nil
-}
-
-func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator, logger *slog.Logger) http.HandlerFunc {
+func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator, runner *supervisor.NodeRunner, logger *slog.Logger) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -233,6 +226,7 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 		controllerID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
 
 		orch.SetController(controllerID, idempotentController)
+		runner.Ping() // Record successful connection as a heartbeat
 
 		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
 
@@ -259,6 +253,9 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 				conn.Close()
 				return
 			}
+
+			// Heartbeat for the Node supervisor
+			runner.Ping()
 
 			switch domain.EventType(msg.Type) {
 			case domain.EventTypeStateTick:

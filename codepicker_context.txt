@@ -1,17 +1,17 @@
-Project Context Dump (29 Mar 26 15:52 PDT)
+Project Context Dump (29 Mar 26 19:20 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 71
+Total Files: 62
 
 # Project Structure
 <file_tree>
-- Makefile
 - cmd\server\main.go
 - internal\decision\engine.go
 - internal\decision\pipeline.go
 - internal\decision\planner.go
 - internal\decision\types.go
 - internal\domain\events.go
+- internal\domain\intent.go
 - internal\domain\state.go
 - internal\eventstore\sqlite.go
 - internal\execution\controller.go
@@ -39,6 +39,9 @@ Total Files: 71
 - internal\policy\survival.go
 - internal\policy\survival_test.go
 - internal\strategy\evaluator.go
+- internal\voyager\critic.go
+- internal\voyager\curriculum.go
+- internal\voyager\vector.go
 - js\index.ts
 - js\lib\config.ts
 - js\lib\logger.ts
@@ -64,61 +67,9 @@ Total Files: 71
 - js\lib\utils\errors.ts
 - js\lib\utils\perception.ts
 - js\lib\utils\threats.ts
-- scripts\find_deprecated_decision_logic.sh
-- scripts\lint_pipeline_immutability.sh
-- ui\index.html
-- ui\src\App.svelte
-- ui\src\app.css
-- ui\src\components\HUD.svelte
-- ui\src\components\ItemIcon.svelte
-- ui\src\components\Sidebar.svelte
-- ui\src\lib\store.svelte.ts
-- ui\src\main.ts
-- ui\svelte.config.js
-- ui\vite.config.ts
 </file_tree>
 
 # File Contents
-<file path="Makefile">
-.PHONY: help install run-server run-bot dev clean test-replay
-
-# Default target
-.DEFAULT_GOAL := help
-
-help: ## Show this help message
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-
-install: ## Install Go and JS dependencies
-	@echo "==> Installing JS dependencies..."
-	cd js && npm install
-	@echo "==> Tidying Go modules..."
-	go mod tidy
-
-run-server: ## Run the Go control plane directly
-	@echo "==> Starting Go WebSocket Server..."
-	go run cmd/server/*.go
-
-run-bot: ## Run the Mineflayer TypeScript bot directly
-	@echo "==> Starting Mineflayer Bot..."
-	cd js && npx tsx index.ts
-
-dev: ## Run both server and bot concurrently in one terminal
-	@echo "==> Starting CraftD Control Plane and Bot..."
-	@trap 'echo "Shutting down..."; kill 0' SIGINT; \
-	go run cmd/server/*.go & \
-	sleep 2; \
-	cd js && npx tsx index.ts
-
-test-replay: ## Run the Replay Test Harness
-	@echo "==> Running Planning Replay Tests..."
-	go test -v ./tests/...
-
-clean: ## Clean up Go cache and Node modules
-	@echo "==> Cleaning up environment..."
-	rm -rf js/node_modules
-	go clean
-</file>
-
 <file path="cmd\server\main.go">
 package main
 
@@ -139,23 +90,21 @@ import (
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
-	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
-	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/orchestrator"
-	"david22573/synaptic-mc/internal/policy"
-	"david22573/synaptic-mc/internal/strategy"
+	"david22573/synaptic-mc/internal/voyager"
 )
 
 type Config struct {
 	HTTPAddr     string
 	EventStoreDB string
 	MemoryDB     string
+	VectorDB     string
 	UIPath       string
 	LLMURL       string
 	LLMKey       string
@@ -182,6 +131,7 @@ func main() {
 
 	eventStorePath := filepath.Join(cfg.DataDir, cfg.EventStoreDB)
 	memoryStorePath := filepath.Join(cfg.DataDir, cfg.MemoryDB)
+	vectorStorePath := filepath.Join(cfg.DataDir, cfg.VectorDB)
 
 	eventStore, err := eventstore.NewSQLiteEventStore(eventStorePath)
 	if err != nil {
@@ -197,6 +147,13 @@ func main() {
 	}
 	defer memoryStore.Close()
 
+	vectorStore, err := voyager.NewSQLiteVectorStore(vectorStorePath)
+	if err != nil {
+		logger.Error("Failed to create vector store", slog.String("path", vectorStorePath), slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer vectorStore.Close()
+
 	llmClient := llm.NewClient(llm.Config{
 		APIURL:     cfg.LLMURL,
 		APIKey:     cfg.LLMKey,
@@ -204,20 +161,14 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	strategyEvaluator := strategy.NewEvaluator()
-	policyExtractor := learning.NewPolicyExtractor(eventStore, logger)
+	// Wire up the new Voyager multi-agent loop
+	critic := voyager.NewStateCritic()
+	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore)
 
-	// Switch to the Phase 7 Advanced Planner
-	planner := decision.NewAdvancedPlanner(llmClient, strategyEvaluator, policyExtractor, memoryStore, eventStore)
-
-	survivalPolicy := policy.NewSurvivalPolicy()
-	intelligencePolicy := policy.NewIntelligencePolicy(eventStore, cfg.SessionID)
-	policyEngine := policy.NewCompositePolicy(survivalPolicy, intelligencePolicy)
-
-	decisionEngine := decision.NewPipeline(planner, policyEngine)
 	uiHub := observability.NewHub(logger)
 
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, decisionEngine, &noopController{}, uiHub, logger)
+	// Inject the Voyager components into the Orchestrator
+	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, &noopController{}, uiHub, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
 
@@ -287,6 +238,7 @@ func parseConfig() Config {
 	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
 	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
 	memoryDB := flag.String("memory", getEnvOrDefault("MEMORY_DB", "memory.db"), "Memory store database filename")
+	vectorDB := flag.String("vector", getEnvOrDefault("VECTOR_DB", "skills.db"), "Vector skill database filename")
 	uiPath := flag.String("ui", getEnvOrDefault("UI_PATH", "ui/dist"), "UI static files path")
 	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
 	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
@@ -300,6 +252,7 @@ func parseConfig() Config {
 		HTTPAddr:     *httpAddr,
 		EventStoreDB: *eventsDB,
 		MemoryDB:     *memoryDB,
+		VectorDB:     *vectorDB,
 		UIPath:       *uiPath,
 		LLMURL:       *llmURL,
 		LLMKey:       *llmKey,
@@ -846,6 +799,28 @@ type EventStore interface {
 	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)
 	GetRecentStream(ctx context.Context, sessionID string, limit int) ([]DomainEvent, error)
 	Close() error
+}
+
+</file>
+
+<file path="internal\domain\intent.go">
+package domain
+
+// ActionIntent replaces the lower-level Action struct for the Voyager loop.
+// It enforces strict expectations so the Critic knows exactly what to measure.
+type ActionIntent struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`    // "mine", "craft", "explore", "hunt"
+	Target    string `json:"target"`    // e.g., "iron_ore", "oak_planks"
+	Count     int    `json:"count"`     // Expected quantity change
+	Rationale string `json:"rationale"` // LLM's reasoning for this intent
+}
+
+// TaskHistory stores the full lifecycle of a task for Phase 4 Vector Memory.
+type TaskHistory struct {
+	Intent   ActionIntent
+	Success  bool
+	Critique string
 }
 
 </file>
@@ -1569,6 +1544,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -1605,12 +1581,91 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	}
 
 	jsonPayload, _ := json.Marshal(payload)
+	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
+}
+
+// CreateEmbedding generates a vector for the input text using the OpenAI-compatible v1/embeddings endpoint.
+func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
+	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
+
+	payload := map[string]any{
+		"model": c.config.Model,
+		"input": input,
+	}
+
+	jsonPayload, _ := json.Marshal(payload)
 
 	var lastErr error
 	baseDelay := 500 * time.Millisecond
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		// FIX: Check context cancellation before each attempt
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+		default:
+		}
+
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
+			time.Sleep(baseDelay + jitter)
+			baseDelay *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		}
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			continue
+		}
+
+		var result struct {
+			Data []struct {
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		}
+
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			lastErr = fmt.Errorf("failed to decode response: %w", err)
+			continue
+		}
+
+		if len(result.Data) == 0 {
+			lastErr = fmt.Errorf("empty embedding array returned")
+			continue
+		}
+
+		return result.Data[0].Embedding, nil
+	}
+
+	return nil, fmt.Errorf("max retries exceeded. last error: %w", lastErr)
+}
+
+func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) (string, error) {
+	var lastErr error
+	baseDelay := 500 * time.Millisecond
+
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
 			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
@@ -1619,15 +1674,11 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 
 		if attempt > 0 {
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-time.After(baseDelay + jitter):
-				baseDelay *= 2
-			case <-ctx.Done():
-				return "", fmt.Errorf("request cancelled during backoff: %w", ctx.Err())
-			}
+			time.Sleep(baseDelay + jitter)
+			baseDelay *= 2
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.APIURL, bytes.NewBuffer(jsonPayload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
 		if err != nil {
 			lastErr = err
 			continue
@@ -2116,30 +2167,30 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
-	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/voyager"
 )
 
 type Orchestrator struct {
-	sessionID   string
-	store       domain.EventStore
-	memory      memory.Store
-	decision    decision.Engine
+	sessionID string
+	store     domain.EventStore
+	memory    memory.Store
+
+	curriculum voyager.Curriculum
+	critic     voyager.Critic
+
 	ctrlManager *execution.ControllerManager
 	taskManager *TaskManager
 	logger      *slog.Logger
@@ -2149,10 +2200,12 @@ type Orchestrator struct {
 
 	mu              sync.RWMutex
 	currentSnapshot domain.EvaluationSnapshot
-	pendingFeedback []domain.Feedback
-	reflexLock      bool
-	evalCancel      context.CancelFunc
-	evalRunID       uint64
+	taskHistory     []domain.TaskHistory
+	activeIntent    *domain.ActionIntent
+	beforeState     domain.GameState
+
+	reflexLock bool
+	evalCancel context.CancelFunc
 
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
@@ -2162,7 +2215,8 @@ func New(
 	sessionID string,
 	store domain.EventStore,
 	memStore memory.Store,
-	decisionEngine decision.Engine,
+	curriculum voyager.Curriculum,
+	critic voyager.Critic,
 	exec execution.Controller,
 	uiHub *observability.Hub,
 	logger *slog.Logger,
@@ -2178,13 +2232,15 @@ func New(
 		sessionID:   sessionID,
 		store:       store,
 		memory:      memStore,
-		decision:    decisionEngine,
+		curriculum:  curriculum,
+		critic:      critic,
 		ctrlManager: cm,
 		taskManager: tm,
 		uiHub:       uiHub,
 		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
 		stateCh:     make(chan domain.VersionedState, 10),
 		eventCh:     make(chan domain.DomainEvent, 100),
+		taskHistory: make([]domain.TaskHistory, 0),
 	}
 
 	tm.OnDrain = o.handleQueueDrain
@@ -2226,11 +2282,9 @@ func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) 
 		case <-o.stateCh:
 		default:
 		}
-
 		select {
 		case o.stateCh <- vState:
 		default:
-			o.logger.Warn("State channel completely backed up, dropping tick")
 		}
 	}
 }
@@ -2260,29 +2314,8 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 }
 
 func (o *Orchestrator) handleQueueDrain() {
-	o.mu.RLock()
-	snap := o.currentSnapshot
-	o.mu.RUnlock()
-
-	if snap.ActivePlan != nil {
-		o.mu.Lock()
-		if o.currentSnapshot.ActivePlan.Status == domain.PlanStatusActive || o.currentSnapshot.ActivePlan.Status == domain.PlanStatusPending {
-			o.currentSnapshot.ActivePlan.Status = domain.PlanStatusCompleted
-
-			event := domain.DomainEvent{
-				SessionID: o.sessionID,
-				Trace:     domain.TraceContext{TraceID: "sys-drain", ActionID: o.currentSnapshot.ActivePlan.ID},
-				Type:      domain.EventTypePlanCompleted,
-				Payload:   marshalJSON(map[string]string{"plan_id": o.currentSnapshot.ActivePlan.ID}),
-			}
-			o.mu.Unlock()
-			o.IngestEvent(context.Background(), event)
-		} else {
-			o.mu.Unlock()
-		}
-	}
-
-	_ = o.evaluate(context.Background(), snap)
+	// Re-plan using a background context to ensure the proposal isn't immediately canceled by the trigger event's context
+	_ = o.evaluateNextTask(context.Background())
 }
 
 func (o *Orchestrator) processStateLoop(ctx context.Context) error {
@@ -2292,29 +2325,13 @@ func (o *Orchestrator) processStateLoop(ctx context.Context) error {
 			return ctx.Err()
 		case vState := <-o.stateCh:
 			o.mu.Lock()
-
-			if o.evalCancel != nil {
-				o.evalCancel()
-				o.evalCancel = nil
-			}
-
-			if len(o.pendingFeedback) > 0 {
-				vState.State.Feedback = append(vState.State.Feedback, o.pendingFeedback...)
-				o.pendingFeedback = nil
-			}
-
 			o.currentSnapshot.State = vState
-			snap := o.currentSnapshot
-
 			o.mu.Unlock()
 
 			if o.uiHub != nil {
 				o.uiHub.Broadcast("state_update", vState.State)
 			}
-
-			if err := o.evaluate(ctx, snap); err != nil {
-				o.logger.Error("Failed to evaluate state", slog.Any("error", err))
-			}
+			// FIX: evaluateNextTask removed from here. We only plan when a task completes or the queue drains.
 		}
 	}
 }
@@ -2339,150 +2356,76 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 	}
 }
 
-func generatePlanID(plan *domain.Plan) string {
-	h := sha1.New()
-	for _, t := range plan.Tasks {
-		h.Write([]byte(t.Action + ":" + t.Target.Name + "|"))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func marshalJSON(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
-}
-
-func (o *Orchestrator) evaluate(ctx context.Context, snap domain.EvaluationSnapshot) error {
+func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
+	state := o.currentSnapshot.State.State
+	history := o.taskHistory
 	o.mu.RUnlock()
 
+	// Guard against concurrent planning or planning during panic states
 	if tm == nil || isLocked || !tm.IsIdle() {
 		return nil
 	}
 
-	evalCtx, cancel := context.WithCancel(ctx)
-
 	o.mu.Lock()
 	if o.evalCancel != nil {
-		o.evalCancel()
+		o.evalCancel() // Cancel any stale planning goroutines
 	}
+	// Use a fresh context for the planning lifecycle
+	evalCtx, cancel := context.WithCancel(context.Background())
 	o.evalCancel = cancel
-	o.evalRunID++
-	runID := o.evalRunID
 	o.mu.Unlock()
 
-	trace := domain.TraceContext{
-		TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
-		ActionID: fmt.Sprintf("act-%d", time.Now().UnixNano()),
-	}
+	go func() {
+		defer cancel()
 
-	go func(evalCtx context.Context, snapshot domain.EvaluationSnapshot, evalID uint64) {
-		defer func() {
-			o.mu.Lock()
-			if o.evalRunID == evalID {
-				o.evalCancel = nil
-			}
-			o.mu.Unlock()
-			cancel()
-		}()
-
-		plan, err := o.decision.Evaluate(evalCtx, o.sessionID, snapshot.State.State, trace)
+		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
 		if err != nil {
-			if evalCtx.Err() != nil {
-				return
+			// Don't log if it was an intentional cancellation
+			if evalCtx.Err() == nil {
+				o.logger.Error("Curriculum failed to propose task", slog.Any("error", err))
 			}
-			o.logger.Error("decision evaluation failed", slog.Any("error", err))
-			o.mu.Lock()
-			o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-				Type:  "PLAN_REJECTED",
-				Cause: err.Error(),
-			})
-			o.mu.Unlock()
 			return
 		}
 
-		if plan == nil || len(plan.Tasks) == 0 {
+		if intent == nil {
 			return
-		}
-
-		plan.StateVersion = snapshot.State.Version
-		plan.CreatedAt = time.Now()
-		plan.Status = domain.PlanStatusPending
-
-		if plan.ID == "" {
-			plan.ID = generatePlanID(plan)
 		}
 
 		o.mu.Lock()
-		isLoop := false
-		if o.currentSnapshot.ActivePlan != nil {
-			isLoop = o.currentSnapshot.ActivePlan.ID == plan.ID
-			if o.currentSnapshot.ActivePlan.ID != plan.ID {
-				if o.currentSnapshot.ActivePlan.Status == domain.PlanStatusPending || o.currentSnapshot.ActivePlan.Status == domain.PlanStatusActive {
-					now := time.Now()
-					o.currentSnapshot.ActivePlan.Status = domain.PlanStatusInvalidated
-					o.currentSnapshot.ActivePlan.InvalidatedAt = &now
-					plan.ParentPlanID = o.currentSnapshot.ActivePlan.ID
-
-					o.IngestEvent(ctx, domain.DomainEvent{
-						SessionID: o.sessionID,
-						Trace:     trace,
-						Type:      domain.EventTypePlanInvalidated,
-						Payload:   marshalJSON(map[string]string{"plan_id": o.currentSnapshot.ActivePlan.ID, "superseded_by": plan.ID}),
-					})
-				}
-			}
-		}
-
-		o.currentSnapshot.ActivePlan = plan
+		o.activeIntent = intent
+		o.beforeState = state
 		o.mu.Unlock()
 
-		o.IngestEvent(ctx, domain.DomainEvent{
+		trace := domain.TraceContext{
+			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+			ActionID: intent.ID,
+		}
+
+		action := domain.Action{
+			ID:        intent.ID,
+			Trace:     trace,
+			Action:    intent.Action,
+			Target:    domain.Target{Name: intent.Target, Type: "intent"},
+			Rationale: intent.Rationale,
+			Priority:  10,
+		}
+
+		o.IngestEvent(evalCtx, domain.DomainEvent{
 			SessionID: o.sessionID,
 			Trace:     trace,
 			Type:      domain.EventTypePlanCreated,
-			Payload:   marshalJSON(plan),
+			Payload:   o.marshalJSON(intent),
 		})
 
-		if isLoop {
-			o.logger.Warn("plan_loop_detected", slog.String("id", plan.ID))
-			exploreTask := domain.Action{
-				ID:       fmt.Sprintf("cmd-%s-explore-break", trace.ActionID),
-				Trace:    trace,
-				Action:   "explore",
-				Target:   domain.Target{Type: "location", Name: "unknown"},
-				Priority: 50,
-			}
-			plan.Tasks = append([]domain.Action{exploreTask}, plan.Tasks...)
-		}
-
 		if o.uiHub != nil {
-			o.uiHub.Broadcast("objective_update", plan.Objective)
+			o.uiHub.Broadcast("objective_update", intent.Rationale)
 		}
 
-		o.logger.Info("New plan generated",
-			slog.String("id", plan.ID),
-			slog.Uint64("state_version", plan.StateVersion),
-			slog.String("objective", plan.Objective),
-			slog.Int("tasks", len(plan.Tasks)))
-
-		o.mu.RLock()
-		freshTM := o.taskManager
-		o.mu.RUnlock()
-
-		if freshTM != nil {
-			o.mu.Lock()
-			if o.currentSnapshot.ActivePlan != nil && o.currentSnapshot.ActivePlan.ID == plan.ID {
-				o.currentSnapshot.ActivePlan.Status = domain.PlanStatusActive
-			}
-			o.mu.Unlock()
-			_ = freshTM.Enqueue(ctx, plan.Tasks...)
-		} else {
-			o.logger.Warn("Dropping generated plan: TaskManager is offline")
-		}
-	}(evalCtx, snap, runID)
+		_ = tm.Enqueue(evalCtx, action)
+	}()
 
 	return nil
 }
@@ -2498,135 +2441,63 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 	switch ev.Type {
 	case domain.EventBotDeath:
-		o.logger.Warn("Bot death detected, aborting active plans")
 		_ = tm.Halt(ctx, "bot_died")
-
-		o.mu.RLock()
-		pos := o.currentSnapshot.State.State.Position
-		o.mu.RUnlock()
-
-		if o.memory != nil {
-			_ = o.memory.MarkWorldNode(ctx, "death_site", "hazard", pos)
-		}
-
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
 
 	case domain.EventTypePanic:
-		o.logger.Warn("Bot panicked, halting execution and locking planner")
 		_ = tm.Halt(ctx, "panic_triggered")
-
 		o.mu.Lock()
 		o.reflexLock = true
 		o.mu.Unlock()
 
 	case domain.EventTypePanicResolved:
-		o.logger.Info("Bot survival reflex resolved, unlocking planner")
 		o.mu.Lock()
 		o.reflexLock = false
 		o.mu.Unlock()
+		o.handleQueueDrain() // Immediately re-evaluate once safe
 
 	case domain.EventTypeTaskEnd:
 		var payload struct {
 			Status    string `json:"status"`
 			CommandID string `json:"command_id"`
 			Cause     string `json:"cause"`
-			Action    string `json:"action"`
 		}
+
 		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			success := payload.Status == "COMPLETED"
+			o.mu.Lock()
+			intent := o.activeIntent
+			before := o.beforeState
+			after := o.currentSnapshot.State.State
+			o.activeIntent = nil
+			o.mu.Unlock()
 
-			if !success && payload.Cause != "" {
-				o.logger.Warn("Task execution failed natively, injecting feedback", slog.String("cause", payload.Cause))
-
-				hint := "Execution failed. Adjust plan and avoid repeating the same sequence."
-				switch payload.Cause {
-				case "PATH_FAILED":
-					hint = "Target unreachable. Try explore first or choose a closer target."
-				case "TIMEOUT":
-					hint = "Task stalled. Retry once; if recurs, choose a different approach."
-				case "NO_BLOCKS":
-					hint = "Resource not found nearby. Check POI list or explore first."
-				case "NO_ENTITY":
-					hint = "Entity not found. Check if any are visible in POIs before hunting."
-				case "NO_TOOL":
-					hint = "Missing required tool. Craft it before retrying this action."
+			if intent != nil && intent.ID == payload.CommandID {
+				success, critique := o.critic.Evaluate(*intent, before, after)
+				if payload.Status != "COMPLETED" {
+					success = false
+					// Incorporate the TS-level error (e.g., STUCK) into the critique for the LLM
+					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
 				}
 
 				o.mu.Lock()
-				if o.currentSnapshot.ActivePlan != nil && o.currentSnapshot.ActivePlan.Status != domain.PlanStatusFailed {
-					o.currentSnapshot.ActivePlan.Status = domain.PlanStatusFailed
-
-					event := domain.DomainEvent{
-						SessionID: o.sessionID,
-						Trace:     ev.Trace,
-						Type:      domain.EventTypePlanFailed,
-						Payload:   marshalJSON(map[string]string{"plan_id": o.currentSnapshot.ActivePlan.ID, "cause": payload.Cause}),
-					}
-
-					o.mu.Unlock()
-					o.IngestEvent(ctx, event)
-					o.mu.Lock()
-				}
-
-				o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-					Type:   "TASK_FAILED",
-					Action: payload.Action,
-					Cause:  payload.Cause,
-					Hint:   hint,
+				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
+					Intent:   *intent,
+					Success:  success,
+					Critique: critique,
 				})
 				o.mu.Unlock()
-
-			} else if success {
-				parts := strings.SplitN(payload.Action, " ", 2)
-				if len(parts) == 2 {
-					actionType := parts[0]
-					targetName := parts[1]
-
-					if (actionType == "gather" || actionType == "mine") && o.memory != nil {
-						o.mu.RLock()
-						pos := o.currentSnapshot.State.State.Position
-						o.mu.RUnlock()
-						_ = o.memory.MarkWorldNode(ctx, targetName, "resource", pos)
-					}
-
-					if actionType == "mark_location" && o.memory != nil {
-						o.mu.RLock()
-						pos := o.currentSnapshot.State.State.Position
-						o.mu.RUnlock()
-
-						_ = o.memory.MarkWorldNode(ctx, targetName, "user_marked", pos)
-						o.logger.Info("Location marked", slog.String("name", targetName))
-
-						o.mu.Lock()
-						o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-							Type:  "SYSTEM",
-							Cause: fmt.Sprintf("Successfully marked location as '%s'", targetName),
-						})
-						o.mu.Unlock()
-
-					} else if actionType == "recall_location" && o.memory != nil {
-						o.mu.RLock()
-						pos := o.currentSnapshot.State.State.Position
-						o.mu.RUnlock()
-
-						knownWorld, _ := o.memory.GetKnownWorld(ctx, pos)
-						o.logger.Info("Location recalled", slog.String("world", knownWorld))
-
-						o.mu.Lock()
-						o.pendingFeedback = append(o.pendingFeedback, domain.Feedback{
-							Type:  "SYSTEM",
-							Cause: "RECALL: " + knownWorld,
-						})
-						o.mu.Unlock()
-					}
-				}
 			}
 
-			_ = tm.Complete(ctx, payload.CommandID, success)
+			_ = tm.Complete(ctx, payload.CommandID, payload.Status == "COMPLETED")
 		}
 	}
+}
+
+func (o *Orchestrator) marshalJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 </file>
@@ -2645,13 +2516,11 @@ import (
 	"david22573/synaptic-mc/internal/execution"
 )
 
-// TaskManager ensures strict concurrency over the bot's physical actions.
-// It guarantees only one task is in-flight and handles clean preemption.
 type TaskManager struct {
 	controller execution.Controller
 	logger     *slog.Logger
 	timeouts   map[string]time.Duration
-	OnDrain    func() // 4.1 FIX: Callback triggered when the queue empties
+	OnDrain    func()
 
 	mu           sync.Mutex
 	activeTask   *domain.Action
@@ -2672,15 +2541,12 @@ func NewTaskManager(ctrl execution.Controller, timeouts map[string]time.Duration
 	}
 }
 
-// IsIdle returns true if there are no active or queued tasks
 func (m *TaskManager) IsIdle() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.activeTask == nil && len(m.queue) == 0
 }
 
-// Enqueue pushes a new plan to the queue.
-// If it's a high-priority interrupt it aborts the current task.
 func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2689,23 +2555,13 @@ func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error
 		return nil
 	}
 
-	// Lower number = higher priority.
-	// If the new task outranks the active one, kill the active one.
 	if m.activeTask != nil && tasks[0].Priority < m.activeTask.Priority {
-		m.logger.Warn("Preempting active task for higher priority action",
-			slog.String("active", m.activeTask.Action),
-			slog.String("new", tasks[0].Action),
-		)
 		_ = m.abortActiveLocked(ctx, "preempted_by_priority")
-
-		// Overwrite the queue entirely with the new plan
 		m.queue = tasks
 		return m.dispatchNextLocked(ctx)
 	}
 
 	m.queue = append(m.queue, tasks...)
-
-	// If the bot is idle, start executing immediately
 	if m.activeTask == nil {
 		return m.dispatchNextLocked(ctx)
 	}
@@ -2713,20 +2569,14 @@ func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error
 	return nil
 }
 
-// Complete handles the lifecycle wrap-up when the TS client reports a task success or failure.
 func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Drop ghost events from previously cancelled tasks
 	if m.activeTask == nil || m.activeTask.ID != taskID {
-		m.logger.Debug("Ignoring completion for inactive or stale task", slog.String("task_id", taskID))
 		return nil
 	}
 
-	m.logger.Info("Task concluded", slog.String("action", m.activeTask.Action), slog.Bool("success", success))
-
-	// Release resources for the active task and cancel its watchdog
 	if m.watchdogDone != nil {
 		close(m.watchdogDone)
 		m.watchdogDone = nil
@@ -2738,11 +2588,9 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	}
 	m.activeTask = nil
 
-	// If the task failed, flush the remaining queue.
 	if !success {
-		m.logger.Warn("Task failed, flushing remaining plan queue")
+		// Flush queue and trigger replanning on failure
 		m.queue = make([]domain.Action, 0)
-
 		if m.OnDrain != nil {
 			go m.OnDrain()
 		}
@@ -2750,8 +2598,6 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	}
 
 	err := m.dispatchNextLocked(ctx)
-
-	// 4.1 FIX: Trigger replanning immediately if the queue just ran dry
 	if m.activeTask == nil && len(m.queue) == 0 && m.OnDrain != nil {
 		go m.OnDrain()
 	}
@@ -2759,11 +2605,9 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	return err
 }
 
-// Halt is the emergency brake for Bot Death or Flee events.
 func (m *TaskManager) Halt(ctx context.Context, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	m.queue = make([]domain.Action, 0)
 	return m.abortActiveLocked(ctx, reason)
 }
@@ -2772,17 +2616,14 @@ func (m *TaskManager) abortActiveLocked(ctx context.Context, reason string) erro
 	if m.activeTask == nil {
 		return nil
 	}
-
 	if m.watchdogDone != nil {
 		close(m.watchdogDone)
 		m.watchdogDone = nil
 	}
-
 	if m.activeCancel != nil {
 		m.activeCancel()
 		m.activeCancel = nil
 	}
-
 	err := m.controller.AbortCurrent(ctx, reason)
 	m.activeTask = nil
 	return err
@@ -2796,14 +2637,10 @@ func (m *TaskManager) dispatchNextLocked(ctx context.Context) error {
 	next := m.queue[0]
 	m.queue = m.queue[1:]
 
-	// Create a dedicated sub-context specifically for this task's lifespan
-	taskCtx, cancel := context.WithCancel(ctx)
-
+	taskCtx, cancel := context.WithCancel(context.Background())
 	m.activeTask = &next
 	m.activeCancel = cancel
 	m.watchdogDone = make(chan struct{})
-
-	m.logger.Info("Dispatching task", slog.String("action", next.Action), slog.String("target", next.Target.Name))
 
 	if err := m.controller.Dispatch(taskCtx, next); err != nil {
 		m.activeTask = nil
@@ -2815,25 +2652,18 @@ func (m *TaskManager) dispatchNextLocked(ctx context.Context) error {
 		return fmt.Errorf("dispatch failed: %w", err)
 	}
 
-	// Watchdog Setup
 	timeout, exists := m.timeouts[next.Action]
 	if !exists {
-		timeout = 45 * time.Second // Safe fallback if the action isn't mapped
+		timeout = 45 * time.Second
 	}
-	gracePeriod := timeout + 10*time.Second
-	taskID := next.ID
-
 	go func(done chan struct{}, waitTime time.Duration, id string) {
 		select {
-		case <-time.After(waitTime):
-			m.logger.Warn("Task watchdog triggered; task timed out natively", slog.String("task_id", id))
-			// Force completion with failure
+		case <-time.After(waitTime + 10*time.Second):
 			_ = m.Complete(context.Background(), id, false)
 		case <-done:
-			// Task completed or aborted normally before the timeout
 			return
 		}
-	}(m.watchdogDone, gracePeriod, taskID)
+	}(m.watchdogDone, timeout, next.ID)
 
 	return nil
 }
@@ -4011,6 +3841,362 @@ func (e *Evaluator) Evaluate(state domain.GameState) Directive {
 
 </file>
 
+<file path="internal\voyager\critic.go">
+package voyager
+
+import (
+	"fmt"
+	"strings"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type Critic interface {
+	Evaluate(intent domain.ActionIntent, before, after domain.GameState) (bool, string)
+}
+
+type StateCritic struct{}
+
+func NewStateCritic() *StateCritic {
+	return &StateCritic{}
+}
+
+func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState) (bool, string) {
+	if after.Health <= 0 {
+		return false, "Critique: Bot died while executing the task. Re-evaluate threat assessment."
+	}
+
+	switch intent.Action {
+	case "mine", "gather":
+		bCount := countItem(before.Inventory, intent.Target)
+		aCount := countItem(after.Inventory, intent.Target)
+
+		if aCount >= bCount+intent.Count {
+			return true, fmt.Sprintf("Success: Gathered %d %s. Inventory went from %d to %d.", aCount-bCount, intent.Target, bCount, aCount)
+		}
+		return false, fmt.Sprintf("Critique: Expected to gather %d %s, but inventory went from %d to %d. The bot may have gotten stuck, the tool might have broken, or the item fell into lava/unreachable area.", intent.Count, intent.Target, bCount, aCount)
+
+	case "craft":
+		bCount := countItem(before.Inventory, intent.Target)
+		aCount := countItem(after.Inventory, intent.Target)
+
+		if aCount > bCount {
+			return true, fmt.Sprintf("Success: Crafted %s.", intent.Target)
+		}
+		return false, fmt.Sprintf("Critique: Failed to craft %s. Ensure ingredients are actually in the inventory and a crafting table is nearby if required.", intent.Target)
+
+	case "smelt":
+		expectedOutput := getSmeltOutput(intent.Target)
+		bCount := countItem(before.Inventory, expectedOutput)
+		aCount := countItem(after.Inventory, expectedOutput)
+
+		if aCount > bCount {
+			return true, fmt.Sprintf("Success: Smelted %s into %s.", intent.Target, expectedOutput)
+		}
+		return false, fmt.Sprintf("Critique: Failed to smelt %s. Ensure fuel is in inventory and a furnace is reachable.", intent.Target)
+
+	case "hunt":
+		if after.Health < before.Health && after.Health < 10 {
+			return true, "Warning: Survived the hunt, but took heavy damage. Consider eating or crafting better armor."
+		}
+		return true, "Success: Engaged and survived the hunt."
+	}
+
+	return true, fmt.Sprintf("Success: %s completed natively without strict state diff violations.", intent.Action)
+}
+
+func countItem(inv []domain.Item, name string) int {
+	for _, item := range inv {
+		if strings.EqualFold(item.Name, name) {
+			return item.Count
+		}
+	}
+	return 0
+}
+
+func getSmeltOutput(input string) string {
+	if strings.HasPrefix(input, "raw_") {
+		return strings.TrimPrefix(input, "raw_") + "_ingot"
+	}
+	return "cooked_" + input
+}
+
+</file>
+
+<file path="internal\voyager\curriculum.go">
+package voyager
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type LLMClient interface {
+	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
+}
+
+type Curriculum interface {
+	ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error)
+}
+
+type AutonomousCurriculum struct {
+	client LLMClient
+	vector VectorStore
+}
+
+func NewAutonomousCurriculum(client LLMClient, vector VectorStore) *AutonomousCurriculum {
+	return &AutonomousCurriculum{
+		client: client,
+		vector: vector,
+	}
+}
+
+const SystemPrompt = `You are the Curriculum Agent for an autonomous Minecraft bot.
+Your job is to evaluate the current Game State, review recent task history (successes/failures), and propose EXACTLY ONE optimal next intent to advance the bot's progression or ensure its survival.
+
+CRITICAL RULES:
+1. SURVIVAL FIRST: If health < 10, your intent MUST be 'eat' or 'retreat'.
+2. PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
+3. COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable (e.g., 1-4 for tools, 4-16 for basic blocks).
+
+AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat"
+
+OUTPUT FORMAT (Strict JSON):
+{
+  "rationale": "Brief explanation of why this is the best next step based on state and history.",
+  "action": "gather",
+  "target": "oak_log",
+  "count": 4
+}`
+
+func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error) {
+	var historyStrs []string
+	recentHistory := memory
+	if len(memory) > 5 {
+		recentHistory = memory[len(memory)-5:]
+	}
+
+	for _, m := range recentHistory {
+		status := "FAILED"
+		if m.Success {
+			status = "SUCCESS"
+		}
+		historyStrs = append(historyStrs, fmt.Sprintf("[%s] Intent: %s %d %s | Critic: %s", status, m.Intent.Action, m.Intent.Count, m.Intent.Target, m.Critique))
+	}
+
+	historyContext := "No recent history."
+	if len(historyStrs) > 0 {
+		historyContext = strings.Join(historyStrs, "\n")
+	}
+
+	stateContext := formatStateForLLM(state)
+
+	queryText := fmt.Sprintf("Health: %.0f, Biome/POIs: %v", state.Health, state.POIs)
+	queryEmb, err := c.client.CreateEmbedding(ctx, queryText)
+
+	skillContext := ""
+	if err == nil && c.vector != nil {
+		skills, _ := c.vector.RetrieveSkills(ctx, queryEmb, 3)
+		if len(skills) > 0 {
+			var skillStrs []string
+			for _, s := range skills {
+				skillStrs = append(skillStrs, fmt.Sprintf("- Situation: %s -> Intent: %s %d %s", s.Description, s.Intent.Action, s.Intent.Count, s.Intent.Target))
+			}
+			skillContext = "RELEVANT PAST SUCCESSES:\n" + strings.Join(skillStrs, "\n")
+		}
+	}
+
+	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\nRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.", stateContext, historyContext, skillContext)
+
+	rawResponse, err := c.client.Generate(ctx, SystemPrompt, userContent)
+	if err != nil {
+		return nil, fmt.Errorf("llm api failure: %w", err)
+	}
+
+	var intent domain.ActionIntent
+	if err := json.Unmarshal([]byte(cleanJSON(rawResponse)), &intent); err != nil {
+		return nil, fmt.Errorf("llm schema violation: %w\nResponse was: %s", err, rawResponse)
+	}
+
+	if len(recentHistory) > 0 {
+		lastTask := recentHistory[len(recentHistory)-1]
+		if lastTask.Success && c.vector != nil {
+			desc := fmt.Sprintf("Health %.0f, needed %s", state.Health, lastTask.Intent.Target)
+			descEmb, _ := c.client.CreateEmbedding(ctx, desc)
+			if len(descEmb) > 0 {
+				_ = c.vector.SaveSkill(context.Background(), desc, lastTask.Intent, descEmb)
+			}
+		}
+	}
+
+	return &intent, nil
+}
+
+func formatStateForLLM(state domain.GameState) string {
+	var inv []string
+	for _, item := range state.Inventory {
+		if item.Count > 0 {
+			inv = append(inv, fmt.Sprintf("%s:%d", item.Name, item.Count))
+		}
+	}
+
+	var pois []string
+	for i, p := range state.POIs {
+		if i >= 5 {
+			break
+		}
+		pois = append(pois, fmt.Sprintf("%s (%.0fm)", p.Name, p.Distance))
+	}
+
+	return fmt.Sprintf("Health: %.0f/20\nFood: %.0f/20\nInventory: %s\nVisible POIs: %s",
+		state.Health, state.Food, strings.Join(inv, ", "), strings.Join(pois, ", "))
+}
+
+func cleanJSON(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned)
+}
+
+</file>
+
+<file path="internal\voyager\vector.go">
+package voyager
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+
+	"david22573/synaptic-mc/internal/domain"
+
+	_ "modernc.org/sqlite"
+)
+
+type VectorStore interface {
+	SaveSkill(ctx context.Context, description string, intent domain.ActionIntent, embedding []float32) error
+	RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error)
+	Close() error
+}
+
+type SkillRecord struct {
+	Description string
+	Intent      domain.ActionIntent
+	Similarity  float32
+}
+
+type SQLiteVectorStore struct {
+	db *sql.DB
+}
+
+func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open vector store sqlite: %w", err)
+	}
+
+	schema := `
+	CREATE TABLE IF NOT EXISTS skills (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		description TEXT NOT NULL,
+		intent_json TEXT NOT NULL,
+		embedding_json TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+
+	if _, err := db.Exec(schema); err != nil {
+		return nil, fmt.Errorf("failed to apply vector store schema: %w", err)
+	}
+
+	return &SQLiteVectorStore{db: db}, nil
+}
+
+func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, intent domain.ActionIntent, embedding []float32) error {
+	intentBytes, _ := json.Marshal(intent)
+	embeddingBytes, _ := json.Marshal(embedding)
+
+	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, query, description, string(intentBytes), string(embeddingBytes))
+	return err
+}
+
+func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
+	query := `SELECT description, intent_json, embedding_json FROM skills`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []SkillRecord
+
+	for rows.Next() {
+		var desc, intentJSON, embJSON string
+		if err := rows.Scan(&desc, &intentJSON, &embJSON); err != nil {
+			continue
+		}
+
+		var intent domain.ActionIntent
+		if err := json.Unmarshal([]byte(intentJSON), &intent); err != nil {
+			continue
+		}
+
+		var embedding []float32
+		if err := json.Unmarshal([]byte(embJSON), &embedding); err != nil {
+			continue
+		}
+
+		sim := cosineSimilarity(queryEmbedding, embedding)
+		records = append(records, SkillRecord{
+			Description: desc,
+			Intent:      intent,
+			Similarity:  sim,
+		})
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].Similarity > records[j].Similarity
+	})
+
+	if len(records) > limit {
+		records = records[:limit]
+	}
+
+	return records, nil
+}
+
+func (s *SQLiteVectorStore) Close() error {
+	return s.db.Close()
+}
+
+func cosineSimilarity(a, b []float32) float32 {
+	if len(a) != len(b) {
+		return 0.0
+	}
+	var dotProduct, normA, normB float32
+	for i := range a {
+		dotProduct += a[i] * b[i]
+		normA += a[i] * a[i]
+		normB += b[i] * b[i]
+	}
+	if normA == 0 || normB == 0 {
+		return 0.0
+	}
+	return dotProduct / (float32(math.Sqrt(float64(normA))) * float32(math.Sqrt(float64(normB))))
+}
+
+</file>
+
 <file path="js\index.ts">
 import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
@@ -4029,12 +4215,10 @@ const { pathfinder, Movements } = pkg;
 
 let viewerStarted = false;
 
-// Aggressively filter out protodef noise
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err.stack || err);
     const name = String(err.name || "");
-
     return (
         name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
@@ -4071,7 +4255,6 @@ console.warn = (...args: any[]) => {
         firstArg.includes("Read error for undefined")
     )
         return;
-
     originalConsoleWarn.apply(console, args);
 };
 
@@ -4140,7 +4323,6 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -4165,7 +4347,6 @@ function normalizeFailureCause(err: any): string {
     )
         return "NO_ENTITY";
 
-    // 2.3 FIX: Catch specific errors before falling back to NO_BLOCKS
     if (msg.includes("no_pickaxe_equipped") || msg.includes("no_tool"))
         return "NO_TOOL";
 
@@ -4194,18 +4375,18 @@ function normalizeFailureCause(err: any): string {
     return "UNKNOWN";
 }
 
-async function executeDecision(decision: models.IncomingDecision) {
-    if (!decision?.action) return;
+async function executeIntent(intent: models.ActionIntent) {
+    if (!intent?.action) return;
     if (isShuttingDown) return;
 
     if (survival?.isPanickingNow()) {
-        if (decision.action === "retreat") {
+        if (intent.action === "retreat") {
             survival.reset();
         } else {
             client.sendEvent(
                 "task_aborted",
                 "lock",
-                decision.id,
+                intent.id,
                 "panic",
                 Date.now(),
             );
@@ -4214,19 +4395,19 @@ async function executeDecision(decision: models.IncomingDecision) {
     }
 
     abortActiveTask("preempted");
-
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
 
     currentTask = {
-        id: decision.id,
-        action: decision.action,
-        target: decision.target || { type: "none", name: "none" },
+        id: intent.id,
+        action: intent.action,
+        target: intent.target || { type: "none", name: "none" },
+        count: intent.count || 1,
         startTime: Date.now(),
-        trace: decision.trace || {
+        trace: intent.trace || {
             trace_id: "unknown",
-            action_id: decision.id,
+            action_id: intent.id,
         },
     };
 
@@ -4236,12 +4417,12 @@ async function executeDecision(decision: models.IncomingDecision) {
 
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-        const timeoutMs = timeouts[decision.action] || 15000;
+        const timeoutMs = timeouts[intent.action] || 15000;
 
         await Promise.race([
             runTask(
                 bot,
-                decision,
+                intent,
                 signal,
                 timeouts,
                 () => getThreats(bot),
@@ -4256,8 +4437,7 @@ async function executeDecision(decision: models.IncomingDecision) {
             }),
         ]);
 
-        if (!signal.aborted) {
-            // Give server half a second to sync inventory over the network before evaluating next step
+        if (!signal.aborted && activeTask) {
             await new Promise((r) => setTimeout(r, 500));
             pushState();
             completeTask(activeTask, "task_completed");
@@ -4265,22 +4445,21 @@ async function executeDecision(decision: models.IncomingDecision) {
     } catch (err: any) {
         if (!signal.aborted || err.message === "timeout") {
             const normalizedCause = normalizeFailureCause(err);
-
             log.error("Task execution failed natively", {
-                action: decision.action,
-                target: decision.target?.name,
+                action: intent.action,
+                target: intent.target?.name,
                 raw_error: err.message,
                 normalized_cause: normalizedCause,
             });
 
-            pushState(); // Force state update on fail too
-            completeTask(activeTask, "task_failed", normalizedCause);
+            pushState();
+            if (activeTask)
+                completeTask(activeTask, "task_failed", normalizedCause);
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
         stopMovement();
-
-        if (currentTask?.id === activeTask.id) currentTask = null;
+        if (currentTask?.id === activeTask?.id) currentTask = null;
         if (taskAbortController === localController) taskAbortController = null;
     }
 }
@@ -4295,6 +4474,7 @@ function pushState() {
     });
 
     const offhandItem = bot.inventory.slots[45];
+
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
@@ -4362,7 +4542,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
     if (!client) {
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
-            onCommand: (d) => void executeDecision(d),
+            onCommand: (i) => void executeIntent(i),
             onUnlock: () => abortActiveTask("unlock"),
         });
     }
@@ -4423,15 +4603,13 @@ async function connectWithRetry(maxAttempts = 10) {
             .filter((id) => id !== undefined);
 
         bot.pathfinder.setMovements(movements);
-
-        // Give pathfinder more breathing room to stop timeout spam
         bot.pathfinder.thinkTimeout = 20000;
 
-        // Safe to attach inventory listeners now
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
 
         if (!client.isConnected()) client.connect();
+
         survival.start();
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
@@ -4460,6 +4638,8 @@ async function connectWithRetry(maxAttempts = 10) {
 
     bot.on("health", pushState);
     bot.on("experience", pushState);
+
+    // @ts-ignore - Supress missing typing for this event in older versions
     bot.on("heldItemChanged", pushState);
 
     if (stateInterval) clearInterval(stateInterval);
@@ -4690,10 +4870,12 @@ export interface DecisionTarget {
     name: string;
 }
 
-export interface IncomingDecision {
+// Replaces IncomingDecision
+export interface ActionIntent {
     id: string;
     action: ActionType;
     target: DecisionTarget;
+    count: number;
     rationale?: string;
     trace?: TraceContext;
 }
@@ -4702,6 +4884,7 @@ export interface ActiveTask {
     id: string;
     action: ActionType;
     target: DecisionTarget;
+    count: number;
     startTime: number;
     trace: TraceContext;
 }
@@ -4732,7 +4915,7 @@ import { log } from "../logger.js";
 import * as models from "../models.js";
 
 export interface ControlPlaneEvents {
-    onCommand: (decision: models.IncomingDecision) => void;
+    onCommand: (intent: models.ActionIntent) => void;
     onUnlock: () => void;
 }
 
@@ -4775,23 +4958,28 @@ export class ControlPlaneClient {
                 const msg = JSON.parse(data.toString());
 
                 if (msg.type === "command") {
-                    const decision = msg.payload as models.IncomingDecision;
+                    const intent = msg.payload as models.ActionIntent;
 
-                    if (!decision || !decision.action) {
-                        log.error("Received malformed command payload", {
+                    if (!intent || !intent.action) {
+                        log.error("Received malformed intent payload", {
                             payload: msg.payload,
                         });
-
                         this.callbacks.onUnlock();
                         return;
                     }
 
-                    decision.trace = msg.trace || {
+                    // Ensure trace is populated for deterministic logging
+                    intent.trace = msg.trace || {
                         trace_id: "unknown",
-                        action_id: decision.id,
+                        action_id: intent.id,
                     };
 
-                    this.callbacks.onCommand(decision);
+                    // Fallback to 1 if Go sent a zero-value count by mistake
+                    if (!intent.count || intent.count <= 0) {
+                        intent.count = 1;
+                    }
+
+                    this.callbacks.onCommand(intent);
                     return;
                 }
 
@@ -4800,10 +4988,7 @@ export class ControlPlaneClient {
                     msg.type === "noop" ||
                     msg.type === "abort_task"
                 ) {
-                    log.debug("Control plane unlocked bot", {
-                        type: msg.type,
-                        payload: msg.payload,
-                    });
+                    log.debug("Control plane unlocked bot", { type: msg.type });
                     this.callbacks.onUnlock();
                 }
             } catch (err) {
@@ -4859,9 +5044,10 @@ export class ControlPlaneClient {
         startTime = 0,
     ): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
 
+        const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
         let msgType = "TASK_END";
+
         if (event === "death") msgType = "BOT_DEATH";
         if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
         if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
@@ -5459,203 +5645,89 @@ export async function handleBuild(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\craft.ts">
-// js/lib/tasks/handlers/craft.ts
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import type { TaskContext } from "../registry.js";
+import { type TaskContext } from "../registry.js";
 import {
     findNearestBlockByName,
     placePortableUtility,
     makeRoomInInventory,
     escapeTree,
-    waitForMs,
     moveToGoal,
 } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
-interface CraftContext extends StateContext {
-    itemType: any;
-    recipe: any;
-    craftingTable: any;
-    isPortableTable: boolean;
-    stopMovement: () => void;
-}
-
-class CleanupState implements FSMState {
-    name = "CLEANUP";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        if (cCtx.isPortableTable && cCtx.craftingTable) {
-            await makeRoomInInventory(cCtx.bot, 1);
-            const pickaxe = cCtx.bot.pathfinder.bestHarvestTool(
-                cCtx.craftingTable,
-            );
-            if (pickaxe) await cCtx.bot.equip(pickaxe, "hand");
-
-            try {
-                await cCtx.bot.dig(cCtx.craftingTable);
-                await waitForMs(1000, cCtx.signal);
-            } catch (_err) {}
-        }
-
-        cCtx.result = { status: "SUCCESS", reason: "CRAFTING_COMPLETE" };
-        return null;
-    }
-}
-
-class CraftingState implements FSMState {
-    name = "CRAFTING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        try {
-            // FIX: Prevent bot.craft from hanging indefinitely when inventory is full
-            await makeRoomInInventory(cCtx.bot, 1);
-
-            const tableToUse = cCtx.recipe.requiresTable
-                ? cCtx.craftingTable
-                : null;
-            await cCtx.bot.craft(cCtx.recipe, 1, tableToUse);
-        } catch (err: any) {
-            cCtx.result = {
-                status: "FAILED",
-                reason: `CRAFT_ACTION_FAILED: ${err.message}`,
-            };
-            return null;
-        }
-
-        return new CleanupState();
-    }
-}
-
-class NavigateTableState implements FSMState {
-    name = "NAVIGATING";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        if (cCtx.recipe.requiresTable && cCtx.craftingTable) {
-            const pos = cCtx.craftingTable.position;
-            try {
-                await moveToGoal(
-                    cCtx.bot,
-                    new goals.GoalNear(pos.x, pos.y, pos.z, 2),
-                    {
-                        signal: cCtx.signal,
-                        timeoutMs: 15000,
-                        stopMovement: cCtx.stopMovement,
-                        dynamic: false,
-                    },
-                );
-            } catch (err: any) {
-                if (err.message === "aborted") {
-                    cCtx.result = { status: "FAILED", reason: "aborted" };
-                } else {
-                    cCtx.result = {
-                        status: "FAILED",
-                        reason: "FAILED_TO_REACH_TABLE",
-                    };
-                }
-                return null;
-            }
-        }
-
-        return new CraftingState();
-    }
-}
-
-class SetupRecipeState implements FSMState {
-    name = "SETUP_RECIPE";
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const cCtx = ctx as CraftContext;
-        const targetRecipeName = cCtx.targetName;
-        const itemType = cCtx.bot.registry.itemsByName[targetRecipeName];
-        if (!itemType) {
-            cCtx.result = {
-                status: "FAILED",
-                reason: `UNKNOWN_ITEM: ${targetRecipeName}`,
-            };
-            return null;
-        }
-        cCtx.itemType = itemType;
-
-        let craftingTable = findNearestBlockByName(cCtx.bot, "crafting_table");
-        let isPortableTable = false;
-
-        let recipes = cCtx.bot.recipesFor(itemType.id, null, 1, craftingTable);
-        if (recipes.length === 0 && !craftingTable) {
-            const hasTableInInv = cCtx.bot.inventory
-                .items()
-                .some((i: any) => i.name === "crafting_table");
-            if (hasTableInInv) {
-                craftingTable = await placePortableUtility(
-                    cCtx.bot,
-                    "crafting_table",
-                );
-                if (craftingTable) {
-                    isPortableTable = true;
-                    recipes = cCtx.bot.recipesFor(
-                        itemType.id,
-                        null,
-                        1,
-                        craftingTable,
-                    );
-                }
-            }
-        }
-
-        if (recipes.length === 0) {
-            cCtx.result = {
-                status: "FAILED",
-                reason: `MISSING_INGREDIENTS_OR_CRAFTING_TABLE_FOR_${targetRecipeName.toUpperCase()}`,
-            };
-            return null;
-        }
-
-        cCtx.recipe = recipes[0];
-        cCtx.craftingTable = craftingTable;
-        cCtx.isPortableTable = isPortableTable;
-        return new NavigateTableState();
-    }
-}
-
 export async function handleCraft(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    const { bot, intent, signal, stopMovement } = ctx;
     await escapeTree(bot, signal);
 
-    const targetName = decision.target?.name;
-    if (!targetName || targetName === "none") {
-        throw new Error("missing craft target");
+    const targetName = intent.target.name;
+    const count = intent.count || 1;
+
+    const itemType = bot.registry.itemsByName[targetName];
+    if (!itemType) {
+        throw new Error(`UNKNOWN_ITEM: ${targetName}`);
     }
 
-    const fsmCtx: CraftContext = {
-        bot,
-        targetName,
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.craft ?? 20000,
-        startTime: 0,
-        signal,
-        itemType: null,
-        recipe: null,
-        craftingTable: null,
-        isPortableTable: false,
-        stopMovement,
-    };
-    const fsm = new StateMachineRunner(new SetupRecipeState(), fsmCtx);
-    const result = await fsm.run();
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
+    let craftingTable = findNearestBlockByName(bot, "crafting_table");
+    let isPortableTable = false;
+
+    let recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
+
+    if (recipes.length === 0 && !craftingTable) {
+        const hasTableInInv = bot.inventory
+            .items()
+            .some((i) => i.name === "crafting_table");
+        if (hasTableInInv) {
+            craftingTable = await placePortableUtility(bot, "crafting_table");
+            if (craftingTable) {
+                isPortableTable = true;
+                recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
+            }
+        }
+    }
+
+    if (recipes.length === 0) {
+        throw new Error(
+            `MISSING_INGREDIENTS_OR_CRAFTING_TABLE_FOR_${targetName.toUpperCase()}`,
+        );
+    }
+
+    const recipe = recipes[0];
+
+    if (!recipe) return;
+
+    if (recipe.requiresTable && craftingTable) {
+        const pos = craftingTable.position;
+        try {
+            await moveToGoal(bot, new goals.GoalNear(pos.x, pos.y, pos.z, 2), {
+                signal,
+                timeoutMs: 15000,
+                stopMovement,
+                dynamic: false,
+            });
+        } catch (err: any) {
+            throw err.message === "aborted"
+                ? err
+                : new Error("FAILED_TO_REACH_TABLE");
+        }
+    }
+
+    try {
+        await makeRoomInInventory(bot, 1);
+        const tableToUse = recipe.requiresTable ? craftingTable : null;
+        await bot.craft(recipe, count, tableToUse);
+    } catch (err: any) {
+        throw new Error(`CRAFT_ACTION_FAILED: ${err.message}`);
+    } finally {
+        if (isPortableTable && craftingTable) {
+            await makeRoomInInventory(bot, 1);
+            const pickaxe = bot.pathfinder.bestHarvestTool(craftingTable);
+            if (pickaxe) await bot.equip(pickaxe, "hand");
+            try {
+                await bot.dig(craftingTable);
+            } catch (_err) {}
+        }
     }
 }
 
@@ -6002,195 +6074,51 @@ export async function handleFarm(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\gather.ts">
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-const LOG_TYPES = [
-    "oak_log",
-    "birch_log",
-    "spruce_log",
-    "acacia_log",
-    "jungle_log",
-    "dark_oak_log",
-    "mangrove_log",
-    "cherry_log",
-];
-
-interface GatherContext extends StateContext {
-    candidatePositions: any[];
-    currentIndex: number;
-    resolvedTarget: string;
-    targetBlock: any;
-    stopMovement: () => void;
-}
-
-class MineState implements FSMState {
-    name = "MINING";
-    async enter() {}
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const gCtx = ctx as GatherContext;
-        const freshBlock = gCtx.bot.blockAt(gCtx.targetBlock.position);
-
-        if (!freshBlock || freshBlock.name !== gCtx.resolvedTarget)
-            return advanceToNextCandidate(gCtx, "BLOCK_CHANGED");
-
-        const tool = gCtx.bot.pathfinder.bestHarvestTool(freshBlock);
-        if (tool) await gCtx.bot.equip(tool, "hand");
-
-        try {
-            await gCtx.bot.dig(freshBlock);
-
-            const blockId =
-                gCtx.bot.registry.blocksByName[gCtx.resolvedTarget]?.id;
-
-            if (blockId) {
-                const nearby = gCtx.bot.findBlocks({
-                    matching: blockId,
-                    maxDistance: 4,
-                    count: 16,
-                });
-
-                for (const pos of nearby) {
-                    if (gCtx.signal.aborted) break;
-                    const nextBlock = gCtx.bot.blockAt(pos);
-                    if (nextBlock && nextBlock.name !== "air") {
-                        const nextTool =
-                            gCtx.bot.pathfinder.bestHarvestTool(nextBlock);
-                        if (nextTool) await gCtx.bot.equip(nextTool, "hand");
-                        await gCtx.bot.dig(nextBlock).catch(() => {});
-                    }
-                }
-            }
-
-            await waitForMs(500, gCtx.signal);
-
-            gCtx.result = { status: "SUCCESS" };
-            return null;
-        } catch (err: any) {
-            return advanceToNextCandidate(gCtx, `DIG_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class NavigateState implements FSMState {
-    name = "NAVIGATING";
-    async enter() {}
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const gCtx = ctx as GatherContext;
-        const pos = gCtx.candidatePositions[gCtx.currentIndex];
-
-        gCtx.targetBlock = gCtx.bot.blockAt(pos);
-        if (!gCtx.targetBlock) {
-            return advanceToNextCandidate(gCtx, "BLOCK_UNLOADED");
-        }
-        gCtx.resolvedTarget = gCtx.targetBlock.name;
-
-        try {
-            await moveToGoal(
-                gCtx.bot,
-                new goals.GoalNear(pos.x, pos.y, pos.z, 1.5),
-                {
-                    signal: gCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: gCtx.stopMovement,
-                },
-            );
-
-            return new MineState();
-        } catch (err: any) {
-            return advanceToNextCandidate(gCtx, `PATH_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class SearchState implements FSMState {
-    name = "SEARCHING";
-    async enter() {}
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const gCtx = ctx as GatherContext;
-
-        const candidates =
-            gCtx.targetName === "wood" ? LOG_TYPES : [gCtx.targetName];
-
-        const ids = candidates
-            .map((n) => gCtx.bot.registry.blocksByName[n]?.id)
-            .filter((id) => id !== undefined);
-
-        let blocks = gCtx.bot.findBlocks({
-            matching: ids,
-            maxDistance: 32,
-            count: 64,
-        });
-
-        const botPos = gCtx.bot.entity.position;
-        blocks = blocks.filter((b: any) => Math.abs(b.y - botPos.y) < 12);
-
-        if (blocks.length === 0) {
-            gCtx.result = { status: "FAILED", reason: "NO_REACHABLE_BLOCKS" };
-            return null;
-        }
-
-        blocks.sort(
-            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
-        );
-
-        gCtx.candidatePositions = blocks.slice(0, 6);
-        gCtx.currentIndex = 0;
-
-        return new NavigateState();
-    }
-}
-
-function advanceToNextCandidate(
-    gCtx: GatherContext,
-    reason: string,
-): FSMState | null {
-    gCtx.currentIndex++;
-
-    if (
-        gCtx.currentIndex >= gCtx.candidatePositions.length ||
-        gCtx.currentIndex > 5
-    ) {
-        gCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
-        return null;
-    }
-    return new NavigateState();
-}
+import { escapeTree } from "../utils.js";
 
 export async function handleGather(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
-
+    const { bot, intent, signal } = ctx;
     await escapeTree(bot, signal);
 
-    const fsmCtx: GatherContext = {
-        bot,
-        targetName: decision.target?.name,
-        targetEntity: null,
-        searchRadius: 32,
-        timeoutMs: timeouts.gather ?? 30000,
-        startTime: 0,
-        signal,
-        candidatePositions: [],
-        currentIndex: 0,
-        resolvedTarget: "",
-        targetBlock: null,
-        stopMovement,
+    const targetName = intent.target.name;
+    const count = intent.count || 1;
+
+    const blockId = bot.registry.blocksByName[targetName]?.id;
+    if (blockId === undefined) {
+        throw new Error(`UNKNOWN_BLOCK: ${targetName}`);
+    }
+
+    // Locate slightly more blocks than needed in case some are unreachable
+    const blockPositions = bot.findBlocks({
+        matching: blockId,
+        maxDistance: 64,
+        count: count + 5,
+    });
+
+    if (blockPositions.length === 0) {
+        throw new Error(`NO_${targetName.toUpperCase()}_NEARBY`);
+    }
+
+    const targets = blockPositions
+        .map((pos) => bot.blockAt(pos))
+        .filter((b) => b !== null);
+
+    // Ensure the high-level plugin aborts cleanly if a higher-priority task preempts it
+    const onAbort = () => {
+        // @ts-ignore - plugin method attached at runtime
+        if (bot.collectBlock) bot.collectBlock.cancelTask();
     };
+    signal.addEventListener("abort", onAbort, { once: true });
 
-    const result = await new StateMachineRunner(
-        new SearchState(),
-        fsmCtx,
-    ).run();
-
-    if (result.status === "FAILED") throw new Error(result.reason);
+    try {
+        // @ts-ignore - collect expects an array of block objects
+        await bot.collectBlock.collect(targets.slice(0, count));
+    } catch (err: any) {
+        throw new Error(`COLLECT_FAILED: ${err.message}`);
+    } finally {
+        signal.removeEventListener("abort", onAbort);
+    }
 }
 
 </file>
@@ -6466,165 +6394,50 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
 </file>
 
 <file path="js\lib\tasks\handlers\mine.ts">
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
-import pkg from "mineflayer-pathfinder";
-
-const { goals } = pkg;
-
-interface MineContext extends StateContext {
-    candidatePositions: any[];
-    currentIndex: number;
-    targetBlock: any;
-    stopMovement: () => void;
-}
-
-class MineBlockState implements FSMState {
-    name = "BREAKING_ORE";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const mCtx = ctx as MineContext;
-        const freshBlock = mCtx.bot.blockAt(mCtx.targetBlock.position);
-
-        if (!freshBlock || freshBlock.name === "air") {
-            return advanceToNextOre(mCtx, "BLOCK_ALREADY_MINED");
-        }
-
-        const pickaxe = mCtx.bot.inventory
-            .items()
-            .find((i: any) => i.name.includes("pickaxe"));
-        if (!pickaxe) {
-            mCtx.result = { status: "FAILED", reason: "NO_PICKAXE_EQUIPPED" };
-            return null;
-        }
-
-        await mCtx.bot.equip(pickaxe, "hand");
-
-        try {
-            await mCtx.bot.dig(freshBlock, true); // true forces line-of-sight bypass
-            await waitForMs(500, mCtx.signal);
-            mCtx.result = { status: "SUCCESS" };
-            return null;
-        } catch (err: any) {
-            return advanceToNextOre(mCtx, `DIG_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class NavigateOreState implements FSMState {
-    name = "NAVIGATING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const mCtx = ctx as MineContext;
-        const pos = mCtx.candidatePositions[mCtx.currentIndex];
-        mCtx.targetBlock = mCtx.bot.blockAt(pos);
-
-        try {
-            // Use GoalGetToBlock so the bot stands *next* to the ore, not inside it
-            await moveToGoal(
-                mCtx.bot,
-                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
-                {
-                    signal: mCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: mCtx.stopMovement,
-                },
-            );
-            return new MineBlockState();
-        } catch (err: any) {
-            return advanceToNextOre(mCtx, `PATH_FAIL: ${err.message}`);
-        }
-    }
-}
-
-class SearchOreState implements FSMState {
-    name = "SEARCHING";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const mCtx = ctx as MineContext;
-        const blockId = mCtx.bot.registry.blocksByName[mCtx.targetName]?.id;
-
-        if (blockId === undefined) {
-            mCtx.result = {
-                status: "FAILED",
-                reason: `UNKNOWN_ORE: ${mCtx.targetName}`,
-            };
-            return null;
-        }
-
-        // Expanded search radius since ores can be sparse
-        let blocks = mCtx.bot.findBlocks({
-            matching: blockId,
-            maxDistance: 64,
-            count: 128,
-        });
-
-        if (blocks.length === 0) {
-            mCtx.result = {
-                status: "FAILED",
-                reason: `NO_${mCtx.targetName.toUpperCase()}_NEARBY`,
-            };
-            return null;
-        }
-
-        const botPos = mCtx.bot.entity.position;
-        blocks.sort(
-            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
-        );
-
-        mCtx.candidatePositions = blocks.slice(0, 5);
-        mCtx.currentIndex = 0;
-        return new NavigateOreState();
-    }
-}
-
-function advanceToNextOre(mCtx: MineContext, reason: string): FSMState | null {
-    mCtx.currentIndex++;
-    if (mCtx.currentIndex >= mCtx.candidatePositions.length) {
-        mCtx.result = { status: "FAILED", reason: `EXHAUSTED: ${reason}` };
-        return null;
-    }
-    return new NavigateOreState();
-}
+import { escapeTree } from "../utils.js";
 
 export async function handleMine(ctx: TaskContext): Promise<void> {
-    const { bot, decision, signal, timeouts, stopMovement } = ctx;
+    const { bot, intent, signal } = ctx;
     await escapeTree(bot, signal);
 
-    if (!decision.target?.name || decision.target.name === "none") {
-        throw new Error("missing mine target");
+    const targetName = intent.target.name;
+    const count = intent.count || 1;
+
+    const blockId = bot.registry.blocksByName[targetName]?.id;
+    if (blockId === undefined) {
+        throw new Error(`UNKNOWN_ORE: ${targetName}`);
     }
 
-    const fsmCtx: MineContext = {
-        bot,
-        targetName: decision.target.name,
-        targetEntity: null,
-        searchRadius: 64,
-        timeoutMs: timeouts.mine ?? 45000,
-        startTime: 0,
-        signal,
-        candidatePositions: [],
-        currentIndex: 0,
-        targetBlock: null,
-        stopMovement,
-    };
+    // Look for a few extra blocks in case some are unreachable or fall in lava
+    const blockPositions = bot.findBlocks({
+        matching: blockId,
+        maxDistance: 64,
+        count: count + 5,
+    });
 
-    const result = await new StateMachineRunner(
-        new SearchOreState(),
-        fsmCtx,
-    ).run();
-    if (result.status === "FAILED") throw new Error(result.reason);
+    if (blockPositions.length === 0) {
+        throw new Error(`NO_${targetName.toUpperCase()}_NEARBY`);
+    }
+
+    const targets = blockPositions
+        .map((pos) => bot.blockAt(pos))
+        .filter((b) => b !== null);
+
+    const onAbort = () => {
+        // @ts-ignore
+        if (bot.collectBlock) bot.collectBlock.cancelTask();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    try {
+        // @ts-ignore
+        await bot.collectBlock.collect(targets.slice(0, count));
+    } catch (err: any) {
+        throw new Error(`COLLECT_FAILED: ${err.message}`);
+    } finally {
+        signal.removeEventListener("abort", onAbort);
+    }
 }
 
 </file>
@@ -6890,7 +6703,6 @@ const LOG_TO_PLANK_MAP: Record<string, string> = {
     cherry_log: "cherry_planks",
 };
 
-// Map common LLM shorthand/misspellings to strict Minecraft registry names
 const TARGET_ALIASES: Record<string, string> = {
     // Farming Aliases
     carrot: "carrots",
@@ -6909,20 +6721,18 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
-    // Note: The validator heavily relies on "wood" mapping to logs for redundancy
-    // and vision checks. Do not remove or change these without updating validator.go.
     tree: "wood",
     log: "wood",
     timber: "wood",
 };
 
-export function normalizeDecision(
+export function normalizeIntent(
     bot: Bot,
-    decision: models.IncomingDecision,
-): models.IncomingDecision {
-    const normalized: models.IncomingDecision = {
-        ...decision,
-        target: { ...decision.target },
+    intent: models.ActionIntent,
+): models.ActionIntent {
+    const normalized: models.ActionIntent = {
+        ...intent,
+        target: { ...intent.target },
     };
 
     const action = normalized.action;
@@ -6932,7 +6742,7 @@ export function normalizeDecision(
 
     let targetName = originalTargetName;
 
-    // 1. Apply static dictionary aliases first (fixes farm/mine targets)
+    // 1. Apply static dictionary aliases first
     if (TARGET_ALIASES[targetName]) {
         targetName = TARGET_ALIASES[targetName]!;
     }
@@ -6977,7 +6787,7 @@ export function normalizeDecision(
     // 3. Log and apply changes if a normalization occurred
     if (targetName !== originalTargetName) {
         normalized.target.name = targetName;
-        log.debug("Decision normalized", {
+        log.debug("Intent normalized", {
             original_target: originalTargetName,
             normalized_target: targetName,
             action,
@@ -7066,11 +6876,10 @@ import type * as models from "../models.js";
 
 export interface TaskContext {
     bot: Bot;
-    decision: models.IncomingDecision;
+    intent: models.ActionIntent;
     signal: AbortSignal;
     timeouts: Record<string, number>;
     stopMovement: () => void;
-
     getThreats: () => any[];
     computeSafeRetreat: (
         threats: any[],
@@ -7100,14 +6909,14 @@ import { handleSmelt } from "./handlers/smelt.js";
 import { handleMine } from "./handlers/mine.js";
 import { handleFarm } from "./handlers/farm.js";
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
-import { normalizeDecision } from "./normalize.js";
+import { normalizeIntent } from "./normalize.js";
 import { handleInteract } from "./handlers/interact.js";
 
 const { goals } = pkg;
 
 export async function runTask(
     bot: Bot,
-    rawDecision: models.IncomingDecision,
+    rawIntent: models.ActionIntent,
     signal: AbortSignal,
     timeouts: Record<string, number>,
     getThreats: () => models.ThreatInfo[],
@@ -7117,11 +6926,11 @@ export async function runTask(
     },
     stopMovement: () => void,
 ): Promise<void> {
-    const decision = normalizeDecision(bot, rawDecision);
+    const intent = normalizeIntent(bot, rawIntent);
 
     const taskCtx: TaskContext = {
         bot,
-        decision,
+        intent,
         signal,
         timeouts,
         getThreats,
@@ -7133,7 +6942,7 @@ export async function runTask(
         throw new Error("aborted");
     }
 
-    switch (decision.action) {
+    switch (intent.action) {
         case "hunt":
             await handleHunt(taskCtx);
             return;
@@ -7161,11 +6970,11 @@ export async function runTask(
         case "eat": {
             const food = bot.inventory
                 .items()
-                .find((i) => i.name === decision.target.name);
-            if (!food) throw new Error(`NO_FOOD: ${decision.target.name}`);
+                .find((i) => i.name === intent.target.name);
+
+            if (!food) throw new Error(`NO_FOOD: ${intent.target.name}`);
 
             try {
-                // Must pass .type to equip safely in all contexts
                 await bot.equip(food.type, "hand");
                 await bot.consume();
             } catch (err) {
@@ -7199,8 +7008,6 @@ export async function runTask(
                 { signal, timeoutMs: 20000, stopMovement },
             );
 
-            // 2.4 FIX: Setup wake listener first to prevent race condition, then
-            // race the combined sleep+wake promise against a graceful 12s timeout.
             let onWake: (() => void) | undefined;
             let onAbort: (() => void) | undefined;
 
@@ -7247,7 +7054,7 @@ export async function runTask(
             await waitForMs(500, signal);
             return;
         default:
-            throw new Error(`unsupported: ${decision.action}`);
+            throw new Error(`unsupported: ${intent.action}`);
     }
 }
 
@@ -7916,1384 +7723,14 @@ export function computeSafeRetreat(
 
 </file>
 
-<file path="scripts\find_deprecated_decision_logic.sh">
-#!/bin/bash
-echo "Identifying old decision logic for removal..."
-grep -rn "func (.*Validator) Validate" internal/decision/validator.go
-grep -rn "func (.*Simulator) RankAndSelect" internal/decision/simulator.go
-echo "These functions should be deleted after Step 1.3 is complete."
-</file>
-
-<file path="scripts\lint_pipeline_immutability.sh">
-#!/bin/bash
-# scripts/lint_policy_authority.sh
-
-echo "Checking for rogue policy overrides outside policy package..."
-ROGUE=$(grep -r "POLICY VIOLATION" internal/ | grep -v "internal/policy/")
-
-if [ -n "$ROGUE" ]; then
-    echo "ERROR: Hardcoded policy constraints found outside internal/policy/!"
-    echo "$ROGUE"
-    exit 1
-fi
-echo "Policy authority checks passed."
-</file>
-
-<file path="ui\index.html">
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ui</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
-</html>
-
-</file>
-
-<file path="ui\src\App.svelte">
-<script lang="ts">
-    import { onMount } from "svelte";
-    import {
-        botStore,
-        uiStore,
-        connectToBot,
-        disconnectBot,
-    } from "./lib/store.svelte";
-    import HUD from "./components/HUD.svelte";
-    import Sidebar from "./components/Sidebar.svelte";
-
-    let viewerUrl = $state("about:blank");
-    let isSidebarOpen = $state(true);
-
-    const position = $derived(
-        botStore.gameState?.position || { x: 0, y: 0, z: 0 },
-    );
-    const timeOfDay = $derived(botStore.gameState?.time_of_day ?? 0);
-
-    const timeDisplay = $derived(formatTimeOfDay(timeOfDay));
-    const coordsDisplay = $derived(
-        `X: ${Math.round(position.x)} Y: ${Math.round(position.y)} Z: ${Math.round(position.z)}`,
-    );
-
-    function formatTimeOfDay(time: number): string {
-        const hours = Math.floor((time / 1000 + 6) % 24);
-        const minutes = Math.floor(((time % 1000) / 1000) * 60);
-        return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}`;
-    }
-
-    onMount(() => {
-        viewerUrl = `http://${window.location.hostname}:3000`;
-        connectToBot();
-        return () => {
-            disconnectBot();
-        };
-    });
-</script>
-
-<main class="fullscreen">
-    <iframe src={viewerUrl} title="Mineflayer Viewer" class="viewer-iframe"
-    ></iframe>
-
-    <div class="floating-header">
-        <div class="title-group">
-            <h1>Synaptic MC</h1>
-            <span class="coords-badge">{timeDisplay} | {coordsDisplay}</span>
-        </div>
-        <div class="status">
-            <span class="indicator {botStore.connectionStatus}"></span>
-            <span class="status-text">
-                {#if botStore.connectionStatus === "connecting"}
-                    Connecting...
-                {:else if botStore.connectionStatus === "connected"}
-                    Connected
-                {:else}
-                    Disconnected
-                {/if}
-            </span>
-        </div>
-    </div>
-
-    <HUD />
-    <Sidebar isOpen={isSidebarOpen} />
-
-    <button
-        class="sidebar-toggle"
-        class:sidebar-closed={!isSidebarOpen}
-        onclick={() => (isSidebarOpen = !isSidebarOpen)}
-        title="Toggle Sidebar"
-    >
-        {isSidebarOpen ? "▶" : "◀"}
-    </button>
-
-    {#if uiStore.tooltip}
-        <div
-            class="mc-tooltip"
-            style="left: {uiStore.mouseX + 15}px; top: {uiStore.mouseY + 15}px;"
-        >
-            {uiStore.tooltip}
-        </div>
-    {/if}
-</main>
-
-<style>
-    :global(body) {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-            sans-serif;
-        background: #000;
-        color: #e2e8f0;
-    }
-
-    .fullscreen {
-        position: relative;
-        width: 100vw;
-        height: 100vh;
-        overflow: hidden;
-    }
-
-    .viewer-iframe {
-        position: absolute;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: none;
-        z-index: 1;
-        pointer-events: auto;
-    }
-
-    .floating-header {
-        position: absolute;
-        top: 1rem;
-        left: 1rem;
-        z-index: 20;
-        display: flex;
-        flex-direction: column;
-        gap: 0.5rem;
-        background: rgba(15, 23, 42, 0.7);
-        backdrop-filter: blur(8px);
-        -webkit-backdrop-filter: blur(8px);
-        padding: 0.75rem 1.25rem;
-        border-radius: 8px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        pointer-events: auto;
-    }
-
-    .title-group {
-        display: flex;
-        align-items: center;
-        gap: 1rem;
-    }
-
-    .floating-header h1 {
-        margin: 0;
-        font-size: 1.25rem;
-        color: #38bdf8;
-    }
-
-    .coords-badge {
-        background: rgba(30, 41, 59, 0.8);
-        padding: 0.25rem 0.5rem;
-        border-radius: 4px;
-        font-family: monospace;
-        font-size: 0.875rem;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-    }
-
-    .status {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        font-size: 0.875rem;
-    }
-
-    .indicator {
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        display: inline-block;
-    }
-    .indicator.connecting {
-        background: #fbbf24;
-        animation: pulse 1s infinite;
-    }
-    .indicator.connected {
-        background: #34d399;
-    }
-    .indicator.disconnected {
-        background: #ef4444;
-    }
-
-    .sidebar-toggle {
-        position: absolute;
-        top: 1rem;
-        right: 430px; /* 420px sidebar + 10px spacing */
-        z-index: 25;
-        background: rgba(15, 23, 42, 0.8);
-        color: white;
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        border-radius: 8px;
-        width: 40px;
-        height: 40px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-        backdrop-filter: blur(4px);
-        transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-
-    .sidebar-toggle:hover {
-        background: rgba(30, 41, 59, 0.9);
-    }
-
-    .sidebar-toggle.sidebar-closed {
-        right: 10px;
-    }
-
-    .mc-tooltip {
-        position: fixed;
-        background: rgba(16, 0, 16, 0.95);
-        border: 2px solid #3700b3; /* Classic minecraft purple border */
-        border-radius: 3px;
-        color: #fff;
-        padding: 4px 8px;
-        font-family: monospace;
-        font-size: 14px;
-        white-space: nowrap;
-        z-index: 9999;
-        pointer-events: none;
-        text-shadow: 1px 1px 0 #000;
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
-    }
-
-    @keyframes pulse {
-        0%,
-        100% {
-            opacity: 1;
-        }
-        50% {
-            opacity: 0.5;
-        }
-    }
-</style>
-
-</file>
-
-<file path="ui\src\app.css">
-/* :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
-
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
-
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
-}
-
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
-
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
-
-#app {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
-}
-
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
-
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
-    }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
-}
-
-#docs {
-  border-right: 1px solid var(--border);
-
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-}
-
-#next-steps ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
-}
-
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
-}
-
-.ticks {
-  position: relative;
-  width: 100%;
-
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
-
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
-  }
-} */
-
-</file>
-
-<file path="ui\src\components\HUD.svelte">
-<script lang="ts">
-    import ItemIcon from "./ItemIcon.svelte";
-    import { botStore, uiStore } from "../lib/store.svelte";
-
-    const health = $derived(botStore.gameState?.health ?? 20);
-    const food = $derived(botStore.gameState?.food ?? 20);
-    const xpProgress = $derived(botStore.gameState?.experience ?? 0);
-    const xpLevel = $derived(botStore.gameState?.level ?? 0);
-
-    const hotbarSlots = $derived(
-        botStore.gameState?.hotbar || Array(9).fill(null),
-    );
-    const offhand = $derived(botStore.gameState?.offhand || null);
-    const activeSlot = $derived(botStore.gameState?.active_slot ?? 0);
-
-    const fullHearts = $derived(Math.max(0, Math.floor(health / 2)));
-    const halfHearts = $derived(health % 2 !== 0 && health > 0 ? 1 : 0);
-    const emptyHearts = $derived(Math.max(0, 10 - fullHearts - halfHearts));
-
-    const fullFood = $derived(Math.max(0, Math.floor(food / 2)));
-    const halfFood = $derived(food % 2 !== 0 && food > 0 ? 1 : 0);
-    const emptyFood = $derived(Math.max(0, 10 - fullFood - halfFood));
-
-    function formatName(name: string) {
-        if (!name) return "";
-        return name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-    }
-
-    function setTooltip(e: MouseEvent, text: string) {
-        if (!text) return;
-        uiStore.mouseX = e.clientX;
-        uiStore.mouseY = e.clientY;
-        uiStore.tooltip = text;
-    }
-
-    function clearTooltip() {
-        uiStore.tooltip = "";
-    }
-</script>
-
-<div class="mc-overlay">
-    <div class="mc-crosshair"></div>
-
-    <div class="mc-hud">
-        <div class="mc-bars">
-            <div class="mc-bar-half left-align">
-                {#each Array(fullHearts) as _}
-                    <span class="mc-icon-stat">❤️</span>
-                {/each}
-                {#each Array(halfHearts) as _}
-                    <span class="mc-icon-stat">💔</span>
-                {/each}
-                {#each Array(emptyHearts) as _}
-                    <span class="mc-icon-stat empty">🖤</span>
-                {/each}
-            </div>
-
-            <div class="mc-bar-half right-align">
-                {#each Array(emptyFood) as _}
-                    <span class="mc-icon-stat empty">🍖</span>
-                {/each}
-                {#each Array(halfFood) as _}
-                    <span class="mc-icon-stat">🍗</span>
-                {/each}
-                {#each Array(fullFood) as _}
-                    <span class="mc-icon-stat">🍖</span>
-                {/each}
-            </div>
-        </div>
-
-        <div class="mc-xp-bar-container">
-            {#if xpLevel > 0}
-                <span class="mc-xp-level">{xpLevel}</span>
-            {/if}
-            <div class="mc-xp-bar">
-                <div
-                    class="mc-xp-fill"
-                    style="width: {xpProgress * 100}%;"
-                ></div>
-            </div>
-        </div>
-
-        <div class="mc-hotbar-container">
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div
-                class="mc-offhand slot"
-                onmousemove={(e) =>
-                    setTooltip(e, offhand ? formatName(offhand.name) : "")}
-                onmouseleave={clearTooltip}
-            >
-                {#if offhand}
-                    <ItemIcon name={offhand.name} size={24} />
-                    {#if offhand.count > 1}
-                        <span class="slot-count">{offhand.count}</span>
-                    {/if}
-                {/if}
-            </div>
-
-            <div class="mc-hotbar">
-                {#each hotbarSlots as slot, i}
-                    <div
-                        class="slot {i === activeSlot ? 'active' : ''}"
-                        onmousemove={(e) =>
-                            setTooltip(e, slot ? formatName(slot.name) : "")}
-                        onmouseleave={clearTooltip}
-                    >
-                        {#if slot}
-                            <ItemIcon name={slot.name} size={24} />
-                            {#if slot.count > 1}
-                                <span class="slot-count">{slot.count}</span>
-                            {/if}
-                        {/if}
-                    </div>
-                {/each}
-            </div>
-        </div>
-    </div>
-</div>
-
-<style>
-    .mc-overlay {
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-        display: flex;
-        flex-direction: column;
-        justify-content: flex-end;
-        align-items: center;
-        padding-bottom: 24px;
-        z-index: 10;
-    }
-
-    .mc-crosshair {
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        width: 16px;
-        height: 16px;
-        pointer-events: none;
-    }
-
-    .mc-crosshair::before,
-    .mc-crosshair::after {
-        content: "";
-        position: absolute;
-        background: rgba(255, 255, 255, 0.6);
-        mix-blend-mode: difference;
-    }
-
-    .mc-crosshair::before {
-        top: 7px;
-        left: 0;
-        width: 16px;
-        height: 2px;
-    }
-    .mc-crosshair::after {
-        top: 0;
-        left: 7px;
-        width: 2px;
-        height: 16px;
-    }
-
-    .mc-hud {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-    }
-
-    .mc-bars {
-        display: flex;
-        justify-content: space-between;
-        width: 364px;
-        gap: 1rem;
-        margin-bottom: 6px;
-        padding: 0 4px;
-    }
-
-    .mc-bar-half {
-        display: flex;
-        gap: 1px;
-    }
-
-    .mc-icon-stat {
-        font-size: 14px;
-        line-height: 1;
-        filter: drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
-    }
-
-    .mc-icon-stat.empty {
-        filter: grayscale(1) brightness(0.2)
-            drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
-    }
-
-    .mc-xp-bar-container {
-        position: relative;
-        width: 364px;
-        display: flex;
-        justify-content: center;
-        margin-bottom: 6px;
-    }
-
-    .mc-xp-bar {
-        width: 100%;
-        height: 10px;
-        background: #222;
-        border: 2px solid #111;
-        box-shadow: inset 1px 1px 0px rgba(0, 0, 0, 0.5);
-    }
-
-    .mc-xp-fill {
-        height: 100%;
-        background: #84e84b;
-        box-shadow: inset 0px 2px 0px rgba(255, 255, 255, 0.3);
-    }
-
-    .mc-xp-level {
-        position: absolute;
-        top: -16px;
-        color: #84e84b;
-        font-family: monospace;
-        font-size: 16px;
-        font-weight: bold;
-        text-shadow:
-            2px 2px 0 #000,
-            -1px -1px 0 #000,
-            1px -1px 0 #000,
-            -1px 1px 0 #000;
-        z-index: 15;
-    }
-
-    .mc-hotbar-container {
-        display: flex;
-        align-items: flex-end;
-        gap: 8px;
-    }
-
-    .mc-hotbar {
-        display: flex;
-        background: #8b8b8b;
-        border: 2px solid #111;
-        padding: 2px;
-        box-shadow:
-            inset 2px 2px 0px rgba(255, 255, 255, 0.4),
-            inset -2px -2px 0px rgba(0, 0, 0, 0.4);
-    }
-
-    .slot {
-        width: 36px;
-        height: 36px;
-        background: #8b8b8b;
-        border-style: solid;
-        border-width: 2px;
-        border-color: #373737 #fff #fff #373737;
-        position: relative;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        cursor: help;
-        pointer-events: auto; /* Ensures tooltips trigger */
-    }
-
-    .mc-offhand {
-        border-color: #373737 #fff #fff #373737;
-    }
-
-    .slot.active {
-        border-color: #fff;
-        box-shadow:
-            inset 0 0 0 2px #fff,
-            0 0 6px rgba(255, 255, 255, 0.6);
-        z-index: 10;
-    }
-
-    .slot-count {
-        position: absolute;
-        bottom: -2px;
-        right: 1px;
-        font-size: 14px;
-        font-weight: 900;
-        color: white;
-        text-shadow:
-            2px 2px 0 #3f3f3f,
-            -1px -1px 0 #3f3f3f,
-            1px -1px 0 #3f3f3f,
-            -1px 1px 0 #3f3f3f;
-    }
-</style>
-
-</file>
-
-<file path="ui\src\components\ItemIcon.svelte">
-<script lang="ts">
-    let { name, size = 32 } = $props();
-
-    // Points to the local public folder (e.g., ui/public/textures/apple.png)
-    // Vite serves everything in /public at the root path '/'
-    const iconUrl = $derived(`/assets/items/${name}.png`);
-</script>
-
-<img
-    src={iconUrl}
-    alt={name}
-    width={size}
-    height={size}
-    style="image-rendering: pixelated; object-fit: contain;"
-    onerror={(e) => {
-        // Fallback to the classic missing texture checkerboard if the local file is missing
-        e.currentTarget.src =
-            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAKElEQVR42mP8z8DAwMgwEAwUMAK1M1Ero7RmcGjAwEBz1DCqGAYAAI8Z/8H/h7i+AAAAAElFTkSuQmCC";
-    }}
-/>
-
-</file>
-
-<file path="ui\src\components\Sidebar.svelte">
-<script lang="ts">
-    import { botStore, uiStore, clearEventLog } from "../lib/store.svelte";
-
-    let { isOpen = true } = $props();
-
-    const inventory = $derived(botStore.gameState?.inventory || []);
-    const threats = $derived(botStore.gameState?.threats || []);
-    const pois = $derived(botStore.gameState?.pois || []);
-
-    function formatName(name: string) {
-        if (!name) return "";
-        return name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-    }
-
-    function setTooltip(e: MouseEvent, text: string) {
-        if (!text) return;
-        uiStore.mouseX = e.clientX;
-        uiStore.mouseY = e.clientY;
-        uiStore.tooltip = text;
-    }
-
-    function clearTooltip() {
-        uiStore.tooltip = "";
-    }
-</script>
-
-<aside class="sidebar" class:open={isOpen}>
-    <section class="card objective-card">
-        <h3>🎯 Current Objective</h3>
-        <p class="objective">{botStore.objective}</p>
-    </section>
-
-    <section class="card">
-        <h3>🎒 Inventory ({inventory.length} items)</h3>
-        {#if inventory.length > 0}
-            <div class="inventory-grid">
-                {#each inventory as item}
-                    <div
-                        class="item"
-                        onmousemove={(e) =>
-                            setTooltip(e, formatName(item.name))}
-                        onmouseleave={clearTooltip}
-                    >
-                        <span class="item-name">{formatName(item.name)}</span>
-                        <span class="item-count">{item.count}</span>
-                    </div>
-                {/each}
-            </div>
-        {:else}
-            <p class="empty">Empty</p>
-        {/if}
-    </section>
-
-    <section class="card">
-        <h3>⚠️ Threats ({threats.length})</h3>
-        {#if threats.length > 0}
-            <ul class="list">
-                {#each threats as threat}
-                    <li
-                        class="threat-item"
-                        onmousemove={(e) =>
-                            setTooltip(e, formatName(threat.name))}
-                        onmouseleave={clearTooltip}
-                    >
-                        <span class="threat-name"
-                            >{formatName(threat.name)}</span
-                        >
-                        <span class="threat-dist">{threat.distance}m</span>
-                    </li>
-                {/each}
-            </ul>
-        {:else}
-            <p class="empty">No threats detected</p>
-        {/if}
-    </section>
-
-    <section class="card">
-        <h3>📡 POIs ({pois.length})</h3>
-        {#if pois.length > 0}
-            <ul class="list">
-                {#each pois.slice(0, 10) as poi}
-                    <li class="poi-item">
-                        <span class="poi-type">{poi.type}</span>
-                        <span
-                            class="poi-name"
-                            onmousemove={(e) =>
-                                setTooltip(e, formatName(poi.name))}
-                            onmouseleave={clearTooltip}
-                        >
-                            {formatName(poi.name)}
-                        </span>
-                        <span class="poi-dist"
-                            >{poi.distance}m {poi.direction}</span
-                        >
-                    </li>
-                {/each}
-            </ul>
-        {:else}
-            <p class="empty">No POIs detected</p>
-        {/if}
-    </section>
-
-    <section class="card events-card">
-        <div class="events-header">
-            <h3>📋 Event Stream</h3>
-            <button onclick={clearEventLog} class="clear-btn">Clear</button>
-        </div>
-        <div class="events-list">
-            {#if botStore.events.length > 0}
-                {#each botStore.events as event}
-                    <div class="event-item">
-                        <span class="event-time">{event.timestamp}</span>
-                        <span class="event-type">{event.type}</span>
-                        <span
-                            class="event-payload"
-                            onmousemove={(e) =>
-                                setTooltip(e, JSON.stringify(event.payload))}
-                            onmouseleave={clearTooltip}
-                        >
-                            {#if event.type === "TASK_END" || event.type === "BOT_DEATH" || event.type === "PANIC_TRIGGERED"}
-                                {event.payload.status || ""}
-                                {event.payload.action || ""}
-                                {event.payload.cause
-                                    ? `(${event.payload.cause})`
-                                    : ""}
-                            {:else}
-                                {JSON.stringify(event.payload)}
-                            {/if}
-                        </span>
-                    </div>
-                {/each}
-            {:else}
-                <p class="empty">No events yet</p>
-            {/if}
-        </div>
-    </section>
-</aside>
-
-<style>
-    .sidebar {
-        position: absolute;
-        top: 0;
-        right: -420px;
-        width: 420px;
-        height: 100vh;
-        background: rgba(15, 23, 42, 0.75);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border-left: 1px solid rgba(255, 255, 255, 0.1);
-        z-index: 20;
-        display: flex;
-        flex-direction: column;
-        gap: 1rem;
-        padding: 1.5rem;
-        box-sizing: border-box;
-        overflow-y: auto;
-        color: #e2e8f0;
-        transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        pointer-events: auto;
-    }
-
-    .sidebar.open {
-        right: 0;
-    }
-
-    .sidebar::-webkit-scrollbar {
-        width: 6px;
-    }
-    .sidebar::-webkit-scrollbar-track {
-        background: transparent;
-    }
-    .sidebar::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.2);
-        border-radius: 3px;
-    }
-
-    .card {
-        background: rgba(30, 41, 59, 0.7);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        padding: 1rem;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-    }
-
-    .card h3 {
-        margin: 0 0 0.5rem 0;
-        color: #94a3b8;
-        font-size: 0.875rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    .objective {
-        font-size: 1.125rem;
-        color: #38bdf8;
-        margin: 0;
-        line-height: 1.4;
-    }
-
-    .inventory-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-        gap: 0.5rem;
-        max-height: 200px;
-        overflow-y: auto;
-    }
-
-    .item {
-        display: flex;
-        justify-content: space-between;
-        padding: 0.5rem;
-        background: rgba(51, 65, 85, 0.8);
-        border-radius: 4px;
-        font-size: 0.875rem;
-        cursor: help;
-    }
-
-    .item-name {
-        font-family: monospace;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 80px;
-    }
-
-    .item-count {
-        font-weight: 600;
-        color: #94a3b8;
-    }
-
-    .list {
-        list-style: none;
-        padding: 0;
-        margin: 0;
-    }
-
-    .threat-item,
-    .poi-item {
-        display: flex;
-        justify-content: space-between;
-        padding: 0.5rem;
-        margin-bottom: 0.25rem;
-        background: rgba(51, 65, 85, 0.8);
-        border-radius: 4px;
-        font-size: 0.875rem;
-        cursor: help;
-    }
-
-    .threat-name {
-        color: #ef4444;
-        font-weight: 600;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 90px;
-    }
-
-    .poi-type {
-        color: #94a3b8;
-        font-size: 0.7rem;
-        text-transform: uppercase;
-    }
-
-    .poi-name {
-        font-family: monospace;
-        margin-left: 0.5rem;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 90px;
-        cursor: help;
-    }
-
-    .events-card {
-        display: flex;
-        flex-direction: column;
-        flex-grow: 1;
-        min-height: 250px;
-    }
-
-    .events-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 0.5rem;
-    }
-
-    .clear-btn {
-        background: #475569;
-        border: none;
-        color: white;
-        padding: 0.25rem 0.75rem;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 0.875rem;
-        transition: background 0.2s;
-    }
-
-    .clear-btn:hover {
-        background: #64748b;
-    }
-
-    .events-list {
-        flex-grow: 1;
-        overflow-y: auto;
-        font-family: monospace;
-        font-size: 0.75rem;
-    }
-
-    .event-item {
-        padding: 0.5rem;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-        display: flex;
-        gap: 0.75rem;
-    }
-
-    .event-time {
-        color: #94a3b8;
-        min-width: 60px;
-    }
-
-    .event-type {
-        color: #38bdf8;
-        min-width: 90px;
-    }
-
-    .event-payload {
-        color: #e2e8f0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        cursor: help;
-    }
-
-    .empty {
-        color: #64748b;
-        font-style: italic;
-        margin: 0;
-    }
-</style>
-
-</file>
-
-<file path="ui\src\lib\store.svelte.ts">
-export const botStore = $state({
-    gameState: null as any,
-    events: [] as any[],
-    objective: "Initializing...",
-    connectionStatus: "connecting" as
-        | "connecting"
-        | "connected"
-        | "disconnected",
-});
-
-// Custom global tooltip state
-export const uiStore = $state({
-    tooltip: "",
-    mouseX: 0,
-    mouseY: 0,
-});
-
-let ws: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectAttempts = 0;
-const maxEvents = 50;
-
-export function connectToBot() {
-    botStore.connectionStatus = "connecting";
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ui/ws`;
-
-    ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-        botStore.connectionStatus = "connected";
-        reconnectAttempts = 0;
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-    };
-
-    ws.onmessage = (event) => {
-        try {
-            const message = JSON.parse(event.data);
-            if (!message.type || !message.payload) return;
-
-            switch (message.type) {
-                case "state_update":
-                    botStore.gameState = message.payload;
-                    break;
-                case "event_stream": {
-                    const newEvent = {
-                        ...message.payload,
-                        timestamp: new Date().toLocaleTimeString(),
-                    };
-                    botStore.events = [newEvent, ...botStore.events].slice(
-                        0,
-                        maxEvents,
-                    );
-                    break;
-                }
-                case "objective_update":
-                    botStore.objective = message.payload;
-                    break;
-            }
-        } catch (err) {
-            console.error("Failed to parse message:", err);
-        }
-    };
-
-    ws.onclose = () => {
-        botStore.connectionStatus = "disconnected";
-        scheduleReconnect();
-    };
-
-    ws.onerror = () => {
-        botStore.connectionStatus = "disconnected";
-    };
-}
-
-function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    const delay = Math.min(3000 * Math.pow(1.5, reconnectAttempts), 30000);
-    reconnectAttempts++;
-    reconnectTimer = setTimeout(() => {
-        connectToBot();
-    }, delay);
-}
-
-export function clearEventLog() {
-    botStore.events = [];
-}
-
-export function disconnectBot() {
-    if (ws) ws.close();
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-}
-
-</file>
-
-<file path="ui\src\main.ts">
-import { mount } from "svelte";
-import "./app.css";
-import App from "./App.svelte";
-
-const app = mount(App, {
-    target: document.getElementById("app")!,
-    props: {},
-});
-
-export default app;
-
-</file>
-
-<file path="ui\svelte.config.js">
-/** @type {import("@sveltejs/vite-plugin-svelte").SvelteConfig} */
-export default {}
-
-</file>
-
-<file path="ui\vite.config.ts">
-import { defineConfig } from "vite";
-import { svelte } from "@sveltejs/vite-plugin-svelte";
-
-// https://vite.dev/config/
-export default defineConfig({
-    plugins: [svelte()],
-    server: {
-        proxy: {
-            "/ui/ws": {
-                target: "ws://localhost:8080",
-                ws: true,
-            },
-            "/bot/ws": {
-                target: "ws://localhost:8080",
-                ws: true,
-            },
-        },
-    },
-});
-
-</file>
-
 
 
 ```json
 {
-  "total_bytes": 252391,
-  "file_count": 71,
-  "estimated_tokens": 64550,
+  "total_bytes": 211515,
+  "file_count": 62,
+  "estimated_tokens": 54172,
   "mode": "full",
-  "generated_at": "2026-03-29T15:52:15.5552883-07:00"
+  "generated_at": "2026-03-29T19:20:00.1317181-07:00"
 }
 ```

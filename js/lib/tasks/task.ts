@@ -15,6 +15,8 @@ import { handleFarm } from "./handlers/farm.js";
 import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
 import { normalizeIntent } from "./normalize.js";
 import { handleInteract } from "./handlers/interact.js";
+import { handleStore } from "./handlers/store.js";
+import { handleRetrieve } from "./handlers/retrieve.js"; // New import
 
 const { goals } = pkg;
 
@@ -70,6 +72,12 @@ export async function runTask(
             return;
         case "explore":
             await handleExplore(taskCtx);
+            return;
+        case "store":
+            await handleStore(taskCtx);
+            return;
+        case "retrieve":
+            await handleRetrieve(taskCtx);
             return;
         case "eat": {
             const food = bot.inventory

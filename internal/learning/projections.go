@@ -1,6 +1,7 @@
 package learning
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -9,21 +10,60 @@ import (
 )
 
 type ActionStats struct {
-	SuccessRate   float64
-	FailureCauses map[string]int
-	AvgDuration   time.Duration
-	Attempts      int
+	SuccessRate   float64        `json:"success_rate"`
+	FailureCauses map[string]int `json:"failure_causes"`
+	AvgDuration   time.Duration  `json:"avg_duration"`
+	Attempts      int            `json:"attempts"`
+}
+
+// GetProjectedStats loads the latest snapshot, fetches delta events, and computes the current stats.
+func GetProjectedStats(ctx context.Context, store domain.EventStore, sessionID string) (map[string]*ActionStats, int64, error) {
+	snap, err := store.GetLatestSnapshot(ctx, sessionID)
+	var lastID int64 = 0
+	stats := make(map[string]*ActionStats)
+
+	if err == nil && snap != nil {
+		lastID = snap.LastEventID
+		_ = json.Unmarshal(snap.Data, &stats)
+	}
+
+	events, err := store.GetStreamSince(ctx, sessionID, lastID)
+	if err != nil {
+		return stats, lastID, err
+	}
+
+	if len(events) > 0 {
+		stats = CalculateActionStats(stats, events)
+		lastID = events[len(events)-1].ID
+	}
+
+	return stats, lastID, nil
 }
 
 // CalculateActionStats projects a stream of events into a statistical model of bot performance.
-func CalculateActionStats(events []domain.DomainEvent) map[string]*ActionStats {
+func CalculateActionStats(existing map[string]*ActionStats, events []domain.DomainEvent) map[string]*ActionStats {
+	stats := make(map[string]*ActionStats)
+
+	// Deep copy existing state to prevent mutating the cached read-model
+	for k, v := range existing {
+		causes := make(map[string]int)
+		for ck, cv := range v.FailureCauses {
+			causes[ck] = cv
+		}
+		stats[k] = &ActionStats{
+			SuccessRate:   v.SuccessRate,
+			FailureCauses: causes,
+			AvgDuration:   v.AvgDuration,
+			Attempts:      v.Attempts,
+		}
+	}
+
 	type taskRun struct {
 		start  time.Time
 		action string
 	}
 
 	inFlight := make(map[string]taskRun)
-	stats := make(map[string]*ActionStats)
 
 	for _, ev := range events {
 		switch ev.Type {
