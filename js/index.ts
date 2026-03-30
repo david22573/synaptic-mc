@@ -2,7 +2,6 @@ import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
 import { plugin as collectBlock } from "mineflayer-collectblock";
-
 import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
@@ -12,9 +11,9 @@ import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 import { getPOIs } from "./lib/utils/perception.js";
 
-const { pathfinder, Movements } = pkg;
-
+const { pathfinder, Movements, goals } = pkg;
 let viewerStarted = false;
+
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err.message || err.stack || err);
@@ -40,9 +39,8 @@ console.error = (...args: any[]) => {
         isIgnorableError(firstArg) ||
         msg.includes("PartialReadError") ||
         msg.includes("protodef")
-    ) {
+    )
         return;
-    }
     originalConsoleError.apply(console, args);
 };
 
@@ -65,10 +63,12 @@ process.on("uncaughtException", (err: Error) => {
     });
     process.exit(1);
 });
+
 process.on("unhandledRejection", (reason: any) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
 });
+
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
 let bot: mineflayer.Bot;
@@ -81,12 +81,11 @@ let lastStatePushTime = 0;
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
-// Global cache for discovered chests
 const knownChests: Record<string, { name: string; count: number }[]> = {};
+let lastVelocity = { x: 0, y: 0, z: 0 };
+
 function stopMovement() {
     if (!bot) return;
-    bot.clearControlStates();
-    if (bot.pathfinder) bot.pathfinder.setGoal(null);
 }
 
 function completeTask(
@@ -99,7 +98,6 @@ function completeTask(
 ) {
     if (!task || !client) return;
     if (currentTask?.id === task.id) currentTask = null;
-
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -135,7 +133,6 @@ function normalizeFailureCause(err: any): string {
     )
         return "TIMEOUT";
     if (msg.includes("stuck")) return "STUCK";
-
     if (
         msg.includes("no_entity") ||
         msg.includes("missing_entity") ||
@@ -151,8 +148,6 @@ function normalizeFailureCause(err: any): string {
         msg.includes("no_chest")
     )
         return "NO_FURNACE";
-    // Generic missing block error
-
     if (msg.includes("no_mature_")) return "NO_MATURE_CROP";
     if (
         msg.includes("missing_ingredients") ||
@@ -174,6 +169,7 @@ function normalizeFailureCause(err: any): string {
 async function executeIntent(intent: models.ActionIntent) {
     if (!intent?.action) return;
     if (isShuttingDown) return;
+
     if (survival?.isPanickingNow()) {
         if (intent.action === "retreat") {
             survival.reset();
@@ -193,20 +189,60 @@ async function executeIntent(intent: models.ActionIntent) {
     taskAbortController = new AbortController();
     const signal = taskAbortController.signal;
     const localController = taskAbortController;
+
     currentTask = {
         id: intent.id,
         action: intent.action,
         target: intent.target || { type: "none", name: "none" },
         count: intent.count || 1,
         startTime: Date.now(),
-        trace: intent.trace || {
-            trace_id: "unknown",
-            action_id: intent.id,
-        },
+        trace: intent.trace || { trace_id: "unknown", action_id: intent.id },
     };
-    stopMovement();
+
     const activeTask = currentTask;
     let timeoutId: NodeJS.Timeout | undefined;
+
+    const highStakes = [
+        "hunt",
+        "combat",
+        "mine",
+        "build",
+        "retreat",
+        "explore",
+    ];
+    if (highStakes.includes(intent.action)) {
+        const jitterMs = 50 + Math.random() * 100;
+        await new Promise((r) => setTimeout(r, jitterMs));
+    }
+
+    // Native fallback for Curiosity Explore loops to prevent promise-hangs
+    if (intent.action === "explore") {
+        log.info("Executing native curiosity exploration");
+        const goalX = Math.round(
+            bot.entity.position.x + (Math.random() - 0.5) * 30,
+        );
+        const goalZ = Math.round(
+            bot.entity.position.z + (Math.random() - 0.5) * 30,
+        );
+
+        if (bot.pathfinder) {
+            bot.pathfinder.setGoal(new goals.GoalXZ(goalX, goalZ), true);
+        }
+
+        await new Promise((r) => {
+            timeoutId = setTimeout(r, 12000); // Wander for 12 seconds
+        });
+
+        if (!signal.aborted && activeTask) {
+            pushState();
+            completeTask(activeTask, "task_completed");
+        }
+        if (timeoutId) clearTimeout(timeoutId);
+        if (currentTask?.id === activeTask?.id) currentTask = null;
+        if (taskAbortController === localController) taskAbortController = null;
+        return;
+    }
+
     try {
         const timeouts = runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
         const timeoutMs = timeouts[intent.action] || 15000;
@@ -228,6 +264,7 @@ async function executeIntent(intent: models.ActionIntent) {
                 }, timeoutMs);
             }),
         ]);
+
         if (!signal.aborted && activeTask) {
             await new Promise((r) => setTimeout(r, 500));
             pushState();
@@ -248,7 +285,6 @@ async function executeIntent(intent: models.ActionIntent) {
         }
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
-        stopMovement();
         if (currentTask?.id === activeTask?.id) currentTask = null;
         if (taskAbortController === localController) taskAbortController = null;
     }
@@ -262,16 +298,16 @@ function pushState() {
         const item = bot.inventory.slots[hotbarStart + i];
         return item ? { name: item.name, count: item.count } : null;
     });
-    const offhandItem = bot.inventory.slots[45];
 
+    const offhandItem = bot.inventory.slots[45];
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
         .join(",")}|${Object.keys(knownChests).length}`;
     const now = Date.now();
-    if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
 
+    if (sig === lastStateSig && now - lastStatePushTime < 5000) return;
     lastStateSig = sig;
     lastStatePushTime = now;
 
@@ -298,7 +334,20 @@ function pushState() {
             ? { name: offhandItem.name, count: offhandItem.count }
             : null,
         active_slot: bot.quickBarSlot,
-        known_chests: knownChests, // Inject the global cache
+        known_chests: knownChests,
+        current_task: currentTask
+            ? {
+                  id: currentTask.id,
+                  action: currentTask.action,
+                  target: currentTask.target,
+                  count: currentTask.count,
+                  priority: 0,
+                  rationale: "",
+                  source: "client",
+                  trace: currentTask.trace,
+              }
+            : null,
+        task_progress: currentTask ? 0.5 : 0.0,
     });
 }
 
@@ -326,6 +375,7 @@ async function connectWithRetry(maxAttempts = 10) {
         username: "CraftBot",
         version: "1.19",
     });
+
     bot.loadPlugin(pathfinder);
     bot.loadPlugin(collectBlock);
 
@@ -333,6 +383,28 @@ async function connectWithRetry(maxAttempts = 10) {
         client = new ControlPlaneClient(runtimeConfig.ws_url, {
             onCommand: (i) => void executeIntent(i),
             onUnlock: () => abortActiveTask("unlock"),
+        });
+
+        client.connect();
+
+        // Immediately push a zero-state to prevent the Go TS_Supervisor from killing us
+        // while Mineflayer takes >15s to resolve DNS, login, and spawn.
+        client.sendState({
+            health: 0,
+            food: 0,
+            time_of_day: 0,
+            experience: 0,
+            level: 0,
+            position: { x: 0, y: 0, z: 0 },
+            threats: [],
+            pois: [],
+            inventory: [],
+            hotbar: [],
+            offhand: null,
+            active_slot: 0,
+            known_chests: {},
+            current_task: null,
+            task_progress: 0,
         });
     }
 
@@ -351,6 +423,7 @@ async function connectWithRetry(maxAttempts = 10) {
         if (isIgnorableError(err)) return;
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
+
     bot.on("end", (reason) => {
         abortActiveTask("bot_disconnected");
         survival.stop();
@@ -363,6 +436,7 @@ async function connectWithRetry(maxAttempts = 10) {
             backoffMs + Math.random() * 1000,
         );
     });
+
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         log.info("Bot spawned successfully.");
@@ -394,8 +468,8 @@ async function connectWithRetry(maxAttempts = 10) {
 
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
-        if (!client.isConnected()) client.connect();
 
+        if (!client.isConnected()) client.connect();
         survival.start();
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
@@ -408,18 +482,57 @@ async function connectWithRetry(maxAttempts = 10) {
                 viewerStarted = true;
             } catch (err) {}
         }
+
+        bot.on("physicsTick", () => {
+            if (bot.entity.velocity) {
+                lastVelocity = {
+                    x: bot.entity.velocity.x,
+                    y: bot.entity.velocity.y,
+                    z: bot.entity.velocity.z,
+                };
+            }
+
+            if (currentTask && bot.pathfinder?.isMoving()) {
+                if (Math.random() < 0.02) {
+                    const noise = (Math.random() - 0.5) * 0.1;
+                    bot.look(
+                        bot.entity.yaw + noise,
+                        bot.entity.pitch,
+                        true,
+                    ).catch(() => {});
+                }
+            }
+
+            if (!currentTask && !bot.pathfinder?.isMoving()) {
+                if (Math.random() < 0.05) {
+                    const entity = bot.nearestEntity(
+                        (e) =>
+                            (e.type === "mob" || e.type === "player") &&
+                            bot.entity.position.distanceTo(e.position) < 16,
+                    );
+                    if (entity) {
+                        bot.lookAt(
+                            entity.position.offset(0, entity.height * 0.8, 0),
+                            true,
+                        ).catch(() => {});
+                    }
+                }
+            }
+        });
     });
+
     bot.on("message", (msg) => {
         const text = msg.toString();
         if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
     });
+
     bot.on("death", () => {
         abortActiveTask("bot_died");
         client.sendEvent("death", "death", "", lastDeathMessage, 0);
         lastDeathMessage = "unknown causes";
     });
-    // Spy on chests to update the global memory cache
+
     bot.on("windowOpen", (window) => {
         if (
             String(window.type).includes("chest") ||
@@ -438,9 +551,9 @@ async function connectWithRetry(maxAttempts = 10) {
             }
         }
     });
+
     bot.on("health", pushState);
     bot.on("experience", pushState);
-
     // @ts-ignore
     bot.on("heldItemChanged", pushState);
 
@@ -464,6 +577,7 @@ process.on("SIGINT", () => {
         process.exit(0);
     }
 });
+
 bootstrap().catch((err) => {
     log.error("Fatal startup", {
         err: err instanceof Error ? err.message : String(err),

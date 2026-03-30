@@ -39,8 +39,10 @@ type GameState struct {
 	Hotbar       []*Item           `json:"hotbar"`
 	Offhand      *Item             `json:"offhand"`
 	ActiveSlot   int               `json:"active_slot"`
-	KnownChests  map[string][]Item `json:"known_chests,omitempty"` // Maps "x,y,z" to chest contents
+	KnownChests  map[string][]Item `json:"known_chests,omitempty"`
 	Feedback     []Feedback        `json:"feedback,omitempty"`
+	CurrentTask  *Action           `json:"current_task,omitempty"`
+	TaskProgress float64           `json:"task_progress,omitempty"`
 }
 
 type VersionedState struct {

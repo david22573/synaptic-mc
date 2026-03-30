@@ -14,6 +14,7 @@ import (
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
@@ -28,6 +29,7 @@ type Orchestrator struct {
 
 	curriculum voyager.Curriculum
 	critic     voyager.Critic
+	humanizer  *humanization.Engine // NEW: Humanization engine
 
 	ctrlManager *execution.ControllerManager
 	taskManager *TaskManager
@@ -61,6 +63,7 @@ func New(
 	uiHub *observability.Hub,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
+	humanCfg humanization.Config, // NEW: Accept humanization config
 ) *Orchestrator {
 	cm := execution.NewControllerManager()
 	if exec != nil {
@@ -82,6 +85,7 @@ func New(
 		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
 		eventCh:     make(chan domain.DomainEvent, 100),
 		taskHistory: make([]domain.TaskHistory, 0),
+		humanizer:   humanization.NewEngine(humanCfg), // NEW: Initialize humanizer
 	}
 
 	tm.OnDrain = o.handleQueueDrain
@@ -197,6 +201,10 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 				jitter = -jitter
 			}
 			observability.Metrics.DecisionJitter.Observe(jitter)
+
+			// NEW: Evolve humanization state
+			hctx := o.buildHumanizationContext()
+			o.humanizer.State().Evolve(hctx, t.Sub(lastTick))
 			lastTick = t
 
 			vState := o.stateBuffer.Load()
@@ -310,10 +318,35 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 			o.uiHub.Broadcast("objective_update", intent.Rationale)
 		}
 
-		_ = tm.Enqueue(evalCtx, action)
+		// NEW: Process through humanization engine
+		plan := domain.Plan{Objective: intent.Rationale, Tasks: []domain.Action{action}}
+		hctx := o.buildHumanizationContext()
+		scheduled := o.humanizer.Process(plan, hctx)
+
+		// Enqueue scheduled actions
+		for _, sa := range scheduled {
+			_ = tm.EnqueueScheduled(evalCtx, sa.Action, sa.ExecuteAt)
+		}
 	}()
 
 	return nil
+}
+
+// NEW: Helper to build humanization context
+func (o *Orchestrator) buildHumanizationContext() humanization.Context {
+	o.mu.RLock()
+	state := o.currentSnapshot.State.State
+	o.mu.RUnlock()
+
+	// Check if stuck (from pipeline logic)
+	isStuck := false
+	// This would ideally reference pipeline.stuckSince, but for now we approximate
+	if state.CurrentTask != nil {
+		// Simple stuck detection based on no progress
+		isStuck = state.TaskProgress < 0.01
+	}
+
+	return humanization.BuildContext(state, isStuck)
 }
 
 func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEvent) {

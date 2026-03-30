@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
@@ -41,6 +43,8 @@ type Config struct {
 	SessionID    string
 	DataDir      string
 	BotScript    string
+	HesitationMs int
+	NoiseLevel   float64
 }
 
 func main() {
@@ -97,7 +101,14 @@ func main() {
 	uiHub := observability.NewHub(logger)
 	flags := config.DefaultFlags()
 
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger, flags)
+	// Initialize humanization config
+	humanCfg := humanization.Config{
+		AttentionDecay: 0.1,
+		HesitationBase: time.Duration(cfg.HesitationMs) * time.Millisecond,
+		NoiseLevel:     cfg.NoiseLevel,
+	}
+
+	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, nil, uiHub, logger, flags, humanCfg)
 	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
@@ -182,6 +193,8 @@ func parseConfig() Config {
 	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
 	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
 	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "dist/index.js"), "Path to the compiled TS bot index.js")
+	hesitationMs := flag.Int("hesitation-ms", getEnvInt("HESITATION_MS", 250), "Base hesitation delay in milliseconds")
+	noiseLevel := flag.Float64("noise-level", getEnvFloat("NOISE_LEVEL", 0.05), "Humanization noise level (0.0-1.0)")
 
 	flag.Parse()
 
@@ -197,12 +210,32 @@ func parseConfig() Config {
 		SessionID:    *sessionID,
 		DataDir:      *dataDir,
 		BotScript:    *botScript,
+		HesitationMs: *hesitationMs,
+		NoiseLevel:   *noiseLevel,
 	}
 }
 
 func getEnvOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
 	return fallback
 }

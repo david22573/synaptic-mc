@@ -1,8 +1,10 @@
 package orchestrator
 
 import (
+	"container/heap"
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -10,17 +12,56 @@ import (
 	"david22573/synaptic-mc/internal/execution"
 )
 
+type ActionPriorityQueue []*domain.Action
+
+func (pq ActionPriorityQueue) Len() int { return len(pq) }
+
+func (pq ActionPriorityQueue) Less(i, j int) bool {
+	return pq[i].Priority > pq[j].Priority
+}
+
+func (pq ActionPriorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+}
+
+func (pq *ActionPriorityQueue) Push(x interface{}) {
+	item := x.(*domain.Action)
+	*pq = append(*pq, item)
+}
+
+func (pq *ActionPriorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	*pq = old[0 : n-1]
+	return item
+}
+
+// NEW: Scheduled action support
+type scheduledItem struct {
+	action    domain.Action
+	executeAt time.Time
+}
+
 type TaskManager struct {
 	controller execution.Controller
 	logger     *slog.Logger
 	timeouts   map[string]time.Duration
 	OnDrain    func()
 
-	actionQueue chan domain.Action
-	mu          sync.Mutex
-	activeTask  *domain.Action
-	cancelTask  context.CancelFunc
-	watchdog    chan struct{}
+	queue      ActionPriorityQueue
+	mu         sync.Mutex
+	activeTask *domain.Action
+	cancelTask context.CancelFunc
+	watchdog   chan struct{}
+	signalCh   chan struct{}
+	idleSince  time.Time
+
+	// NEW: Scheduled action fields
+	scheduleMu  sync.Mutex
+	scheduled   []scheduledItem
+	scheduleSig chan struct{}
 }
 
 func NewTaskManager(ctrl execution.Controller, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
@@ -31,39 +72,153 @@ func NewTaskManager(ctrl execution.Controller, timeouts map[string]time.Duration
 		controller:  ctrl,
 		logger:      logger.With(slog.String("component", "task_manager")),
 		timeouts:    timeouts,
-		actionQueue: make(chan domain.Action, 100),
+		queue:       make(ActionPriorityQueue, 0, 10),
+		signalCh:    make(chan struct{}, 1),
+		scheduleSig: make(chan struct{}, 1), // NEW
 	}
 
+	heap.Init(&tm.queue)
 	go tm.Run(context.Background())
 	return tm
 }
 
 func (m *TaskManager) Run(ctx context.Context) {
+	idleCheck := time.NewTicker(1 * time.Second)
+	defer idleCheck.Stop()
+
+	scheduleTicker := time.NewTicker(100 * time.Millisecond) // NEW
+	defer scheduleTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case action := <-m.actionQueue:
-			m.dispatchCurrent(ctx, action)
+		case <-idleCheck.C:
+			m.mu.Lock()
+			if m.activeTask == nil && m.queue.Len() == 0 {
+				if m.idleSince.IsZero() {
+					m.idleSince = time.Now()
+				} else if time.Since(m.idleSince) > 5*time.Second {
+					m.logger.Info("Curiosity loop triggered: autonomous exploration")
+					exploreTask := domain.Action{
+						ID:        "explore-curiosity",
+						Action:    "explore",
+						Target:    domain.Target{Type: "category", Name: "surroundings"},
+						Priority:  -1,
+						Rationale: "Curiosity loop: self-starting exploration",
+					}
+					t := exploreTask
+					heap.Push(&m.queue, &t)
+					m.idleSince = time.Time{}
+					select {
+					case m.signalCh <- struct{}{}:
+					default:
+					}
+				}
+			} else {
+				m.idleSince = time.Time{}
+			}
+			m.mu.Unlock()
+
+		case <-scheduleTicker.C: // NEW
+			m.processScheduled()
+
+		case <-m.scheduleSig: // NEW
+			m.processScheduled()
+
+		case <-m.signalCh:
+			m.mu.Lock()
+			if m.activeTask == nil && m.queue.Len() > 0 {
+				next := heap.Pop(&m.queue).(*domain.Action)
+
+				if m.queue.Len() > 0 {
+					peekNext := m.queue[0]
+					m.warmStartNext(ctx, peekNext)
+				}
+
+				m.idleSince = time.Time{}
+				m.mu.Unlock()
+				m.dispatchCurrent(ctx, *next)
+			} else {
+				m.mu.Unlock()
+			}
 		}
 	}
+}
+
+func (m *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
+	m.logger.Debug("Warm starting next task in background", slog.String("action", nextTask.Action))
 }
 
 func (m *TaskManager) IsIdle() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.activeTask == nil && len(m.actionQueue) == 0
+	return m.activeTask == nil && m.queue.Len() == 0
 }
 
 func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	for _, task := range tasks {
-		select {
-		case m.actionQueue <- task:
-		default:
-			m.logger.Warn("Task queue full, dropping action", slog.String("action_id", task.ID))
-		}
+		t := task
+		heap.Push(&m.queue, &t)
+	}
+	m.idleSince = time.Time{}
+
+	select {
+	case m.signalCh <- struct{}{}:
+	default:
 	}
 	return nil
+}
+
+// NEW: Enqueue scheduled actions
+func (m *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
+	m.scheduleMu.Lock()
+	m.scheduled = append(m.scheduled, scheduledItem{action, executeAt})
+	// Sort by execution time
+	sort.Slice(m.scheduled, func(i, j int) bool {
+		return m.scheduled[i].executeAt.Before(m.scheduled[j].executeAt)
+	})
+	m.scheduleMu.Unlock()
+
+	select {
+	case m.scheduleSig <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// NEW: Process scheduled actions
+func (m *TaskManager) processScheduled() {
+	m.scheduleMu.Lock()
+	defer m.scheduleMu.Unlock()
+
+	if len(m.scheduled) == 0 {
+		return
+	}
+
+	now := time.Now()
+	ready := make([]domain.Action, 0)
+
+	for len(m.scheduled) > 0 && m.scheduled[0].executeAt.Before(now) {
+		ready = append(ready, m.scheduled[0].action)
+		m.scheduled = m.scheduled[1:]
+	}
+
+	if len(ready) > 0 {
+		m.mu.Lock()
+		for _, action := range ready {
+			heap.Push(&m.queue, &action)
+		}
+		m.mu.Unlock()
+
+		select {
+		case m.signalCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
@@ -86,15 +241,23 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	m.activeTask = nil
 
 	if !success {
-		m.flushQueue()
+		m.queue = make(ActionPriorityQueue, 0, 10)
+		heap.Init(&m.queue)
 		if m.OnDrain != nil {
 			go m.OnDrain()
 		}
 		return nil
 	}
 
-	if len(m.actionQueue) == 0 && m.OnDrain != nil {
-		go m.OnDrain()
+	if m.queue.Len() == 0 {
+		if m.OnDrain != nil {
+			go m.OnDrain()
+		}
+	} else {
+		select {
+		case m.signalCh <- struct{}{}:
+		default:
+		}
 	}
 
 	return nil
@@ -103,18 +266,10 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 func (m *TaskManager) Halt(ctx context.Context, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.flushQueue()
-	return m.abortActiveLocked(ctx, reason)
-}
 
-func (m *TaskManager) flushQueue() {
-	for {
-		select {
-		case <-m.actionQueue:
-		default:
-			return
-		}
-	}
+	m.queue = make(ActionPriorityQueue, 0, 10)
+	heap.Init(&m.queue)
+	return m.abortActiveLocked(ctx, reason)
 }
 
 func (m *TaskManager) abortActiveLocked(ctx context.Context, reason string) error {
@@ -157,6 +312,8 @@ func (m *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action)
 			close(m.watchdog)
 			m.watchdog = nil
 		}
+		// Push the idle tracker into the future so we don't spam while offline
+		m.idleSince = time.Now().Add(10 * time.Second)
 		m.mu.Unlock()
 		m.logger.Error("Dispatch failed", slog.Any("error", err))
 		return

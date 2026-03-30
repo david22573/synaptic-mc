@@ -4,26 +4,38 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
-	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/pipeline"
 	"david22573/synaptic-mc/internal/policy"
 )
 
+type TaskManager interface {
+	Enqueue(ctx context.Context, tasks ...domain.Action) error
+}
+
 type Pipeline struct {
 	planner     *AdvancedPlanner
 	stages      []pipeline.Stage
-	executor    *execution.ControllerManager
+	taskManager TaskManager
 	logger      *slog.Logger
 	currentTask atomic.Pointer[domain.Action]
+
+	// Phase 3.2: State tracking for smart interrupts
+	lastState     domain.GameState
+	lastStateMu   sync.Mutex
+	lastStateTime time.Time
+	stuckSince    time.Time
 }
 
 func NewPipeline(
 	p *AdvancedPlanner,
 	policyEngine policy.Engine,
-	executor *execution.ControllerManager,
+	taskManager TaskManager,
 	logger *slog.Logger,
 ) *Pipeline {
 	return &Pipeline{
@@ -34,19 +46,17 @@ func NewPipeline(
 			pipeline.NewSimulateStage(),
 			pipeline.NewPolicyStage(policyEngine),
 		},
-		executor: executor,
-		logger:   logger.With(slog.String("component", "pipeline")),
+		taskManager: taskManager,
+		logger:      logger.With(slog.String("component", "pipeline")),
 	}
 }
 
-// Process replaces Evaluate, now fully asynchronous and managing task commitments natively
 func (p *Pipeline) Process(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) {
 	active := p.currentTask.Load()
 
-	// Task Commitment Window
 	if active != nil {
 		if !p.shouldInterrupt(state) {
-			return // Task committed and running safely. Skip replanning.
+			return
 		}
 		p.logger.Warn("Task commitment broken by state urgency", slog.String("action", active.Action))
 	}
@@ -54,16 +64,55 @@ func (p *Pipeline) Process(ctx context.Context, sessionID string, state domain.G
 	p.generatePlanAndDispatch(ctx, sessionID, state, trace)
 }
 
+// Phase 3.2: Smart Interrupt Logic
 func (p *Pipeline) shouldInterrupt(state domain.GameState) bool {
-	// Interrupt active committed tasks if health falls into critical margins
-	return state.Health < 6.0
+	p.lastStateMu.Lock()
+	defer p.lastStateMu.Unlock()
+
+	now := time.Now()
+
+	// Initial assignment guard
+	if p.lastStateTime.IsZero() {
+		p.lastState = state
+		p.lastStateTime = now
+		return false
+	}
+
+	healthDrop := p.lastState.Health - state.Health
+	timeDiff := now.Sub(p.lastStateTime).Seconds()
+
+	droppingRate := 0.0
+	if timeDiff > 0 {
+		droppingRate = healthDrop / timeDiff
+	}
+
+	dx := p.lastState.Position.X - state.Position.X
+	dy := p.lastState.Position.Y - state.Position.Y
+	dz := p.lastState.Position.Z - state.Position.Z
+	distMoved := math.Sqrt(dx*dx + dy*dy + dz*dz)
+
+	active := p.currentTask.Load()
+	isMovingTask := active != nil && active.Action != "idle"
+
+	if distMoved < 0.1 && isMovingTask {
+		if p.stuckSince.IsZero() {
+			p.stuckSince = now
+		}
+	} else {
+		p.stuckSince = time.Time{} // Reset if moving
+	}
+
+	isStuck := !p.stuckSince.IsZero() && now.Sub(p.stuckSince) > 3*time.Second
+	threatsInView := len(state.Threats) > 0
+
+	p.lastState = state
+	p.lastStateTime = now
+
+	return droppingRate > 2.0 || threatsInView || isStuck
 }
 
 func (p *Pipeline) generatePlanAndDispatch(ctx context.Context, sessionID string, state domain.GameState, trace domain.TraceContext) {
-	// 1. Kick off the slow background LLM process with fresh context
 	p.planner.TriggerReplan(state)
-
-	// 2. Instant grab of the fastest available plan
 	rawPlan := p.planner.FastPlan(state)
 
 	pipeState := pipeline.PipelineState{
@@ -73,7 +122,6 @@ func (p *Pipeline) generatePlanAndDispatch(ctx context.Context, sessionID string
 		Plan:      &rawPlan,
 	}
 
-	// 3. Pure stage execution (Normalize -> Validate -> Simulate -> Policy)
 	for _, stage := range p.stages {
 		nextState, err := stage.Process(ctx, pipeState)
 		if err != nil {
@@ -93,19 +141,10 @@ func (p *Pipeline) generatePlanAndDispatch(ctx context.Context, sessionID string
 		return
 	}
 
-	// 4. Action Queue Prefill
-	// Take the current goal and aggressively pre-queue the next 2 steps so TS doesn't idle
-	for i := 0; i < 2 && i < len(finalPlan.Tasks); i++ {
-		task := finalPlan.Tasks[i]
+	p.currentTask.Store(&finalPlan.Tasks[0])
 
-		// Set the top-level pointer so we know we're committed to this execution trace
-		if i == 0 {
-			p.currentTask.Store(&task)
-		}
-
-		err := p.executor.Dispatch(ctx, task)
-		if err != nil {
-			p.logger.Error("Failed to prefill execution queue", slog.String("task_id", task.ID), slog.Any("error", err))
-		}
+	err := p.taskManager.Enqueue(ctx, finalPlan.Tasks...)
+	if err != nil {
+		p.logger.Error("Failed to enqueue tasks", slog.Any("error", err))
 	}
 }
