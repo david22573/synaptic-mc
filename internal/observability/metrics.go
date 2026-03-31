@@ -9,6 +9,8 @@ type FluidityMetrics struct {
 	DecisionJitter   prometheus.Histogram
 	ActionGapMs      prometheus.Gauge
 	TaskInterruption prometheus.Counter
+	UIJitter         prometheus.Histogram
+	UISyncDrift      prometheus.Gauge
 }
 
 var Metrics = &FluidityMetrics{
@@ -24,5 +26,14 @@ var Metrics = &FluidityMetrics{
 	TaskInterruption: promauto.NewCounter(prometheus.CounterOpts{
 		Name: "agent_task_interruptions_total",
 		Help: "How often tasks are aborted early due to replanning or panic",
+	}),
+	UIJitter: promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ui_state_jitter_ms",
+		Help:    "Time between UI state updates",
+		Buckets: []float64{20, 50, 100, 250, 500},
+	}),
+	UISyncDrift: promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ui_position_drift_blocks",
+		Help: "Distance between UI interpolated and server position",
 	}),
 }

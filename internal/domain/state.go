@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"strings"
+	"time"
+)
 
 type PlanStatus string
 
@@ -101,4 +105,114 @@ type EvaluationSnapshot struct {
 	State      VersionedState
 	History    []DomainEvent
 	ActivePlan *Plan
+}
+
+// LLM Formatting Structs
+type CompactPOI struct {
+	Type      string  `json:"type"`
+	Name      string  `json:"name"`
+	Distance  float64 `json:"distance"`
+	Direction string  `json:"direction"`
+}
+
+type CompactThreat struct {
+	Name string `json:"name"`
+}
+
+type CompactTask struct {
+	Action   string  `json:"action"`
+	Target   string  `json:"target"`
+	Progress float64 `json:"progress"`
+}
+
+func FormatStateForLLM(state GameState) string {
+	compact := struct {
+		Health       float64                   `json:"health"`
+		Food         float64                   `json:"food"`
+		TimeOfDay    int                       `json:"time_of_day"`
+		Experience   float64                   `json:"experience"`
+		Level        int                       `json:"level"`
+		HasBedNearby bool                      `json:"has_bed_nearby"`
+		Inventory    map[string]int            `json:"inventory"`
+		Threats      []CompactThreat           `json:"threats"`
+		POIs         []CompactPOI              `json:"pois"`
+		HasPickaxe   bool                      `json:"has_pickaxe"`
+		HasWeapon    bool                      `json:"has_weapon"`
+		KnownChests  map[string]map[string]int `json:"known_chests,omitempty"`
+		Feedback     []Feedback                `json:"feedback,omitempty"`
+		CurrentTask  *CompactTask              `json:"current_task,omitempty"`
+	}{
+		Health:       state.Health,
+		Food:         state.Food,
+		TimeOfDay:    state.TimeOfDay,
+		Experience:   state.Experience,
+		Level:        state.Level,
+		HasBedNearby: state.HasBedNearby,
+		Inventory:    make(map[string]int),
+		Threats:      make([]CompactThreat, 0),
+		POIs:         make([]CompactPOI, 0),
+		KnownChests:  make(map[string]map[string]int),
+		Feedback:     state.Feedback,
+	}
+
+	if state.CurrentTask != nil {
+		compact.CurrentTask = &CompactTask{
+			Action:   state.CurrentTask.Action,
+			Target:   state.CurrentTask.Target.Name,
+			Progress: state.TaskProgress,
+		}
+	}
+
+	for _, item := range state.Inventory {
+		if item.Count > 0 {
+			compact.Inventory[item.Name] += item.Count
+			if strings.Contains(item.Name, "pickaxe") {
+				compact.HasPickaxe = true
+			}
+			if strings.Contains(item.Name, "sword") ||
+				(strings.Contains(item.Name, "axe") && !strings.Contains(item.Name, "pickaxe")) {
+				compact.HasWeapon = true
+			}
+		}
+	}
+
+	for i, t := range state.Threats {
+		if i >= 3 {
+			break
+		}
+		compact.Threats = append(compact.Threats, CompactThreat{Name: t.Name})
+	}
+
+	for i, p := range state.POIs {
+		if i >= 5 {
+			break
+		}
+		compact.POIs = append(compact.POIs, CompactPOI{
+			Type:      p.Type,
+			Name:      p.Name,
+			Distance:  p.Distance,
+			Direction: p.Direction,
+		})
+	}
+
+	for pos, items := range state.KnownChests {
+		cInv := make(map[string]int)
+		for _, item := range items {
+			if item.Count > 0 {
+				cInv[item.Name] += item.Count
+			}
+		}
+		compact.KnownChests[pos] = cInv
+	}
+
+	b, _ := json.MarshalIndent(compact, "", "  ")
+	return string(b)
+}
+
+func CleanJSON(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned)
 }

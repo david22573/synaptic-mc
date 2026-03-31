@@ -6,7 +6,6 @@
     const food = $derived(botStore.gameState?.food ?? 20);
     const xpProgress = $derived(botStore.gameState?.experience ?? 0);
     const xpLevel = $derived(botStore.gameState?.level ?? 0);
-
     const hotbarSlots = $derived(
         botStore.gameState?.hotbar || Array(9).fill(null),
     );
@@ -81,9 +80,9 @@
         </div>
 
         <div class="mc-hotbar-container">
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
                 class="mc-offhand slot"
+                role="presentation"
                 onmousemove={(e) =>
                     setTooltip(e, offhand ? formatName(offhand.name) : "")}
                 onmouseleave={clearTooltip}
@@ -100,6 +99,7 @@
                 {#each hotbarSlots as slot, i}
                     <div
                         class="slot {i === activeSlot ? 'active' : ''}"
+                        role="presentation"
                         onmousemove={(e) =>
                             setTooltip(e, slot ? formatName(slot.name) : "")}
                         onmouseleave={clearTooltip}
@@ -154,6 +154,7 @@
         width: 16px;
         height: 2px;
     }
+
     .mc-crosshair::after {
         top: 0;
         left: 7px;
@@ -257,7 +258,7 @@
         justify-content: center;
         align-items: center;
         cursor: help;
-        pointer-events: auto; /* Ensures tooltips trigger */
+        pointer-events: auto;
     }
 
     .mc-offhand {

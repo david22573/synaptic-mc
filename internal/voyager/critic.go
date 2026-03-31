@@ -1,6 +1,7 @@
 package voyager
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -77,7 +78,7 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount < bCount || target == "all" || target == "dump" {
-			return true, fmt.Sprintf("Success: Stored items in chest.")
+			return true, "Success: Stored items in chest."
 		}
 		return false, fmt.Sprintf("Critique: Failed to store %s. Inventory count remained at %d. Chest might be full or pathfinding failed.", intent.Target, bCount)
 
@@ -144,4 +145,27 @@ func getSmeltOutput(input string) string {
 		return "glass"
 	}
 	return "cooked_" + input
+}
+
+// GenerateRules implements the RuleExtractor interface
+func (c *StateCritic) GenerateRules(ctx context.Context, sessionID string) string {
+	var rules strings.Builder
+	rules.WriteString("CRITICAL SURVIVAL RULES:\n")
+	rules.WriteString("- If health < 10, prioritize 'eat' or 'retreat' actions\n")
+	rules.WriteString("- Avoid 'hunt' when health < 12\n")
+	rules.WriteString("- Always ensure food is available before dangerous activities\n\n")
+
+	rules.WriteString("TOOL & PREREQUISITE RULES:\n")
+	rules.WriteString("- Cannot mine stone without wooden_pickaxe or better\n")
+	rules.WriteString("- Crafting table required for most tool recipes\n")
+	rules.WriteString("- Verify materials are in inventory before crafting\n\n")
+
+	rules.WriteString("ACTION VALIDATION RULES:\n")
+	rules.WriteString("- 'store' requires accessible chest with space\n")
+	rules.WriteString("- 'retrieve' requires item exists in known chest\n")
+	rules.WriteString("- 'build' requires ≥20 blocks (dirt/planks/cobblestone)\n")
+	rules.WriteString("- 'smelt' requires raw material + fuel (coal/wood)\n")
+	rules.WriteString("- Movement actions should result in >3 block displacement\n")
+
+	return rules.String()
 }

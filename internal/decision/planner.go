@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -89,92 +88,6 @@ Response format (JSON only):
     ]
     }`
 
-// Package-level definitions to fix compiler undeclared name errors
-type CompactPOI struct {
-	Type      string  `json:"type"`
-	Name      string  `json:"name"`
-	Distance  float64 `json:"distance"`
-	Direction string  `json:"direction"`
-}
-
-type CompactThreat struct {
-	Name string `json:"name"`
-}
-
-type CompactTask struct {
-	Action   string  `json:"action"`
-	Target   string  `json:"target"`
-	Progress float64 `json:"progress"`
-}
-
-func formatStateForLLM(state domain.GameState) string {
-	compact := struct {
-		Health       float64           `json:"health"`
-		Food         float64           `json:"food"`
-		TimeOfDay    int               `json:"time_of_day"`
-		HasBedNearby bool              `json:"has_bed_nearby"`
-		Inventory    map[string]int    `json:"inventory"`
-		Threats      []CompactThreat   `json:"threats"`
-		POIs         []CompactPOI      `json:"pois"`
-		HasPickaxe   bool              `json:"has_pickaxe"`
-		HasWeapon    bool              `json:"has_weapon"`
-		Feedback     []domain.Feedback `json:"feedback,omitempty"`
-		CurrentTask  *CompactTask      `json:"current_task,omitempty"`
-	}{
-		Health:       state.Health,
-		Food:         state.Food,
-		TimeOfDay:    state.TimeOfDay,
-		HasBedNearby: state.HasBedNearby,
-		Inventory:    make(map[string]int),
-		Threats:      make([]CompactThreat, 0),
-		POIs:         make([]CompactPOI, 0),
-		Feedback:     state.Feedback,
-	}
-
-	if state.CurrentTask != nil {
-		compact.CurrentTask = &CompactTask{
-			Action:   state.CurrentTask.Action,
-			Target:   state.CurrentTask.Target.Name,
-			Progress: state.TaskProgress,
-		}
-	}
-
-	for _, item := range state.Inventory {
-		if item.Count > 0 {
-			compact.Inventory[item.Name] += item.Count
-			if strings.Contains(item.Name, "pickaxe") {
-				compact.HasPickaxe = true
-			}
-			if strings.Contains(item.Name, "sword") ||
-				(strings.Contains(item.Name, "axe") && !strings.Contains(item.Name, "pickaxe")) {
-				compact.HasWeapon = true
-			}
-		}
-	}
-
-	for i, t := range state.Threats {
-		if i >= 3 {
-			break
-		}
-		compact.Threats = append(compact.Threats, CompactThreat{Name: t.Name})
-	}
-
-	for i, p := range state.POIs {
-		if i >= 5 {
-			break
-		}
-		compact.POIs = append(compact.POIs, CompactPOI{
-			Type:      p.Type,
-			Name:      p.Name,
-			Distance:  p.Distance,
-			Direction: p.Direction,
-		})
-	}
-
-	b, _ := json.Marshal(compact)
-	return string(b)
-}
-
 type multiCandidateResponse struct {
 	Objective  string            `json:"objective"`
 	Candidates [][]domain.Action `json:"candidates"`
@@ -224,6 +137,7 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 			p.currentPlan.Store(plan)
 			lastPlannedState = latestState
+			p.logger.Info("Background replan complete", slog.String("objective", plan.Objective))
 		}
 	}
 }
@@ -232,6 +146,7 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 	select {
 	case p.replanCh <- state:
 	default:
+		// Channel full, drop to avoid blocking
 	}
 }
 
@@ -282,8 +197,15 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	knownWorld := "KNOWN WORLD: empty"
 	longTermMem := "No active summary."
 	if p.memStore != nil {
-		knownWorld, _ = p.memStore.GetKnownWorld(ctx, state.Position)
-		longTermMem, _ = p.memStore.GetSummary(ctx, sessionID)
+		var err error
+		knownWorld, err = p.memStore.GetKnownWorld(ctx, state.Position)
+		if err != nil {
+			p.logger.Warn("Failed to get known world", slog.Any("error", err))
+		}
+		longTermMem, err = p.memStore.GetSummary(ctx, sessionID)
+		if err != nil {
+			p.logger.Warn("Failed to get long-term memory", slog.Any("error", err))
+		}
 	}
 
 	systemPrompt := fmt.Sprintf("%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
@@ -295,7 +217,7 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		directive.SecondaryGoal,
 	)
 
-	userContent := formatStateForLLM(state)
+	userContent := domain.FormatStateForLLM(state)
 
 	rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)
 	if err != nil {
@@ -303,7 +225,7 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	}
 
 	var parsed multiCandidateResponse
-	if err := json.Unmarshal([]byte(cleanJSON(rawResponse)), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &parsed); err != nil {
 		return nil, fmt.Errorf("llm schema violation: %w", err)
 	}
 
@@ -356,12 +278,4 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 	}
 
 	return score
-}
-
-func cleanJSON(raw string) string {
-	cleaned := strings.TrimSpace(raw)
-	cleaned = strings.TrimPrefix(cleaned, "```json")
-	cleaned = strings.TrimPrefix(cleaned, "```")
-	cleaned = strings.TrimSuffix(cleaned, "```")
-	return strings.TrimSpace(cleaned)
 }

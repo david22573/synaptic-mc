@@ -5,13 +5,15 @@
         uiStore,
         connectToBot,
         disconnectBot,
+        sendCameraControl,
     } from "./lib/store.svelte";
-    import { controller } from "./lib/store.svelte"; // Import the Phase 3 controller
+    import { controller } from "./lib/store.svelte";
     import HUD from "./components/HUD.svelte";
     import Sidebar from "./components/Sidebar.svelte";
 
     let viewerUrl = $state("about:blank");
     let isSidebarOpen = $state(true);
+    let viewerIframe: HTMLIFrameElement;
 
     // 60 FPS Interpolation State
     let renderPosition = $state({ x: 0, y: 0, z: 0 });
@@ -48,15 +50,48 @@
         connectToBot();
         renderLoop();
 
+        let lastMouseMove = 0;
+        const onMouseMove = (e: MouseEvent) => {
+            const now = performance.now();
+            if (now - lastMouseMove < 50) return; // Throttle to roughly 20 FPS
+
+            lastMouseMove = now;
+
+            if (viewerIframe) {
+                const rect = viewerIframe.getBoundingClientRect();
+                const relativeX = e.clientX - rect.left;
+                const relativeY = e.clientY - rect.top;
+
+                // Only send controls if mouse is actively over the viewer area
+                if (
+                    relativeX >= 0 &&
+                    relativeX <= rect.width &&
+                    relativeY >= 0 &&
+                    relativeY <= rect.height
+                ) {
+                    const yaw = (relativeX / rect.width - 0.5) * 180;
+                    const pitch = (relativeY / rect.height - 0.5) * 90;
+                    sendCameraControl(yaw, pitch);
+                }
+            }
+        };
+
+        window.addEventListener("mousemove", onMouseMove);
+
         return () => {
             disconnectBot();
+            window.removeEventListener("mousemove", onMouseMove);
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
         };
     });
 </script>
 
 <main class="fullscreen">
-    <iframe src={viewerUrl} title="Mineflayer Viewer" class="viewer-iframe"
+    <iframe
+        bind:this={viewerIframe}
+        src={viewerUrl}
+        title="Mineflayer Viewer"
+        class="viewer-iframe"
     ></iframe>
 
     <div class="floating-header">
@@ -92,7 +127,7 @@
         onclick={() => (isSidebarOpen = !isSidebarOpen)}
         title="Toggle Sidebar"
     >
-        {isSidebarOpen ? "▶" : "◀"}
+        {isSidebarOpen ? "◀" : "▶"}
     </button>
 
     {#if uiStore.tooltip}
@@ -176,7 +211,7 @@
         font-family: monospace;
         font-size: 0.875rem;
         border: 1px solid rgba(255, 255, 255, 0.1);
-        color: #60a5fa; /* Make smooth coords pop a bit */
+        color: #60a5fa;
     }
 
     .raw-coords {

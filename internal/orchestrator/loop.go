@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"david22573/synaptic-mc/internal/config"
+	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/humanization"
@@ -24,6 +25,8 @@ import (
 const (
 	SnapshotEventInterval = 500
 	DefaultTickRate       = 50 * time.Millisecond
+	PanicLockTimeout      = 15 * time.Second
+	RespawnCooldown       = 10 * time.Second
 )
 
 type Orchestrator struct {
@@ -34,6 +37,7 @@ type Orchestrator struct {
 
 	curriculum voyager.Curriculum
 	critic     voyager.Critic
+	planner    *decision.AdvancedPlanner
 	humanizer  *humanization.Engine
 
 	ctrlManager *execution.ControllerManager
@@ -53,17 +57,20 @@ type Orchestrator struct {
 	currentSnapshot domain.EvaluationSnapshot
 	taskHistory     []domain.TaskHistory
 
-	// Safely scoped pointers to avoid race conditions during read/write
 	activeIntent atomic.Pointer[domain.ActionIntent]
 	beforeState  atomic.Pointer[domain.GameState]
 
-	reflexLock   bool
-	evalCancel   context.CancelFunc
-	evalInFlight atomic.Bool
+	reflexLock    bool
+	reflexTimer   *time.Timer
+	evalCancel    context.CancelFunc
+	evalSemaphore chan struct{}
 
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
 	eventCount   atomic.Int64
+
+	botDead       atomic.Bool
+	lastDeathTime atomic.Int64
 }
 
 func New(
@@ -72,6 +79,7 @@ func New(
 	memStore memory.Store,
 	curriculum voyager.Curriculum,
 	critic voyager.Critic,
+	planner *decision.AdvancedPlanner,
 	exec execution.Controller,
 	uiHub *observability.Hub,
 	logger *slog.Logger,
@@ -84,28 +92,45 @@ func New(
 	}
 
 	engine := execution.NewTaskExecutionEngine(cm, logger)
-	tm := NewTaskManager(engine, nil, logger)
+	tm := NewTaskManager(engine, cm, nil, logger)
 	humanizer := humanization.NewEngine(humanCfg)
 
 	o := &Orchestrator{
-		sessionID:   sessionID,
-		store:       store,
-		memory:      memStore,
-		flags:       flags,
-		curriculum:  curriculum,
-		critic:      critic,
-		ctrlManager: cm,
-		engine:      engine,
-		taskManager: tm,
-		humanizer:   humanizer,
-		uiHub:       uiHub,
-		logger:      logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
-		eventCh:     make(chan domain.DomainEvent, 100),
-		taskHistory: make([]domain.TaskHistory, 0),
+		sessionID:     sessionID,
+		store:         store,
+		memory:        memStore,
+		flags:         flags,
+		curriculum:    curriculum,
+		critic:        critic,
+		planner:       planner,
+		ctrlManager:   cm,
+		engine:        engine,
+		taskManager:   tm,
+		humanizer:     humanizer,
+		uiHub:         uiHub,
+		logger:        logger.With(slog.String("component", "orchestrator"), slog.String("session_id", sessionID)),
+		eventCh:       make(chan domain.DomainEvent, 100),
+		taskHistory:   make([]domain.TaskHistory, 0),
+		evalSemaphore: make(chan struct{}, 1),
 	}
 
 	o.planTracker = NewPlanTracker(tm, humanizer, o.buildHumanizationContext, logger)
 	tm.OnDrain = o.handleQueueDrain
+
+	o.taskManager.SetReadyChecker(func() bool {
+		if o.botDead.Load() {
+			return false
+		}
+
+		o.mu.RLock()
+		state := o.currentSnapshot.State.State
+		o.mu.RUnlock()
+
+		if state.Position.X == 0 && state.Position.Z == 0 && state.Health <= 0 {
+			return false
+		}
+		return true
+	})
 
 	return o
 }
@@ -135,8 +160,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return o.processEventLoop(gCtx)
 	})
 
+	// Start planner slow replan loop in background
+	g.Go(func() error {
+		o.logger.Info("Starting planner slow replan loop")
+		o.planner.SlowReplanLoop(gCtx, o.sessionID)
+		return nil
+	})
+
 	<-gCtx.Done()
-	o.logger.Info("Orchestrator shutting down, waiting for loops...")
 	return g.Wait()
 }
 
@@ -147,6 +178,9 @@ func (o *Orchestrator) IngestState(ctx context.Context, state domain.GameState) 
 	}
 
 	o.stateBuffer.Store(&vState)
+
+	// Trigger planner replan on new state
+	o.planner.TriggerReplan(state)
 
 	if o.uiHub != nil {
 		go o.uiHub.Broadcast("state_update", state)
@@ -179,7 +213,6 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 
 func (o *Orchestrator) handleQueueDrain() {
 	if !o.planTracker.HasActivePlan() {
-		// Use the orchestrator's base context to prevent detached goroutine evaluation leaks
 		if o.baseCtx != nil {
 			_ = o.evaluateNextTask(o.baseCtx)
 		}
@@ -248,7 +281,9 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 			isLocked := o.reflexLock
 			o.mu.RUnlock()
 
-			if tm != nil && !o.planTracker.HasActivePlan() && tm.IsIdle() && !isLocked && !o.evalInFlight.Load() {
+			isEvaluating := len(o.evalSemaphore) > 0
+
+			if tm != nil && !o.planTracker.HasActivePlan() && tm.IsIdle() && !isLocked && !isEvaluating {
 				go o.handleQueueDrain()
 			}
 		}
@@ -261,13 +296,26 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case ev := <-o.eventCh:
+			// 1. Persist first to ensure database consistency
 			if err := o.store.Append(ctx, o.sessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
 				o.logger.Error("Failed to append event to store", slog.Any("error", err))
 				continue
 			}
 
+			// 2. Broadcast with a UI-friendly map
 			if o.uiHub != nil {
-				o.uiHub.Broadcast("event_stream", ev)
+				var payloadObj interface{}
+				_ = json.Unmarshal(ev.Payload, &payloadObj)
+
+				broadcastEv := map[string]interface{}{
+					"id":         ev.ID,
+					"session_id": ev.SessionID,
+					"type":       ev.Type,
+					"trace":      ev.Trace,
+					"payload":    payloadObj,
+					"created_at": ev.CreatedAt,
+				}
+				o.uiHub.Broadcast("event_stream", broadcastEv)
 			}
 
 			o.handleDomainEvent(ctx, ev)
@@ -280,19 +328,32 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 }
 
 func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
-	if !o.evalInFlight.CompareAndSwap(false, true) {
+	select {
+	case o.evalSemaphore <- struct{}{}:
+	default:
 		return nil
+	}
+
+	release := func() {
+		select {
+		case <-o.evalSemaphore:
+		default:
+		}
 	}
 
 	o.mu.RLock()
 	tm := o.taskManager
 	isLocked := o.reflexLock
 	state := o.currentSnapshot.State.State
-	history := o.taskHistory
 	o.mu.RUnlock()
 
-	if tm == nil || isLocked || o.planTracker.HasActivePlan() {
-		o.evalInFlight.Store(false)
+	if o.botDead.Load() || state.Health <= 0 || tm == nil || isLocked || o.planTracker.HasActivePlan() {
+		release()
+		return nil
+	}
+
+	if !o.ctrlManager.HasActiveController() {
+		release()
 		return nil
 	}
 
@@ -306,58 +367,49 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 	o.mu.Unlock()
 
 	go func() {
-		defer o.evalInFlight.Store(false)
-		defer cancel() // Explicitly chains cancellation to prevent leaking after ProposeTask
+		defer release()
+		defer cancel()
 
-		intent, err := o.curriculum.ProposeTask(evalCtx, state, history)
-		if err != nil {
-			if evalCtx.Err() == nil {
-				o.logger.Error("Curriculum failed to propose task", slog.Any("error", err))
-			}
+		o.logger.Info("Evaluating next objective")
+
+		// Get fast plan from planner instead of curriculum
+		plan := o.planner.FastPlan(state)
+		if len(plan.Tasks) == 0 {
+			o.logger.Debug("Planner returned empty plan")
 			return
 		}
 
-		if intent == nil {
-			return
-		}
-
-		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
-
-		o.activeIntent.Store(intent)
-		o.beforeState.Store(&state)
-
+		// Create trace for plan execution
 		trace := domain.TraceContext{
 			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
-			ActionID: intent.ID,
+			ActionID: plan.Tasks[0].ID,
 		}
 
-		action := domain.Action{
-			ID:        intent.ID,
-			Trace:     trace,
-			Action:    intent.Action,
-			Target:    domain.Target{Name: intent.Target, Type: "intent"},
-			Count:     intent.Count,
-			Rationale: intent.Rationale,
-			Priority:  10,
-		}
-
+		// Emit plan creation event
 		o.IngestEvent(evalCtx, domain.DomainEvent{
 			SessionID: o.sessionID,
 			Trace:     trace,
 			Type:      domain.EventTypePlanCreated,
-			Payload:   o.marshalJSON(intent),
+			Payload:   o.marshalJSON(plan),
+			CreatedAt: time.Now(),
 		})
 
-		if o.uiHub != nil {
-			o.uiHub.Broadcast("objective_update", intent.Rationale)
-		}
+		// Set plan for execution
+		o.planTracker.SetPlan(evalCtx, &plan)
 
-		plan := &domain.Plan{
-			Objective: intent.Rationale,
-			Tasks:     []domain.Action{action},
+		// Store first task as active intent for critic evaluation
+		if len(plan.Tasks) > 0 {
+			firstTask := plan.Tasks[0]
+			intent := &domain.ActionIntent{
+				ID:        firstTask.ID,
+				Action:    firstTask.Action,
+				Target:    firstTask.Target.Name,
+				Count:     firstTask.Count,
+				Rationale: firstTask.Rationale,
+			}
+			o.activeIntent.Store(intent)
+			o.beforeState.Store(&state)
 		}
-
-		o.planTracker.SetPlan(evalCtx, plan)
 	}()
 
 	return nil
@@ -387,35 +439,63 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 
 	switch ev.Type {
 	case domain.EventBotDeath:
+		o.botDead.Store(true)
+		o.lastDeathTime.Store(time.Now().UnixNano())
 		_ = tm.Halt(ctx, "bot_died")
 		o.planTracker.ClearPlan(ctx, "bot_died")
 		o.mu.Lock()
 		o.reflexLock = false
+		if o.reflexTimer != nil {
+			o.reflexTimer.Stop()
+		}
+		o.reflexTimer = time.AfterFunc(RespawnCooldown, func() {
+			o.mu.Lock()
+			o.reflexLock = false
+			o.mu.Unlock()
+			o.handleQueueDrain()
+		})
 		o.mu.Unlock()
-		observability.Metrics.TaskInterruption.Inc()
+
+	case domain.EventBotRespawn:
+		o.logger.Info("Bot respawn detected, resetting death state")
+		o.botDead.Store(false)
+		o.lastDeathTime.Store(0)
+
+		// Reset reflex lock to allow normal operation
+		o.mu.Lock()
+		o.reflexLock = false
+		if o.reflexTimer != nil {
+			o.reflexTimer.Stop()
+			o.reflexTimer = nil
+		}
+		o.mu.Unlock()
+
+		o.handleQueueDrain()
 
 	case domain.EventTypePanic:
-		// Enhanced recovery logging mechanism captures the TS stack trace correctly
-		var payload struct {
-			Error string `json:"error"`
-			Stack string `json:"stack"`
-		}
-		if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-			o.logger.Error("TS Handler Panic", slog.String("error", payload.Error), slog.String("stack", payload.Stack))
-		} else {
-			o.logger.Error("TS Handler Panic (unknown payload structure)", slog.String("raw", string(ev.Payload)))
-		}
-
-		_ = tm.Halt(ctx, "panic_triggered")
-		o.planTracker.ClearPlan(ctx, "panic_triggered")
 		o.mu.Lock()
+		if !o.reflexLock {
+			_ = tm.Halt(ctx, "panic_triggered")
+			o.planTracker.ClearPlan(ctx, "panic_triggered")
+		}
 		o.reflexLock = true
+		if o.reflexTimer != nil {
+			o.reflexTimer.Stop()
+		}
+		o.reflexTimer = time.AfterFunc(PanicLockTimeout, func() {
+			o.mu.Lock()
+			o.reflexLock = false
+			o.mu.Unlock()
+			o.handleQueueDrain()
+		})
 		o.mu.Unlock()
-		observability.Metrics.TaskInterruption.Inc()
 
 	case domain.EventTypePanicResolved:
 		o.mu.Lock()
 		o.reflexLock = false
+		if o.reflexTimer != nil {
+			o.reflexTimer.Stop()
+		}
 		o.mu.Unlock()
 		o.handleQueueDrain()
 
@@ -443,26 +523,21 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 			intent := o.activeIntent.Load()
 			beforePtr := o.beforeState.Load()
 
-			o.mu.Lock()
-			after := o.currentSnapshot.State.State
-
 			if intent != nil && beforePtr != nil && intent.ID == payload.CommandID {
-				o.activeIntent.Store(nil)
-				o.beforeState.Store(nil)
-
+				o.mu.Lock()
+				after := o.currentSnapshot.State.State
 				successCritic, critique := o.critic.Evaluate(*intent, *beforePtr, after)
 				if !success {
 					successCritic = false
-					critique = fmt.Sprintf("TS Execution Failed: %s. %s", payload.Cause, critique)
+					critique = fmt.Sprintf("TS Failed: %s. %s", payload.Cause, critique)
 				}
-
 				o.taskHistory = append(o.taskHistory, domain.TaskHistory{
-					Intent:   *intent,
-					Success:  successCritic,
-					Critique: critique,
+					Intent: *intent, Success: successCritic, Critique: critique,
 				})
+				o.activeIntent.Store(nil)
+				o.beforeState.Store(nil)
+				o.mu.Unlock()
 			}
-			o.mu.Unlock()
 
 			_ = tm.Complete(ctx, payload.CommandID, success)
 		}

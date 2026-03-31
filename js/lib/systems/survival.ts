@@ -4,7 +4,6 @@ import { log } from "../logger.js";
 import { getThreats, computeSafeRetreat } from "../utils/threats.js";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
-
 const { goals } = pkg;
 
 export interface SurvivalConfig {
@@ -16,13 +15,15 @@ export class SurvivalSystem {
     public bot: Bot;
     private client: SynapticClient;
     private config: SurvivalConfig;
-
     private running = false;
     private isPanicking = false;
     private lastDangerAt = 0;
     private lastFleeTime = 0;
     private diggingEscape = false;
     private pillaringOut = false;
+    private panicCheckCount = 0;
+    private lastPos: Vec3 | null = null;
+    private tickTimeout: NodeJS.Timeout | null = null;
 
     constructor(bot: Bot, client: SynapticClient, config: SurvivalConfig) {
         this.bot = bot;
@@ -37,6 +38,14 @@ export class SurvivalSystem {
         const tick = async () => {
             if (!this.running) return;
 
+            if (!this.bot?.entity || this.bot.health <= 0) {
+                if (this.isPanicking) {
+                    this.reset();
+                }
+                this.tickTimeout = setTimeout(tick, 5000);
+                return;
+            }
+
             try {
                 await this.checkSurvival();
             } catch (err) {
@@ -46,7 +55,7 @@ export class SurvivalSystem {
             }
 
             if (this.running) {
-                setTimeout(tick, 1000);
+                this.tickTimeout = setTimeout(tick, 1000);
             }
         };
 
@@ -55,6 +64,7 @@ export class SurvivalSystem {
 
     public stop() {
         this.running = false;
+        if (this.tickTimeout) clearTimeout(this.tickTimeout);
         this.reset();
     }
 
@@ -64,6 +74,8 @@ export class SurvivalSystem {
         this.lastFleeTime = 0;
         this.diggingEscape = false;
         this.pillaringOut = false;
+        this.panicCheckCount = 0;
+        this.lastPos = null;
     }
 
     public isPanickingNow(): boolean {
@@ -71,10 +83,11 @@ export class SurvivalSystem {
     }
 
     private async checkSurvival() {
-        if (!this.bot?.entity) return;
+        if (!this.bot?.entity || this.bot.health <= 0) return;
         if (this.diggingEscape || this.pillaringOut) return;
 
         const threats = getThreats(this.bot);
+        // Immediate threats are closer and higher score
         const immediateThreats = threats.filter(
             (t: any) =>
                 t.distance < 24 &&
@@ -85,12 +98,14 @@ export class SurvivalSystem {
 
         if (immediateThreats.length > 0) {
             const topThreat = immediateThreats[0]!;
+
             const hasWeapon = this.bot.inventory
                 .items()
                 .some(
                     (i) => i.name.includes("axe") || i.name.includes("sword"),
                 );
 
+            // Logic to stand and fight if we are healthy and armed
             const isOneOnOne = immediateThreats.length === 1;
             const isUnavoidableDeath =
                 topThreat.name === "creeper" || topThreat.name === "warden";
@@ -103,19 +118,47 @@ export class SurvivalSystem {
             ) {
                 if (this.isPanicking) {
                     this.isPanicking = false;
+                    this.panicCheckCount = 0;
                     this.config.stopMovement();
-                    this.client.sendEvent(
-                        "panic_retreat_end",
-                        "evasion_complete",
-                        "",
-                        "engaging_in_combat",
-                        0,
-                    );
+                    if (this.bot.health > 0) {
+                        this.client.sendEvent("panic_retreat_end", {
+                            status: "RESOLVED",
+                            cause: "engaging_in_combat",
+                        });
+                    }
                 }
                 return;
             }
 
             this.lastDangerAt = Date.now();
+
+            const currentPos = this.bot.entity.position.clone();
+            if (this.lastPos && currentPos.distanceTo(this.lastPos) < 0.5) {
+                this.panicCheckCount++;
+            } else {
+                this.panicCheckCount = Math.max(0, this.panicCheckCount - 1);
+            }
+            this.lastPos = currentPos;
+
+            if (this.panicCheckCount > 15) {
+                log.warn(
+                    "Panic resolution forced: Bot is physically stuck during flee",
+                    { count: this.panicCheckCount },
+                );
+                this.isPanicking = false;
+                this.panicCheckCount = 0;
+                this.config.stopMovement();
+                if (this.bot.health > 0) {
+                    this.client.sendPanic(
+                        new Error(
+                            "Panic loop detected: Bot is stuck or unreachable destination",
+                        ),
+                    );
+                }
+                // Emergency: try to dig down if stuck
+                await this.digEscape();
+                return;
+            }
 
             if (!this.isPanicking) {
                 this.isPanicking = true;
@@ -124,18 +167,15 @@ export class SurvivalSystem {
                     health: Math.round(this.bot.health),
                     threatCount: immediateThreats.length,
                 });
-
                 this.config.onInterrupt("panic_flee");
-                this.config.stopMovement();
-                this.client.sendEvent(
-                    "panic_retreat_start",
-                    "evasion",
-                    "",
-                    topThreat.name,
-                    0,
-                );
+                if (this.bot.health > 0) {
+                    this.client.sendPanic(
+                        new Error(`Panic: ${topThreat.name}`),
+                    );
+                }
             }
 
+            // Persistence: recalculate path every 5 seconds if still in danger
             if (
                 !this.bot.pathfinder.isMoving() ||
                 Date.now() - this.lastFleeTime > 5000
@@ -149,50 +189,39 @@ export class SurvivalSystem {
                 this.fleeTo(safePos);
             }
         } else if (this.isPanicking && Date.now() > this.lastDangerAt + 5000) {
+            // No threats for 5 seconds, clear panic
             this.isPanicking = false;
-            log.debug(
-                "Survival goal reached; securing exit and releasing reflex lock",
-            );
-
+            this.panicCheckCount = 0;
+            this.lastPos = null;
+            log.info("Survival goal reached; releasing reflex lock");
             this.config.stopMovement();
 
-            this.pillaringOut = true;
             await this.pillarOut().catch((err) =>
                 log.warn("Pillar out failed", { err }),
             );
-            this.pillaringOut = false;
 
-            this.client.sendEvent(
-                "panic_retreat_end",
-                "evasion_complete",
-                "",
-                "safe",
-                0,
-            );
+            if (this.bot.health > 0) {
+                this.client.sendEvent("panic_retreat_end", {
+                    status: "RESOLVED",
+                    cause: "safe",
+                });
+            }
+        } else if (!this.isPanicking) {
+            this.panicCheckCount = 0;
+            this.lastPos = null;
         }
     }
 
     private async fleeTo(safePos: { x: number; z: number }) {
         try {
             const goal = new goals.GoalNearXZ(safePos.x, safePos.z, 2);
-            const path = this.bot.pathfinder.getPathTo(
-                this.bot.pathfinder.movements,
-                goal,
-            );
-
-            if (path.status === "noPath" || path.status === "timeout") {
-                log.warn(
-                    "Panic pathfinding failed, attempting vertical dig escape",
-                );
-                await this.digEscape();
-                return;
+            if (this.bot.pathfinder) {
+                this.bot.pathfinder.setGoal(goal);
             }
-
-            this.bot.pathfinder.setGoal(goal);
         } catch (e) {
-            log.warn(
-                "Pathfinder threw during panic, attempting vertical dig escape",
-            );
+            log.warn("Pathfinder failed during flee, attempting vertical dig", {
+                err: e,
+            });
             await this.digEscape();
         }
     }
@@ -203,28 +232,22 @@ export class SurvivalSystem {
         const inWater =
             this.bot.blockAt(this.bot.entity.position.floored())?.name ===
             "water";
-
-        if (inWater) {
-            log.warn("Refusing to vertical dig escape while submerged.");
-            return;
-        }
+        if (inWater) return;
 
         this.diggingEscape = true;
         this.config.stopMovement();
 
         try {
+            log.info("Initiating emergency vertical dig escape");
             for (let i = 0; i < 3; i++) {
                 if (this.bot.health <= 0) break;
-
                 const pos = this.bot.entity.position.floored();
                 const below = this.bot.blockAt(pos.offset(0, -1, 0));
-
                 if (
                     below &&
                     below.name !== "air" &&
                     below.name !== "bedrock" &&
-                    below.name !== "water" &&
-                    below.name !== "lava"
+                    !["water", "lava"].includes(below.name)
                 ) {
                     const tool = this.bot.pathfinder.bestHarvestTool(below);
                     if (tool) await this.bot.equip(tool.type, "hand");
@@ -232,57 +255,23 @@ export class SurvivalSystem {
                 }
             }
 
+            // Try to seal the roof
             const trashBlock = this.bot.inventory
                 .items()
                 .find((i) =>
-                    [
-                        "dirt",
-                        "cobblestone",
-                        "stone",
-                        "granite",
-                        "diorite",
-                        "andesite",
-                        "netherrack",
-                    ].includes(i.name),
+                    ["dirt", "cobblestone", "stone", "netherrack"].includes(
+                        i.name,
+                    ),
                 );
 
             if (trashBlock) {
                 await this.bot.equip(trashBlock.type, "hand");
-
                 const pos = this.bot.entity.position.floored();
-                const compassVectors = [
-                    new Vec3(1, 0, 0),
-                    new Vec3(-1, 0, 0),
-                    new Vec3(0, 0, 1),
-                    new Vec3(0, 0, -1),
-                ];
-
-                let placed = false;
-
-                for (const vec of compassVectors) {
-                    const wallBlock = this.bot.blockAt(
-                        pos.offset(vec.x, 2, vec.z),
-                    );
-
-                    if (wallBlock && wallBlock.boundingBox === "block") {
-                        try {
-                            await this.bot.placeBlock(
-                                wallBlock,
-                                vec.scaled(-1),
-                            );
-                            placed = true;
-                            log.debug(
-                                "Successfully sealed roof at surface level.",
-                            );
-                            break;
-                        } catch (e) {}
-                    }
-                }
-
-                if (!placed) {
-                    log.warn(
-                        "Failed to seal roof. Terrain geometry unsupported.",
-                    );
+                const wallBlock = this.bot.blockAt(pos.offset(1, 2, 0));
+                if (wallBlock && wallBlock.boundingBox === "block") {
+                    await this.bot
+                        .placeBlock(wallBlock, new Vec3(-1, 0, 0))
+                        .catch(() => {});
                 }
             }
         } catch (err) {
@@ -293,100 +282,74 @@ export class SurvivalSystem {
     }
 
     private async pillarOut() {
-        if (!this.bot.entity || this.bot.health <= 0) return;
+        if (this.pillaringOut) return;
+        this.pillaringOut = true;
 
-        const isEnclosed = (yOffset: number) => {
-            const pos = this.bot.entity.position.floored();
-            const blocks = [
-                this.bot.blockAt(pos.offset(0, yOffset, -1)),
-                this.bot.blockAt(pos.offset(0, yOffset, 1)),
-                this.bot.blockAt(pos.offset(1, yOffset, 0)),
-                this.bot.blockAt(pos.offset(-1, yOffset, 0)),
-            ];
+        try {
+            if (!this.bot.entity || this.bot.health <= 0) return;
 
-            return blocks.filter((b) => b?.boundingBox === "block").length >= 3;
-        };
-
-        if (!isEnclosed(0) && !isEnclosed(1)) {
-            return;
-        }
-
-        log.info("Trapped in pit. Initiating pillar-out recovery sequence.");
-
-        let jumps = 0;
-        while (jumps < 10) {
-            jumps++;
-
-            if (this.bot.health <= 0) return;
-
-            const pos = this.bot.entity.position.floored();
-            if (!isEnclosed(0) && !isEnclosed(1)) {
-                log.info("Surface reached. Resuming normal operations.");
-                break;
-            }
-
-            const trashBlock = this.bot.inventory
-                .items()
-                .find((i) =>
-                    [
-                        "dirt",
-                        "cobblestone",
-                        "stone",
-                        "netherrack",
-                        "granite",
-                        "diorite",
-                        "andesite",
-                    ].includes(i.name),
+            const isEnclosed = (yOffset: number) => {
+                const pos = this.bot.entity.position.floored();
+                const blocks = [
+                    this.bot.blockAt(pos.offset(0, yOffset, -1)),
+                    this.bot.blockAt(pos.offset(0, yOffset, 1)),
+                    this.bot.blockAt(pos.offset(1, yOffset, 0)),
+                    this.bot.blockAt(pos.offset(-1, yOffset, 0)),
+                ];
+                return (
+                    blocks.filter((b) => b?.boundingBox === "block").length >= 3
                 );
+            };
 
-            if (!trashBlock) {
-                log.warn("Out of blocks! Cannot pillar out of hole.");
-                break;
-            }
+            if (!isEnclosed(0) && !isEnclosed(1)) return;
 
-            const roof = this.bot.blockAt(pos.offset(0, 2, 0));
+            log.info("Bot appears trapped. Initiating pillar-out recovery.");
+            let jumps = 0;
+            // LIMIT TO 3 JUMPS MAX. Any higher, and pathfinder panics about lethal fall distance
+            while (jumps < 3) {
+                jumps++;
+                if (this.bot.health <= 0) return;
+                if (!isEnclosed(0) && !isEnclosed(1)) break;
 
-            if (
-                roof &&
-                roof.name !== "air" &&
-                roof.name !== "water" &&
-                roof.name !== "lava"
-            ) {
-                const tool = this.bot.pathfinder.bestHarvestTool(roof);
-                if (tool) await this.bot.equip(tool.type, "hand");
-                await this.bot.dig(roof).catch(() => {});
-            }
+                const trashBlock = this.bot.inventory
+                    .items()
+                    .find((i) =>
+                        ["dirt", "cobblestone", "stone", "netherrack"].includes(
+                            i.name,
+                        ),
+                    );
+                if (!trashBlock) break;
 
-            await this.bot.equip(trashBlock.type, "hand");
-
-            const refBlock = this.bot.blockAt(pos.offset(0, -1, 0));
-            if (refBlock && refBlock.name !== "air") {
-                await this.bot.lookAt(pos.offset(0.5, 0, 0.5), true);
-                this.bot.setControlState("jump", true);
-
-                const startY = this.bot.entity.position.y;
-
-                for (let k = 0; k < 20; k++) {
-                    await new Promise((resolve) => setTimeout(resolve, 20));
-
-                    if (this.bot.entity.position.y >= startY + 1.1) {
-                        break;
-                    }
+                // Clear roof if needed
+                const pos = this.bot.entity.position.floored();
+                const roof = this.bot.blockAt(pos.offset(0, 2, 0));
+                if (
+                    roof &&
+                    roof.name !== "air" &&
+                    !["water", "lava"].includes(roof.name)
+                ) {
+                    const tool = this.bot.pathfinder.bestHarvestTool(roof);
+                    if (tool) await this.bot.equip(tool.type, "hand");
+                    await this.bot.dig(roof).catch(() => {});
                 }
+
+                await this.bot.equip(trashBlock.type, "hand");
+                this.bot.setControlState("jump", true);
+                await new Promise((r) => setTimeout(r, 300));
 
                 try {
-                    await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                } catch (e: any) {
-                    log.warn("Failed to place block under feet", {
-                        err: e.message || e,
-                    });
-                }
+                    const refBlock = this.bot.blockAt(
+                        this.bot.entity.position.floored().offset(0, -1, 0),
+                    );
+                    if (refBlock)
+                        await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                } catch (e) {}
 
                 this.bot.setControlState("jump", false);
-                await new Promise((resolve) => setTimeout(resolve, 200));
-            } else {
-                await new Promise((resolve) => setTimeout(resolve, 200));
+                await new Promise((r) => setTimeout(r, 200));
             }
+        } finally {
+            this.pillaringOut = false;
         }
     }
 }

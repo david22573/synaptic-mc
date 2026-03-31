@@ -16,6 +16,7 @@ type Config struct {
 	APIURL     string
 	APIKey     string
 	Model      string
+	EmbedModel string
 	MaxRetries int
 }
 
@@ -55,7 +56,7 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
 
 	payload := map[string]any{
-		"model": c.config.Model,
+		"model": c.config.EmbedModel,
 		"input": input,
 	}
 

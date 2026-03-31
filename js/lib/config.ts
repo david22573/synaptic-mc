@@ -7,26 +7,20 @@ function loadEnv(): string {
         path.resolve(process.cwd(), ".env"),
         path.resolve(process.cwd(), "../.env"),
     ];
-
     for (const envPath of candidates) {
         if (fs.existsSync(envPath)) {
             dotenv.config({ path: envPath });
             return envPath;
         }
     }
-
     dotenv.config();
     return "default-dotenv-lookup";
 }
 
 export const ENV_PATH = loadEnv();
-
 export const ENABLE_VIEWER = process.env.ENABLE_VIEWER === "true";
 export const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || "3000", 10);
-
 export const DEBUG_CHAT = process.env.DEBUG_CHAT === "true";
-
-// FIX: Correct default WebSocket path from /ws to /bot/ws
 export const WS_URL = process.env.WS_URL || "ws://localhost:8080/bot/ws";
 
 export const TASK_TIMEOUTS: Record<string, number> = {
@@ -55,6 +49,7 @@ export const THREAT_WEIGHTS: Record<string, number> = {
 
 export interface Config {
     ws_url: string;
+    bot_ws_url?: string;
     viewer_port: number;
     enable_viewer: boolean;
     debug_chat: boolean;
@@ -68,7 +63,6 @@ export async function loadConfig(): Promise<Config> {
     if (configCache) return configCache;
 
     let timeoutId: NodeJS.Timeout | null = null;
-
     try {
         const controller = new AbortController();
         timeoutId = setTimeout(() => controller.abort(), 3000);
@@ -80,6 +74,8 @@ export async function loadConfig(): Promise<Config> {
         if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
 
         configCache = await res.json();
+
+        configCache!.ws_url = configCache!.bot_ws_url || WS_URL;
 
         if (configCache!.task_timeouts) {
             Object.assign(TASK_TIMEOUTS, configCache!.task_timeouts);
@@ -97,7 +93,6 @@ export async function loadConfig(): Promise<Config> {
             "Failed to fetch dynamic config, relying on static defaults",
             err instanceof Error ? err.message : String(err),
         );
-
         configCache = {
             ws_url: WS_URL,
             viewer_port: VIEWER_PORT,
@@ -106,7 +101,6 @@ export async function loadConfig(): Promise<Config> {
             task_timeouts: TASK_TIMEOUTS,
             threat_weights: THREAT_WEIGHTS,
         };
-
         return configCache;
     } finally {
         if (timeoutId) clearTimeout(timeoutId);

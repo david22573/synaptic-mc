@@ -9,11 +9,16 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
+type queuedAction struct {
+	ctx    context.Context
+	action domain.Action
+}
+
 type TaskExecutionEngine struct {
 	controller  Controller
 	logger      *slog.Logger
 	mu          sync.Mutex
-	queue       []domain.Action
+	queue       []queuedAction
 	inFlight    *ExecutionTask
 	maxInFlight int
 }
@@ -22,66 +27,74 @@ func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecution
 	return &TaskExecutionEngine{
 		controller:  ctrl,
 		logger:      logger.With(slog.String("component", "task_execution_engine")),
-		queue:       make([]domain.Action, 0),
+		queue:       make([]queuedAction, 0),
 		maxInFlight: 1,
 	}
 }
 
-// Enqueue adds an action to the execution queue, applying backpressure if needed.
-func (e *TaskExecutionEngine) Enqueue(action domain.Action) {
+// HasController checks if a controller is actually registered.
+func (e *TaskExecutionEngine) HasController() bool {
+	if manager, ok := e.controller.(*ControllerManager); ok {
+		return manager.current.Load() != nil
+	}
+	return true
+}
+
+func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action) {
 	e.mu.Lock()
 
-	// Backpressure: Drop low-priority drift/background actions if we are busy
 	if action.Priority < 0 && (e.inFlight != nil || len(e.queue) > 0) {
 		e.mu.Unlock()
 		return
 	}
 
-	e.queue = append(e.queue, action)
+	e.queue = append(e.queue, queuedAction{ctx: ctx, action: action})
 	e.mu.Unlock()
 
 	e.pump()
 }
 
-// pump drains the queue based on priority and max in-flight limits.
 func (e *TaskExecutionEngine) pump() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
-	if e.inFlight != nil {
-		return // Enforce maxInFlight = 1
-	}
-
-	if len(e.queue) == 0 {
+	if e.inFlight != nil || len(e.queue) == 0 {
+		e.mu.Unlock()
 		return
 	}
 
-	// Find the highest priority action in the queue
 	bestIdx := 0
 	for i := 1; i < len(e.queue); i++ {
-		if e.queue[i].Priority > e.queue[bestIdx].Priority {
+		if e.queue[i].action.Priority > e.queue[bestIdx].action.Priority {
 			bestIdx = i
 		}
 	}
 
-	action := e.queue[bestIdx]
-
-	// Remove the selected action from the queue
+	qa := e.queue[bestIdx]
 	e.queue = append(e.queue[:bestIdx], e.queue[bestIdx+1:]...)
 
 	e.inFlight = &ExecutionTask{
-		Action:      action,
+		Action:      qa.action,
 		Status:      StatusDispatched,
 		EnqueueTime: time.Now(),
 	}
+	e.mu.Unlock() // Unlock before reaching out to the controller
 
-	err := e.controller.Dispatch(context.Background(), action)
+	err := e.controller.Dispatch(qa.ctx, qa.action)
 	if err != nil {
-		e.inFlight.Status = StatusFailed
-		e.inFlight.Error = err.Error()
-		e.inFlight = nil
-		e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", action.Action))
-		go e.pump() // Try next
+		e.mu.Lock()
+		// Only nil it out if it hasn't already been aborted/replaced by something else
+		if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
+			e.inFlight.Status = StatusFailed
+			e.inFlight.Error = err.Error()
+			e.inFlight = nil
+		}
+		e.mu.Unlock()
+
+		if err.Error() != "no active controller" {
+			e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action))
+		}
+
+		go e.pump()
 		return
 	}
 }
@@ -114,7 +127,6 @@ func (e *TaskExecutionEngine) OnTaskEnd(actionID string, success bool) {
 	e.pump()
 }
 
-// AbortCurrent forces the engine to drop its active task, clears the queue, and signals the TS controller.
 func (e *TaskExecutionEngine) AbortCurrent(ctx context.Context, reason string) error {
 	e.mu.Lock()
 	if e.inFlight != nil {
@@ -124,8 +136,7 @@ func (e *TaskExecutionEngine) AbortCurrent(ctx context.Context, reason string) e
 		e.inFlight = nil
 	}
 
-	// Clear the engine queue to prevent backlogged tasks from instantly executing after abort
-	e.queue = make([]domain.Action, 0)
+	e.queue = make([]queuedAction, 0)
 	e.mu.Unlock()
 
 	return e.controller.AbortCurrent(ctx, reason)

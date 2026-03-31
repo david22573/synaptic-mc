@@ -10,6 +10,8 @@ import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
+const MAX_HISTORY_POINTS = 50;
+
 interface ExploreContext extends StateContext {
     targetX: number;
     targetZ: number;
@@ -35,12 +37,17 @@ class NavigateState implements FSMState {
                     dynamic: false,
                 },
             );
+
             // Successfully reached new area. Record it to repel future exploration.
             eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
                 z: eCtx.bot.entity.position.z,
             });
-            if (eCtx.visitedPoints.length > 20) eCtx.visitedPoints.shift();
+
+            // In-place truncation to preserve array reference bound to bot instance
+            while (eCtx.visitedPoints.length > MAX_HISTORY_POINTS) {
+                eCtx.visitedPoints.shift();
+            }
 
             eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
             return null;
@@ -66,6 +73,7 @@ class PickDirectionState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
         eCtx.attempts++;
+
         // Reduced from 4 attempts to 2 to prevent hitting global 25s FSM timeout
         if (eCtx.attempts > 2) {
             eCtx.result = {
@@ -118,6 +126,7 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
     // Bind the history array to the bot instance itself.
     const botRef = bot as any;
     botRef.explorationHistory = botRef.explorationHistory || [];
+
     const fsmCtx: ExploreContext = {
         bot,
         targetName: "explore",
@@ -132,10 +141,12 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
         stopMovement,
         visitedPoints: botRef.explorationHistory,
     };
+
     const result = await new StateMachineRunner(
         new PickDirectionState(),
         fsmCtx,
     ).run();
+
     if (result.status === "FAILED")
         throw new Error(result.reason || "unknown_fsm_failure");
 }

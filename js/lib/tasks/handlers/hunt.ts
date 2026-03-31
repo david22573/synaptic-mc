@@ -47,6 +47,7 @@ class EngageState implements FSMState {
 
         const combatStartTime = Date.now();
         const maxCombatDurationMs = 60000;
+        let lastValidation = Date.now();
 
         bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
 
@@ -58,6 +59,22 @@ class EngageState implements FSMState {
                     throw new Error(
                         "PANIC: Combat loop exceeded max duration. Target might be bugged or unreachable.",
                     );
+                }
+
+                // Add periodic re-validation to prevent swinging at ghosts
+                if (Date.now() - lastValidation > 1000) {
+                    const filter = (entity: any) =>
+                        entity.name === sCtx.targetName &&
+                        entity.type === "mob" &&
+                        entity.health > 0;
+
+                    const revalidate = bot.nearestEntity(filter);
+                    if (!revalidate || revalidate.id !== target.id) {
+                        throw new Error(
+                            "TARGET_LOST: Entity despawned or replaced",
+                        );
+                    }
+                    lastValidation = Date.now();
                 }
 
                 await this.ensureBestEquipment(bot, sCtx);
@@ -105,10 +122,17 @@ class EngageState implements FSMState {
                 await bot.waitForTicks(1);
             }
         } catch (err: any) {
-            if (err.message !== "aborted") {
+            if (
+                err.message !== "aborted" &&
+                !err.message.includes("TARGET_LOST")
+            ) {
                 throw new Error(
                     `PANIC: Internal error during combat loop: ${err.stack || err.message}`,
                 );
+            }
+            if (err.message.includes("TARGET_LOST")) {
+                bot.pathfinder.setGoal(null);
+                return new SearchState();
             }
             throw err;
         } finally {
@@ -196,18 +220,52 @@ class SearchState implements FSMState {
             entity.type === "mob" &&
             entity.health > 0;
 
-        const target = bot.nearestEntity(filter);
+        let attempts = 0;
+        const maxAttempts = 6;
 
-        if (!target) {
-            sCtx.result = {
-                status: "FAILED",
-                reason: `NO_ENTITY: Could not find any ${sCtx.targetName} nearby.`,
-            };
-            return null;
+        while (attempts < maxAttempts) {
+            if (sCtx.signal.aborted) throw new Error("aborted");
+
+            const target = bot.nearestEntity(filter);
+
+            if (target) {
+                sCtx.targetEntity = target;
+                bot.pathfinder.setGoal(null);
+                return new EngageState();
+            }
+
+            attempts++;
+            const angle = Math.random() * Math.PI * 2;
+            const radius = 8 * attempts; // Expands outward: 8, 16, 24...
+
+            const pos = bot.entity.position
+                .clone()
+                .offset(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+
+            try {
+                bot.pathfinder.setGoal(new goals.GoalNearXZ(pos.x, pos.z, 4));
+
+                // Walk for roughly 3 seconds to let chunks load / targets enter vision
+                for (let i = 0; i < 60; i++) {
+                    if (sCtx.signal.aborted) throw new Error("aborted");
+
+                    if (i % 10 === 0 && bot.nearestEntity(filter)) {
+                        break;
+                    }
+                    await bot.waitForTicks(1);
+                }
+            } catch (e) {
+                // If pathing fails to random point, pause and retry next angle
+                await bot.waitForTicks(10);
+            }
         }
 
-        sCtx.targetEntity = target;
-        return new EngageState();
+        bot.pathfinder.setGoal(null);
+        sCtx.result = {
+            status: "FAILED",
+            reason: `NO_ENTITY: Could not find any ${sCtx.targetName} nearby after exploring.`,
+        };
+        return null;
     }
 }
 

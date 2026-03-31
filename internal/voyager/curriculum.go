@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/memory"
 )
 
 type LLMClient interface {
@@ -16,18 +17,20 @@ type LLMClient interface {
 }
 
 type Curriculum interface {
-	ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error)
+	ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory, sessionID string) (*domain.ActionIntent, error)
 }
 
 type AutonomousCurriculum struct {
-	client LLMClient
-	vector VectorStore
+	client   LLMClient
+	vector   VectorStore
+	memStore memory.Store
 }
 
-func NewAutonomousCurriculum(client LLMClient, vector VectorStore) *AutonomousCurriculum {
+func NewAutonomousCurriculum(client LLMClient, vector VectorStore, memStore memory.Store) *AutonomousCurriculum {
 	return &AutonomousCurriculum{
-		client: client,
-		vector: vector,
+		client:   client,
+		vector:   vector,
+		memStore: memStore,
 	}
 }
 
@@ -41,6 +44,7 @@ CRITICAL RULES:
 4.  STORAGE: If inventory is full, use the 'store' action to put items in a chest.
 5.  RETRIEVAL: If you need an item and it is in a known chest, use the 'retrieve' action.
 6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker. You need at least 20 blocks (dirt, planks, or cobblestone).
+
 AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build", "farm"
 
 OUTPUT FORMAT (Strict JSON):
@@ -51,7 +55,11 @@ OUTPUT FORMAT (Strict JSON):
 	"count": 4
 }`
 
-func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory) (*domain.ActionIntent, error) {
+func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory, sessionID string) (*domain.ActionIntent, error) {
+	if state.Health <= 0 {
+		return nil, fmt.Errorf("bot is dead, waiting for respawn")
+	}
+
 	var historyStrs []string
 	recentHistory := memory
 	if len(memory) > 5 {
@@ -75,7 +83,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 	if len(recentHistory) > 0 {
 		lastTask := recentHistory[len(recentHistory)-1]
 		if lastTask.Success && c.vector != nil {
-			// Detach from request context so save completes even if evaluation context cancels
 			go func(task domain.TaskHistory, finalState domain.GameState) {
 				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -90,8 +97,8 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 	}
 
 	// 2. Fetch Relevant Skills via Semantic Search
-	stateContext := formatStateForLLM(state)
-	queryText := fmt.Sprintf("Current Goal: Progression. Health: %.0f. Inventory focus: Tools and Food.", state.Health)
+	stateContext := domain.FormatStateForLLM(state)
+	queryText := buildRetrievalQuery(state)
 	queryEmb, err := c.client.CreateEmbedding(ctx, queryText)
 
 	skillContext := ""
@@ -106,9 +113,32 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\nRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.", stateContext, historyContext, skillContext)
+	// 3. Retrieve long-term memory
+	var memoryContext strings.Builder
+	if c.memStore != nil {
+		// Session summary
+		summary, err := c.memStore.GetSummary(ctx, sessionID)
+		if err == nil && summary != "No active summary." {
+			memoryContext.WriteString("SESSION SUMMARY:\n")
+			memoryContext.WriteString(summary)
+			memoryContext.WriteString("\n\n")
+		}
 
-	// 3. LLM Generation with Schema Retry Loop
+		// Known world nodes
+		knownWorld, err := c.memStore.GetKnownWorld(ctx, state.Position)
+		if err == nil && knownWorld != "KNOWN WORLD: empty" {
+			memoryContext.WriteString(knownWorld)
+			memoryContext.WriteString("\n\n")
+		}
+	}
+
+	// 4. LLM Generation with Schema Retry Loop
+	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
+		stateContext,
+		memoryContext.String(),
+		historyContext,
+		skillContext)
+
 	var intent domain.ActionIntent
 	var parseErr error
 
@@ -118,12 +148,11 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			return nil, fmt.Errorf("llm api failure: %w", genErr)
 		}
 
-		parseErr = json.Unmarshal([]byte(cleanJSON(rawResponse)), &intent)
+		parseErr = json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &intent)
 		if parseErr == nil && intent.Action != "" {
 			break
 		}
 
-		// Append error to user content for self-correction
 		userContent += fmt.Sprintf("\n\nSYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
@@ -134,50 +163,29 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 	return &intent, nil
 }
 
-func formatStateForLLM(state domain.GameState) string {
-	var inv []string
-	for _, item := range state.Inventory {
-		if item.Count > 0 {
-			inv = append(inv, fmt.Sprintf("%s:%d", item.Name, item.Count))
-		}
+func buildRetrievalQuery(state domain.GameState) string {
+	var priorities []string
+
+	// Check critical survival stats
+	if state.Health <= 10 {
+		priorities = append(priorities, "survival, healing, retreating")
+	}
+	if state.Food <= 6 {
+		priorities = append(priorities, "finding food, eating, hunting")
 	}
 
-	var pois []string
-	for i, p := range state.POIs {
-		if i >= 5 {
-			break
-		}
-		pois = append(pois, fmt.Sprintf("%s (%.0fm)", p.Name, p.Distance))
+	// Minecraft night ticks usually span 13000 to 23000
+	if state.TimeOfDay >= 13000 && state.TimeOfDay <= 23000 {
+		priorities = append(priorities, "shelter, defense, avoiding mobs at night")
 	}
 
-	var chests []string
-	for pos, items := range state.KnownChests {
-		var cInv []string
-		for _, item := range items {
-			if item.Count > 0 {
-				cInv = append(cInv, fmt.Sprintf("%s:%d", item.Name, item.Count))
-			}
-		}
-		if len(cInv) > 0 {
-			chests = append(chests, fmt.Sprintf("Chest at [%s]: %s", pos, strings.Join(cInv, ", ")))
-		} else {
-			chests = append(chests, fmt.Sprintf("Chest at [%s]: EMPTY", pos))
-		}
+	// Default to progression if nothing is actively trying to kill the bot
+	if len(priorities) == 0 {
+		priorities = append(priorities, "progression, resource gathering, crafting tools")
 	}
 
-	knownChestsContext := "None discovered."
-	if len(chests) > 0 {
-		knownChestsContext = strings.Join(chests, "\n")
-	}
-
-	return fmt.Sprintf("Health: %.0f/20\nFood: %.0f/20\nInventory: %s\nVisible POIs: %s\nKnown Chests:\n%s",
-		state.Health, state.Food, strings.Join(inv, ", "), strings.Join(pois, ", "), knownChestsContext)
-}
-
-func cleanJSON(raw string) string {
-	cleaned := strings.TrimSpace(raw)
-	cleaned = strings.TrimPrefix(cleaned, "```json")
-	cleaned = strings.TrimPrefix(cleaned, "```")
-	cleaned = strings.TrimSuffix(cleaned, "```")
-	return strings.TrimSpace(cleaned)
+	return fmt.Sprintf("State - Health: %.0f/20, Food: %.0f/20. Priority focus: %s.",
+		state.Health,
+		state.Food,
+		strings.Join(priorities, " and "))
 }

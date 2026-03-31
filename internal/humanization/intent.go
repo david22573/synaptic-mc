@@ -26,7 +26,7 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 
 	// 1. Calculate Frustration
 	if ctx.IsStuck {
-		state.Intent.Frustration += 0.2
+		state.Intent.Frustration += 0.01
 	} else {
 		state.Intent.Frustration -= 0.05
 		if state.Intent.Frustration < 0 {

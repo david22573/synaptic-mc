@@ -4,6 +4,8 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 )
@@ -18,7 +20,16 @@ type PerceptionResult struct {
 	TopTarget  *ScoredPOI
 }
 
-type PerceptionStage struct{}
+type poiCache struct {
+	stateVersion uint64
+	pois         []ScoredPOI
+	lastUpdate   time.Time
+}
+
+type PerceptionStage struct {
+	cache poiCache
+	mu    sync.RWMutex
+}
 
 func NewPerceptionStage() *PerceptionStage {
 	return &PerceptionStage{}
@@ -30,8 +41,22 @@ func (s *PerceptionStage) Name() string {
 
 func (s *PerceptionStage) Process(ctx context.Context, input PipelineState) (PipelineState, error) {
 	output := input
-	state := input.GameState
 
+	// Return cached if state hasn't changed significantly (500ms TTL)
+	s.mu.RLock()
+	if time.Since(s.cache.lastUpdate) < 500*time.Millisecond {
+		output.Perception = &PerceptionResult{
+			RankedPOIs: s.cache.pois,
+		}
+		if len(s.cache.pois) > 0 {
+			output.Perception.TopTarget = &s.cache.pois[0]
+		}
+		s.mu.RUnlock()
+		return output, nil
+	}
+	s.mu.RUnlock()
+
+	state := input.GameState
 	var scored []ScoredPOI
 
 	// Check biological imperatives
@@ -99,5 +124,12 @@ func (s *PerceptionStage) Process(ctx context.Context, input PipelineState) (Pip
 	}
 
 	output.Perception = &result
+
+	// Update cache
+	s.mu.Lock()
+	s.cache.pois = scored
+	s.cache.lastUpdate = time.Now()
+	s.mu.Unlock()
+
 	return output, nil
 }

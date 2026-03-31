@@ -33,6 +33,7 @@ func (pt *PlanTracker) SetPlan(ctx context.Context, plan *domain.Plan) {
 	defer pt.mu.Unlock()
 
 	if pt.activePlan != nil {
+		pt.logger.Info("Replacing active plan", slog.String("old_objective", pt.activePlan.Objective), slog.String("new_objective", plan.Objective))
 		pt.taskManager.Halt(ctx, "plan_superseded")
 	}
 
@@ -52,7 +53,7 @@ func (pt *PlanTracker) OnTaskComplete(ctx context.Context, taskID string, succes
 	}
 
 	if !success {
-		pt.logger.Warn("Plan failed due to task failure", slog.String("failed_task", taskID))
+		pt.logger.Warn("Plan failed due to task failure", slog.String("failed_task", taskID), slog.String("objective", pt.activePlan.Objective))
 		pt.activePlan = nil
 		pt.currentIndex = 0
 		return
@@ -68,6 +69,8 @@ func (pt *PlanTracker) OnTaskComplete(ctx context.Context, taskID string, succes
 		} else {
 			pt.enqueueNextLocked(ctx)
 		}
+	} else {
+		pt.logger.Warn("Task completion out of sequence", slog.String("task_id", taskID), slog.Int("expected_index", pt.currentIndex))
 	}
 }
 
@@ -76,7 +79,7 @@ func (pt *PlanTracker) ClearPlan(ctx context.Context, reason string) {
 	defer pt.mu.Unlock()
 
 	if pt.activePlan != nil {
-		pt.logger.Info("Clearing active plan", slog.String("reason", reason))
+		pt.logger.Info("Clearing active plan", slog.String("reason", reason), slog.String("objective", pt.activePlan.Objective))
 		pt.taskManager.Halt(ctx, reason)
 		pt.activePlan = nil
 		pt.currentIndex = 0

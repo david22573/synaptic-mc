@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 )
@@ -22,12 +23,12 @@ func NewNodeRunner(scriptPath string, logger *slog.Logger) *NodeRunner {
 	}
 }
 
-// Ping resets the watchdog timer. Should be called whenever a state tick is received.
+// Ping resets the watchdog timer.
 func (r *NodeRunner) Ping() {
 	r.lastPing.Store(time.Now().UnixNano())
 }
 
-// Start begins the process loop. It blocks until the context is canceled.
+// Start begins the process loop.
 func (r *NodeRunner) Start(ctx context.Context) {
 	for {
 		select {
@@ -40,6 +41,7 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		r.logger.Info("Spawning Node.js bot process")
 
 		cmd := exec.CommandContext(ctx, "node", r.scriptPath)
+		cmd.Dir = filepath.Dir(r.scriptPath)
 		cmd.Stdout = r.loggerWriter("STDOUT")
 		cmd.Stderr = r.loggerWriter("STDERR")
 
@@ -95,7 +97,11 @@ type streamWriter struct {
 }
 
 func (w *streamWriter) Write(p []byte) (n int, err error) {
-	// Optional: You can filter or structure this further, but raw text is fine for the supervisor
-	w.logger.Debug("TS Engine Output", slog.String("stream", w.stream), slog.String("msg", string(p)))
+	// FIXED: Escalate STDERR to WARN level so it's visible in the server logs
+	if w.stream == "STDERR" {
+		w.logger.Warn("TS Engine Error", slog.String("msg", string(p)))
+	} else {
+		w.logger.Debug("TS Engine Output", slog.String("msg", string(p)))
+	}
 	return len(p), nil
 }

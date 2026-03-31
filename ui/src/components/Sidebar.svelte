@@ -37,6 +37,7 @@
                 {#each inventory as item}
                     <div
                         class="item"
+                        role="presentation"
                         onmousemove={(e) =>
                             setTooltip(e, formatName(item.name))}
                         onmouseleave={clearTooltip}
@@ -58,6 +59,7 @@
                 {#each threats as threat}
                     <li
                         class="threat-item"
+                        role="presentation"
                         onmousemove={(e) =>
                             setTooltip(e, formatName(threat.name))}
                         onmouseleave={clearTooltip}
@@ -83,6 +85,7 @@
                         <span class="poi-type">{poi.type}</span>
                         <span
                             class="poi-name"
+                            role="presentation"
                             onmousemove={(e) =>
                                 setTooltip(e, formatName(poi.name))}
                             onmouseleave={clearTooltip}
@@ -113,6 +116,7 @@
                         <span class="event-type">{event.type}</span>
                         <span
                             class="event-payload"
+                            role="presentation"
                             onmousemove={(e) =>
                                 setTooltip(e, JSON.stringify(event.payload))}
                             onmouseleave={clearTooltip}
@@ -166,9 +170,11 @@
     .sidebar::-webkit-scrollbar {
         width: 6px;
     }
+
     .sidebar::-webkit-scrollbar-track {
         background: transparent;
     }
+
     .sidebar::-webkit-scrollbar-thumb {
         background: rgba(255, 255, 255, 0.2);
         border-radius: 3px;

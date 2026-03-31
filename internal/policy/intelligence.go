@@ -22,17 +22,24 @@ func NewIntelligencePolicy(store domain.EventStore, sessionID string) *Intellige
 }
 
 func (p *IntelligencePolicy) Decide(ctx context.Context, input DecisionInput) Decision {
-	// Directly load the projected snapshot + delta instead of replaying everything.
 	stats, _, err := learning.GetProjectedStats(ctx, p.store, p.sessionID)
 	if err != nil {
-		return Decision{IsApproved: true} // Fail open if event store is unreachable
+		return Decision{IsApproved: true}
 	}
 
 	for _, task := range input.Plan.Tasks {
+		// NEVER reject survival actions based on intelligence stats.
+		// If we fail to eat, we should keep trying to eat.
+		if task.Action == "eat" || task.Action == "retreat" {
+			continue
+		}
+
 		stat, exists := stats[task.Action]
 
-		// If we've tried this action at least 3 times and it fails > 70% of the time
-		if exists && stat.Attempts >= 3 && stat.SuccessRate < 0.3 {
+		// Relaxed Thresholds:
+		// Attempts: 3 -> 5
+		// Success Rate: 0.3 -> 0.15
+		if exists && stat.Attempts >= 5 && stat.SuccessRate < 0.15 {
 			maxCount := 0
 			topCause := "unknown"
 			for cause, count := range stat.FailureCauses {
@@ -43,7 +50,7 @@ func (p *IntelligencePolicy) Decide(ctx context.Context, input DecisionInput) De
 			}
 
 			reason := fmt.Sprintf(
-				"Action '%s' has a historically low success rate (%.0f%%) over %d attempts. Primary failure cause: %s. Try a completely different approach.",
+				"Action '%s' has a critically low success rate (%.0f%%) over %d attempts. Primary failure: %s. Switching strategy recommended.",
 				task.Action, stat.SuccessRate*100, stat.Attempts, topCause,
 			)
 

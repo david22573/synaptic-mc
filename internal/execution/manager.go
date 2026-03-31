@@ -18,8 +18,6 @@ type VersionedController struct {
 	active   sync.WaitGroup
 }
 
-// ControllerManager orchestrates graceful swaps between bot connections
-// preventing in-flight task corruption and ghost execution.
 type ControllerManager struct {
 	current atomic.Pointer[VersionedController]
 	mu      sync.Mutex
@@ -29,6 +27,22 @@ func NewControllerManager() *ControllerManager {
 	return &ControllerManager{}
 }
 
+func (m *ControllerManager) HasActiveController() bool {
+	return m.current.Load() != nil
+}
+
+// GetIdempotent returns the IdempotentController if it is the currently active controller.
+func (m *ControllerManager) GetIdempotent() *IdempotentController {
+	vc := m.current.Load()
+	if vc == nil {
+		return nil
+	}
+	if idm, ok := vc.Ctrl.(*IdempotentController); ok {
+		return idm
+	}
+	return nil
+}
+
 func (m *ControllerManager) SetController(id string, ctrl Controller) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -36,7 +50,6 @@ func (m *ControllerManager) SetController(id string, ctrl Controller) {
 	old := m.current.Load()
 	if old != nil {
 		old.draining.Store(true)
-		// Drain in-flight dispatches/aborts before swapping
 		old.active.Wait()
 		_ = old.Ctrl.Close()
 	}
@@ -60,7 +73,6 @@ func (m *ControllerManager) Dispatch(ctx context.Context, action domain.Action) 
 	vc.active.Add(1)
 	defer vc.active.Done()
 
-	// Tag the action to prevent ghost execution execution loops
 	action.ControllerID = vc.ID
 	return vc.Ctrl.Dispatch(ctx, action)
 }

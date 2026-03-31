@@ -44,30 +44,42 @@ type scheduledItem struct {
 }
 
 type TaskManager struct {
-	engine   *execution.TaskExecutionEngine // REPLACED CONTROLLER WITH ENGINE
-	logger   *slog.Logger
-	timeouts map[string]time.Duration
-	OnDrain  func()
+	engine      *execution.TaskExecutionEngine
+	ctrlManager *execution.ControllerManager
+	logger      *slog.Logger
+	timeouts    map[string]time.Duration
+	OnDrain     func()
 
-	queue      ActionPriorityQueue
-	mu         sync.Mutex
-	activeTask *domain.Action
-	cancelTask context.CancelFunc
-	watchdog   chan struct{}
-	signalCh   chan struct{}
-	idleSince  time.Time
+	queue       ActionPriorityQueue
+	mu          sync.Mutex
+	activeTask  *domain.Action
+	activeCtx   context.Context // Stored derived context
+	cancelTask  context.CancelFunc
+	watchdog    chan struct{}
+	signalCh    chan struct{}
+	idleSince   time.Time
+	lastFailure time.Time // Added backoff tracking
 
 	scheduleMu  sync.Mutex
 	scheduled   []scheduledItem
 	scheduleSig chan struct{}
+
+	isSystemLocked func() bool
+	isBotReady     func() bool
 }
 
-func NewTaskManager(engine *execution.TaskExecutionEngine, timeouts map[string]time.Duration, logger *slog.Logger) *TaskManager {
+func NewTaskManager(
+	engine *execution.TaskExecutionEngine,
+	ctrlManager *execution.ControllerManager,
+	timeouts map[string]time.Duration,
+	logger *slog.Logger,
+) *TaskManager {
 	if timeouts == nil {
 		timeouts = make(map[string]time.Duration)
 	}
 	tm := &TaskManager{
-		engine:      engine, // INJECT ENGINE HERE
+		engine:      engine,
+		ctrlManager: ctrlManager,
 		logger:      logger.With(slog.String("component", "task_manager")),
 		timeouts:    timeouts,
 		queue:       make(ActionPriorityQueue, 0, 10),
@@ -79,7 +91,19 @@ func NewTaskManager(engine *execution.TaskExecutionEngine, timeouts map[string]t
 	return tm
 }
 
-func (m *TaskManager) Run(ctx context.Context) {
+func (tm *TaskManager) SetLockChecker(checker func() bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.isSystemLocked = checker
+}
+
+func (tm *TaskManager) SetReadyChecker(checker func() bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.isBotReady = checker
+}
+
+func (tm *TaskManager) Run(ctx context.Context) {
 	idleCheck := time.NewTicker(1 * time.Second)
 	defer idleCheck.Stop()
 
@@ -91,12 +115,24 @@ func (m *TaskManager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-idleCheck.C:
-			m.mu.Lock()
-			if m.activeTask == nil && m.queue.Len() == 0 {
-				if m.idleSince.IsZero() {
-					m.idleSince = time.Now()
-				} else if time.Since(m.idleSince) > 5*time.Second {
-					m.logger.Info("Curiosity loop triggered: autonomous exploration")
+			tm.mu.Lock()
+			// Backoff check: Don't run curiosity if we just failed a task (wait 5s for reflex)
+			if time.Since(tm.lastFailure) < 5*time.Second {
+				tm.mu.Unlock()
+				continue
+			}
+
+			systemLocked := tm.isSystemLocked != nil && tm.isSystemLocked()
+			hasController := tm.engine.HasController()
+			botReady := tm.isBotReady == nil || tm.isBotReady()
+
+			shouldRunCuriosity := tm.activeTask == nil && tm.queue.Len() == 0 && !systemLocked && hasController && botReady
+
+			if shouldRunCuriosity {
+				if tm.idleSince.IsZero() {
+					tm.idleSince = time.Now()
+				} else if time.Since(tm.idleSince) > 5*time.Second {
+					tm.logger.Info("Curiosity loop triggered: autonomous exploration")
 					exploreTask := domain.Action{
 						ID:        "explore-curiosity",
 						Action:    "explore",
@@ -105,151 +141,161 @@ func (m *TaskManager) Run(ctx context.Context) {
 						Rationale: "Curiosity loop: self-starting exploration",
 					}
 					t := exploreTask
-					heap.Push(&m.queue, &t)
-					m.idleSince = time.Time{}
+					heap.Push(&tm.queue, &t)
+					tm.idleSince = time.Time{}
 					select {
-					case m.signalCh <- struct{}{}:
+					case tm.signalCh <- struct{}{}:
 					default:
 					}
 				}
 			} else {
-				m.idleSince = time.Time{}
+				tm.idleSince = time.Time{}
 			}
-			m.mu.Unlock()
+			tm.mu.Unlock()
 
 		case <-scheduleTicker.C:
-			m.processScheduled()
+			tm.processScheduled()
 
-		case <-m.scheduleSig:
-			m.processScheduled()
+		case <-tm.scheduleSig:
+			tm.processScheduled()
 
-		case <-m.signalCh:
-			m.mu.Lock()
-			if m.activeTask == nil && m.queue.Len() > 0 {
-				next := heap.Pop(&m.queue).(*domain.Action)
+		case <-tm.signalCh:
+			tm.mu.Lock()
+			if tm.queue.Len() > 0 {
+				peek := tm.queue[0]
+				if tm.activeTask == nil || peek.Priority > tm.activeTask.Priority {
+					next := heap.Pop(&tm.queue).(*domain.Action)
 
-				if m.queue.Len() > 0 {
-					peekNext := m.queue[0]
-					m.warmStartNext(ctx, peekNext)
+					if tm.queue.Len() > 0 {
+						peekNext := tm.queue[0]
+						tm.warmStartNext(ctx, peekNext)
+					}
+
+					tm.idleSince = time.Time{}
+					tm.mu.Unlock()
+					tm.dispatchCurrent(ctx, *next)
+					continue
 				}
-
-				m.idleSince = time.Time{}
-				m.mu.Unlock()
-				m.dispatchCurrent(ctx, *next)
-			} else {
-				m.mu.Unlock()
 			}
+			tm.mu.Unlock()
 		}
 	}
 }
 
-func (m *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
-	m.logger.Debug("Warm starting next task in background", slog.String("action", nextTask.Action))
+func (tm *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
+	tm.logger.Debug("Warm starting next task in background", slog.String("action", nextTask.Action))
 }
 
-func (m *TaskManager) IsIdle() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.activeTask == nil && m.queue.Len() == 0
+func (tm *TaskManager) IsIdle() bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.activeTask == nil && tm.queue.Len() == 0
 }
 
-func (m *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (tm *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
 	for _, task := range tasks {
 		t := task
-		heap.Push(&m.queue, &t)
+		heap.Push(&tm.queue, &t)
 	}
-	m.idleSince = time.Time{}
+	tm.idleSince = time.Time{}
 
 	select {
-	case m.signalCh <- struct{}{}:
+	case tm.signalCh <- struct{}{}:
 	default:
 	}
 	return nil
 }
 
-func (m *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
-	m.scheduleMu.Lock()
-	m.scheduled = append(m.scheduled, scheduledItem{action, executeAt})
-	sort.Slice(m.scheduled, func(i, j int) bool {
-		return m.scheduled[i].executeAt.Before(m.scheduled[j].executeAt)
+func (tm *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
+	tm.scheduleMu.Lock()
+	tm.scheduled = append(tm.scheduled, scheduledItem{action, executeAt})
+	sort.Slice(tm.scheduled, func(i, j int) bool {
+		return tm.scheduled[i].executeAt.Before(tm.scheduled[j].executeAt)
 	})
-	m.scheduleMu.Unlock()
+	tm.scheduleMu.Unlock()
 
 	select {
-	case m.scheduleSig <- struct{}{}:
+	case tm.scheduleSig <- struct{}{}:
 	default:
 	}
 	return nil
 }
 
-func (m *TaskManager) processScheduled() {
-	m.scheduleMu.Lock()
-	defer m.scheduleMu.Unlock()
+func (tm *TaskManager) processScheduled() {
+	tm.scheduleMu.Lock()
+	defer tm.scheduleMu.Unlock()
 
-	if len(m.scheduled) == 0 {
+	if len(tm.scheduled) == 0 {
 		return
 	}
 
 	now := time.Now()
 	ready := make([]domain.Action, 0)
 
-	for len(m.scheduled) > 0 && m.scheduled[0].executeAt.Before(now) {
-		ready = append(ready, m.scheduled[0].action)
-		m.scheduled = m.scheduled[1:]
+	for len(tm.scheduled) > 0 && tm.scheduled[0].executeAt.Before(now) {
+		ready = append(ready, tm.scheduled[0].action)
+		tm.scheduled = tm.scheduled[1:]
 	}
 
 	if len(ready) > 0 {
-		m.mu.Lock()
+		tm.mu.Lock()
 		for _, action := range ready {
-			heap.Push(&m.queue, &action)
+			heap.Push(&tm.queue, &action)
 		}
-		m.mu.Unlock()
+		tm.mu.Unlock()
 
 		select {
-		case m.signalCh <- struct{}{}:
+		case tm.signalCh <- struct{}{}:
 		default:
 		}
 	}
 }
 
-func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
-	if m.activeTask == nil || m.activeTask.ID != taskID {
+	if tm.activeTask == nil || tm.activeTask.ID != taskID {
 		return nil
 	}
 
-	if m.watchdog != nil {
-		close(m.watchdog)
-		m.watchdog = nil
+	if tm.watchdog != nil {
+		close(tm.watchdog)
+		tm.watchdog = nil
 	}
 
-	if m.cancelTask != nil {
-		m.cancelTask()
-		m.cancelTask = nil
+	if tm.cancelTask != nil {
+		tm.cancelTask()
+		tm.cancelTask = nil
+		tm.activeCtx = nil
 	}
-	m.activeTask = nil
+	tm.activeTask = nil
 
 	if !success {
-		m.queue = make(ActionPriorityQueue, 0, 10)
-		heap.Init(&m.queue)
-		if m.OnDrain != nil {
-			go m.OnDrain()
+		tm.lastFailure = time.Now() // Trigger Curiosity backoff
+		if tm.ctrlManager != nil {
+			if idm := tm.ctrlManager.GetIdempotent(); idm != nil {
+				idm.Clear(taskID)
+			}
+		}
+		tm.queue = make(ActionPriorityQueue, 0, 10)
+		heap.Init(&tm.queue)
+		if tm.OnDrain != nil {
+			go tm.OnDrain()
 		}
 		return nil
 	}
 
-	if m.queue.Len() == 0 {
-		if m.OnDrain != nil {
-			go m.OnDrain()
+	if tm.queue.Len() == 0 {
+		if tm.OnDrain != nil {
+			go tm.OnDrain()
 		}
 	} else {
 		select {
-		case m.signalCh <- struct{}{}:
+		case tm.signalCh <- struct{}{}:
 		default:
 		}
 	}
@@ -257,64 +303,82 @@ func (m *TaskManager) Complete(ctx context.Context, taskID string, success bool)
 	return nil
 }
 
-func (m *TaskManager) Halt(ctx context.Context, reason string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (tm *TaskManager) Halt(ctx context.Context, reason string) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
-	m.queue = make(ActionPriorityQueue, 0, 10)
-	heap.Init(&m.queue)
-	return m.abortActiveLocked(ctx, reason)
+	tm.queue = make(ActionPriorityQueue, 0, 10)
+	heap.Init(&tm.queue)
+	return tm.abortActiveLocked(ctx, reason)
 }
 
-func (m *TaskManager) abortActiveLocked(ctx context.Context, reason string) error {
-	if m.activeTask == nil {
+func (tm *TaskManager) abortActiveLocked(ctx context.Context, reason string) error {
+	if tm.activeTask == nil {
 		return nil
 	}
-	if m.watchdog != nil {
-		close(m.watchdog)
-		m.watchdog = nil
+	if tm.watchdog != nil {
+		close(tm.watchdog)
+		tm.watchdog = nil
 	}
-	if m.cancelTask != nil {
-		m.cancelTask()
-		m.cancelTask = nil
+	if tm.cancelTask != nil {
+		tm.cancelTask()
+		tm.cancelTask = nil
+		tm.activeCtx = nil
 	}
 
-	// Delegate abort to the engine
-	err := m.engine.AbortCurrent(ctx, reason)
+	err := tm.engine.AbortCurrent(ctx, reason)
 
-	m.activeTask = nil
+	tm.activeTask = nil
 	return err
 }
 
-func (m *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action) {
-	m.mu.Lock()
-	if m.activeTask != nil && action.Priority > m.activeTask.Priority {
-		_ = m.abortActiveLocked(ctx, "preempted_by_priority")
-	} else if m.activeTask != nil {
-		m.mu.Unlock()
+func (tm *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action) {
+	tm.mu.Lock()
+
+	if tm.activeTask != nil && !tm.engine.HasController() {
+		tm.logger.Warn("Controller missing, preserving active task")
+		tm.mu.Unlock()
 		return
 	}
 
-	_, cancel := context.WithCancel(ctx)
-	m.activeTask = &action
-	m.cancelTask = cancel
-	m.watchdog = make(chan struct{})
-	m.mu.Unlock()
+	if tm.activeTask != nil && action.Priority > tm.activeTask.Priority {
+		if action.Priority-tm.activeTask.Priority > 5 {
+			_ = tm.abortActiveLocked(ctx, "preempted_by_priority")
+		} else {
+			t := action
+			heap.Push(&tm.queue, &t)
+			tm.mu.Unlock()
+			return
+		}
+	} else if tm.activeTask != nil {
+		tm.mu.Unlock()
+		return
+	}
 
-	// THE FIX: Delegate to Engine instead of Controller
-	m.engine.Enqueue(action)
+	// Fix: store and use the derived context so abort signals actually propagate to the engine
+	derivedCtx, cancel := context.WithCancel(ctx)
+	tm.activeTask = &action
+	tm.activeCtx = derivedCtx
+	tm.cancelTask = cancel
+	tm.watchdog = make(chan struct{})
+	tm.mu.Unlock()
 
-	timeout, exists := m.timeouts[action.Action]
+	tm.engine.Enqueue(derivedCtx, action)
+
+	timeout, exists := tm.timeouts[action.Action]
 	if !exists {
 		timeout = 45 * time.Second
 	}
 
 	go func(done chan struct{}, waitTime time.Duration, id string) {
+		timer := time.NewTimer(waitTime + 10*time.Second)
+		defer timer.Stop()
+
 		select {
-		case <-time.After(waitTime + 10*time.Second):
-			_ = m.Complete(context.Background(), id, false)
+		case <-timer.C:
+			_ = tm.Complete(context.Background(), id, false)
 		case <-done:
 			return
 		}
-	}(m.watchdog, timeout, action.ID)
+	}(tm.watchdog, timeout, action.ID)
 }

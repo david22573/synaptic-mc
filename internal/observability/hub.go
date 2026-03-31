@@ -8,14 +8,18 @@ import (
 	"sync"
 	"time"
 
+	"david22573/synaptic-mc/internal/domain"
+
 	"github.com/gorilla/websocket"
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512 * 1024
+	writeWait           = 10 * time.Second
+	pongWait            = 60 * time.Second
+	pingPeriod          = (pongWait * 9) / 10
+	maxMessageSize      = 512 * 1024
+	MsgTypeControlInput = "CONTROL_INPUT"
+	MsgTypeStateSync    = "STATE_SYNC"
 )
 
 var upgrader = websocket.Upgrader{
@@ -26,6 +30,10 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+type ControlOrchestrator interface {
+	IngestControlInput(ctx context.Context, input domain.ControlInput)
+}
+
 type UIClient struct {
 	hub  *Hub
 	conn *websocket.Conn
@@ -34,11 +42,12 @@ type UIClient struct {
 }
 
 type Hub struct {
-	clients    map[*UIClient]bool
-	broadcast  chan []byte
-	register   chan *UIClient
-	unregister chan *UIClient
-	logger     *slog.Logger
+	clients      map[*UIClient]bool
+	broadcast    chan []byte
+	register     chan *UIClient
+	unregister   chan *UIClient
+	logger       *slog.Logger
+	orchestrator ControlOrchestrator
 
 	mu         sync.RWMutex
 	isShutdown bool
@@ -47,11 +56,17 @@ type Hub struct {
 func NewHub(logger *slog.Logger) *Hub {
 	return &Hub{
 		broadcast:  make(chan []byte, 1024),
-		register:   make(chan *UIClient),
-		unregister: make(chan *UIClient),
+		register:   make(chan *UIClient, 32),
+		unregister: make(chan *UIClient, 32),
 		clients:    make(map[*UIClient]bool),
 		logger:     logger.With(slog.String("component", "ui_hub")),
 	}
+}
+
+func (h *Hub) SetOrchestrator(orch ControlOrchestrator) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.orchestrator = orch
 }
 
 func (h *Hub) Run(ctx context.Context) {
@@ -101,7 +116,6 @@ func (h *Hub) Run(ctx context.Context) {
 				default:
 					h.logger.Warn("UI Client buffer full, scheduling drop")
 					go func(c *UIClient) {
-						// Non-blocking unregister to prevent deadlocks during teardown
 						select {
 						case h.unregister <- c:
 						default:
@@ -126,7 +140,6 @@ func (h *Hub) pingAll() {
 		if err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
 			h.logger.Warn("Failed to ping client, will unregister", slog.Any("error", err))
 			go func(c *UIClient) {
-				// Non-blocking unregister
 				select {
 				case h.unregister <- c:
 				default:
@@ -146,15 +159,10 @@ func (h *Hub) shutdown() {
 	}
 	h.isShutdown = true
 
-	// Close all client connections
 	for client := range h.clients {
 		client.conn.Close()
 		delete(h.clients, client)
 	}
-
-	// DO NOT close channels (register, unregister, broadcast) here.
-	// Lingering readPump/writePump goroutines will panic if they send to closed channels.
-	// Since the Hub loop is dead, we rely on GC and non-blocking sends to clean up gracefully.
 }
 
 func (h *Hub) Broadcast(msgType string, payload any) {
@@ -176,6 +184,22 @@ func (h *Hub) Broadcast(msgType string, payload any) {
 	}
 }
 
+func (h *Hub) handleControlInput(client *UIClient, payload []byte) {
+	var input domain.ControlInput
+	if err := json.Unmarshal(payload, &input); err != nil {
+		h.logger.Error("Invalid control input", slog.Any("error", err))
+		return
+	}
+
+	h.mu.RLock()
+	orch := h.orchestrator
+	h.mu.RUnlock()
+
+	if orch != nil {
+		orch.IngestControlInput(context.Background(), input)
+	}
+}
+
 func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -190,7 +214,6 @@ func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 	client := &UIClient{hub: h, conn: ws, send: make(chan []byte, 256)}
 
-	// Non-blocking register check
 	select {
 	case h.register <- client:
 	default:
@@ -204,23 +227,35 @@ func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 func (c *UIClient) readPump() {
 	defer func() {
-		// Non-blocking unregister prevents deadlock/panic when Hub shuts down
 		select {
 		case c.hub.unregister <- c:
 		default:
+			c.hub.logger.Warn("Unregister channel full, dropping client forcefully")
 		}
 		c.conn.Close()
 	}()
 
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	for {
-		_, _, err := c.conn.ReadMessage()
+		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				c.hub.logger.Warn("UI Client read error", slog.Any("error", err))
 			}
 			break
 		}
+
+		var envelope struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+
+		if err := json.Unmarshal(msg, &envelope); err == nil {
+			if envelope.Type == MsgTypeControlInput {
+				c.hub.handleControlInput(c, envelope.Payload)
+			}
+		}
+
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	}
 }

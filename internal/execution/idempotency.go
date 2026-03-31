@@ -6,8 +6,8 @@ import (
 	"sync"
 )
 
-// IdempotentController wraps an Execution Controller to silently drop duplicate commands.
-// It uses a bounded LRU cache track dispatched Task IDs.
+// IdempotentController wraps an Execution Controller to drop duplicate commands.
+// Refactored to allow clearing IDs so retries aren't blocked.
 type IdempotentController struct {
 	base Controller
 
@@ -44,6 +44,12 @@ func (c *IdempotentController) Dispatch(ctx context.Context, action domain.Actio
 	c.mu.Unlock()
 
 	return c.base.Dispatch(ctx, action)
+}
+
+func (c *IdempotentController) Clear(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.seen, id)
 }
 
 func (c *IdempotentController) AbortCurrent(ctx context.Context, reason string) error {

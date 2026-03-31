@@ -35,6 +35,9 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		return nil, fmt.Errorf("failed to open vector store sqlite: %w", err)
 	}
 
+	// Add connection pooling for SQLite
+	db.SetMaxOpenConns(1)
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +45,9 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		intent_json TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);`
+	);
+	CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(description);
+	CREATE INDEX IF NOT EXISTS idx_embedding_similarity ON skills(embedding_json);`
 
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply vector store schema: %w", err)
@@ -58,11 +63,22 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, i
 	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?) 
 	          ON CONFLICT(description) DO UPDATE SET intent_json=excluded.intent_json, embedding_json=excluded.embedding_json`
 	_, err := s.db.ExecContext(ctx, query, description, string(intentBytes), string(embeddingBytes))
+
+	if err == nil {
+		// Keep FTS table in sync
+		ftsQuery := `INSERT INTO skills_fts (description) VALUES (?)`
+		_, _ = s.db.ExecContext(ctx, ftsQuery, description)
+	}
+
 	return err
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	query := `SELECT description, intent_json, embedding_json FROM skills LIMIT 500`
+	// Use LIMIT with WHERE clause for approximate search to prevent full table scans
+	query := `SELECT description, intent_json, embedding_json FROM skills 
+	          WHERE id IN (SELECT id FROM skills ORDER BY id DESC LIMIT 1000)
+	          LIMIT 500`
+
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
