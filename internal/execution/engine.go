@@ -94,6 +94,8 @@ func (e *TaskExecutionEngine) pump() {
 			e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action))
 		}
 
+		// FIX: Throttle loop on immediate synchronous failure to prevent goroutine explosion
+		time.Sleep(100 * time.Millisecond)
 		go e.pump()
 		return
 	}

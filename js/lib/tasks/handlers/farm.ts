@@ -71,7 +71,8 @@ class HarvestState implements FSMState {
 
         try {
             await fCtx.bot.dig(cropBlock, true);
-            await waitForMs(400, fCtx.signal);
+            // FIX: Wait significantly longer for drops to spawn and travel to the bot's inventory
+            await waitForMs(1000, fCtx.signal);
             return new ReplantState();
         } catch (err: any) {
             return advanceToNextCrop(fCtx, `DIG_FAIL: ${err.message}`);

@@ -151,7 +151,9 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 }
 
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
-	if plan := p.currentPlan.Load(); plan != nil {
+	// FIX: Use Swap(nil) so we flush the cache when it's consumed. This prevents
+	// the orchestrator from infinitely looping on the same stale, failed plan.
+	if plan := p.currentPlan.Swap(nil); plan != nil {
 		if len(plan.Tasks) > 0 {
 			return *plan
 		}

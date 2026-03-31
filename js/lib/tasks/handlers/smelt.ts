@@ -170,7 +170,11 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         while (collectedCount < targetCount) {
             if (signal.aborted) throw new Error("TIMEOUT");
 
-            if (!furnace.fuelItem() && furnace.fuel && furnace.fuel === 0) {
+            // FIX: Removed the buggy '&& furnace.fuel && furnace.fuel === 0' check
+            if (
+                !furnace.fuelItem() &&
+                (!furnace.fuel || Math.round(furnace.fuel) === 0)
+            ) {
                 const currentFuel = bot.inventory
                     .items()
                     .find((item) => FUEL_TYPES.includes(item.name));

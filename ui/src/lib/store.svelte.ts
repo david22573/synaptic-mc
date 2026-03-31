@@ -58,7 +58,8 @@ export function connectToBot() {
             const message = JSON.parse(event.data);
             if (!message.type || !message.payload) return;
 
-            switch (message.type) {
+            // FIX: Normalize to uppercase to catch Go backend enums
+            switch (message.type.toUpperCase()) {
                 case "SYNC_REQUEST":
                     if (message.payload?.authoritative_state) {
                         controller.reconcileState(
@@ -66,11 +67,11 @@ export function connectToBot() {
                         );
                     }
                     break;
-                case "state_update":
+                case "STATE_UPDATE":
                     botStore.gameState = message.payload;
                     controller.onStateUpdate(message.payload);
                     break;
-                case "event_stream": {
+                case "EVENT_STREAM": {
                     const goEvent = message.payload;
                     let innerPayload: any = {};
 
@@ -112,7 +113,7 @@ export function connectToBot() {
                     }
                     break;
                 }
-                case "objective_update":
+                case "OBJECTIVE_UPDATE":
                     botStore.objective = message.payload;
                     break;
             }

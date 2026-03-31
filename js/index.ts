@@ -94,7 +94,7 @@ let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 let isBotSpawned = false;
-let hasDied = false; // Track if bot has died to detect respawns
+let hasDied = false;
 const knownChests: Record<string, { name: string; count: number }[]> = {};
 let lastVelocity = { x: 0, y: 0, z: 0 };
 
@@ -192,7 +192,6 @@ function normalizeFailureCause(err: any): string {
 async function executeAntiStuckReflex() {
     if (!bot || !bot.entity || bot.health <= 0) return;
     try {
-        // First try: Jump and look around
         bot.setControlState("jump", true);
         await new Promise((r) => setTimeout(r, 200));
         bot.setControlState("jump", false);
@@ -200,7 +199,6 @@ async function executeAntiStuckReflex() {
         const pos = bot.entity.position.floored();
         const blockBelow = bot.blockAt(pos.offset(0, -1, 0));
 
-        // Check if there's a block directly in front of legs
         const yaw = bot.entity.yaw;
         const dx = -Math.sin(yaw);
         const dz = -Math.cos(yaw);
@@ -362,7 +360,6 @@ async function executeIntent(intent: models.ActionIntent) {
                         normalizedCause === "PATH_FAILED"
                     ) {
                         await executeAntiStuckReflex();
-                        // MANDATORY: Wait for physics to settle and broadcast new state
                         await new Promise((r) => setTimeout(r, 500));
                         pushState();
                     }
@@ -602,7 +599,6 @@ async function connectWithRetry(maxAttempts = 10) {
         reconnectAttempt = 1;
         isBotSpawned = true;
 
-        // Emit respawn event if this is a respawn after death
         if (hasDied) {
             hasDied = false;
             log.info("Bot respawned after death");
@@ -636,9 +632,13 @@ async function connectWithRetry(maxAttempts = 10) {
         ]
             .map((name) => bot.registry.blocksByName[name]?.id)
             .filter((id) => id !== undefined);
+
         bot.pathfinder.setMovements(movements);
 
-        // Increased pathfinder think timeout to 30s for complex terrain
+        // FIX: Ensure collectBlock inherits custom movements so it can actually pathfind
+        // @ts-ignore
+        if (bot.collectBlock) bot.collectBlock.movements = movements;
+
         bot.pathfinder.thinkTimeout = 30000;
 
         bot.inventory.removeAllListeners("updateSlot");
@@ -703,7 +703,7 @@ async function connectWithRetry(maxAttempts = 10) {
     });
     bot.on("death", () => {
         isBotSpawned = false;
-        hasDied = true; // Set flag when bot dies
+        hasDied = true;
         abortActiveTask("bot_died");
         if (survival) survival.reset();
         client.sendEvent("death", {

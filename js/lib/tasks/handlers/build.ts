@@ -144,10 +144,30 @@ class ConstructState implements FSMState {
 
             const distToBot = bot.entity.position.distanceTo(targetPos);
             if (distToBot < 1.5) {
+                // FIX: Perform placeBlock atomically WITH the jump, instead of sequentially after waiting
                 if (node.dx === 0 && node.dz === 0 && node.dy >= 0) {
-                    bot.setControlState("jump", true);
-                    await new Promise((r) => setTimeout(r, 250));
-                    bot.setControlState("jump", false);
+                    const localRef = this.findReferenceBlock(bot, targetPos);
+                    if (localRef) {
+                        bot.setControlState("jump", true);
+                        await bot.waitForTicks(2); // allow height to accumulate
+
+                        try {
+                            const faceVector = targetPos.minus(
+                                localRef.position,
+                            );
+                            await bot.placeBlock(localRef, faceVector);
+                            consecutiveFailures = 0;
+                        } catch (err) {
+                            consecutiveFailures++;
+                        } finally {
+                            bot.setControlState("jump", false);
+                        }
+                    } else {
+                        consecutiveFailures++;
+                    }
+
+                    sCtx.currentIndex++;
+                    continue;
                 } else {
                     try {
                         await moveToGoal(

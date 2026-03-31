@@ -1,3 +1,4 @@
+// internal/orchestrator/task_manager.go
 package orchestrator
 
 import (
@@ -243,7 +244,8 @@ func (tm *TaskManager) processScheduled() {
 	if len(ready) > 0 {
 		tm.mu.Lock()
 		for _, action := range ready {
-			heap.Push(&tm.queue, &action)
+			t := action // FIX: copy value to avoid loop variable pointer capture
+			heap.Push(&tm.queue, &t)
 		}
 		tm.mu.Unlock()
 

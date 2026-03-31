@@ -148,8 +148,6 @@ export class SynapticClient extends EventEmitter {
         this.ws.send(JSON.stringify({ type: "STATE_UPDATE", payload: state }));
     }
 
-    // In SynapticClient class, replace the sendEvent overloads:
-
     public sendPanic(error: Error): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
@@ -188,9 +186,13 @@ export class SynapticClient extends EventEmitter {
 
         if (typeof arg2 === "object") {
             payload = arg2;
-            // REMOVE the manual type mapping - let callers specify explicitly
+            // FIX: Don't swallow the event type if an object payload is passed!
+            if (event === "death") msgType = "BOT_DEATH";
+            else if (event === "bot_respawn") msgType = "BOT_RESPAWN";
+            else if (event === "panic_retreat_start")
+                msgType = "PANIC_TRIGGERED";
+            else if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
         } else {
-            // Original string-based API
             const actionStr = arg2 as string;
             const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
 

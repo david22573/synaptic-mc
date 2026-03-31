@@ -15,7 +15,8 @@ export enum ActionType {
     Eat = "eat",
     Interact = "interact",
     Store = "store",
-    Retrieve = "retrieve", // New intent
+    Retrieve = "retrieve",
+    Look = "look", // Fixed missing enum member
 }
 
 export enum ClientEventType {

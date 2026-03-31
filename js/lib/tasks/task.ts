@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
 import { type TaskContext } from "./registry.js";
-import { log } from "../logger.js"; // Added for error logging
+import { log } from "../logger.js";
 
 // Handlers
 import { handleGather } from "./handlers/gather.js";
@@ -120,6 +120,10 @@ export async function runTask(
             case "idle":
                 await waitForMs(1500, signal);
                 break;
+            case "look":
+                // FIX: Ignore LLM hallucinations for a 'look' action
+                await waitForMs(500, signal);
+                break;
             case "sleep": {
                 await escapeTree(bot, signal);
 
@@ -192,7 +196,6 @@ export async function runTask(
                 throw new Error(`unsupported: ${intent.action}`);
         }
     } catch (err: any) {
-        // Ensure errors are propagated to trigger the Anti-Stuck Reflex in index.ts
         stopMovement();
         log.error(`Task handler error in ${intent.action}`, {
             error: err.message,
