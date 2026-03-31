@@ -259,8 +259,6 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 	score := 100.0
 
 	for _, t := range tasks {
-		score -= 5.0
-
 		if t.Action == "hunt" {
 			score -= 20.0
 		}
@@ -276,6 +274,9 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 			score += 5.0
 		}
 	}
+
+	// Light tie-breaker penalty to favor shorter paths without drowning out quality
+	score -= float64(len(tasks)) * 1.0
 
 	return score
 }

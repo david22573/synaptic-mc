@@ -606,10 +606,13 @@ async function connectWithRetry(maxAttempts = 10) {
         if (hasDied) {
             hasDied = false;
             log.info("Bot respawned after death");
-            client.sendEvent("bot_respawn", {
-                message: "Bot respawned after death",
-                timestamp: Date.now(),
-            });
+            client.sendEvent(
+                "bot_respawn",
+                "Bot respawned after death",
+                "respawn",
+                "death",
+                Date.now(),
+            );
         }
 
         log.info("Bot spawned successfully.");

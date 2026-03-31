@@ -372,10 +372,38 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 
 		o.logger.Info("Evaluating next objective")
 
-		// Get fast plan from planner instead of curriculum
+		// Get fast plan from planner
 		plan := o.planner.FastPlan(state)
+
+		// Fallback to curriculum if planner only has the reactive fallback
+		if plan.Objective == "Reactive Fallback Plan" && o.curriculum != nil {
+			o.logger.Info("Planner cache empty, falling back to curriculum")
+
+			intent, err := o.curriculum.ProposeTask(evalCtx, state, o.taskHistory, o.sessionID)
+			if err != nil {
+				o.logger.Error("Curriculum fallback failed", slog.Any("error", err))
+				return
+			}
+
+			if intent != nil {
+				plan = domain.Plan{
+					Objective: "Curriculum Fallback",
+					Tasks: []domain.Action{
+						{
+							ID:        intent.ID,
+							Action:    intent.Action,
+							Target:    domain.Target{Name: intent.Target, Type: "inferred"},
+							Count:     intent.Count,
+							Rationale: intent.Rationale,
+							Priority:  50,
+						},
+					},
+				}
+			}
+		}
+
 		if len(plan.Tasks) == 0 {
-			o.logger.Debug("Planner returned empty plan")
+			o.logger.Debug("Final plan is empty")
 			return
 		}
 

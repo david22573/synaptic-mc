@@ -38,10 +38,20 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		}
 
 		r.Ping() // Reset on startup
-		r.logger.Info("Spawning Node.js bot process")
 
-		cmd := exec.CommandContext(ctx, "node", r.scriptPath)
-		cmd.Dir = filepath.Dir(r.scriptPath)
+		// Resolve absolute path to make chdir bulletproof
+		absScriptPath, err := filepath.Abs(r.scriptPath)
+		if err != nil {
+			r.logger.Error("Failed to resolve absolute path for TS script", slog.String("path", r.scriptPath), slog.Any("error", err))
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		workDir := filepath.Dir(absScriptPath)
+		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir))
+
+		cmd := exec.CommandContext(ctx, "node", absScriptPath)
+		cmd.Dir = workDir
 		cmd.Stdout = r.loggerWriter("STDOUT")
 		cmd.Stderr = r.loggerWriter("STDERR")
 
@@ -72,7 +82,7 @@ func (r *NodeRunner) Start(ctx context.Context) {
 			}
 		}()
 
-		err := cmd.Wait()
+		err = cmd.Wait()
 		cancelWatchdog()
 
 		if ctx.Err() != nil {
@@ -97,7 +107,6 @@ type streamWriter struct {
 }
 
 func (w *streamWriter) Write(p []byte) (n int, err error) {
-	// FIXED: Escalate STDERR to WARN level so it's visible in the server logs
 	if w.stream == "STDERR" {
 		w.logger.Warn("TS Engine Error", slog.String("msg", string(p)))
 	} else {

@@ -46,7 +46,6 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		embedding_json TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
-	CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(description);
 	CREATE INDEX IF NOT EXISTS idx_embedding_similarity ON skills(embedding_json);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -63,12 +62,6 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, i
 	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?) 
 	          ON CONFLICT(description) DO UPDATE SET intent_json=excluded.intent_json, embedding_json=excluded.embedding_json`
 	_, err := s.db.ExecContext(ctx, query, description, string(intentBytes), string(embeddingBytes))
-
-	if err == nil {
-		// Keep FTS table in sync
-		ftsQuery := `INSERT INTO skills_fts (description) VALUES (?)`
-		_, _ = s.db.ExecContext(ctx, ftsQuery, description)
-	}
 
 	return err
 }

@@ -34,7 +34,7 @@ build: build-ui build-ts build-go ## Full production build (recommended)
 
 run-prod: build ## Run production binaries
 	@echo "==> Starting production server..."
-	./$(BIN_NAME) -http=:8080 -data-dir=data -bot-script=dist/index.js -hesitation-ms=180 -noise-level=0.03
+	./$(BIN_NAME) -http=:8080 -data-dir=data -bot-script=js/dist/index.js -hesitation-ms=180 -noise-level=0.03
 
 run-server: ## Run Go server (dev)
 	go run cmd/server/*.go
