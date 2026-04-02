@@ -59,18 +59,29 @@ func (pt *PlanTracker) OnTaskComplete(ctx context.Context, taskID string, succes
 		return
 	}
 
-	// Verify this was the task we expected in the sequence
-	if pt.currentIndex < len(pt.activePlan.Tasks) && pt.activePlan.Tasks[pt.currentIndex].ID == taskID {
-		pt.currentIndex++
-		if pt.currentIndex >= len(pt.activePlan.Tasks) {
-			pt.logger.Info("Plan completed successfully", slog.String("objective", pt.activePlan.Objective))
-			pt.activePlan = nil
-			pt.currentIndex = 0
-		} else {
-			pt.enqueueNextLocked(ctx)
+	// Direct ID match to avoid index desyncs and empty string bugs
+	foundIndex := -1
+	for i, task := range pt.activePlan.Tasks {
+		if task.ID == taskID {
+			foundIndex = i
+			break
 		}
+	}
+
+	if foundIndex == -1 {
+		pt.logger.Warn("Task completion not found in active plan", slog.String("task_id", taskID), slog.String("objective", pt.activePlan.Objective))
+		return
+	}
+
+	// Advance past the completed task
+	pt.currentIndex = foundIndex + 1
+
+	if pt.currentIndex >= len(pt.activePlan.Tasks) {
+		pt.logger.Info("Plan completed successfully", slog.String("objective", pt.activePlan.Objective))
+		pt.activePlan = nil
+		pt.currentIndex = 0
 	} else {
-		pt.logger.Warn("Task completion out of sequence", slog.String("task_id", taskID), slog.Int("expected_index", pt.currentIndex))
+		pt.enqueueNextLocked(ctx)
 	}
 }
 

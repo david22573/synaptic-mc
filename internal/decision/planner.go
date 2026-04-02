@@ -79,11 +79,11 @@ Response format (JSON only):
     "objective": "Sub-goal description",
     "candidates": [
     [
-    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Directly gather wood" }
+    { "id": "task-1", "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Directly gather wood" }
     ],
     [
-    { "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
-    { "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood safely" }
+    { "id": "task-2", "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
+    { "id": "task-3", "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood safely" }
     ]
     ]
     }`
@@ -235,6 +235,15 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		return nil, fmt.Errorf("planner returned zero candidates")
 	}
 
+	// Bulletproof ID generation in case LLM forgets
+	for i := range parsed.Candidates {
+		for j := range parsed.Candidates[i] {
+			if parsed.Candidates[i][j].ID == "" {
+				parsed.Candidates[i][j].ID = fmt.Sprintf("plan-%d-%d", time.Now().UnixNano(), j)
+			}
+		}
+	}
+
 	events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
 	stats := learning.CalculateActionStats(nil, events)
 
@@ -276,9 +285,6 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 			score += 5.0
 		}
 	}
-
-	// Light tie-breaker penalty to favor shorter paths without drowning out quality
-	score -= float64(len(tasks)) * 1.0
 
 	return score
 }

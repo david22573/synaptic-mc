@@ -21,6 +21,7 @@ type TaskExecutionEngine struct {
 	queue       []queuedAction
 	inFlight    *ExecutionTask
 	maxInFlight int
+	retryCount  int
 }
 
 func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
@@ -29,6 +30,7 @@ func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecution
 		logger:      logger.With(slog.String("component", "task_execution_engine")),
 		queue:       make([]queuedAction, 0),
 		maxInFlight: 1,
+		retryCount:  0,
 	}
 }
 
@@ -88,17 +90,34 @@ func (e *TaskExecutionEngine) pump() {
 			e.inFlight.Error = err.Error()
 			e.inFlight = nil
 		}
+
+		// FIX: Cap synchronous dispatch retries to prevent the goroutine hydra
+		e.retryCount++
+		shouldRetry := e.retryCount < 5
 		e.mu.Unlock()
 
 		if err.Error() != "no active controller" {
-			e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action))
+			e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action), slog.Int("retry", e.retryCount))
 		}
 
-		// FIX: Throttle loop on immediate synchronous failure to prevent goroutine explosion
-		time.Sleep(100 * time.Millisecond)
-		go e.pump()
+		if shouldRetry {
+			// Throttle loop on immediate synchronous failure with backoff
+			backoff := time.Duration(e.retryCount*100) * time.Millisecond
+			time.Sleep(backoff)
+			go e.pump()
+		} else {
+			e.logger.Error("Max dispatch retries exceeded, dropping task", slog.String("action", qa.action.Action))
+			e.mu.Lock()
+			e.retryCount = 0
+			e.mu.Unlock()
+		}
 		return
 	}
+
+	// Reset retry counter on successful dispatch
+	e.mu.Lock()
+	e.retryCount = 0
+	e.mu.Unlock()
 }
 
 func (e *TaskExecutionEngine) OnTaskStart(actionID string) {

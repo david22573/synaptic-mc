@@ -198,6 +198,7 @@ export class SynapticClient extends EventEmitter {
 
             if (event === "task_start") msgType = "TASK_START";
             if (event === "death") msgType = "BOT_DEATH";
+            if (event === "bot_respawn") msgType = "BOT_RESPAWN";
             if (event === "panic_retreat_start") msgType = "PANIC_TRIGGERED";
             if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
             if (event === "task_aborted") msgType = "TASK_END";

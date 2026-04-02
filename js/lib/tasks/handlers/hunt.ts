@@ -32,6 +32,7 @@ interface CombatContext extends StateContext {
     hasShield: boolean;
     isBlocking: boolean;
     lastAttackTime: number;
+    lastHitTime: number; // Added to track actual connection for timeout fallback
     stopMovement: () => void;
 }
 
@@ -48,8 +49,17 @@ class EngageState implements FSMState {
         const combatStartTime = Date.now();
         const maxCombatDurationMs = 60000;
         let lastValidation = Date.now();
+        sCtx.lastHitTime = Date.now(); // Initialize
 
         bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+
+        // Listen for actual damage to update lastHitTime
+        const onEntityHurt = (entity: any) => {
+            if (entity.id === target.id) {
+                sCtx.lastHitTime = Date.now();
+            }
+        };
+        bot.on("entityHurt", onEntityHurt);
 
         try {
             while (target && target.isValid && target.health > 0) {
@@ -59,6 +69,19 @@ class EngageState implements FSMState {
                     throw new Error(
                         "PANIC: Combat loop exceeded max duration. Target might be bugged or unreachable.",
                     );
+                }
+
+                // FIX: Fallback timeout if health isn't updating but we haven't landed a hit in 10s
+                if (Date.now() - sCtx.lastHitTime > 10000) {
+                    // Check if it's actually dead but metadata lagged
+                    const isActuallyDead = !bot.entities[target.id];
+                    if (isActuallyDead) {
+                        break;
+                    } else {
+                        throw new Error(
+                            "TARGET_LOST: Failed to damage target for 10s, assuming unreachable.",
+                        );
+                    }
                 }
 
                 // Add periodic re-validation to prevent swinging at ghosts
@@ -136,6 +159,7 @@ class EngageState implements FSMState {
             }
             throw err;
         } finally {
+            bot.removeListener("entityHurt", onEntityHurt); // Cleanup
             bot.pathfinder.setGoal(null);
             bot.clearControlStates();
             if (sCtx.hasShield && sCtx.isBlocking) {
@@ -144,20 +168,19 @@ class EngageState implements FSMState {
             }
         }
 
-        if (!target.isValid || target.health <= 0) {
-            sCtx.killCount++;
+        // If we broke out of the loop normally, or via the fallback, count it as a kill
+        sCtx.killCount++;
 
-            const deathPos = target.position.clone();
-            bot.pathfinder.setGoal(
-                new goals.GoalNear(deathPos.x, deathPos.y, deathPos.z, 1),
-            );
-            await bot.waitForTicks(20);
-            bot.pathfinder.setGoal(null);
+        const deathPos = target.position.clone();
+        bot.pathfinder.setGoal(
+            new goals.GoalNear(deathPos.x, deathPos.y, deathPos.z, 1),
+        );
+        await bot.waitForTicks(20);
+        bot.pathfinder.setGoal(null);
 
-            if (sCtx.killCount >= sCtx.targetCount) {
-                sCtx.result = { status: "SUCCESS", reason: "HUNT_COMPLETE" };
-                return null;
-            }
+        if (sCtx.killCount >= sCtx.targetCount) {
+            sCtx.result = { status: "SUCCESS", reason: "HUNT_COMPLETE" };
+            return null;
         }
 
         return new SearchState();
@@ -300,6 +323,7 @@ export async function handleHunt(ctx: TaskContext): Promise<void> {
         hasShield: false,
         isBlocking: false,
         lastAttackTime: 0,
+        lastHitTime: 0,
         searchRadius: 0,
         timeoutMs: timeouts.hunt ?? 120000,
         startTime: 0,

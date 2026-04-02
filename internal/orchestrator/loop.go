@@ -65,6 +65,8 @@ type Orchestrator struct {
 	evalCancel    context.CancelFunc
 	evalSemaphore chan struct{}
 
+	drainSignal chan struct{}
+
 	uiHub        *observability.Hub
 	stateVersion atomic.Uint64
 	eventCount   atomic.Int64
@@ -112,10 +114,18 @@ func New(
 		eventCh:       make(chan domain.DomainEvent, 100),
 		taskHistory:   make([]domain.TaskHistory, 0),
 		evalSemaphore: make(chan struct{}, 1),
+		drainSignal:   make(chan struct{}, 1),
 	}
 
 	o.planTracker = NewPlanTracker(tm, humanizer, o.buildHumanizationContext, logger)
-	tm.OnDrain = o.handleQueueDrain
+
+	// FIX: Don't spawn a goroutine directly, signal the worker instead
+	tm.OnDrain = func() {
+		select {
+		case o.drainSignal <- struct{}{}:
+		default:
+		}
+	}
 
 	o.taskManager.SetReadyChecker(func() bool {
 		if o.botDead.Load() {
@@ -167,6 +177,25 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return nil
 	})
 
+	// Single worker to handle evaluation drains
+	g.Go(func() error {
+		for {
+			select {
+			case <-gCtx.Done():
+				return nil
+			case <-o.drainSignal:
+				if !o.planTracker.HasActivePlan() {
+					o.mu.RLock()
+					ctx := o.baseCtx
+					o.mu.RUnlock()
+					if ctx != nil {
+						_ = o.evaluateNextTask(ctx)
+					}
+				}
+			}
+		}
+	})
+
 	<-gCtx.Done()
 	return g.Wait()
 }
@@ -209,14 +238,6 @@ func (o *Orchestrator) SetController(id string, ctrl execution.Controller) {
 
 	o.ctrlManager.SetController(id, ctrl)
 	o.logger.Info("Execution controller updated", slog.String("controller_id", id))
-}
-
-func (o *Orchestrator) handleQueueDrain() {
-	if !o.planTracker.HasActivePlan() {
-		if o.baseCtx != nil {
-			_ = o.evaluateNextTask(o.baseCtx)
-		}
-	}
 }
 
 func (o *Orchestrator) takeSnapshot(ctx context.Context) {
@@ -284,7 +305,10 @@ func (o *Orchestrator) processStateLoop(ctx context.Context, targetTick time.Dur
 			isEvaluating := len(o.evalSemaphore) > 0
 
 			if tm != nil && !o.planTracker.HasActivePlan() && tm.IsIdle() && !isLocked && !isEvaluating {
-				go o.handleQueueDrain()
+				select {
+				case o.drainSignal <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}
@@ -321,7 +345,12 @@ func (o *Orchestrator) processEventLoop(ctx context.Context) error {
 			o.handleDomainEvent(ctx, ev)
 
 			if count := o.eventCount.Add(1); count%SnapshotEventInterval == 0 {
-				go o.takeSnapshot(context.Background())
+				o.mu.RLock()
+				baseCtx := o.baseCtx
+				o.mu.RUnlock()
+				if baseCtx != nil {
+					go o.takeSnapshot(baseCtx)
+				}
 			}
 		}
 	}
@@ -379,7 +408,23 @@ func (o *Orchestrator) evaluateNextTask(ctx context.Context) error {
 		if plan.Objective == "Reactive Fallback Plan" && o.curriculum != nil {
 			o.logger.Info("Planner cache empty, falling back to curriculum")
 
-			intent, err := o.curriculum.ProposeTask(evalCtx, state, o.taskHistory, o.sessionID)
+			// FIX: Extract history safely to prevent data race
+			o.mu.RLock()
+			historyCopy := make([]domain.TaskHistory, len(o.taskHistory))
+			copy(historyCopy, o.taskHistory)
+			o.mu.RUnlock()
+
+			// FIX: Release semaphore so curriculum isn't holding it hostage during LLM calls
+			release()
+			intent, err := o.curriculum.ProposeTask(evalCtx, state, historyCopy, o.sessionID)
+
+			// Reacquire immediately after
+			select {
+			case o.evalSemaphore <- struct{}{}:
+			case <-evalCtx.Done():
+				return
+			}
+
 			if err != nil {
 				o.logger.Error("Curriculum fallback failed", slog.Any("error", err))
 				return
@@ -480,7 +525,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 			o.mu.Lock()
 			o.reflexLock = false
 			o.mu.Unlock()
-			o.handleQueueDrain()
+			select {
+			case o.drainSignal <- struct{}{}:
+			default:
+			}
 		})
 		o.mu.Unlock()
 
@@ -498,7 +546,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 		}
 		o.mu.Unlock()
 
-		o.handleQueueDrain()
+		select {
+		case o.drainSignal <- struct{}{}:
+		default:
+		}
 
 	case domain.EventTypePanic:
 		o.mu.Lock()
@@ -514,7 +565,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 			o.mu.Lock()
 			o.reflexLock = false
 			o.mu.Unlock()
-			o.handleQueueDrain()
+			select {
+			case o.drainSignal <- struct{}{}:
+			default:
+			}
 		})
 		o.mu.Unlock()
 
@@ -525,7 +579,10 @@ func (o *Orchestrator) handleDomainEvent(ctx context.Context, ev domain.DomainEv
 			o.reflexTimer.Stop()
 		}
 		o.mu.Unlock()
-		o.handleQueueDrain()
+		select {
+		case o.drainSignal <- struct{}{}:
+		default:
+		}
 
 	case domain.EventTypeTaskStart:
 		var payload struct {

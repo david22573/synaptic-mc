@@ -38,6 +38,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	// Add connection pooling for SQLite
 	db.SetMaxOpenConns(1)
 
+	// FIX: Removed the dead B-Tree index on embedding_json which causes query planner issues
 	schema := `
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,8 +46,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		intent_json TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	CREATE INDEX IF NOT EXISTS idx_embedding_similarity ON skills(embedding_json);`
+	);`
 
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply vector store schema: %w", err)

@@ -49,6 +49,7 @@ AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat",
 
 OUTPUT FORMAT (Strict JSON):
 {
+	"id": "intent-123",
 	"rationale": "Brief explanation of why this is the best next step based on state and history.",
 	"action": "gather",
 	"target": "oak_log",
@@ -158,6 +159,11 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 
 	if parseErr != nil || intent.Action == "" {
 		return nil, fmt.Errorf("failed to generate valid intent after 3 attempts: %w", parseErr)
+	}
+
+	// Fallback ID generation
+	if intent.ID == "" {
+		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
 	}
 
 	return &intent, nil

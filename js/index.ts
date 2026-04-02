@@ -562,6 +562,11 @@ async function connectWithRetry(maxAttempts = 10) {
             }
             abortActiveTask("unlock");
         });
+        // Ensure we send the first state the moment the socket opens
+        client.on("connected", () => {
+            lastStatePushTime = 0; // Bypass throttle
+            if (isBotSpawned) pushState();
+        });
         client.connect();
     }
     if (!survival) {
@@ -656,9 +661,13 @@ async function connectWithRetry(maxAttempts = 10) {
             isPathfinding = false;
             pathProgress = 1.0;
         });
-        pushState();
+
+        // Initialize connection first, state will be pushed by the connected event listener
         client.connect();
         survival.start();
+        lastStatePushTime = 0;
+        pushState();
+
         if (runtimeConfig.enable_viewer && !viewerStarted) {
             try {
                 viewer(bot, {

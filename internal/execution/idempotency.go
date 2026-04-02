@@ -50,6 +50,14 @@ func (c *IdempotentController) Clear(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.seen, id)
+
+	// Clean out the ghost keys so capacity doesn't silently shrink
+	for i, k := range c.keys {
+		if k == id {
+			c.keys = append(c.keys[:i], c.keys[i+1:]...)
+			break
+		}
+	}
 }
 
 func (c *IdempotentController) AbortCurrent(ctx context.Context, reason string) error {
