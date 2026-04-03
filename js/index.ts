@@ -9,7 +9,7 @@ import { runTask } from "./lib/tasks/task.js";
 import { SynapticClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
-import { getPOIs, clearPOICache } from "./lib/utils/perception.js
+import { getPOIs, clearPOICache } from "./lib/utils/perception.js";
 import { Vec3 } from "vec3";
 const { pathfinder, Movements, goals } = pkg;
 
@@ -580,7 +580,7 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.on("end", (reason) => {
         isBotSpawned = false;
         abortActiveTask("bot_disconnected");
-        clearPOICache(); 
+        clearPOICache();
         if (survival) survival.stop();
         if (isShuttingDown) {
             log.info("Bot disconnected cleanly for shutdown.");
