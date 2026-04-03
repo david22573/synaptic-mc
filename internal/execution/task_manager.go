@@ -1,5 +1,4 @@
-// internal/orchestrator/task_manager.go
-package orchestrator
+package execution
 
 import (
 	"container/heap"
@@ -10,7 +9,6 @@ import (
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
-	"david22573/synaptic-mc/internal/execution"
 )
 
 type ActionPriorityQueue []*domain.Action
@@ -45,8 +43,8 @@ type scheduledItem struct {
 }
 
 type TaskManager struct {
-	engine      *execution.TaskExecutionEngine
-	ctrlManager *execution.ControllerManager
+	engine      *TaskExecutionEngine
+	ctrlManager *ControllerManager
 	logger      *slog.Logger
 	timeouts    map[string]time.Duration
 	OnDrain     func()
@@ -70,8 +68,8 @@ type TaskManager struct {
 }
 
 func NewTaskManager(
-	engine *execution.TaskExecutionEngine,
-	ctrlManager *execution.ControllerManager,
+	engine *TaskExecutionEngine,
+	ctrlManager *ControllerManager,
 	timeouts map[string]time.Duration,
 	logger *slog.Logger,
 ) *TaskManager {

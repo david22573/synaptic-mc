@@ -18,6 +18,7 @@ type EventType string
 
 const (
 	EventTypeStateTick       EventType = "STATE_TICK"
+	EventTypeStateUpdated    EventType = "STATE_UPDATED" // Emitted by StateService after processing a tick
 	EventTypeTaskStart       EventType = "TASK_START"
 	EventTypeTaskEnd         EventType = "TASK_END"
 	EventTypePlanCreated     EventType = "PLAN_CREATED"

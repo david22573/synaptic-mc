@@ -18,16 +18,14 @@ import (
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
-	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
-	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
-	"david22573/synaptic-mc/internal/orchestrator"
+	"david22573/synaptic-mc/internal/state"
 	"david22573/synaptic-mc/internal/strategy"
 	"david22573/synaptic-mc/internal/supervisor"
 	"david22573/synaptic-mc/internal/voyager"
@@ -100,35 +98,76 @@ func main() {
 		MaxRetries: 3,
 	})
 
+	// === CORE ARCHITECTURE WIRING ===
+
+	eventBus := domain.NewEventBus()
+	uiHub := observability.NewHub(logger)
+
+	// 1. State Service
+	stateSvc := state.NewService(eventBus, logger)
+
+	// 2. Execution Service
+	ctrlManager := execution.NewControllerManager()
+	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger)
+	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
+	execService := execution.NewService(eventBus, execEngine, taskManager, ctrlManager, logger)
+
+	// Wire UI Hub to Execution Service for direct control inputs
+	uiHub.SetOrchestrator(execService)
+
+	// 3. Decision Service
 	evaluator := strategy.NewEvaluator()
 	critic := voyager.NewStateCritic()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore)
 
-	planner := decision.NewAdvancedPlanner(
-		llmClient,
-		evaluator,
-		critic,
-		memoryStore,
-		eventStore,
-		logger,
-	)
+	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger)
+	planManager := decision.NewPlanManager()
+	_ = decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, logger)
 
-	uiHub := observability.NewHub(logger)
-	flags := config.DefaultFlags()
+	// Global Event Sink for DB persistence and UI Broadcasts
+	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		// Persist to SQLite
+		_ = eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload)
 
-	humanCfg := humanization.Config{
-		AttentionDecay: 0.08,
-		HesitationBase: time.Duration(cfg.HesitationMs) * time.Millisecond,
-		NoiseLevel:     cfg.NoiseLevel,
-		BaseDriftRate:  0.08,
-		MaxDriftDelay:  2 * time.Second,
+		// Broadcast to UI
+		var payloadObj interface{}
+		_ = json.Unmarshal(ev.Payload, &payloadObj)
+		broadcastEv := map[string]interface{}{
+			"id":         ev.ID,
+			"session_id": ev.SessionID,
+			"type":       ev.Type,
+			"trace":      ev.Trace,
+			"payload":    payloadObj,
+			"created_at": ev.CreatedAt,
+		}
+		uiHub.Broadcast("event_stream", broadcastEv)
+	})
+
+	// Explicitly map all events so the local bus routes them correctly
+	eventTypes := []domain.EventType{
+		domain.EventTypeStateTick,
+		domain.EventTypeStateUpdated,
+		domain.EventTypeTaskStart,
+		domain.EventTypeTaskEnd,
+		domain.EventTypePlanCreated,
+		domain.EventTypePlanInvalidated,
+		domain.EventTypePlanCompleted,
+		domain.EventTypePlanFailed,
+		domain.EventTypePanic,
+		domain.EventTypePanicResolved,
+		domain.EventBotDeath,
+		domain.EventBotRespawn,
+		domain.EventType("STATE_UPDATE"), // Catch manual UI updates
+		domain.EventType("DISPATCH_TASK"),
 	}
 
-	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, planner, nil, uiHub, logger, flags, humanCfg)
+	for _, et := range eventTypes {
+		eventBus.Subscribe(et, globalSink)
+	}
+
 	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
 	g, ctx := errgroup.WithContext(context.Background())
-
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +182,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, orch, runner, logger))
+	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, eventBus, ctrlManager, runner, logger, cfg.SessionID))
 
 	uiPath := cfg.UIPath
 	if !filepath.IsAbs(uiPath) {
@@ -159,6 +198,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Start Background Routines
 	g.Go(func() error {
 		logger.Info("Starting UI hub")
 		uiHub.Run(ctx)
@@ -166,13 +206,26 @@ func main() {
 	})
 
 	g.Go(func() error {
-		logger.Info("Starting orchestrator")
-		return orch.Run(ctx)
+		logger.Info("Starting TS supervisor")
+		runner.Start(ctx)
+		return nil
 	})
 
 	g.Go(func() error {
-		logger.Info("Starting TS supervisor")
-		runner.Start(ctx)
+		logger.Info("Starting Planner slow loop")
+		planner.SlowReplanLoop(ctx, cfg.SessionID)
+		return nil
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting Task Execution Engine")
+		execEngine.Start(ctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		logger.Info("Starting Task Manager Queue")
+		taskManager.Run(ctx)
 		return nil
 	})
 
@@ -262,7 +315,7 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator, runner *supervisor.NodeRunner, logger *slog.Logger) http.HandlerFunc {
+func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			allowedOrigins := map[string]bool{
@@ -289,21 +342,12 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 		onMessage := func(msgType string, payload []byte) {
 			runner.Ping()
 
-			if msgType == "STATE_TICK" || msgType == "STATE_UPDATE" {
-				var state domain.GameState
-				if err := json.Unmarshal(payload, &state); err != nil {
-					logger.Error("Failed to unmarshal state", slog.Any("error", err))
-					return
-				}
-				orch.IngestState(appCtx, state)
-			} else {
-				orch.IngestEvent(appCtx, domain.DomainEvent{
-					SessionID: orch.SessionID(),
-					Type:      domain.EventType(msgType),
-					Payload:   payload,
-					CreatedAt: time.Now(),
-				})
-			}
+			bus.Publish(appCtx, domain.DomainEvent{
+				SessionID: sessionID,
+				Type:      domain.EventType(msgType),
+				Payload:   payload,
+				CreatedAt: time.Now(),
+			})
 		}
 
 		onClose := func() {
@@ -313,6 +357,6 @@ func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator
 		botController := execution.NewWSController(conn, logger, onMessage, onClose)
 		idempotentController := execution.NewIdempotentController(botController, 1000)
 
-		orch.SetController(controllerID, idempotentController)
+		cm.SetController(controllerID, idempotentController)
 	}
 }
