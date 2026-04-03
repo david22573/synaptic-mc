@@ -38,7 +38,6 @@ type SQLiteStore struct {
 }
 
 func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
-	// Enable WAL mode and busy timeout via DSN
 	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -126,7 +125,7 @@ func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain
 		return ctx.Err()
 	default:
 		s.logger.Warn("Event buffer full, performing synchronous insert")
-		return s.insertBatch([]pendingEvent{ev})
+		return s.insertBatch(ctx, []pendingEvent{ev})
 	}
 }
 
@@ -221,7 +220,7 @@ func (s *SQLiteStore) batchWorker() {
 		if len(batch) == 0 {
 			return
 		}
-		if err := s.insertBatch(batch); err != nil {
+		if err := s.insertBatch(s.ctx, batch); err != nil {
 			s.logger.Error("Failed to flush event batch", slog.Any("error", err), slog.Int("count", len(batch)))
 		}
 		batch = batch[:0]
@@ -242,7 +241,6 @@ func (s *SQLiteStore) batchWorker() {
 
 		case ev := <-s.buffer:
 			batch = append(batch, ev)
-			// Adaptive load scaling: flush immediately if batch size is met OR buffer is at >50% pressure
 			if len(batch) >= batchSize || len(s.buffer) > cap(s.buffer)/2 {
 				flush()
 				if !timer.Stop() {
@@ -261,12 +259,12 @@ func (s *SQLiteStore) batchWorker() {
 	}
 }
 
-func (s *SQLiteStore) insertBatch(events []pendingEvent) error {
+func (s *SQLiteStore) insertBatch(ctx context.Context, events []pendingEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

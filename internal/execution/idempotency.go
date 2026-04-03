@@ -2,8 +2,9 @@ package execution
 
 import (
 	"context"
-	"david22573/synaptic-mc/internal/domain"
 	"sync"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
 // IdempotentController wraps an Execution Controller to drop duplicate commands.
@@ -24,6 +25,10 @@ func NewIdempotentController(base Controller, capacity int) *IdempotentControlle
 		keys:     make([]string, 0, capacity),
 		capacity: capacity,
 	}
+}
+
+func (c *IdempotentController) IsReady() bool {
+	return c.base.IsReady()
 }
 
 func (c *IdempotentController) Dispatch(ctx context.Context, action domain.Action) error {

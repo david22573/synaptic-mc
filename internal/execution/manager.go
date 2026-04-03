@@ -31,6 +31,14 @@ func (m *ControllerManager) HasActiveController() bool {
 	return m.current.Load() != nil
 }
 
+func (m *ControllerManager) IsReady() bool {
+	vc := m.current.Load()
+	if vc == nil {
+		return false
+	}
+	return vc.Ctrl.IsReady()
+}
+
 // GetIdempotent returns the IdempotentController if it is the currently active controller.
 func (m *ControllerManager) GetIdempotent() *IdempotentController {
 	vc := m.current.Load()

@@ -52,11 +52,16 @@ func NewWSController(
 
 	c.conn.SetReadLimit(maxMessageSize)
 
-	// Start the pumps
 	go c.readPump()
 	go c.writePump()
 
 	return c
+}
+
+func (c *WSController) IsReady() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.isClosed
 }
 
 func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error {

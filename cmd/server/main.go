@@ -100,19 +100,14 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	// Instantiate strategy evaluator for planner
 	evaluator := strategy.NewEvaluator()
-
-	// Initialize curriculum with memory store
 	critic := voyager.NewStateCritic()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore)
 
-	// Wire AdvancedPlanner into the dependency graph
-	// Note: Assuming critic implements decision.RuleExtractor interface
 	planner := decision.NewAdvancedPlanner(
 		llmClient,
 		evaluator,
-		critic, // Use critic as RuleExtractor
+		critic,
 		memoryStore,
 		eventStore,
 		logger,
@@ -129,7 +124,6 @@ func main() {
 		MaxDriftDelay:  2 * time.Second,
 	}
 
-	// Pass planner to orchestrator
 	orch := orchestrator.New(cfg.SessionID, eventStore, memoryStore, curriculum, critic, planner, nil, uiHub, logger, flags, humanCfg)
 	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
@@ -270,7 +264,12 @@ func getEnvFloat(key string, fallback float64) float64 {
 
 func handleBotConnection(appCtx context.Context, orch *orchestrator.Orchestrator, runner *supervisor.NodeRunner, logger *slog.Logger) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
-		CheckOrigin:     func(r *http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool {
+			allowedOrigins := map[string]bool{
+				"http://localhost:3000": true,
+			}
+			return allowedOrigins[r.Header.Get("Origin")]
+		},
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 	}

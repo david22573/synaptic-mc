@@ -106,6 +106,10 @@ func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState)
 	return dist > 2.0 || prev.Health != curr.Health || prev.Food != curr.Food
 }
 
+func (p *AdvancedPlanner) Close() {
+	close(p.replanCh)
+}
+
 func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -117,7 +121,10 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 		select {
 		case <-ctx.Done():
 			return
-		case state := <-p.replanCh:
+		case state, ok := <-p.replanCh:
+			if !ok {
+				return
+			}
 			latestState = state
 		case <-ticker.C:
 			if latestState.Health == 0 {
@@ -151,8 +158,6 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 }
 
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
-	// FIX: Use Swap(nil) so we flush the cache when it's consumed. This prevents
-	// the orchestrator from infinitely looping on the same stale, failed plan.
 	if plan := p.currentPlan.Swap(nil); plan != nil {
 		if len(plan.Tasks) > 0 {
 			return *plan
