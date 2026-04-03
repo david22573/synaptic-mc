@@ -17,6 +17,7 @@ export enum ActionType {
     Store = "store",
     Retrieve = "retrieve",
     Look = "look", // Fixed missing enum member
+    CameraMove = "camera_move",
 }
 
 export enum ClientEventType {

@@ -174,19 +174,51 @@ func main() {
 	}))
 
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
-		_ = eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload)
+		// 🚨 DROP invalid events early
+		if ev.Type == "" {
+			logger.Error("Dropping event with empty type")
+			return
+		}
 
+		// Ensure payload is never nil
+		if len(ev.Payload) == 0 {
+			ev.Payload = []byte(`{}`)
+		}
+
+		// Validate JSON payload
 		var payloadObj interface{}
-		_ = json.Unmarshal(ev.Payload, &payloadObj)
+		if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
+			logger.Warn("Invalid JSON payload, coercing to empty object",
+				slog.String("type", string(ev.Type)),
+				slog.String("raw_payload", string(ev.Payload)),
+				slog.Any("error", err),
+			)
+			payloadObj = map[string]any{}
+		}
+
+		// Persist event
+		if err := eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
+			logger.Error("Failed to persist event", slog.Any("error", err))
+			return
+		}
+
+		// Broadcast clean event to UI
 		broadcastEv := map[string]interface{}{
 			"id":         ev.ID,
 			"session_id": ev.SessionID,
-			"type":       ev.Type,
+			"type":       string(ev.Type), // force string
 			"trace":      ev.Trace,
 			"payload":    payloadObj,
 			"created_at": ev.CreatedAt,
 		}
+
 		uiHub.Broadcast("event_stream", broadcastEv)
+
+		// 🔍 Debug (temporary but HIGH value)
+		logger.Debug("Event broadcasted",
+			slog.String("type", string(ev.Type)),
+			slog.Any("payload", payloadObj),
+		)
 	})
 
 	eventTypes := []domain.EventType{
@@ -399,10 +431,18 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 		onMessage := func(msgType string, payload []byte) {
 			runner.Ping()
 
+			normalizedType := domain.NormalizeEventType(msgType)
+
+			// Defensive: ensure payload is valid JSON
+			cleanPayload := payload
+			if len(cleanPayload) == 0 {
+				cleanPayload = []byte(`{}`)
+			}
+
 			bus.Publish(appCtx, domain.DomainEvent{
 				SessionID: sessionID,
-				Type:      domain.EventType(msgType),
-				Payload:   payload,
+				Type:      normalizedType,
+				Payload:   cleanPayload,
 				CreatedAt: time.Now(),
 			})
 		}

@@ -1,3 +1,4 @@
+// internal/policy/survival.go  (FIXED)
 package policy
 
 import (
@@ -7,21 +8,23 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// SurvivalPolicy replaces the old HardGuardrails.
-// It strictly enforces biological and physical bot safety invariants.
 type SurvivalPolicy struct{}
 
-func NewSurvivalPolicy() *SurvivalPolicy {
-	return &SurvivalPolicy{}
-}
+func NewSurvivalPolicy() *SurvivalPolicy { return &SurvivalPolicy{} }
 
 func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decision {
 	if input.Plan == nil {
 		return Decision{IsApproved: true}
 	}
 
-	// 1. Critical Health Override (Week 3: Survival Priority Override)
-	if input.State.Health < 6.0 || len(input.State.Threats) > 0 {
+	// --- tuned thresholds -------------------------------------------------
+	const criticalHealth = 4.0 // was 6.0  -> fewer false positives
+	const minFoodForHunt = 8   // was 12 -> align with JS panic threshold
+	const maxThreatDist = 12.0 // was 16 -> ignore far-away mobs
+	// ---------------------------------------------------------------------
+
+	// 1. Critical-health override
+	if input.State.Health < criticalHealth {
 		isValidEscape := false
 		for _, t := range input.Plan.Tasks {
 			if t.Action == "retreat" || t.Action == "eat" || t.Action == "gather" || t.Action == "explore" {
@@ -29,81 +32,97 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 				break
 			}
 		}
-
-		if !isValidEscape || len(input.State.Threats) > 0 {
-			var overridePlan *domain.Plan
-			var foodItemName string
-
-			foodItems := []string{
-				"beef", "porkchop", "mutton", "chicken", "rabbit",
-				"cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_rabbit",
-				"apple", "sweet_berries", "bread", "carrot", "potato", "baked_potato", "kelp", "dried_kelp",
-			}
-
-			for _, invItem := range input.State.Inventory {
-				if invItem.Count > 0 {
-					for _, f := range foodItems {
-						if strings.Contains(invItem.Name, f) {
-							foodItemName = invItem.Name
-							break
-						}
-					}
-				}
-				if foodItemName != "" {
-					break
-				}
-			}
-
-			if foodItemName != "" && len(input.State.Threats) == 0 {
-				overridePlan = &domain.Plan{
-					Objective: "EMERGENCY OVERRIDE: Eat food to survive.",
-					Tasks: []domain.Action{
-						{
-							Action:   "eat",
-							Target:   domain.Target{Type: "item", Name: foodItemName},
-							Priority: 100, // Hard interrupt priority
-						},
-					},
-				}
-			} else {
-				overridePlan = &domain.Plan{
-					Objective: "EMERGENCY OVERRIDE: Retreat to safety.",
-					Tasks: []domain.Action{
-						{
-							Action:   "retreat",
-							Target:   domain.Target{Type: "none", Name: "none"},
-							Priority: 100, // Hard interrupt priority
-						},
-					},
-				}
-			}
-
+		if !isValidEscape {
+			override := p.buildEmergencyPlan(input.State)
 			return Decision{
 				IsApproved:      false,
-				Reason:          "POLICY VIOLATION: Health is critical or threats are present. Plan must prioritize survival.",
-				OverridePlan:    overridePlan,
-				ReflexTriggered: true, // Week 1: Reflex Lock to block planner
+				Reason:          "POLICY: health < 4; forcing eat/retreat",
+				OverridePlan:    override,
+				ReflexTriggered: true,
 			}
 		}
 	}
 
-	// 2. Combat Avoidance
+	// 2. Threat proximity override
+	if len(input.State.Threats) > 0 {
+		for _, t := range input.State.Threats {
+			if t.Distance <= maxThreatDist {
+				isValidEscape := false
+				for _, task := range input.Plan.Tasks {
+					if task.Action == "retreat" || task.Action == "eat" {
+						isValidEscape = true
+						break
+					}
+				}
+				if !isValidEscape {
+					override := p.buildEmergencyPlan(input.State)
+					return Decision{
+						IsApproved:      false,
+						Reason:          "POLICY: hostile within 12 blocks; forcing eat/retreat",
+						OverridePlan:    override,
+						ReflexTriggered: true,
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// 3. Hunt safety check
 	for _, t := range input.Plan.Tasks {
 		if t.Action == "hunt" {
-			if input.State.Health < 12.0 {
+			if input.State.Health < minFoodForHunt {
 				return Decision{
 					IsApproved: false,
-					Reason:     "POLICY VIOLATION: Cannot initiate hunt with health under 12",
+					Reason:     "POLICY: health < 8; too weak to hunt",
 				}
 			}
-			if t.Target.Name == "creeper" || t.Target.Name == "warden" || t.Target.Name == "iron_golem" {
+			if strings.Contains(t.Target.Name, "creeper") ||
+				strings.Contains(t.Target.Name, "warden") {
 				return Decision{
 					IsApproved: false,
-					Reason:     "POLICY VIOLATION: Target is on the absolute do-not-engage list",
+					Reason:     "POLICY: target on do-not-engage list",
 				}
 			}
 		}
 	}
-
 	return Decision{IsApproved: true}
+}
+
+func (p *SurvivalPolicy) buildEmergencyPlan(state domain.GameState) *domain.Plan {
+	// prefer eat if food exists, else retreat
+	foodName := ""
+	for _, item := range state.Inventory {
+		if isFood(item.Name) && item.Count > 0 {
+			foodName = item.Name
+			break
+		}
+	}
+	action := "retreat"
+	target := domain.Target{Type: "none", Name: "none"}
+	if foodName != "" {
+		action = "eat"
+		target = domain.Target{Type: "item", Name: foodName}
+	}
+	return &domain.Plan{
+		Objective: "EMERGENCY SURVIVAL",
+		Tasks: []domain.Action{{
+			Action:    action,
+			Target:    target,
+			Priority:  100,
+			Rationale: "SurvivalPolicy emergency override",
+		}},
+	}
+}
+
+func isFood(name string) bool {
+	foods := []string{"beef", "porkchop", "chicken", "mutton", "rabbit",
+		"cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton", "cooked_rabbit",
+		"apple", "bread", "carrot", "potato", "baked_potato", "sweet_berries"}
+	for _, f := range foods {
+		if strings.Contains(name, f) {
+			return true
+		}
+	}
+	return false
 }

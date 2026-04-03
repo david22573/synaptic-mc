@@ -56,7 +56,8 @@ type VersionedState struct {
 }
 
 type Threat struct {
-	Name string `json:"name"`
+	Name     string  `json:"name"`
+	Distance float64 `json:"distance"`
 }
 
 type Target struct {
@@ -102,6 +103,7 @@ type Plan struct {
 	Objective     string     `json:"objective"`
 	Tasks         []Action   `json:"tasks"`
 	Fallbacks     [][]Action `json:"fallbacks,omitempty"` // Week 4: Multi-Plan Fallback
+	IsFallback    bool       `json:"is_fallback,omitempty"`
 }
 
 type EvaluationSnapshot struct {

@@ -178,19 +178,19 @@ func (h *Hub) shutdown() {
 }
 
 func (h *Hub) Broadcast(msgType string, payload any) {
-	msg := map[string]any{
-		"type":    msgType,
-		"payload": payload,
+	// ---- produce the exact JSON the UI expects ----
+	env := struct {
+		Type    string `json:"type"`
+		Payload any    `json:"payload"`
+	}{
+		Type:    msgType,
+		Payload: payload,
 	}
 
-	data, err := json.Marshal(msg)
-	if err != nil {
-		h.logger.Error("Failed to marshal broadcast message", slog.Any("error", err))
-		return
-	}
+	raw, _ := json.Marshal(env)
 
 	select {
-	case h.broadcast <- data:
+	case h.broadcast <- raw:
 	default:
 		h.logger.Warn("UI Hub broadcast channel full, dropping message")
 	}

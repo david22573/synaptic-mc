@@ -1,3 +1,5 @@
+// js/lib/tasks/task.ts
+
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
@@ -29,7 +31,6 @@ function calculateDynamicTimeout(
     const invCount = bot.inventory.items().length;
     const healthFactor = Math.max(bot.health, 1) / 20;
 
-    // FIX: Health factor now properly scales timeout up when healthy, down when dying
     return baseTimeout * (1 + invCount * 0.02) * (0.5 + healthFactor);
 }
 
@@ -100,6 +101,12 @@ export async function runTask(
             case "retrieve":
                 await handleRetrieve(taskCtx);
                 break;
+            case "camera_move": {
+                // Parse coordinates from target name JSON
+                const data = JSON.parse(intent.target.name);
+                await bot.look(data.yaw, data.pitch, true);
+                break;
+            }
             case "eat": {
                 const food = bot.inventory
                     .items()

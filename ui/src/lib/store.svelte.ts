@@ -1,3 +1,5 @@
+// ui/src/lib/store.svelte.ts
+
 import { AgentController } from "./agent-controller";
 import { TaskCommitment } from "./task-commitment";
 import { Prefetcher } from "./prefetcher";
@@ -58,7 +60,6 @@ export function connectToBot() {
             const message = JSON.parse(event.data);
             if (!message.type || !message.payload) return;
 
-            // FIX: Normalize to uppercase to catch Go backend enums
             switch (message.type.toUpperCase()) {
                 case "SYNC_REQUEST":
                     if (message.payload?.authoritative_state) {
@@ -71,28 +72,33 @@ export function connectToBot() {
                     botStore.gameState = message.payload;
                     controller.onStateUpdate(message.payload);
                     break;
+
                 case "EVENT_STREAM": {
                     const goEvent = message.payload;
-                    let innerPayload: any = {};
 
-                    if (goEvent.Payload) {
+                    let innerPayload: any = {};
+                    // FIX: Go broadcast payload uses lowercase 'payload'
+                    const rawPayload = goEvent.payload || goEvent.Payload;
+
+                    if (rawPayload) {
                         try {
-                            const decoded = atob(goEvent.Payload);
+                            const decoded = atob(rawPayload);
                             innerPayload = JSON.parse(decoded);
                         } catch {
                             try {
                                 innerPayload =
-                                    typeof goEvent.Payload === "string"
-                                        ? JSON.parse(goEvent.Payload)
-                                        : goEvent.Payload;
+                                    typeof rawPayload === "string"
+                                        ? JSON.parse(rawPayload)
+                                        : rawPayload;
                             } catch {
-                                innerPayload = goEvent.Payload;
+                                innerPayload = rawPayload;
                             }
                         }
                     }
 
                     const newEvent = {
-                        type: goEvent.Type || "UNKNOWN",
+                        // FIX: Go broadcast payload uses lowercase 'type'
+                        type: goEvent.type || goEvent.Type || "UNKNOWN",
                         payload: innerPayload,
                         timestamp: new Date().toLocaleTimeString(),
                     };
@@ -107,10 +113,7 @@ export function connectToBot() {
                             prefetcher.onTaskStart(newEvent.payload.task);
                         }
                     }
-
-                    if (newEvent.type === "TASK_END") {
-                        commitment.reset();
-                    }
+                    if (newEvent.type === "TASK_END") commitment.reset();
                     break;
                 }
                 case "OBJECTIVE_UPDATE":
