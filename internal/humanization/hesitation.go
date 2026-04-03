@@ -1,3 +1,4 @@
+// internal/humanization/hesitation.go
 package humanization
 
 import (
@@ -12,29 +13,37 @@ func CalculateHesitation(action domain.Action, ctx Context, state *State, cfg Co
 	base := float64(cfg.HesitationBase.Milliseconds())
 
 	// 1. Complexity Scaling
-	// High-stakes or complex physical actions require more "thinking" time.
 	switch action.Action {
 	case "hunt", "combat", "retreat", "build":
 		base += 600.0
 	case "craft", "smelt", "store":
 		base += 300.0
 	case "explore":
-		base += 100.0 // Wandering is instinctual, low hesitation
+		base += 100.0
 	}
 
 	// 2. Confusion Scaling
-	// If the bot is stuck, it hesitates longer, simulating confusion.
 	if ctx.IsStuck {
 		base += 1200.0
 	}
 
 	// 3. Attention Scaling
-	// Lower attention = slower reaction times.
 	attentionModifier := 1.0 + (1.0 - state.GetAttention())
 	base *= attentionModifier
 
-	// 4. Natural Jitter
-	// Add up to 50% random jitter so the delay is never exactly the same.
+	// 4. Week 5: Risk-Based Hesitation (Caution factor)
+	// Base delay + (risk * factor). High risk environments cause the bot to pause
+	// and "think" before acting (simulating stealth/caution), unless panic mode overrides.
+	risk := 0.0
+	if ctx.State.Health < 20 {
+		risk += (20.0 - ctx.State.Health) * 0.5
+	}
+	risk += float64(len(ctx.State.Threats) * 2.0)
+
+	factor := 45.0 // ms added per unit of risk
+	base += (risk * factor)
+
+	// 5. Natural Jitter
 	jitterLimit := int64(base * 0.5)
 	var jitter int64
 	if jitterLimit > 0 {

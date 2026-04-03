@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,9 @@ type AdvancedPlanner struct {
 
 	planCache map[uint64]*domain.Plan
 	cacheMu   sync.RWMutex
+
+	failures map[string]int // objective -> failure count
+	failMu   sync.Mutex
 }
 
 func NewAdvancedPlanner(
@@ -61,6 +65,7 @@ func NewAdvancedPlanner(
 		flags:     flags,
 		replanCh:  make(chan domain.GameState, 1),
 		planCache: make(map[uint64]*domain.Plan),
+		failures:  make(map[string]int),
 	}
 }
 
@@ -105,23 +110,25 @@ type multiCandidateResponse struct {
 
 func hashState(state domain.GameState) uint64 {
 	h := fnv.New64a()
-	// Discard minor floating point variances by casting to int for the hash
-	str := fmt.Sprintf("%d|%d|%d|%d|%d|%d|%d",
-		state.TimeOfDay,
-		int(state.Health),
-		int(state.Food),
-		int(state.Position.X),
-		int(state.Position.Y),
-		int(state.Position.Z),
-		len(state.Threats),
-	)
+
+	healthBucket := int(state.Health) / 4
+	foodBucket := int(state.Food) / 4
+	threatLevel := len(state.Threats)
+
+	str := fmt.Sprintf("h:%d|f:%d|t:%d", healthBucket, foodBucket, threatLevel)
 	h.Write([]byte(str))
 
+	var items []string
 	for _, item := range state.Inventory {
 		if item.Count > 0 {
-			h.Write([]byte(fmt.Sprintf("|%s:%d", item.Name, item.Count)))
+			items = append(items, item.Name)
 		}
 	}
+	sort.Strings(items)
+	for _, item := range items {
+		h.Write([]byte(fmt.Sprintf("|%s", item)))
+	}
+
 	return h.Sum64()
 }
 
@@ -140,6 +147,18 @@ func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState)
 
 func (p *AdvancedPlanner) Close() {
 	close(p.replanCh)
+}
+
+func (p *AdvancedPlanner) RecordFailure(objective string) {
+	p.failMu.Lock()
+	p.failures[objective]++
+	p.failMu.Unlock()
+}
+
+func (p *AdvancedPlanner) RecordSuccess(objective string) {
+	p.failMu.Lock()
+	delete(p.failures, objective)
+	p.failMu.Unlock()
 }
 
 func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) {
@@ -163,7 +182,6 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 				continue
 			}
 
-			// Churn Limiter: Skip LLM call if state hasn't meaningfully changed
 			if !p.stateChangedSignificantly(lastPlannedState, latestState) {
 				continue
 			}
@@ -201,13 +219,13 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 	var tasks []domain.Action
 
-	if state.Health < 10 {
+	if state.Health < 10 || len(state.Threats) > 0 {
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-heal-%d", time.Now().UnixNano()),
 			Action:    "retreat",
 			Target:    domain.Target{Name: "none", Type: "none"},
 			Priority:  100,
-			Rationale: "Reactive fast-path fallback: Health critical",
+			Rationale: "Reactive fast-path fallback: Survival Critical",
 		})
 	} else {
 		tasks = append(tasks, domain.Action{
@@ -226,7 +244,6 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 }
 
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
-	// Phase 2 Improvement: plan-cache-by-state-hash
 	stateHash := hashState(state)
 
 	p.cacheMu.RLock()
@@ -294,23 +311,34 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
 	stats := learning.CalculateActionStats(nil, events)
 
-	bestIdx := 0
-	highestScore := math.Inf(-1)
+	p.failMu.Lock()
+	failureCount := p.failures[parsed.Objective]
+	p.failMu.Unlock()
 
-	for i, candidate := range parsed.Candidates {
-		score := p.scoreCandidate(candidate, state, stats)
-		if score > highestScore {
-			highestScore = score
-			bestIdx = i
-		}
+	type scoredCandidate struct {
+		tasks []domain.Action
+		score float64
 	}
+
+	var scored []scoredCandidate
+	for _, candidate := range parsed.Candidates {
+		score := p.scoreCandidate(candidate, state, stats, failureCount)
+		scored = append(scored, scoredCandidate{candidate, score})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
 
 	finalPlan := &domain.Plan{
 		Objective: parsed.Objective,
-		Tasks:     parsed.Candidates[bestIdx],
+		Tasks:     scored[0].tasks,
 	}
 
-	// Save to cache
+	for i := 1; i < len(scored); i++ {
+		finalPlan.Fallbacks = append(finalPlan.Fallbacks, scored[i].tasks)
+	}
+
 	p.cacheMu.Lock()
 	p.planCache[stateHash] = finalPlan
 	p.cacheMu.Unlock()
@@ -318,8 +346,6 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	return finalPlan, nil
 }
 
-// clonePlanWithNewIDs prevents the IdempotentController from dropping
-// actions if the exact same plan is pulled from the cache later.
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {
 	clone := &domain.Plan{
 		Objective: original.Objective,
@@ -332,31 +358,57 @@ func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Pla
 		clone.Tasks[i].ID = fmt.Sprintf("cached-plan-%d-%d", now, i)
 	}
 
+	for _, fallback := range original.Fallbacks {
+		newFallback := make([]domain.Action, len(fallback))
+		for i, t := range fallback {
+			newFallback[i] = t
+			newFallback[i].ID = fmt.Sprintf("cached-plan-fb-%d-%d", now, i)
+		}
+		clone.Fallbacks = append(clone.Fallbacks, newFallback)
+	}
+
 	return clone
 }
 
-func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats) float64 {
+func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats, failureCount int) float64 {
+	if len(tasks) == 0 {
+		return 0
+	}
+
 	score := 100.0
 	weights := p.flags.Weights
 
+	score -= float64(failureCount) * 15.0
+
+	explorationBonus := weights.ExplorationBonus
+	if failureCount >= 2 {
+		explorationBonus *= 2.5
+	}
+
+	// Add exploration bonus exactly ONCE per candidate plan
+	hasExplored := false
+	var totalRisk float64
+
 	for _, t := range tasks {
 		if t.Action == "hunt" {
-			score -= weights.RiskPenalty
+			totalRisk += weights.RiskPenalty
 		}
 		if t.Action == "mine" {
-			score -= (weights.RiskPenalty / 2.0)
+			totalRisk += (weights.RiskPenalty / 2.0)
 		}
 
 		if stat, ok := stats[t.Action]; ok && stat.Attempts > 0 {
 			probability := stat.SuccessRate
 			score += (probability * weights.SuccessWeight)
-
-			// Penalty for low probability tasks scales with success weight
 			score -= ((1.0 - probability) * (weights.SuccessWeight + 10.0))
-		} else {
-			score += weights.ExplorationBonus
+		} else if !hasExplored {
+			score += explorationBonus
+			hasExplored = true
 		}
 	}
+
+	// Apply average risk penalty, not additive per step
+	score -= (totalRisk / float64(len(tasks)))
 
 	return score
 }

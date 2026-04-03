@@ -216,11 +216,11 @@ func (s *SQLiteStore) batchWorker() {
 
 	batch := make([]pendingEvent, 0, batchSize)
 
-	flush := func() {
+	flush := func(drainCtx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		if err := s.insertBatch(s.ctx, batch); err != nil {
+		if err := s.insertBatch(drainCtx, batch); err != nil {
 			s.logger.Error("Failed to flush event batch", slog.Any("error", err), slog.Int("count", len(batch)))
 		}
 		batch = batch[:0]
@@ -233,16 +233,20 @@ func (s *SQLiteStore) batchWorker() {
 			for ev := range s.buffer {
 				batch = append(batch, ev)
 				if len(batch) >= batchSize {
-					flush()
+					drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					flush(drainCtx)
+					cancel()
 				}
 			}
-			flush()
+			drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			flush(drainCtx)
+			cancel()
 			return
 
 		case ev := <-s.buffer:
 			batch = append(batch, ev)
 			if len(batch) >= batchSize || len(s.buffer) > cap(s.buffer)/2 {
-				flush()
+				flush(s.ctx)
 				if !timer.Stop() {
 					select {
 					case <-timer.C:
@@ -253,7 +257,7 @@ func (s *SQLiteStore) batchWorker() {
 			}
 
 		case <-timer.C:
-			flush()
+			flush(s.ctx)
 			timer.Reset(flushInterval)
 		}
 	}

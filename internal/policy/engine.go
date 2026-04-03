@@ -15,9 +15,10 @@ type DecisionInput struct {
 
 // Decision represents the authoritative ruling from the policy engine.
 type Decision struct {
-	IsApproved   bool
-	Reason       string
-	OverridePlan *domain.Plan // Optional: A fallback plan if the original is rejected
+	IsApproved      bool
+	Reason          string
+	OverridePlan    *domain.Plan // Optional: A fallback plan if the original is rejected
+	ReflexTriggered bool         // Week 1: Signal to lock out the planner
 }
 
 // Engine defines the contract for all behavioral guardrails.

@@ -38,6 +38,22 @@ func (pm *PlanManager) SetPlan(plan *domain.Plan) {
 	pm.current = plan
 }
 
+// NextFallback pops the next best candidate from the multi-plan list
+// and prepares it for execution without going back to the LLM.
+func (pm *PlanManager) NextFallback() bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.current == nil || len(pm.current.Fallbacks) == 0 {
+		return false
+	}
+
+	pm.current.Tasks = pm.current.Fallbacks[0]
+	pm.current.Fallbacks = pm.current.Fallbacks[1:]
+	pm.current.Status = domain.PlanStatusPending
+	return true
+}
+
 func (pm *PlanManager) Transition(to domain.PlanStatus) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -47,14 +63,15 @@ func (pm *PlanManager) Transition(to domain.PlanStatus) error {
 	}
 
 	from := pm.current.Status
-
 	valid := false
+
 	switch from {
 	case domain.PlanStatusPending:
-		valid = (to == domain.PlanStatusActive || to == domain.PlanStatusInvalidated)
+		valid = (to == domain.PlanStatusActive || to == domain.PlanStatusInvalidated || to == domain.PlanStatusBlocked)
 	case domain.PlanStatusActive:
-		valid = (to == domain.PlanStatusCompleted || to == domain.PlanStatusFailed || to == domain.PlanStatusInvalidated)
-	// Terminal states cannot transition further
+		valid = (to == domain.PlanStatusCompleted || to == domain.PlanStatusFailed || to == domain.PlanStatusInvalidated || to == domain.PlanStatusBlocked)
+	case domain.PlanStatusBlocked:
+		valid = (to == domain.PlanStatusActive || to == domain.PlanStatusInvalidated || to == domain.PlanStatusFailed)
 	case domain.PlanStatusCompleted, domain.PlanStatusFailed, domain.PlanStatusInvalidated:
 		valid = false
 	}
@@ -87,5 +104,5 @@ func (pm *PlanManager) HasActivePlan() bool {
 	}
 
 	status := pm.current.Status
-	return status == domain.PlanStatusPending || status == domain.PlanStatusActive
+	return status == domain.PlanStatusPending || status == domain.PlanStatusActive || status == domain.PlanStatusBlocked
 }

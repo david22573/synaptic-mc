@@ -138,8 +138,6 @@ func (e *TaskExecutionEngine) pump() {
 		return
 	}
 
-	// Phase 4 Improvement: attention-system-gating
-	// If attention is low, the agent simulates cognitive load by dropping background/low-priority tasks
 	if e.getAttention != nil {
 		attention := e.getAttention()
 		if attention < 0.3 {
@@ -171,18 +169,27 @@ func (e *TaskExecutionEngine) pump() {
 	}
 	e.mu.Unlock()
 
-	// Phase 4 Improvement: execution-noise
-	// Inject bounded random jitter to break uniform execution pacing (non-mechanical signature)
 	if qa.action.Priority < 10 && e.noiseLevel > 0.01 {
-		maxJitter := int64(e.noiseLevel * 5000) // e.g. 0.03 * 5000 = up to 150ms of jitter
+		maxJitter := int64(e.noiseLevel * 5000)
 		if maxJitter > 0 {
 			jitter := time.Duration(rand.Int63n(maxJitter)) * time.Millisecond
 			time.Sleep(jitter)
 		}
 	}
 
-	err := e.controller.Dispatch(qa.ctx, qa.action)
+	dispatchCtx := qa.ctx
+
+	err := e.controller.Dispatch(dispatchCtx, qa.action)
 	if err != nil {
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			e.logger.Debug("Task aborted cleanly", slog.String("action", qa.action.Action), slog.Any("reason", err))
+			e.mu.Lock()
+			e.inFlight = nil
+			e.retryCount = 0
+			e.mu.Unlock()
+			return
+		}
+
 		e.mu.Lock()
 		if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
 			e.inFlight.Status = StatusFailed

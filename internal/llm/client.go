@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -59,7 +60,21 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 }
 
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
-	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
+	// Robustly convert the chat completion endpoint into an embeddings endpoint
+	parsedURL, err := url.Parse(c.config.APIURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid APIURL configured: %w", err)
+	}
+
+	// Handles variations like /v1/chat/completions -> /v1/embeddings
+	pathParts := strings.Split(parsedURL.Path, "/")
+	if len(pathParts) > 0 {
+		pathParts = pathParts[:len(pathParts)-2] // strip off "chat/completions" or similar
+	}
+	pathParts = append(pathParts, "embeddings")
+	parsedURL.Path = strings.Join(pathParts, "/")
+
+	embedURL := parsedURL.String()
 
 	// Embeddings should be fast; enforce a tighter timeout
 	embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

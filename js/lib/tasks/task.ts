@@ -4,7 +4,6 @@ import * as models from "../models.js";
 import { type TaskContext } from "./registry.js";
 import { log } from "../logger.js";
 
-// Handlers
 import { handleGather } from "./handlers/gather.js";
 import { handleCraft } from "./handlers/craft.js";
 import { handleHunt } from "./handlers/hunt.js";
@@ -30,7 +29,8 @@ function calculateDynamicTimeout(
     const invCount = bot.inventory.items().length;
     const healthFactor = Math.max(bot.health, 1) / 20;
 
-    return baseTimeout * (1 + invCount * 0.02) * (2 - healthFactor);
+    // FIX: Health factor now properly scales timeout up when healthy, down when dying
+    return baseTimeout * (1 + invCount * 0.02) * (0.5 + healthFactor);
 }
 
 export async function runTask(
@@ -121,7 +121,6 @@ export async function runTask(
                 await waitForMs(1500, signal);
                 break;
             case "look":
-                // FIX: Ignore LLM hallucinations for a 'look' action
                 await waitForMs(500, signal);
                 break;
             case "sleep": {

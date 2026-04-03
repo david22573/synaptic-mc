@@ -1,7 +1,9 @@
+// ui/src/lib/task-commitment.ts
 export interface Task {
     id: string;
     type: string;
     completed: boolean;
+    priority?: number;
     next?: Task;
     target?: any;
     resources?: any[];
@@ -9,19 +11,39 @@ export interface Task {
 
 export class TaskCommitment {
     private commitmentTicks: number = 0;
-    private readonly minCommitment: number = 10; // ticks to lock in
+    private minCommitment: number = 10; // ticks to lock in
+    private lockedTaskType: string | null = null;
 
-    shouldCommit(task: Task): boolean {
+    shouldCommit(task: Task, isPanicMode: boolean = false): boolean {
         if (task.completed) {
-            this.commitmentTicks = 0;
+            this.reset();
             return false;
         }
 
-        // Lock in movement tasks so the agent doesn't twitch if the planner
-        // fast-path re-evaluates rapidly on slight position changes.
-        if (task.type === "move" && this.commitmentTicks < this.minCommitment) {
-            this.commitmentTicks++;
-            return true;
+        // Week 5: Panic Mode bypasses all hard UI commitments
+        if (isPanicMode) {
+            this.reset();
+            return false;
+        }
+
+        // Week 5: Hard Commitment Enforcement
+        if (this.lockedTaskType && this.lockedTaskType !== task.type) {
+            if (this.commitmentTicks < this.minCommitment) {
+                this.commitmentTicks++;
+                return true; // Enforce the lock, reject overriding plan
+            }
+        }
+
+        if (
+            task.type === "move" ||
+            task.type === "craft" ||
+            task.type === "mine"
+        ) {
+            if (this.commitmentTicks < this.minCommitment) {
+                this.lockedTaskType = task.type;
+                this.commitmentTicks++;
+                return true;
+            }
         }
 
         return false;
@@ -29,5 +51,10 @@ export class TaskCommitment {
 
     reset() {
         this.commitmentTicks = 0;
+        this.lockedTaskType = null;
+    }
+
+    setCommitmentDuration(ticks: number) {
+        this.minCommitment = Math.max(0, ticks);
     }
 }

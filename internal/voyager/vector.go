@@ -35,10 +35,8 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		return nil, fmt.Errorf("failed to open vector store sqlite: %w", err)
 	}
 
-	// Add connection pooling for SQLite
 	db.SetMaxOpenConns(1)
 
-	// FIX: Removed the dead B-Tree index on embedding_json which causes query planner issues
 	schema := `
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,10 +65,8 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, i
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	// Use LIMIT with WHERE clause for approximate search to prevent full table scans
-	query := `SELECT description, intent_json, embedding_json FROM skills 
-	          WHERE id IN (SELECT id FROM skills ORDER BY id DESC LIMIT 1000)
-	          LIMIT 500`
+	// Full table scan for accurate cosine similarity
+	query := `SELECT description, intent_json, embedding_json FROM skills`
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
@@ -81,7 +77,6 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 	var records []SkillRecord
 
 	for rows.Next() {
-		// Respect context cancellation mid-scan for large tables
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

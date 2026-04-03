@@ -14,6 +14,7 @@ const (
 	PlanStatusCompleted   PlanStatus = "COMPLETED"
 	PlanStatusFailed      PlanStatus = "FAILED"
 	PlanStatusInvalidated PlanStatus = "INVALIDATED"
+	PlanStatusBlocked     PlanStatus = "BLOCKED" // Week 3: Plan State Machine
 )
 
 type Vec3 struct {
@@ -88,7 +89,7 @@ type Action struct {
 	Count        int           `json:"count"`
 	Rationale    string        `json:"rationale"`
 	Priority     int           `json:"priority"`
-	Timeout      time.Duration `json:"timeout,omitempty"` // Phase 3 Improvement: execution-deadlines
+	Timeout      time.Duration `json:"timeout,omitempty"`
 }
 
 type Plan struct {
@@ -100,6 +101,7 @@ type Plan struct {
 	InvalidatedAt *time.Time `json:"invalidated_at,omitempty"`
 	Objective     string     `json:"objective"`
 	Tasks         []Action   `json:"tasks"`
+	Fallbacks     [][]Action `json:"fallbacks,omitempty"` // Week 4: Multi-Plan Fallback
 }
 
 type EvaluationSnapshot struct {

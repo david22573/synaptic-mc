@@ -139,9 +139,11 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 cleanup();
                 resolve();
             };
-            const onStop = () => {
-                cleanup();
-                reject(new Error("PATH_FAILED: Navigation interrupted"));
+            const onStop = (r: any) => {
+                if (r.status === "noPath") {
+                    cleanup();
+                    reject(new Error("PATH_FAILED: Navigation interrupted"));
+                }
             };
             const onAbort = () => {
                 cleanup();
@@ -155,10 +157,8 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 stopMovement();
             };
 
-            bot.once("goal_reached", onGoal);
-            bot.once("path_update", (r: any) => {
-                if (r.status === "noPath") onStop();
-            });
+            bot.on("goal_reached", onGoal);
+            bot.on("path_update", onStop);
             signal.addEventListener("abort", onAbort);
         });
     }
@@ -170,7 +170,6 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         while (collectedCount < targetCount) {
             if (signal.aborted) throw new Error("TIMEOUT");
 
-            // FIX: Removed the buggy '&& furnace.fuel && furnace.fuel === 0' check
             if (
                 !furnace.fuelItem() &&
                 (!furnace.fuel || Math.round(furnace.fuel) === 0)

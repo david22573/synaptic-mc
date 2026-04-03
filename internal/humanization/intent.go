@@ -1,12 +1,18 @@
+// internal/humanization/intent.go
 package humanization
 
-import "david22573/synaptic-mc/internal/domain"
+import (
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
 
 // IntentState tracks the bot's emotional commitment to its current goal.
 type IntentState struct {
-	CurrentGoal string
-	Commitment  float64
-	Frustration float64
+	CurrentGoal    string
+	Commitment     float64
+	Frustration    float64
+	CommitmentTime time.Time
 }
 
 type IntentModel struct{}
@@ -24,6 +30,14 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
+	// Week 5: Panic Mode
+	// If survival is threatened, drop all frustration and lock strictly into the plan
+	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
+		state.Intent.Frustration = 0.0
+		state.Intent.Commitment = 1.0
+		return tasks
+	}
+
 	// 1. Calculate Frustration
 	if ctx.IsStuck {
 		state.Intent.Frustration += 0.01
@@ -35,7 +49,6 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 	}
 
 	// 2. Rage Quit Threshold
-	// If frustration maxes out, wipe the intent and return no actions to force a re-plan.
 	if state.Intent.Frustration > 0.8 {
 		state.Intent.CurrentGoal = ""
 		state.Intent.Commitment = 0.0
@@ -49,6 +62,12 @@ func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []
 		state.Intent.CurrentGoal = primaryTask.Action
 		state.Intent.Commitment = 1.0
 		state.Intent.Frustration = 0.0
+		state.Intent.CommitmentTime = time.Now()
+	} else {
+		// Strengthen emotional commitment the longer a task runs
+		if time.Since(state.Intent.CommitmentTime) > 3*time.Second {
+			state.Intent.Commitment = 1.0
+		}
 	}
 
 	return tasks

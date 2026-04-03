@@ -1,3 +1,4 @@
+// ui/src/lib/agent-controller.ts
 export type Vec3 = { x: number; y: number; z: number };
 
 function getDistance(a: Vec3, b: Vec3): number {
@@ -7,12 +8,16 @@ function getDistance(a: Vec3, b: Vec3): number {
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+// Week 6 Observability sync
 export interface AgentState {
     path?: Vec3[];
     position: Vec3;
     health: number;
     food: number;
+    threats: number;
     timestamp?: number;
+    isPanicMode?: boolean;
+    isStuck?: boolean;
 }
 
 export class AgentController {
@@ -22,6 +27,8 @@ export class AgentController {
     private path: Vec3[] | null = null;
 
     public entityPosition: Vec3 = { x: 0, y: 0, z: 0 };
+    public isStuck: boolean = false;
+    public isPanicMode: boolean = false;
 
     constructor(initialPosition?: Vec3) {
         if (initialPosition) {
@@ -33,6 +40,10 @@ export class AgentController {
     onStateUpdate(state: AgentState) {
         this.lastServerUpdate = state.timestamp || performance.now();
         this.path = state.path || null;
+
+        // Observability states
+        this.isStuck = !!state.isStuck;
+        this.isPanicMode = !!state.isPanicMode;
 
         if (state.path && state.path.length > 0) {
             this.targetPosition = state.path[0];
@@ -67,7 +78,12 @@ export class AgentController {
         const now = performance.now();
         const timeSinceUpdate = Math.max(now - this.lastServerUpdate, 1);
 
-        const dynamicSpeed = Math.min(0.15, 50 / Math.max(timeSinceUpdate, 50));
+        // Snap faster if we are in panic mode
+        const baseSpeed = this.isPanicMode ? 0.3 : 0.15;
+        const dynamicSpeed = Math.min(
+            baseSpeed,
+            50 / Math.max(timeSinceUpdate, 50),
+        );
         this.smoothSpeed = dynamicSpeed;
 
         this.entityPosition.x = this.lerp(

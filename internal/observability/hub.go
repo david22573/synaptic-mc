@@ -15,11 +15,12 @@ import (
 
 const (
 	writeWait           = 10 * time.Second
-	pongWait            = 60 * time.Second
+	pongWait            = 15 * time.Second // Synced with WSController timeout tolerance
 	pingPeriod          = (pongWait * 9) / 10
 	maxMessageSize      = 512 * 1024
 	MsgTypeControlInput = "CONTROL_INPUT"
 	MsgTypeStateSync    = "STATE_SYNC"
+	MsgTypeFailureLog   = "FAILURE_LOG"
 )
 
 var upgrader = websocket.Upgrader{
@@ -28,6 +29,13 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true // Relaxed for local agent UI development
 	},
+}
+
+type StructuredFailureLog struct {
+	PlanID        string `json:"plan_id"`
+	Reason        string `json:"reason"`
+	StateSnapshot string `json:"state_snapshot"`
+	FailureCount  int    `json:"failure_count"`
 }
 
 type ControlOrchestrator interface {
@@ -160,6 +168,10 @@ func (h *Hub) shutdown() {
 	h.isShutdown = true
 
 	for client := range h.clients {
+		client.mu.Lock()
+		_ = client.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "server shutting down"))
+		client.mu.Unlock()
+
 		client.conn.Close()
 		delete(h.clients, client)
 	}
@@ -182,6 +194,15 @@ func (h *Hub) Broadcast(msgType string, payload any) {
 	default:
 		h.logger.Warn("UI Hub broadcast channel full, dropping message")
 	}
+}
+
+func (h *Hub) BroadcastFailureLog(failure StructuredFailureLog) {
+	h.logger.Error("Structured Failure Log",
+		slog.String("plan_id", failure.PlanID),
+		slog.String("reason", failure.Reason),
+		slog.Int("failure_count", failure.FailureCount),
+	)
+	h.Broadcast(MsgTypeFailureLog, failure)
 }
 
 func (h *Hub) handleControlInput(client *UIClient, payload []byte) {

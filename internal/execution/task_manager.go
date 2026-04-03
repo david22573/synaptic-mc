@@ -3,6 +3,7 @@ package execution
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
@@ -52,12 +53,11 @@ type TaskManager struct {
 	queue       ActionPriorityQueue
 	mu          sync.Mutex
 	activeTask  *domain.Action
-	activeCtx   context.Context // Stored derived context
+	activeCtx   context.Context
 	cancelTask  context.CancelFunc
-	watchdog    chan struct{}
 	signalCh    chan struct{}
 	idleSince   time.Time
-	lastFailure time.Time // Added backoff tracking
+	lastFailure time.Time
 
 	scheduleMu  sync.Mutex
 	scheduled   []scheduledItem
@@ -115,7 +115,6 @@ func (tm *TaskManager) Run(ctx context.Context) {
 			return
 		case <-idleCheck.C:
 			tm.mu.Lock()
-			// Backoff check: Don't run curiosity if we just failed a task (wait 5s for reflex)
 			if time.Since(tm.lastFailure) < 5*time.Second {
 				tm.mu.Unlock()
 				continue
@@ -133,7 +132,8 @@ func (tm *TaskManager) Run(ctx context.Context) {
 				} else if time.Since(tm.idleSince) > 5*time.Second {
 					tm.logger.Info("Curiosity loop triggered: autonomous exploration")
 					exploreTask := domain.Action{
-						ID:        "explore-curiosity",
+						// FIX: Append timestamp to ensure unique task ID for idempotency cache bypass
+						ID:        fmt.Sprintf("explore-curiosity-%d", time.Now().UnixNano()),
 						Action:    "explore",
 						Target:    domain.Target{Type: "category", Name: "surroundings"},
 						Priority:  -1,
@@ -242,7 +242,7 @@ func (tm *TaskManager) processScheduled() {
 	if len(ready) > 0 {
 		tm.mu.Lock()
 		for _, action := range ready {
-			t := action // FIX: copy value to avoid loop variable pointer capture
+			t := action
 			heap.Push(&tm.queue, &t)
 		}
 		tm.mu.Unlock()
@@ -262,11 +262,6 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 		return nil
 	}
 
-	if tm.watchdog != nil {
-		close(tm.watchdog)
-		tm.watchdog = nil
-	}
-
 	if tm.cancelTask != nil {
 		tm.cancelTask()
 		tm.cancelTask = nil
@@ -275,7 +270,7 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 	tm.activeTask = nil
 
 	if !success {
-		tm.lastFailure = time.Now() // Trigger Curiosity backoff
+		tm.lastFailure = time.Now()
 		if tm.ctrlManager != nil {
 			if idm := tm.ctrlManager.GetIdempotent(); idm != nil {
 				idm.Clear(taskID)
@@ -316,10 +311,6 @@ func (tm *TaskManager) abortActiveLocked(ctx context.Context, reason string) err
 	if tm.activeTask == nil {
 		return nil
 	}
-	if tm.watchdog != nil {
-		close(tm.watchdog)
-		tm.watchdog = nil
-	}
 	if tm.cancelTask != nil {
 		tm.cancelTask()
 		tm.cancelTask = nil
@@ -327,7 +318,6 @@ func (tm *TaskManager) abortActiveLocked(ctx context.Context, reason string) err
 	}
 
 	err := tm.engine.AbortCurrent(ctx, reason)
-
 	tm.activeTask = nil
 	return err
 }
@@ -355,30 +345,11 @@ func (tm *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action
 		return
 	}
 
-	// Fix: store and use the derived context so abort signals actually propagate to the engine
 	derivedCtx, cancel := context.WithCancel(ctx)
 	tm.activeTask = &action
 	tm.activeCtx = derivedCtx
 	tm.cancelTask = cancel
-	tm.watchdog = make(chan struct{})
 	tm.mu.Unlock()
 
 	tm.engine.Enqueue(derivedCtx, action)
-
-	timeout, exists := tm.timeouts[action.Action]
-	if !exists {
-		timeout = 45 * time.Second
-	}
-
-	go func(done chan struct{}, waitTime time.Duration, id string) {
-		timer := time.NewTimer(waitTime + 10*time.Second)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			_ = tm.Complete(context.Background(), id, false)
-		case <-done:
-			return
-		}
-	}(tm.watchdog, timeout, action.ID)
 }

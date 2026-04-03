@@ -9,7 +9,7 @@ import { runTask } from "./lib/tasks/task.js";
 import { SynapticClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
-import { getPOIs } from "./lib/utils/perception.js";
+import { getPOIs, clearPOICache } from "./lib/utils/perception.js
 import { Vec3 } from "vec3";
 const { pathfinder, Movements, goals } = pkg;
 
@@ -100,6 +100,7 @@ let lastVelocity = { x: 0, y: 0, z: 0 };
 
 let isPathfinding = false;
 let pathProgress = 0.0;
+
 function stopMovement() {
     if (!bot || !bot.entity) return;
     try {
@@ -374,9 +375,6 @@ async function executeIntent(intent: models.ActionIntent) {
                 }
             } finally {
                 if (timeoutId) clearTimeout(timeoutId);
-                if (currentTask?.id === activeTask?.id) currentTask = null;
-                if (taskAbortController === localController)
-                    taskAbortController = null;
             }
             return;
         }
@@ -429,9 +427,6 @@ async function executeIntent(intent: models.ActionIntent) {
             }
         } finally {
             if (timeoutId) clearTimeout(timeoutId);
-            if (currentTask?.id === activeTask?.id) currentTask = null;
-            if (taskAbortController === localController)
-                taskAbortController = null;
         }
     } catch (err: any) {
         log.error("Uncaught intent execution error", { err });
@@ -562,9 +557,8 @@ async function connectWithRetry(maxAttempts = 10) {
             }
             abortActiveTask("unlock");
         });
-        // Ensure we send the first state the moment the socket opens
         client.on("connected", () => {
-            lastStatePushTime = 0; // Bypass throttle
+            lastStatePushTime = 0;
             if (isBotSpawned) pushState();
         });
         client.connect();
@@ -586,6 +580,7 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.on("end", (reason) => {
         isBotSpawned = false;
         abortActiveTask("bot_disconnected");
+        clearPOICache(); 
         if (survival) survival.stop();
         if (isShuttingDown) {
             log.info("Bot disconnected cleanly for shutdown.");
@@ -640,7 +635,6 @@ async function connectWithRetry(maxAttempts = 10) {
 
         bot.pathfinder.setMovements(movements);
 
-        // FIX: Ensure collectBlock inherits custom movements so it can actually pathfind
         // @ts-ignore
         if (bot.collectBlock) bot.collectBlock.movements = movements;
 

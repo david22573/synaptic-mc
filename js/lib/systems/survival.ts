@@ -349,6 +349,7 @@ export class SurvivalSystem {
                 await new Promise((r) => setTimeout(r, 200));
             }
         } finally {
+            this.bot.setControlState("jump", false);
             this.pillaringOut = false;
         }
     }

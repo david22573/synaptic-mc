@@ -10,10 +10,30 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
+type FailureRecord struct {
+	IntentID    string
+	Count       int
+	LastFailure time.Time
+}
+
+type RecoveryLevel int
+
+const (
+	RecoveryJump RecoveryLevel = iota
+	RecoveryStrafe
+	RecoveryRepath
+	RecoveryPanicTeleport
+)
+
+type StabilityState struct {
+	ReflexActive bool
+	IsStuck      bool
+}
+
 // IngestControlInput satisfies the observability.ControlOrchestrator interface.
 // It receives high-frequency UI inputs (like mouse-look) and routes them directly
 // to the active controller, bypassing the standard task execution queue.
-func (s *Service) IngestControlInput(ctx context.Context, input domain.ControlInput) {
+func (s *ControlService) IngestControlInput(ctx context.Context, input domain.ControlInput) {
 	// Throttle logging so we don't spam stdout at high tick rates
 	if input.Action != "camera_move" {
 		s.logger.Debug("Received control input from UI", slog.String("action", input.Action))
@@ -38,13 +58,10 @@ func (s *Service) IngestControlInput(ctx context.Context, input domain.ControlIn
 
 	// Wrap the control input into a domain.Action
 	action := domain.Action{
-		ID:     fmt.Sprintf("ctrl-%d", time.Now().UnixNano()),
-		Source: "ui_direct_control",
-		Action: input.Action,
-		Target: domain.Target{
-			Type: "direct_input",
-			Name: string(payloadBytes),
-		},
+		ID:        fmt.Sprintf("ctrl-%d", time.Now().UnixNano()),
+		Source:    "ui_direct_control",
+		Action:    input.Action,
+		Target:    domain.Target{Type: "direct_input", Name: string(payloadBytes)},
 		Priority:  1000, // Absolute highest priority
 		Rationale: "Direct user control input",
 	}

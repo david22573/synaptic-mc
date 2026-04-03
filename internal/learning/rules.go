@@ -32,7 +32,7 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 	}
 
 	failures := make(map[string]int)
-	causes := make(map[string]string)
+	causes := make(map[string]map[string]int)
 
 	for _, ev := range events {
 		if ev.Type == domain.EventTypeTaskEnd {
@@ -42,13 +42,16 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 				Cause  string `json:"cause"`
 			}
 			if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-				// Fix: using a tagged switch
 				switch payload.Status {
 				case "FAILED", "ABORTED":
 					failures[payload.Action]++
-					causes[payload.Action] = payload.Cause
+					if causes[payload.Action] == nil {
+						causes[payload.Action] = make(map[string]int)
+					}
+					causes[payload.Action][payload.Cause]++
 				case "COMPLETED":
-					failures[payload.Action] = 0
+					delete(failures, payload.Action)
+					delete(causes, payload.Action)
 				}
 			}
 		}
@@ -57,26 +60,35 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 	var rules []string
 	for action, count := range failures {
 		if count >= 2 {
-			cause := causes[action]
+			// Find the most frequent cause
+			maxFreq := 0
+			primaryCause := ""
+			for c, freq := range causes[action] {
+				if freq > maxFreq {
+					maxFreq = freq
+					primaryCause = c
+				}
+			}
+
 			attribution := "Unknown failure."
 
 			switch {
-			case strings.Contains(cause, "PATH_FAILED"):
+			case strings.Contains(primaryCause, "PATH_FAILED"):
 				attribution = "The target is physically inaccessible or blocked by terrain."
-			case strings.Contains(cause, "NO_ENTITY"):
+			case strings.Contains(primaryCause, "NO_ENTITY"):
 				attribution = "The entity despawned, died, or moved out of range."
-			case strings.Contains(cause, "TIMEOUT"):
+			case strings.Contains(primaryCause, "TIMEOUT"):
 				attribution = "The action took too long, likely due to a stuck path or lag."
-			case strings.Contains(cause, "NO_TOOL"):
+			case strings.Contains(primaryCause, "NO_TOOL"):
 				attribution = "You lack the required tool (e.g., pickaxe). Craft it first."
-			case strings.Contains(cause, "NO_FURNACE"):
+			case strings.Contains(primaryCause, "NO_FURNACE"):
 				attribution = "No furnace is available to smelt items. Craft and place one."
-			case strings.Contains(cause, "NO_MATURE_CROP"):
+			case strings.Contains(primaryCause, "NO_MATURE_CROP"):
 				attribution = "The crops are not fully grown yet. Wait or find another food source."
-			case strings.Contains(cause, "MISSING_INGREDIENTS"):
+			case strings.Contains(primaryCause, "MISSING_INGREDIENTS"):
 				attribution = "You are missing the required materials or crafting table. Gather them first."
 			default:
-				attribution = fmt.Sprintf("Reported cause: %s", cause)
+				attribution = fmt.Sprintf("Reported cause: %s", primaryCause)
 			}
 			rules = append(rules, fmt.Sprintf("- AVOID: Executing '%s'. %s", action, attribution))
 		}

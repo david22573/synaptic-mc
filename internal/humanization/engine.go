@@ -1,3 +1,4 @@
+// internal/humanization/engine.go
 package humanization
 
 import (
@@ -41,6 +42,7 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 		return scheduled
 	}
 
+	// Week 5: Panic Mode (Pure reflex + escape, disable humanization noise)
 	isCritical := false
 	if ctx.State.CurrentTask != nil {
 		action := ctx.State.CurrentTask.Action
@@ -48,10 +50,11 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 			isCritical = true
 		}
 	}
-	if ctx.State.Health < 10 {
+	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
 		isCritical = true
 	}
 
+	// Only drift if we aren't in a life-or-death situation
 	if !isCritical {
 		driftActions := ProcessAttentionDrift(ctx, e.state, now)
 		scheduled = append(scheduled, driftActions...)
@@ -80,9 +83,13 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 			hesitation = CalculateHesitation(noisyTask, ctx, e.state, e.cfg)
 		}
 
-		// PRODUCTION: tighter hesitation for chained tasks
 		if i > 0 && !isCritical {
 			hesitation = hesitation / 2
+		}
+
+		// In Panic Mode, reaction time is instantaneous
+		if isCritical {
+			hesitation = 0
 		}
 
 		currentDelay += hesitation

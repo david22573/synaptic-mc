@@ -9,7 +9,7 @@
         "hunt": 30000,
         "explore": 45000,
         "build": 20000,
-        "retreat": 15000,
+        "retreat": 25000,
         "idle": 3000
     },
     "threat_weights": {

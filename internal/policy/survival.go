@@ -20,18 +20,17 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 		return Decision{IsApproved: true}
 	}
 
-	// 1. Critical Health Override
-	if input.State.Health < 6.0 {
+	// 1. Critical Health Override (Week 3: Survival Priority Override)
+	if input.State.Health < 6.0 || len(input.State.Threats) > 0 {
 		isValidEscape := false
 		for _, t := range input.Plan.Tasks {
-			// Loosened to allow gathering passive food or exploring when starving
 			if t.Action == "retreat" || t.Action == "eat" || t.Action == "gather" || t.Action == "explore" {
 				isValidEscape = true
 				break
 			}
 		}
-		if !isValidEscape {
-			// 2.1 FIX: Populate OverridePlan to prevent idle deaths
+
+		if !isValidEscape || len(input.State.Threats) > 0 {
 			var overridePlan *domain.Plan
 			var foodItemName string
 
@@ -55,14 +54,14 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 				}
 			}
 
-			if foodItemName != "" {
+			if foodItemName != "" && len(input.State.Threats) == 0 {
 				overridePlan = &domain.Plan{
 					Objective: "EMERGENCY OVERRIDE: Eat food to survive.",
 					Tasks: []domain.Action{
 						{
 							Action:   "eat",
 							Target:   domain.Target{Type: "item", Name: foodItemName},
-							Priority: 1,
+							Priority: 100, // Hard interrupt priority
 						},
 					},
 				}
@@ -73,16 +72,17 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 						{
 							Action:   "retreat",
 							Target:   domain.Target{Type: "none", Name: "none"},
-							Priority: 1,
+							Priority: 100, // Hard interrupt priority
 						},
 					},
 				}
 			}
 
 			return Decision{
-				IsApproved:   false,
-				Reason:       "POLICY VIOLATION: Health is critical. Plan must prioritize survival (retreat, eat, gather, explore).",
-				OverridePlan: overridePlan,
+				IsApproved:      false,
+				Reason:          "POLICY VIOLATION: Health is critical or threats are present. Plan must prioritize survival.",
+				OverridePlan:    overridePlan,
+				ReflexTriggered: true, // Week 1: Reflex Lock to block planner
 			}
 		}
 	}

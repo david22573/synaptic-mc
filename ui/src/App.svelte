@@ -13,7 +13,7 @@
 
     let viewerUrl = $state("about:blank");
     let isSidebarOpen = $state(true);
-    let viewerIframe: HTMLIFrameElement;
+    let viewerIframe = $state<HTMLIFrameElement>();
 
     // 60 FPS Interpolation State
     let renderPosition = $state({ x: 0, y: 0, z: 0 });
@@ -92,12 +92,19 @@
 </script>
 
 <main class="fullscreen">
-    <iframe
-        bind:this={viewerIframe}
-        src={viewerUrl}
-        title="Mineflayer Viewer"
-        class="viewer-iframe"
-    ></iframe>
+    {#if botStore.connectionStatus === "connected"}
+        <iframe
+            bind:this={viewerIframe}
+            src={viewerUrl}
+            title="Mineflayer Viewer"
+            class="viewer-iframe"
+        ></iframe>
+    {:else}
+        <div class="viewer-iframe placeholder">
+            <span class="indicator connecting"></span>
+            <p>Waiting for bot to initialize viewer on port 3000...</p>
+        </div>
+    {/if}
 
     <div class="floating-header">
         <div class="title-group">
@@ -171,6 +178,17 @@
         border: none;
         z-index: 1;
         pointer-events: auto;
+    }
+
+    .placeholder {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #0f172a;
+        color: #94a3b8;
+        font-family: monospace;
+        gap: 1rem;
     }
 
     .floating-header {

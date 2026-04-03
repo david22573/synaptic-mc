@@ -17,7 +17,6 @@ type StateProvider interface {
 	GetCurrentState() domain.VersionedState
 }
 
-// Phase 4 Improvement: commitment-lock
 type Commitment struct {
 	TaskID      string
 	MinDuration time.Duration
@@ -72,6 +71,50 @@ func NewService(
 	return s
 }
 
+// Validate filters out impossible plans based on local state
+func Validate(plan *domain.Plan, state domain.GameState) bool {
+	if plan == nil || len(plan.Tasks) == 0 {
+		return false
+	}
+
+	hasPickaxe := false
+	hasCraftingTable := false
+
+	for _, item := range state.Inventory {
+		if item.Name == "wooden_pickaxe" || item.Name == "stone_pickaxe" || item.Name == "iron_pickaxe" || item.Name == "diamond_pickaxe" {
+			hasPickaxe = true
+		}
+		if item.Name == "crafting_table" {
+			hasCraftingTable = true
+		}
+	}
+
+	for _, task := range plan.Tasks {
+		switch task.Action {
+		case "eat":
+			if state.Food >= 20 {
+				return false
+			}
+		case "craft":
+			if len(state.Inventory) == 0 {
+				return false
+			}
+			if task.Target.Name == "wooden_pickaxe" && !hasCraftingTable {
+				return false
+			}
+		case "mine":
+			if !hasPickaxe {
+				return false
+			}
+		case "hunt":
+			if state.Health < 12 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
 	if !s.planManager.HasActivePlan() {
 		go s.evaluateNextPlan(context.Background())
@@ -118,10 +161,21 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 	if !success {
 		s.logger.Warn("Plan failed due to task failure", slog.String("failed_task", payload.CommandID))
-		_ = s.planManager.Transition(domain.PlanStatusFailed)
-
-		// Clear commitment on failure
 		s.commitment.Store(nil)
+
+		currentPlan := s.planManager.GetCurrent()
+		if currentPlan != nil {
+			s.planner.RecordFailure(currentPlan.Objective)
+		}
+
+		if s.planManager.NextFallback() {
+			s.logger.Info("Attempting fallback plan candidate")
+			_ = s.planManager.Transition(domain.PlanStatusActive)
+			s.dispatchActivePlan(ctx)
+			return
+		}
+
+		_ = s.planManager.Transition(domain.PlanStatusFailed)
 
 		s.bus.Publish(ctx, domain.DomainEvent{
 			SessionID: s.sessionID,
@@ -130,6 +184,22 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		})
 		go s.evaluateNextPlan(context.Background())
 		return
+	}
+
+	currentPlan := s.planManager.GetCurrent()
+	if currentPlan != nil && len(currentPlan.Tasks) > 0 {
+		if currentPlan.Tasks[0].ID == payload.CommandID {
+			currentPlan.Tasks = currentPlan.Tasks[1:]
+		}
+
+		if len(currentPlan.Tasks) > 0 {
+			s.dispatchActivePlan(ctx)
+			return
+		}
+	}
+
+	if currentPlan != nil {
+		s.planner.RecordSuccess(currentPlan.Objective)
 	}
 
 	_ = s.planManager.Transition(domain.PlanStatusCompleted)
@@ -149,10 +219,8 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		return
 	}
 
-	// Phase 4 Improvement: commitment-lock
 	if currCommitment := s.commitment.Load(); currCommitment != nil {
 		if time.Since(currCommitment.StartTime) < currCommitment.MinDuration {
-			// Allow overriding the lock for CRITICAL severity events (e.g., taking damage, low health)
 			if state.Health >= 10 && len(state.Threats) == 0 {
 				return
 			}
@@ -160,10 +228,23 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		}
 	}
 
-	s.logger.Info("Evaluating next objective")
-	plan := s.planner.FastPlan(state)
+	var plan domain.Plan
 
-	if plan.Objective == "Reactive Fallback Plan" && s.curriculum != nil {
+	if len(state.Threats) > 0 || state.Health < 12 {
+		s.logger.Warn("Survival priority override active")
+		plan = s.planner.reactivePlan(state)
+	} else {
+		s.logger.Info("Evaluating next objective")
+		plan = s.planner.FastPlan(state)
+	}
+
+	if !Validate(&plan, state) {
+		s.logger.Warn("Generated plan failed validation, discarding", slog.String("objective", plan.Objective))
+		return
+	}
+
+	// FIX: Use robust IsFallback boolean instead of string checking
+	if plan.IsFallback && s.curriculum != nil {
 		s.logger.Info("Planner cache empty, falling back to curriculum")
 
 		s.mu.Lock()
@@ -174,7 +255,8 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		intent, err := s.curriculum.ProposeTask(ctx, state, historyCopy, s.sessionID)
 		if err == nil && intent != nil {
 			plan = domain.Plan{
-				Objective: "Curriculum Fallback",
+				Objective:  "Curriculum Fallback",
+				IsFallback: true,
 				Tasks: []domain.Action{
 					{
 						ID:        intent.ID,
@@ -195,14 +277,21 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 
 	s.planManager.SetPlan(&plan)
 	_ = s.planManager.Transition(domain.PlanStatusActive)
+	s.dispatchActivePlan(ctx)
+}
+
+func (s *Service) dispatchActivePlan(ctx context.Context) {
+	plan := s.planManager.GetCurrent()
+	if plan == nil || len(plan.Tasks) == 0 {
+		return
+	}
 
 	firstTask := plan.Tasks[0]
 
-	// Set the commitment lock for stable, non-twitchy task execution
 	s.commitment.Store(&Commitment{
 		TaskID:      firstTask.ID,
 		StartTime:   time.Now(),
-		MinDuration: 2 * time.Second, // Minimum time before we allow replanning
+		MinDuration: 2 * time.Second,
 	})
 
 	s.activeIntent.Store(&domain.ActionIntent{
@@ -212,7 +301,9 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		Count:     firstTask.Count,
 		Rationale: firstTask.Rationale,
 	})
-	s.beforeState.Store(&state)
+
+	currentState := s.stateProvider.GetCurrentState().State
+	s.beforeState.Store(&currentState)
 
 	payload, _ := json.Marshal(plan)
 	s.bus.Publish(ctx, domain.DomainEvent{

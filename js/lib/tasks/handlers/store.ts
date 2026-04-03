@@ -8,7 +8,6 @@ import {
     escapeTree,
     findNearestBlockByName,
     placePortableUtility,
-    moveToGoal,
 } from "../utils.js";
 import pkg from "mineflayer-pathfinder";
 
@@ -81,25 +80,50 @@ class ApproachChestState implements FSMState {
         const cPos = sCtx.chestBlock.position;
 
         try {
-            await moveToGoal(
-                sCtx.bot,
+            sCtx.bot.pathfinder.setGoal(
                 new goals.GoalNear(cPos.x, cPos.y, cPos.z, 2),
-                {
-                    signal: sCtx.signal,
-                    timeoutMs: 15000,
-                    stopMovement: sCtx.stopMovement,
-                    dynamic: false,
-                },
+                true,
             );
-        } catch (err: any) {
-            if (err.message === "aborted") {
-                sCtx.result = { status: "FAILED", reason: "aborted" };
-            } else {
-                sCtx.result = {
-                    status: "FAILED",
-                    reason: "FAILED_TO_REACH_CHEST",
+
+            await new Promise<void>((resolve, reject) => {
+                let timeoutId: NodeJS.Timeout | null = null;
+                const onGoal = () => {
+                    cleanup();
+                    resolve();
                 };
-            }
+                const onStop = (r: any) => {
+                    if (r.status === "noPath") {
+                        cleanup();
+                        reject(new Error("FAILED_TO_REACH_CHEST"));
+                    }
+                };
+                const onAbort = () => {
+                    cleanup();
+                    reject(new Error("aborted"));
+                };
+
+                const cleanup = () => {
+                    if (timeoutId) clearTimeout(timeoutId);
+                    sCtx.bot.removeListener("goal_reached", onGoal);
+                    sCtx.bot.removeListener("path_update", onStop);
+                    sCtx.signal.removeEventListener("abort", onAbort);
+                    sCtx.stopMovement();
+                };
+
+                timeoutId = setTimeout(() => {
+                    cleanup();
+                    reject(new Error("FAILED_TO_REACH_CHEST"));
+                }, 15000);
+
+                sCtx.bot.on("goal_reached", onGoal);
+                sCtx.bot.on("path_update", onStop);
+                sCtx.signal.addEventListener("abort", onAbort);
+            });
+        } catch (err: any) {
+            sCtx.result = {
+                status: "FAILED",
+                reason: err.message || "FAILED_TO_REACH_CHEST",
+            };
             return null;
         }
 
@@ -169,16 +193,22 @@ class CheckItemsState implements FSMState {
                 return null;
             }
 
-            const totalInInv = items.reduce(
-                (sum: number, i: any) => sum + i.count,
-                0,
-            );
-            const toStore =
+            // FIX: Accumulate count correctly across multiple stacks of the target item
+            let remainingToStore =
                 sCtx.targetCount > 0
-                    ? Math.min(totalInInv, sCtx.targetCount)
-                    : totalInInv;
+                    ? sCtx.targetCount
+                    : items.reduce((sum: number, i: any) => sum + i.count, 0);
 
-            sCtx.targetItems = [{ type: items[0].type, count: toStore }];
+            sCtx.targetItems = [];
+            for (const item of items) {
+                if (remainingToStore <= 0) break;
+                const toStoreFromStack = Math.min(item.count, remainingToStore);
+                sCtx.targetItems.push({
+                    type: item.type,
+                    count: toStoreFromStack,
+                });
+                remainingToStore -= toStoreFromStack;
+            }
         }
 
         if (sCtx.targetItems.length === 0) {

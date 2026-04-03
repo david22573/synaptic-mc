@@ -1,3 +1,4 @@
+// internal/observability/metrics.go
 package observability
 
 import (
@@ -17,6 +18,11 @@ type SystemMetrics struct {
 	TaskCompletionTime prometheus.Histogram
 	LLMLatency         prometheus.Histogram
 	RetryCountTotal    prometheus.Counter
+
+	// Week 6: Core Metrics
+	StuckEvents    prometheus.Counter
+	ReflexTriggers prometheus.Counter
+	FailureLoops   prometheus.Counter
 }
 
 var Metrics = &SystemMetrics{
@@ -64,5 +70,19 @@ var Metrics = &SystemMetrics{
 	RetryCountTotal: promauto.NewCounter(prometheus.CounterOpts{
 		Name: "agent_dispatch_retry_total",
 		Help: "Total number of task dispatch retries due to controller errors",
+	}),
+
+	// Week 6 Metrics
+	StuckEvents: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_stuck_events_total",
+		Help: "Number of times the movement watchdog detected the bot as physically stuck",
+	}),
+	ReflexTriggers: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_reflex_triggers_total",
+		Help: "Number of times the survival policy overrode the planner",
+	}),
+	FailureLoops: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_failure_loops_total",
+		Help: "Number of times a task hit the infinite failure loop threshold",
 	}),
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 
 	"david22573/synaptic-mc/internal/config"
@@ -106,7 +107,6 @@ func main() {
 	eventBus := domain.NewEventBus()
 	uiHub := observability.NewHub(logger)
 
-	// Phase 4: Wire the humanization engine
 	humanCfg := humanization.Config{
 		AttentionDecay: 0.08,
 		HesitationBase: time.Duration(cfg.HesitationMs) * time.Millisecond,
@@ -116,7 +116,6 @@ func main() {
 	}
 	humanizer := humanization.NewEngine(humanCfg)
 
-	// Helper to extract attention state dynamically
 	getAttention := func() float64 {
 		return humanizer.State().GetAttention()
 	}
@@ -128,9 +127,8 @@ func main() {
 	ctrlManager := execution.NewControllerManager()
 	execEngine := execution.NewTaskExecutionEngine(ctrlManager, cfg.NoiseLevel, getAttention, logger)
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
-	execService := execution.NewService(eventBus, execEngine, taskManager, ctrlManager, logger)
+	execService := execution.NewControlService(eventBus, execEngine, taskManager, ctrlManager, logger)
 
-	// Wire UI Hub to Execution Service for direct control inputs
 	uiHub.SetOrchestrator(execService)
 
 	// 3. Decision Service
@@ -142,14 +140,42 @@ func main() {
 
 	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger, dynFlags.Get())
 	planManager := decision.NewPlanManager()
-	_ = decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, logger)
 
-	// Global Event Sink for DB persistence and UI Broadcasts
+	// FIX: Capture and retain the Decision Service reference
+	decisionSvc := decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, logger)
+	if decisionSvc == nil {
+		logger.Error("Failed to initialize decision service")
+		os.Exit(1)
+	}
+
+	// === SYSTEM INTEGRATION HOOKS ===
+
+	eventBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		var stateUpdate struct {
+			POIs []struct {
+				Name string      `json:"name"`
+				Type string      `json:"type"`
+				Pos  domain.Vec3 `json:"position"`
+			} `json:"pois"`
+		}
+		if err := json.Unmarshal(ev.Payload, &stateUpdate); err == nil {
+			for _, poi := range stateUpdate.POIs {
+				_ = memoryStore.MarkWorldNode(ctx, poi.Name, poi.Type, poi.Pos)
+			}
+		}
+	}))
+
+	eventBus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		eventBus.Publish(ctx, domain.DomainEvent{
+			SessionID: ev.SessionID,
+			Type:      domain.EventTypePlanInvalidated,
+			CreatedAt: time.Now(),
+		})
+	}))
+
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
-		// Persist to SQLite
 		_ = eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload)
 
-		// Broadcast to UI
 		var payloadObj interface{}
 		_ = json.Unmarshal(ev.Payload, &payloadObj)
 		broadcastEv := map[string]interface{}{
@@ -163,7 +189,6 @@ func main() {
 		uiHub.Broadcast("event_stream", broadcastEv)
 	})
 
-	// Explicitly map all events so the local bus routes them correctly
 	eventTypes := []domain.EventType{
 		domain.EventTypeStateTick,
 		domain.EventTypeStateUpdated,
@@ -177,7 +202,7 @@ func main() {
 		domain.EventTypePanicResolved,
 		domain.EventBotDeath,
 		domain.EventBotRespawn,
-		domain.EventType("STATE_UPDATE"), // Catch manual UI updates
+		domain.EventType("STATE_UPDATE"),
 		domain.EventType("DISPATCH_TASK"),
 	}
 
@@ -203,6 +228,7 @@ func main() {
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
 	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, eventBus, ctrlManager, runner, logger, cfg.SessionID))
+	mux.Handle("/metrics", promhttp.Handler())
 
 	uiPath := cfg.UIPath
 	if !filepath.IsAbs(uiPath) {
@@ -218,7 +244,6 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Start Background Routines
 	g.Go(func() error {
 		logger.Info("Starting Dynamic Config Watcher")
 		dynFlags.Watch(ctx)
@@ -347,7 +372,6 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
-			// Programmatic clients (like our Node.js bot) usually don't send an Origin header.
 			if origin == "" {
 				return true
 			}

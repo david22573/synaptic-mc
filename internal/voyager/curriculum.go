@@ -80,7 +80,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		historyContext = strings.Join(historyStrs, "\n")
 	}
 
-	// 1. Asynchronously save previous successful skill to vector memory
 	if len(recentHistory) > 0 {
 		lastTask := recentHistory[len(recentHistory)-1]
 		if lastTask.Success && c.vector != nil {
@@ -97,7 +96,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	// 2. Fetch Relevant Skills via Semantic Search
 	stateContext := domain.FormatStateForLLM(state)
 	queryText := buildRetrievalQuery(state)
 	queryEmb, err := c.client.CreateEmbedding(ctx, queryText)
@@ -114,10 +112,8 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	// 3. Retrieve long-term memory
 	var memoryContext strings.Builder
 	if c.memStore != nil {
-		// Session summary
 		summary, err := c.memStore.GetSummary(ctx, sessionID)
 		if err == nil && summary != "No active summary." {
 			memoryContext.WriteString("SESSION SUMMARY:\n")
@@ -125,7 +121,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			memoryContext.WriteString("\n\n")
 		}
 
-		// Known world nodes
 		knownWorld, err := c.memStore.GetKnownWorld(ctx, state.Position)
 		if err == nil && knownWorld != "KNOWN WORLD: empty" {
 			memoryContext.WriteString(knownWorld)
@@ -133,7 +128,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	// 4. LLM Generation with Schema Retry Loop
 	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
 		stateContext,
 		memoryContext.String(),
@@ -161,7 +155,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		return nil, fmt.Errorf("failed to generate valid intent after 3 attempts: %w", parseErr)
 	}
 
-	// Fallback ID generation
 	if intent.ID == "" {
 		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())
 	}
@@ -172,20 +165,19 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 func buildRetrievalQuery(state domain.GameState) string {
 	var priorities []string
 
-	// Check critical survival stats
 	if state.Health <= 10 {
 		priorities = append(priorities, "survival, healing, retreating")
 	}
-	if state.Food <= 6 {
+
+	// FIX: Align with survival.ts threshold (bot starts panicking about food around 8)
+	if state.Food <= 8 {
 		priorities = append(priorities, "finding food, eating, hunting")
 	}
 
-	// Minecraft night ticks usually span 13000 to 23000
 	if state.TimeOfDay >= 13000 && state.TimeOfDay <= 23000 {
 		priorities = append(priorities, "shelter, defense, avoiding mobs at night")
 	}
 
-	// Default to progression if nothing is actively trying to kill the bot
 	if len(priorities) == 0 {
 		priorities = append(priorities, "progression, resource gathering, crafting tools")
 	}
