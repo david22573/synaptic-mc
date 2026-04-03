@@ -9,11 +9,20 @@ import (
 	"time"
 )
 
+// Phase 2 Improvement: scoring-system-first-class
+// Move magic numbers into an explicit configuration struct.
+type ScoreWeights struct {
+	RiskPenalty      float64 `json:"risk_penalty"`
+	SuccessWeight    float64 `json:"success_weight"`
+	ExplorationBonus float64 `json:"exploration_bonus"`
+}
+
 type FeatureFlags struct {
-	AsyncLoop       bool `json:"async_loop" env:"FF_ASYNC_LOOP"`
-	NonBlockPlanner bool `json:"non_block_planner" env:"FF_NON_BLOCK_PLANNER"`
-	ActionQueue     bool `json:"action_queue" env:"FF_ACTION_QUEUE"`
-	ClientSmooth    bool `json:"client_smooth" env:"FF_CLIENT_SMOOTH"`
+	AsyncLoop       bool         `json:"async_loop" env:"FF_ASYNC_LOOP"`
+	NonBlockPlanner bool         `json:"non_block_planner" env:"FF_NON_BLOCK_PLANNER"`
+	ActionQueue     bool         `json:"action_queue" env:"FF_ACTION_QUEUE"`
+	ClientSmooth    bool         `json:"client_smooth" env:"FF_CLIENT_SMOOTH"`
+	Weights         ScoreWeights `json:"score_weights"`
 }
 
 func DefaultFlags() FeatureFlags {
@@ -22,6 +31,11 @@ func DefaultFlags() FeatureFlags {
 		NonBlockPlanner: true, // Production: background LLM planning
 		ActionQueue:     true, // Production: priority queue + backpressure
 		ClientSmooth:    true, // Production: 60 FPS interpolation
+		Weights: ScoreWeights{
+			RiskPenalty:      20.0,
+			SuccessWeight:    30.0,
+			ExplorationBonus: 5.0,
+		},
 	}
 }
 
@@ -84,6 +98,12 @@ func (f *DynamicFlags) LoadFromFile() error {
 	}
 
 	f.mu.Lock()
+
+	// Ensure defaults for weights exist if the JSON file is missing them
+	if newFlags.Weights.SuccessWeight == 0 {
+		newFlags.Weights = DefaultFlags().Weights
+	}
+
 	f.flags = newFlags
 	f.lastMod = info.ModTime()
 	f.mu.Unlock()

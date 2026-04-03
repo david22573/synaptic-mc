@@ -1,310 +1,365 @@
-Project Context Dump (02 Apr 26 20:49 PDT)
+Project Context Dump (02 Apr 26 20:52 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 1
+Total Files: 2
 
 # Project Structure
 <file_tree>
-- internal\observability\hub.go
+- internal\config\flags.go
+- internal\llm\client.go
 </file_tree>
 
 # File Contents
-<file path="internal\observability\hub.go">
-package observability
+<file path="internal\config\flags.go">
+package config
 
 import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net/http"
+	"os"
 	"sync"
 	"time"
-
-	"david22573/synaptic-mc/internal/domain"
-
-	"github.com/gorilla/websocket"
 )
 
-const (
-	writeWait           = 10 * time.Second
-	pongWait            = 60 * time.Second
-	pingPeriod          = (pongWait * 9) / 10
-	maxMessageSize      = 512 * 1024
-	MsgTypeControlInput = "CONTROL_INPUT"
-	MsgTypeStateSync    = "STATE_SYNC"
-)
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Relaxed for local agent UI development
-	},
+type FeatureFlags struct {
+	AsyncLoop       bool `json:"async_loop" env:"FF_ASYNC_LOOP"`
+	NonBlockPlanner bool `json:"non_block_planner" env:"FF_NON_BLOCK_PLANNER"`
+	ActionQueue     bool `json:"action_queue" env:"FF_ACTION_QUEUE"`
+	ClientSmooth    bool `json:"client_smooth" env:"FF_CLIENT_SMOOTH"`
 }
 
-type ControlOrchestrator interface {
-	IngestControlInput(ctx context.Context, input domain.ControlInput)
-}
-
-type UIClient struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
-	mu   sync.Mutex
-}
-
-type Hub struct {
-	clients      map[*UIClient]bool
-	broadcast    chan []byte
-	register     chan *UIClient
-	unregister   chan *UIClient
-	logger       *slog.Logger
-	orchestrator ControlOrchestrator
-
-	mu         sync.RWMutex
-	isShutdown bool
-}
-
-func NewHub(logger *slog.Logger) *Hub {
-	return &Hub{
-		broadcast:  make(chan []byte, 1024),
-		register:   make(chan *UIClient, 32),
-		unregister: make(chan *UIClient, 32),
-		clients:    make(map[*UIClient]bool),
-		logger:     logger.With(slog.String("component", "ui_hub")),
+func DefaultFlags() FeatureFlags {
+	return FeatureFlags{
+		AsyncLoop:       true, // Production: non-blocking loops
+		NonBlockPlanner: true, // Production: background LLM planning
+		ActionQueue:     true, // Production: priority queue + backpressure
+		ClientSmooth:    true, // Production: 60 FPS interpolation
 	}
 }
 
-func (h *Hub) SetOrchestrator(orch ControlOrchestrator) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.orchestrator = orch
+// DynamicFlags wraps FeatureFlags with thread-safe access and file-watching for hot-reloads.
+type DynamicFlags struct {
+	mu    sync.RWMutex
+	flags FeatureFlags
+
+	filepath string
+	lastMod  time.Time
+	logger   *slog.Logger
+
+	reloadCh chan struct{}
 }
 
-func (h *Hub) Run(ctx context.Context) {
-	ticker := time.NewTicker(pingPeriod)
+func NewDynamicFlags(path string, logger *slog.Logger) *DynamicFlags {
+	df := &DynamicFlags{
+		flags:    DefaultFlags(),
+		filepath: path,
+		logger:   logger.With(slog.String("component", "config_watcher")),
+		reloadCh: make(chan struct{}),
+	}
+
+	if path != "" {
+		_ = df.LoadFromFile() // Attempt initial load, ignore error if file doesn't exist yet
+	}
+
+	return df
+}
+
+// Get returns a thread-safe copy of the current feature flags.
+func (f *DynamicFlags) Get() FeatureFlags {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.flags
+}
+
+// ReloadChannel returns a channel that gets closed whenever the config is successfully reloaded.
+func (f *DynamicFlags) ReloadChannel() <-chan struct{} {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.reloadCh
+}
+
+// LoadFromFile reads the JSON config and updates the flags safely.
+func (f *DynamicFlags) LoadFromFile() error {
+	info, err := os.Stat(f.filepath)
+	if err != nil {
+		return err
+	}
+
+	data, err := os.ReadFile(f.filepath)
+	if err != nil {
+		return err
+	}
+
+	var newFlags FeatureFlags
+	if err := json.Unmarshal(data, &newFlags); err != nil {
+		return err
+	}
+
+	f.mu.Lock()
+	f.flags = newFlags
+	f.lastMod = info.ModTime()
+	f.mu.Unlock()
+
+	f.logger.Info("Feature flags hot-reloaded from file", slog.String("file", f.filepath))
+	return nil
+}
+
+func (f *DynamicFlags) hasConfigChanged() bool {
+	info, err := os.Stat(f.filepath)
+	if err != nil {
+		return false
+	}
+
+	f.mu.RLock()
+	changed := info.ModTime().After(f.lastMod)
+	f.mu.RUnlock()
+
+	return changed
+}
+
+// Watch starts a background routine that polls the config file for modifications.
+func (f *DynamicFlags) Watch(ctx context.Context) {
+	if f.filepath == "" {
+		f.logger.Warn("No config file path provided, skipping watcher")
+		return
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			h.logger.Info("UI Hub shutting down")
-			h.shutdown()
+			f.logger.Info("Stopping config watcher")
 			return
-
 		case <-ticker.C:
-			h.pingAll()
-
-		case client := <-h.register:
-			h.mu.Lock()
-			if !h.isShutdown {
-				h.clients[client] = true
-				h.logger.Info("UI Client connected", slog.Int("active_clients", len(h.clients)))
-			} else {
-				client.conn.Close()
-			}
-			h.mu.Unlock()
-
-		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				h.logger.Info("UI Client disconnected", slog.Int("active_clients", len(h.clients)))
-			}
-			h.mu.Unlock()
-
-		case message := <-h.broadcast:
-			h.mu.RLock()
-			clients := make([]*UIClient, 0, len(h.clients))
-			for client := range h.clients {
-				clients = append(clients, client)
-			}
-			h.mu.RUnlock()
-
-			for _, client := range clients {
-				select {
-				case client.send <- message:
-				default:
-					h.logger.Warn("UI Client buffer full, scheduling drop")
-					go func(c *UIClient) {
-						select {
-						case h.unregister <- c:
-						default:
-						}
-					}(client)
+			if f.hasConfigChanged() {
+				if err := f.LoadFromFile(); err == nil {
+					f.mu.Lock()
+					// Close the old channel to broadcast the change, then make a new one for the next cycle
+					close(f.reloadCh)
+					f.reloadCh = make(chan struct{})
+					f.mu.Unlock()
+				} else {
+					f.logger.Error("Failed to parse updated config file", slog.Any("error", err))
 				}
 			}
 		}
 	}
 }
 
-func (h *Hub) pingAll() {
-	h.mu.RLock()
-	clients := make([]*UIClient, 0, len(h.clients))
-	for client := range h.clients {
-		clients = append(clients, client)
-	}
-	h.mu.RUnlock()
+</file>
 
-	for _, client := range clients {
-		client.mu.Lock()
-		if err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
-			h.logger.Warn("Failed to ping client, will unregister", slog.Any("error", err))
-			go func(c *UIClient) {
-				select {
-				case h.unregister <- c:
-				default:
-				}
-			}(client)
-		}
-		client.mu.Unlock()
+<file path="internal\llm\client.go">
+package llm
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	APIURL     string
+	APIKey     string
+	Model      string
+	EmbedModel string
+	MaxRetries int
+}
+
+type Client struct {
+	config Config
+	http   *http.Client
+}
+
+func NewClient(cfg Config) *Client {
+	return &Client{
+		config: cfg,
+		http: &http.Client{
+			Timeout: 45 * time.Second,
+		},
 	}
 }
 
-func (h *Hub) shutdown() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.isShutdown {
-		return
-	}
-	h.isShutdown = true
-
-	for client := range h.clients {
-		client.conn.Close()
-		delete(h.clients, client)
-	}
-}
-
-func (h *Hub) Broadcast(msgType string, payload any) {
-	msg := map[string]any{
-		"type":    msgType,
-		"payload": payload,
+func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	payload := map[string]any{
+		"model": c.config.Model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userContent},
+		},
+		"response_format": map[string]string{"type": "json_object"},
+		"temperature":     0.2,
 	}
 
-	data, err := json.Marshal(msg)
+	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		h.logger.Error("Failed to marshal broadcast message", slog.Any("error", err))
-		return
+		return "", fmt.Errorf("failed to marshal generation payload: %w", err)
 	}
-
-	select {
-	case h.broadcast <- data:
-	default:
-		h.logger.Warn("UI Hub broadcast channel full, dropping message")
-	}
+	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
 }
 
-func (h *Hub) handleControlInput(client *UIClient, payload []byte) {
-	var input domain.ControlInput
-	if err := json.Unmarshal(payload, &input); err != nil {
-		h.logger.Error("Invalid control input", slog.Any("error", err))
-		return
+func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
+	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
+
+	payload := map[string]any{
+		"model": c.config.EmbedModel,
+		"input": input,
 	}
 
-	h.mu.RLock()
-	orch := h.orchestrator
-	h.mu.RUnlock()
-
-	if orch != nil {
-		orch.IngestControlInput(context.Background(), input)
-	}
-}
-
-func (h *Hub) HandleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
+	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		h.logger.Error("UI Hub upgrade failed", slog.Any("error", err))
-		return
+		return nil, fmt.Errorf("failed to marshal embedding payload: %w", err)
 	}
 
-	ws.SetReadLimit(maxMessageSize)
-	ws.SetPongHandler(func(string) error {
-		return ws.SetReadDeadline(time.Now().Add(pongWait))
-	})
+	var lastErr error
+	baseDelay := 500 * time.Millisecond
 
-	client := &UIClient{hub: h, conn: ws, send: make(chan []byte, 256)}
-
-	select {
-	case h.register <- client:
-	default:
-		ws.Close()
-		return
-	}
-
-	go client.writePump()
-	go client.readPump()
-}
-
-func (c *UIClient) readPump() {
-	defer func() {
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		select {
-		case c.hub.unregister <- c:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
 		default:
-			c.hub.logger.Warn("Unregister channel full, dropping client forcefully")
 		}
-		c.conn.Close()
-	}()
 
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	for {
-		_, msg, err := c.conn.ReadMessage()
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
+			baseDelay *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				c.hub.logger.Warn("UI Client read error", slog.Any("error", err))
-			}
-			break
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 		}
 
-		var envelope struct {
-			Type    string          `json:"type"`
-			Payload json.RawMessage `json:"payload"`
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
 		}
 
-		if err := json.Unmarshal(msg, &envelope); err == nil {
-			if envelope.Type == MsgTypeControlInput {
-				c.hub.handleControlInput(c, envelope.Payload)
-			}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			continue
+		}
+
+		var result struct {
+			Data []struct {
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		}
+
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			lastErr = fmt.Errorf("failed to decode response: %w", err)
+			continue
+		}
+
+		if len(result.Data) == 0 {
+			lastErr = fmt.Errorf("empty embedding array returned")
+			continue
+		}
+
+		return result.Data[0].Embedding, nil
 	}
+
+	return nil, fmt.Errorf("max retries exceeded. last error: %w", lastErr)
 }
 
-func (c *UIClient) writePump() {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
+func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) (string, error) {
+	var lastErr error
+	baseDelay := 500 * time.Millisecond
 
-	for {
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		select {
-		case message, ok := <-c.send:
-			c.mu.Lock()
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				c.mu.Unlock()
-				return
-			}
-
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				c.mu.Unlock()
-				return
-			}
-			c.mu.Unlock()
-
-		case <-ticker.C:
-			c.mu.Lock()
-			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
-				c.mu.Unlock()
-				return
-			}
-			c.mu.Unlock()
+		case <-ctx.Done():
+			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+		default:
 		}
+
+		if attempt > 0 {
+			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-time.After(baseDelay + jitter):
+			}
+			baseDelay *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+		}
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			continue
+		}
+
+		var result struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			lastErr = fmt.Errorf("failed to decode response: %w", err)
+			continue
+		}
+
+		if len(result.Choices) == 0 {
+			lastErr = fmt.Errorf("empty choices array returned")
+			continue
+		}
+
+		return result.Choices[0].Message.Content, nil
 	}
+
+	return "", fmt.Errorf("max retries exceeded. last error: %w", lastErr)
 }
 
 </file>
@@ -313,10 +368,10 @@ func (c *UIClient) writePump() {
 
 ```json
 {
-  "total_bytes": 6547,
-  "file_count": 1,
-  "estimated_tokens": 1682,
+  "total_bytes": 8384,
+  "file_count": 2,
+  "estimated_tokens": 2157,
   "mode": "full",
-  "generated_at": "2026-04-02T20:49:21.2590491-07:00"
+  "generated_at": "2026-04-02T20:52:13.2010707-07:00"
 }
 ```

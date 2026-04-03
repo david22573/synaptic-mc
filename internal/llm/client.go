@@ -29,12 +29,18 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		config: cfg,
 		http: &http.Client{
+			// Base transport timeout; context timeouts will override this per-call
 			Timeout: 45 * time.Second,
 		},
 	}
 }
 
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	// 1. Enforce strict timeout for the entire generation process
+	// Phase 2 Improvement: llm-timeout-and-circuit-breaker
+	genCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	payload := map[string]any{
 		"model": c.config.Model,
 		"messages": []map[string]string{
@@ -49,11 +55,15 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal generation payload: %w", err)
 	}
-	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
+	return c.doRequest(genCtx, c.config.APIURL, jsonPayload)
 }
 
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
 	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
+
+	// Embeddings should be fast; enforce a tighter timeout
+	embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
 	payload := map[string]any{
 		"model": c.config.EmbedModel,
@@ -70,22 +80,22 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+		case <-embedCtx.Done():
+			return nil, fmt.Errorf("request cancelled or timed out: %w", embedCtx.Err())
 		default:
 		}
 
 		if attempt > 0 {
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
 			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
+			case <-embedCtx.Done():
+				return nil, fmt.Errorf("request cancelled or timed out during backoff: %w", embedCtx.Err())
 			case <-time.After(baseDelay + jitter):
 			}
 			baseDelay *= 2
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
+		req, err := http.NewRequestWithContext(embedCtx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
 		if err != nil {
 			lastErr = err
 			continue
@@ -98,6 +108,7 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
+			// Network errors are transient, proceed to retry
 			continue
 		}
 
@@ -108,8 +119,15 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 			continue
 		}
 
+		// Phase 2 Improvement: Circuit Breaker / Strict Retry Policy
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+
+			// 4xx errors (Auth, Bad Request) are terminal. Do NOT retry.
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				return nil, lastErr
+			}
+			// 5xx errors (Gateway timeout, server overload) are transient. Proceed to retry.
 			continue
 		}
 
@@ -120,13 +138,13 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 		}
 
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			lastErr = fmt.Errorf("failed to decode response: %w", err)
-			continue
+			// Schema validation failures are terminal. Do NOT retry.
+			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Data) == 0 {
-			lastErr = fmt.Errorf("empty embedding array returned")
-			continue
+			// Bad API response payload is terminal. Do NOT retry.
+			return nil, fmt.Errorf("empty embedding array returned")
 		}
 
 		return result.Data[0].Embedding, nil
@@ -142,7 +160,7 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+			return "", fmt.Errorf("request cancelled or timed out: %w", ctx.Err())
 		default:
 		}
 
@@ -150,7 +168,7 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
 			select {
 			case <-ctx.Done():
-				return "", fmt.Errorf("request cancelled: %w", ctx.Err())
+				return "", fmt.Errorf("request cancelled or timed out during backoff: %w", ctx.Err())
 			case <-time.After(baseDelay + jitter):
 			}
 			baseDelay *= 2
@@ -169,6 +187,7 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
+			// Network errors are transient, proceed to retry
 			continue
 		}
 
@@ -179,8 +198,15 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 			continue
 		}
 
+		// Phase 2 Improvement: Circuit Breaker / Strict Retry Policy
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+
+			// 4xx errors (Auth, Bad Request) are terminal. Do NOT retry.
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				return "", lastErr
+			}
+			// 5xx errors (Gateway timeout, server overload) are transient. Proceed to retry.
 			continue
 		}
 
@@ -193,13 +219,13 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 		}
 
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			lastErr = fmt.Errorf("failed to decode response: %w", err)
-			continue
+			// Schema validation failures are terminal. Do NOT retry.
+			return "", fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Choices) == 0 {
-			lastErr = fmt.Errorf("empty choices array returned")
-			continue
+			// Bad API response payload is terminal. Do NOT retry.
+			return "", fmt.Errorf("empty choices array returned")
 		}
 
 		return result.Choices[0].Message.Content, nil

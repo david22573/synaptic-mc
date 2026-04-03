@@ -18,6 +18,7 @@ import (
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
+	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
@@ -46,6 +47,7 @@ type Config struct {
 	BotScript     string
 	HesitationMs  int
 	NoiseLevel    float64
+	ConfigPath    string
 }
 
 func main() {
@@ -120,7 +122,9 @@ func main() {
 	critic := voyager.NewStateCritic()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore)
 
-	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger)
+	dynFlags := config.NewDynamicFlags(cfg.ConfigPath, logger)
+
+	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger, dynFlags.Get())
 	planManager := decision.NewPlanManager()
 	_ = decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, logger)
 
@@ -200,6 +204,12 @@ func main() {
 
 	// Start Background Routines
 	g.Go(func() error {
+		logger.Info("Starting Dynamic Config Watcher")
+		dynFlags.Watch(ctx)
+		return nil
+	})
+
+	g.Go(func() error {
 		logger.Info("Starting UI hub")
 		uiHub.Run(ctx)
 		return nil
@@ -269,6 +279,7 @@ func parseConfig() Config {
 	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "./js/index.ts"), "Path to the compiled TS bot index.js")
 	hesitationMs := flag.Int("hesitation-ms", getEnvInt("HESITATION_MS", 180), "Base hesitation delay in milliseconds")
 	noiseLevel := flag.Float64("noise-level", getEnvFloat("NOISE_LEVEL", 0.03), "Humanization noise level (0.0-1.0)")
+	configPath := flag.String("config", getEnvOrDefault("CONFIG_PATH", "config.json"), "Path to hot-reloadable feature flags JSON")
 
 	flag.Parse()
 
@@ -287,6 +298,7 @@ func parseConfig() Config {
 		BotScript:     *botScript,
 		HesitationMs:  *hesitationMs,
 		NoiseLevel:    *noiseLevel,
+		ConfigPath:    *configPath,
 	}
 }
 

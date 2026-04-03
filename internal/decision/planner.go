@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
@@ -30,9 +33,13 @@ type AdvancedPlanner struct {
 	memStore  memory.Store
 	store     domain.EventStore
 	logger    *slog.Logger
+	flags     config.FeatureFlags
 
 	currentPlan atomic.Pointer[domain.Plan]
 	replanCh    chan domain.GameState
+
+	planCache map[uint64]*domain.Plan
+	cacheMu   sync.RWMutex
 }
 
 func NewAdvancedPlanner(
@@ -42,6 +49,7 @@ func NewAdvancedPlanner(
 	memStore memory.Store,
 	store domain.EventStore,
 	logger *slog.Logger,
+	flags config.FeatureFlags,
 ) *AdvancedPlanner {
 	return &AdvancedPlanner{
 		client:    client,
@@ -50,7 +58,9 @@ func NewAdvancedPlanner(
 		memStore:  memStore,
 		store:     store,
 		logger:    logger.With(slog.String("component", "advanced_planner")),
+		flags:     flags,
 		replanCh:  make(chan domain.GameState, 1),
+		planCache: make(map[uint64]*domain.Plan),
 	}
 }
 
@@ -91,6 +101,28 @@ Response format (JSON only):
 type multiCandidateResponse struct {
 	Objective  string            `json:"objective"`
 	Candidates [][]domain.Action `json:"candidates"`
+}
+
+func hashState(state domain.GameState) uint64 {
+	h := fnv.New64a()
+	// Discard minor floating point variances by casting to int for the hash
+	str := fmt.Sprintf("%d|%d|%d|%d|%d|%d|%d",
+		state.TimeOfDay,
+		int(state.Health),
+		int(state.Food),
+		int(state.Position.X),
+		int(state.Position.Y),
+		int(state.Position.Z),
+		len(state.Threats),
+	)
+	h.Write([]byte(str))
+
+	for _, item := range state.Inventory {
+		if item.Count > 0 {
+			h.Write([]byte(fmt.Sprintf("|%s:%d", item.Name, item.Count)))
+		}
+	}
+	return h.Sum64()
 }
 
 func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState) bool {
@@ -194,6 +226,17 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 }
 
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
+	// Phase 2 Improvement: plan-cache-by-state-hash
+	stateHash := hashState(state)
+
+	p.cacheMu.RLock()
+	if cachedPlan, ok := p.planCache[stateHash]; ok {
+		p.cacheMu.RUnlock()
+		p.logger.Info("Using cached plan for stable state", slog.String("objective", cachedPlan.Objective))
+		return p.clonePlanWithNewIDs(cachedPlan), nil
+	}
+	p.cacheMu.RUnlock()
+
 	directive := p.evaluator.Evaluate(state)
 	learnedRules := ""
 
@@ -240,7 +283,6 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		return nil, fmt.Errorf("planner returned zero candidates")
 	}
 
-	// Bulletproof ID generation in case LLM forgets
 	for i := range parsed.Candidates {
 		for j := range parsed.Candidates[i] {
 			if parsed.Candidates[i][j].ID == "" {
@@ -263,31 +305,56 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		}
 	}
 
-	bestTasks := parsed.Candidates[bestIdx]
-
-	return &domain.Plan{
+	finalPlan := &domain.Plan{
 		Objective: parsed.Objective,
-		Tasks:     bestTasks,
-	}, nil
+		Tasks:     parsed.Candidates[bestIdx],
+	}
+
+	// Save to cache
+	p.cacheMu.Lock()
+	p.planCache[stateHash] = finalPlan
+	p.cacheMu.Unlock()
+
+	return finalPlan, nil
+}
+
+// clonePlanWithNewIDs prevents the IdempotentController from dropping
+// actions if the exact same plan is pulled from the cache later.
+func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {
+	clone := &domain.Plan{
+		Objective: original.Objective,
+		Tasks:     make([]domain.Action, len(original.Tasks)),
+	}
+
+	now := time.Now().UnixNano()
+	for i, t := range original.Tasks {
+		clone.Tasks[i] = t
+		clone.Tasks[i].ID = fmt.Sprintf("cached-plan-%d-%d", now, i)
+	}
+
+	return clone
 }
 
 func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats) float64 {
 	score := 100.0
+	weights := p.flags.Weights
 
 	for _, t := range tasks {
 		if t.Action == "hunt" {
-			score -= 20.0
+			score -= weights.RiskPenalty
 		}
 		if t.Action == "mine" {
-			score -= 10.0
+			score -= (weights.RiskPenalty / 2.0)
 		}
 
 		if stat, ok := stats[t.Action]; ok && stat.Attempts > 0 {
 			probability := stat.SuccessRate
-			score += (probability * 30.0)
-			score -= ((1.0 - probability) * 40.0)
+			score += (probability * weights.SuccessWeight)
+
+			// Penalty for low probability tasks scales with success weight
+			score -= ((1.0 - probability) * (weights.SuccessWeight + 10.0))
 		} else {
-			score += 5.0
+			score += weights.ExplorationBonus
 		}
 	}
 
