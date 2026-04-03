@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -16,12 +17,10 @@ type queuedAction struct {
 	enqueuedAt time.Time
 }
 
-// Phase 3 Improvement: priority-queue-replacement
 type actionHeap []queuedAction
 
 func (h actionHeap) Len() int { return len(h) }
 func (h actionHeap) Less(i, j int) bool {
-	// Highest priority first. Tiebreaker is FIFO.
 	if h[i].action.Priority == h[j].action.Priority {
 		return h[i].enqueuedAt.Before(h[j].enqueuedAt)
 	}
@@ -46,9 +45,12 @@ type TaskExecutionEngine struct {
 	inFlight      *ExecutionTask
 	maxInFlight   int
 	retryCount    int
+
+	noiseLevel   float64
+	getAttention func() float64
 }
 
-func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
+func NewTaskExecutionEngine(ctrl Controller, noiseLevel float64, getAttention func() float64, logger *slog.Logger) *TaskExecutionEngine {
 	e := &TaskExecutionEngine{
 		controller:    ctrl,
 		logger:        logger.With(slog.String("component", "task_execution_engine")),
@@ -56,13 +58,14 @@ func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecution
 		recentActions: make(map[string]time.Time),
 		maxInFlight:   1,
 		retryCount:    0,
+		noiseLevel:    noiseLevel,
+		getAttention:  getAttention,
 	}
 	heap.Init(&e.queue)
 	return e
 }
 
 func (e *TaskExecutionEngine) Start(ctx context.Context) {
-	// Cleanup loop for deduplication map to prevent memory leaks over time
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -107,7 +110,6 @@ func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Phase 3 Improvement: action-deduplication
 	dedupKey := action.Action + ":" + action.Target.Name
 	if lastSeen, exists := e.recentActions[dedupKey]; exists {
 		if time.Since(lastSeen) < 2*time.Second {
@@ -136,6 +138,30 @@ func (e *TaskExecutionEngine) pump() {
 		return
 	}
 
+	// Phase 4 Improvement: attention-system-gating
+	// If attention is low, the agent simulates cognitive load by dropping background/low-priority tasks
+	if e.getAttention != nil {
+		attention := e.getAttention()
+		if attention < 0.3 {
+			var filtered actionHeap
+			for _, qa := range e.queue {
+				if qa.action.Priority >= 5 {
+					filtered = append(filtered, qa)
+				} else {
+					e.logger.Debug("Dropped low-priority task due to low attention", slog.String("action", qa.action.Action))
+				}
+			}
+			if len(filtered) != len(e.queue) {
+				e.queue = filtered
+				heap.Init(&e.queue)
+			}
+			if len(e.queue) == 0 {
+				e.mu.Unlock()
+				return
+			}
+		}
+	}
+
 	qa := heap.Pop(&e.queue).(queuedAction)
 
 	e.inFlight = &ExecutionTask{
@@ -144,6 +170,16 @@ func (e *TaskExecutionEngine) pump() {
 		EnqueueTime: time.Now(),
 	}
 	e.mu.Unlock()
+
+	// Phase 4 Improvement: execution-noise
+	// Inject bounded random jitter to break uniform execution pacing (non-mechanical signature)
+	if qa.action.Priority < 10 && e.noiseLevel > 0.01 {
+		maxJitter := int64(e.noiseLevel * 5000) // e.g. 0.03 * 5000 = up to 150ms of jitter
+		if maxJitter > 0 {
+			jitter := time.Duration(rand.Int63n(maxJitter)) * time.Millisecond
+			time.Sleep(jitter)
+		}
+	}
 
 	err := e.controller.Dispatch(qa.ctx, qa.action)
 	if err != nil {
@@ -167,7 +203,6 @@ func (e *TaskExecutionEngine) pump() {
 			time.Sleep(backoff)
 
 			e.mu.Lock()
-			// Refresh enqueuedAt so it doesn't sink in priority forever
 			qa.enqueuedAt = time.Now()
 			heap.Push(&e.queue, qa)
 			e.mu.Unlock()
@@ -221,7 +256,6 @@ func (e *TaskExecutionEngine) AbortCurrent(ctx context.Context, reason string) e
 		e.inFlight = nil
 	}
 
-	// Reinitialize the heap to clear it
 	e.queue = make(actionHeap, 0)
 	heap.Init(&e.queue)
 	e.mu.Unlock()

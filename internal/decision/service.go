@@ -17,6 +17,13 @@ type StateProvider interface {
 	GetCurrentState() domain.VersionedState
 }
 
+// Phase 4 Improvement: commitment-lock
+type Commitment struct {
+	TaskID      string
+	MinDuration time.Duration
+	StartTime   time.Time
+}
+
 type Service struct {
 	sessionID     string
 	bus           domain.EventBus
@@ -32,6 +39,8 @@ type Service struct {
 	activeIntent  atomic.Pointer[domain.ActionIntent]
 	beforeState   atomic.Pointer[domain.GameState]
 	taskHistory   []domain.TaskHistory
+
+	commitment atomic.Pointer[Commitment]
 }
 
 func NewService(
@@ -64,7 +73,6 @@ func NewService(
 }
 
 func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
-	// If we have no active plan, try to formulate one
 	if !s.planManager.HasActivePlan() {
 		go s.evaluateNextPlan(context.Background())
 	}
@@ -83,7 +91,6 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 	success := payload.Status == "COMPLETED"
 
-	// 1. Evaluate with Critic
 	intent := s.activeIntent.Load()
 	beforePtr := s.beforeState.Load()
 
@@ -105,7 +112,6 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		s.beforeState.Store(nil)
 	}
 
-	// 2. Manage Plan Lifecycle
 	if !s.planManager.HasActivePlan() {
 		return
 	}
@@ -113,6 +119,10 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	if !success {
 		s.logger.Warn("Plan failed due to task failure", slog.String("failed_task", payload.CommandID))
 		_ = s.planManager.Transition(domain.PlanStatusFailed)
+
+		// Clear commitment on failure
+		s.commitment.Store(nil)
+
 		s.bus.Publish(ctx, domain.DomainEvent{
 			SessionID: s.sessionID,
 			Type:      domain.EventTypePlanInvalidated,
@@ -122,7 +132,6 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		return
 	}
 
-	// For Phase 1, we assume 1-task plans for simplicity until the state machine loop is fully restored.
 	_ = s.planManager.Transition(domain.PlanStatusCompleted)
 	go s.evaluateNextPlan(context.Background())
 }
@@ -131,13 +140,24 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 	select {
 	case s.evalSemaphore <- struct{}{}:
 	default:
-		return // Already evaluating
+		return
 	}
 	defer func() { <-s.evalSemaphore }()
 
 	state := s.stateProvider.GetCurrentState().State
 	if state.Health <= 0 {
 		return
+	}
+
+	// Phase 4 Improvement: commitment-lock
+	if currCommitment := s.commitment.Load(); currCommitment != nil {
+		if time.Since(currCommitment.StartTime) < currCommitment.MinDuration {
+			// Allow overriding the lock for CRITICAL severity events (e.g., taking damage, low health)
+			if state.Health >= 10 && len(state.Threats) == 0 {
+				return
+			}
+			s.logger.Info("Breaking commitment lock for critical survival event")
+		}
 	}
 
 	s.logger.Info("Evaluating next objective")
@@ -176,8 +196,15 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 	s.planManager.SetPlan(&plan)
 	_ = s.planManager.Transition(domain.PlanStatusActive)
 
-	// Record intent for the critic
 	firstTask := plan.Tasks[0]
+
+	// Set the commitment lock for stable, non-twitchy task execution
+	s.commitment.Store(&Commitment{
+		TaskID:      firstTask.ID,
+		StartTime:   time.Now(),
+		MinDuration: 2 * time.Second, // Minimum time before we allow replanning
+	})
+
 	s.activeIntent.Store(&domain.ActionIntent{
 		ID:        firstTask.ID,
 		Action:    firstTask.Action,

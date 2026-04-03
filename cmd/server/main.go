@@ -23,6 +23,7 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
 	"david22573/synaptic-mc/internal/execution"
+	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
@@ -105,12 +106,27 @@ func main() {
 	eventBus := domain.NewEventBus()
 	uiHub := observability.NewHub(logger)
 
+	// Phase 4: Wire the humanization engine
+	humanCfg := humanization.Config{
+		AttentionDecay: 0.08,
+		HesitationBase: time.Duration(cfg.HesitationMs) * time.Millisecond,
+		NoiseLevel:     cfg.NoiseLevel,
+		BaseDriftRate:  0.08,
+		MaxDriftDelay:  2 * time.Second,
+	}
+	humanizer := humanization.NewEngine(humanCfg)
+
+	// Helper to extract attention state dynamically
+	getAttention := func() float64 {
+		return humanizer.State().GetAttention()
+	}
+
 	// 1. State Service
 	stateSvc := state.NewService(eventBus, logger)
 
 	// 2. Execution Service
 	ctrlManager := execution.NewControllerManager()
-	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger)
+	execEngine := execution.NewTaskExecutionEngine(ctrlManager, cfg.NoiseLevel, getAttention, logger)
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
 	execService := execution.NewService(eventBus, execEngine, taskManager, ctrlManager, logger)
 

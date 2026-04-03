@@ -1,365 +1,234 @@
-Project Context Dump (02 Apr 26 20:52 PDT)
+Project Context Dump (02 Apr 26 21:03 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 2
+Total Files: 4
 
 # Project Structure
 <file_tree>
-- internal\config\flags.go
-- internal\llm\client.go
+- internal\humanization\attention.go
+- internal\humanization\context.go
+- internal\humanization\engine.go
+- internal\humanization\noise.go
 </file_tree>
 
 # File Contents
-<file path="internal\config\flags.go">
-package config
+<file path="internal\humanization\attention.go">
+package humanization
 
 import (
-	"context"
-	"encoding/json"
-	"log/slog"
-	"os"
-	"sync"
+	"fmt"
+	"math/rand"
 	"time"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
-type FeatureFlags struct {
-	AsyncLoop       bool `json:"async_loop" env:"FF_ASYNC_LOOP"`
-	NonBlockPlanner bool `json:"non_block_planner" env:"FF_NON_BLOCK_PLANNER"`
-	ActionQueue     bool `json:"action_queue" env:"FF_ACTION_QUEUE"`
-	ClientSmooth    bool `json:"client_smooth" env:"FF_CLIENT_SMOOTH"`
-}
+// ProcessAttentionDrift checks if the bot should be distracted by its environment.
+func ProcessAttentionDrift(ctx Context, state *State, now time.Time) []ScheduledAction {
+	var actions []ScheduledAction
 
-func DefaultFlags() FeatureFlags {
-	return FeatureFlags{
-		AsyncLoop:       true, // Production: non-blocking loops
-		NonBlockPlanner: true, // Production: background LLM planning
-		ActionQueue:     true, // Production: priority queue + backpressure
-		ClientSmooth:    true, // Production: 60 FPS interpolation
-	}
-}
+	attention := state.GetAttention()
 
-// DynamicFlags wraps FeatureFlags with thread-safe access and file-watching for hot-reloads.
-type DynamicFlags struct {
-	mu    sync.RWMutex
-	flags FeatureFlags
+	// If attention is low and we aren't fighting for our life or stuck...
+	if attention < 0.5 && !ctx.IsStuck && ctx.State.Health >= 15 {
 
-	filepath string
-	lastMod  time.Time
-	logger   *slog.Logger
+		// 15% chance to actually trigger a physical drift action per evaluation
+		if rand.Float64() < 0.15 && len(ctx.State.POIs) > 0 {
 
-	reloadCh chan struct{}
-}
+			// Pick a random nearby Point of Interest
+			poi := ctx.State.POIs[rand.Intn(len(ctx.State.POIs))]
 
-func NewDynamicFlags(path string, logger *slog.Logger) *DynamicFlags {
-	df := &DynamicFlags{
-		flags:    DefaultFlags(),
-		filepath: path,
-		logger:   logger.With(slog.String("component", "config_watcher")),
-		reloadCh: make(chan struct{}),
-	}
-
-	if path != "" {
-		_ = df.LoadFromFile() // Attempt initial load, ignore error if file doesn't exist yet
-	}
-
-	return df
-}
-
-// Get returns a thread-safe copy of the current feature flags.
-func (f *DynamicFlags) Get() FeatureFlags {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.flags
-}
-
-// ReloadChannel returns a channel that gets closed whenever the config is successfully reloaded.
-func (f *DynamicFlags) ReloadChannel() <-chan struct{} {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.reloadCh
-}
-
-// LoadFromFile reads the JSON config and updates the flags safely.
-func (f *DynamicFlags) LoadFromFile() error {
-	info, err := os.Stat(f.filepath)
-	if err != nil {
-		return err
-	}
-
-	data, err := os.ReadFile(f.filepath)
-	if err != nil {
-		return err
-	}
-
-	var newFlags FeatureFlags
-	if err := json.Unmarshal(data, &newFlags); err != nil {
-		return err
-	}
-
-	f.mu.Lock()
-	f.flags = newFlags
-	f.lastMod = info.ModTime()
-	f.mu.Unlock()
-
-	f.logger.Info("Feature flags hot-reloaded from file", slog.String("file", f.filepath))
-	return nil
-}
-
-func (f *DynamicFlags) hasConfigChanged() bool {
-	info, err := os.Stat(f.filepath)
-	if err != nil {
-		return false
-	}
-
-	f.mu.RLock()
-	changed := info.ModTime().After(f.lastMod)
-	f.mu.RUnlock()
-
-	return changed
-}
-
-// Watch starts a background routine that polls the config file for modifications.
-func (f *DynamicFlags) Watch(ctx context.Context) {
-	if f.filepath == "" {
-		f.logger.Warn("No config file path provided, skipping watcher")
-		return
-	}
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			f.logger.Info("Stopping config watcher")
-			return
-		case <-ticker.C:
-			if f.hasConfigChanged() {
-				if err := f.LoadFromFile(); err == nil {
-					f.mu.Lock()
-					// Close the old channel to broadcast the change, then make a new one for the next cycle
-					close(f.reloadCh)
-					f.reloadCh = make(chan struct{})
-					f.mu.Unlock()
-				} else {
-					f.logger.Error("Failed to parse updated config file", slog.Any("error", err))
-				}
+			driftAction := domain.Action{
+				ID:        fmt.Sprintf("drift-%d", time.Now().UnixNano()),
+				Action:    "look",
+				Target:    domain.Target{Type: "poi", Name: poi.Name},
+				Priority:  -1, // Background priority, instantly preempted by real tasks
+				Rationale: "Attention drifted to nearby " + poi.Name,
 			}
+
+			actions = append(actions, ScheduledAction{
+				Action: driftAction,
+				// Execute the drift almost immediately
+				ExecuteAt: now.Add(50 * time.Millisecond),
+			})
 		}
+	}
+
+	return actions
+}
+
+</file>
+
+<file path="internal\humanization\context.go">
+package humanization
+
+import "david22573/synaptic-mc/internal/domain"
+
+// Context provides the situational awareness required for behavioral modifiers.
+type Context struct {
+	State   domain.GameState
+	IsStuck bool
+}
+
+// BuildContext constructs a new behavioral context from the orchestrator's state.
+func BuildContext(state domain.GameState, isStuck bool) Context {
+	return Context{
+		State:   state,
+		IsStuck: isStuck,
 	}
 }
 
 </file>
 
-<file path="internal\llm\client.go">
-package llm
+<file path="internal\humanization\engine.go">
+package humanization
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/rand"
-	"net/http"
-	"strings"
 	"time"
+
+	"david22573/synaptic-mc/internal/domain"
 )
 
-type Config struct {
-	APIURL     string
-	APIKey     string
-	Model      string
-	EmbedModel string
-	MaxRetries int
+type ScheduledAction struct {
+	Action    domain.Action
+	ExecuteAt time.Time
 }
 
-type Client struct {
-	config Config
-	http   *http.Client
+type Engine struct {
+	cfg         Config
+	state       *State
+	intentModel *IntentModel
 }
 
-func NewClient(cfg Config) *Client {
-	return &Client{
-		config: cfg,
-		http: &http.Client{
-			Timeout: 45 * time.Second,
-		},
+func NewEngine(cfg Config) *Engine {
+	return &Engine{
+		cfg:         cfg,
+		state:       NewState(cfg),
+		intentModel: NewIntentModel(),
 	}
 }
 
-func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	payload := map[string]any{
-		"model": c.config.Model,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": userContent},
-		},
-		"response_format": map[string]string{"type": "json_object"},
-		"temperature":     0.2,
-	}
-
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal generation payload: %w", err)
-	}
-	return c.doRequest(ctx, c.config.APIURL, jsonPayload)
+func (e *Engine) State() *State {
+	return e.state
 }
 
-func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
-	embedURL := strings.Replace(c.config.APIURL, "chat/completions", "embeddings", 1)
+func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
+	var scheduled []ScheduledAction
+	now := time.Now()
+	currentDelay := time.Duration(0)
 
-	payload := map[string]any{
-		"model": c.config.EmbedModel,
-		"input": input,
+	approvedTasks := e.intentModel.Apply(plan.Tasks, e.state, ctx)
+	if len(approvedTasks) == 0 {
+		return scheduled
 	}
 
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal embedding payload: %w", err)
-	}
-
-	var lastErr error
-	baseDelay := 500 * time.Millisecond
-
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
-		default:
+	isCritical := false
+	if ctx.State.CurrentTask != nil {
+		action := ctx.State.CurrentTask.Action
+		if action == "combat" || action == "retreat" || action == "eat" || action == "mine" {
+			isCritical = true
 		}
+	}
+	if ctx.State.Health < 10 {
+		isCritical = true
+	}
 
-		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("request cancelled: %w", ctx.Err())
-			case <-time.After(baseDelay + jitter):
+	if !isCritical {
+		driftActions := ProcessAttentionDrift(ctx, e.state, now)
+		scheduled = append(scheduled, driftActions...)
+
+		if rand.Float64() < e.cfg.BaseDriftRate {
+			driftAction := e.generateDrift(ctx)
+			if driftAction != nil {
+				driftDelay := time.Duration(rand.Int63n(int64(e.cfg.MaxDriftDelay)))
+				scheduled = append(scheduled, ScheduledAction{
+					Action:    *driftAction,
+					ExecuteAt: now.Add(driftDelay),
+				})
 			}
-			baseDelay *= 2
 		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.config.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-			continue
-		}
-
-		var result struct {
-			Data []struct {
-				Embedding []float32 `json:"embedding"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			lastErr = fmt.Errorf("failed to decode response: %w", err)
-			continue
-		}
-
-		if len(result.Data) == 0 {
-			lastErr = fmt.Errorf("empty embedding array returned")
-			continue
-		}
-
-		return result.Data[0].Embedding, nil
 	}
 
-	return nil, fmt.Errorf("max retries exceeded. last error: %w", lastErr)
+	for i, task := range approvedTasks {
+		if task.Priority == 0 {
+			task.Priority = 5
+		}
+
+		noisyTask := ApplyNoise(task, ctx, e.cfg)
+		hesitation := time.Duration(0)
+
+		if i == 0 || !isCritical {
+			hesitation = CalculateHesitation(noisyTask, ctx, e.state, e.cfg)
+		}
+
+		// PRODUCTION: tighter hesitation for chained tasks
+		if i > 0 && !isCritical {
+			hesitation = hesitation / 2
+		}
+
+		currentDelay += hesitation
+
+		scheduled = append(scheduled, ScheduledAction{
+			Action:    noisyTask,
+			ExecuteAt: now.Add(currentDelay),
+		})
+
+		currentDelay += 100 * time.Millisecond
+	}
+
+	return scheduled
 }
 
-func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) (string, error) {
-	var lastErr error
-	baseDelay := 500 * time.Millisecond
+func (e *Engine) generateDrift(ctx Context) *domain.Action {
+	roll := rand.Float64()
 
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("request cancelled: %w", ctx.Err())
-		default:
-		}
-
-		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-ctx.Done():
-				return "", fmt.Errorf("request cancelled: %w", ctx.Err())
-			case <-time.After(baseDelay + jitter):
-			}
-			baseDelay *= 2
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.config.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-			continue
-		}
-
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			lastErr = fmt.Errorf("failed to decode response: %w", err)
-			continue
-		}
-
-		if len(result.Choices) == 0 {
-			lastErr = fmt.Errorf("empty choices array returned")
-			continue
-		}
-
-		return result.Choices[0].Message.Content, nil
+	action := domain.Action{
+		ID:       fmt.Sprintf("drift-%d", time.Now().UnixNano()),
+		Priority: -1,
 	}
 
-	return "", fmt.Errorf("max retries exceeded. last error: %w", lastErr)
+	if roll < 0.5 {
+		action.Action = "look"
+		action.Target = domain.Target{Type: "relative", Name: "random_yaw"}
+		action.Rationale = "Humanization: idle looking around"
+	} else if roll < 0.8 {
+		action.Action = "inventory"
+		action.Target = domain.Target{Type: "ui", Name: "open_close"}
+		action.Rationale = "Humanization: nervously checking inventory"
+	} else {
+		return nil
+	}
+
+	return &action
+}
+
+</file>
+
+<file path="internal\humanization\noise.go">
+package humanization
+
+import (
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// ApplyNoise lightly fuzzes the intent parameters.
+// Currently acts as a passthrough for structural safety, but is hooked up
+// for future vector/coordinate fuzzing when actions carry explicit Vec3s.
+func ApplyNoise(action domain.Action, ctx Context, cfg Config) domain.Action {
+	if cfg.NoiseLevel <= 0.01 {
+		return action
+	}
+
+	noisyAction := action
+
+	// Example: If the action involves a specific coordinate, we would
+	// apply +/- NoiseLevel to X/Z here so the bot doesn't walk perfectly straight.
+	// Since our current target types are mostly entity names (e.g., "oak_log"),
+	// we rely on the TS client (Movements config) for physical path jitter.
+
+	return noisyAction
 }
 
 </file>
@@ -368,10 +237,10 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 
 ```json
 {
-  "total_bytes": 8384,
-  "file_count": 2,
-  "estimated_tokens": 2157,
+  "total_bytes": 5270,
+  "file_count": 4,
+  "estimated_tokens": 1433,
   "mode": "full",
-  "generated_at": "2026-04-02T20:52:13.2010707-07:00"
+  "generated_at": "2026-04-02T21:03:15.14243-07:00"
 }
 ```
