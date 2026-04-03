@@ -79,15 +79,16 @@ type Item struct {
 }
 
 type Action struct {
-	ID           string       `json:"id"`
-	ControllerID string       `json:"controller_id,omitempty"`
-	Source       string       `json:"source"`
-	Trace        TraceContext `json:"trace"`
-	Action       string       `json:"action"`
-	Target       Target       `json:"target"`
-	Count        int          `json:"count"`
-	Rationale    string       `json:"rationale"`
-	Priority     int          `json:"priority"`
+	ID           string        `json:"id"`
+	ControllerID string        `json:"controller_id,omitempty"`
+	Source       string        `json:"source"`
+	Trace        TraceContext  `json:"trace"`
+	Action       string        `json:"action"`
+	Target       Target        `json:"target"`
+	Count        int           `json:"count"`
+	Rationale    string        `json:"rationale"`
+	Priority     int           `json:"priority"`
+	Timeout      time.Duration `json:"timeout,omitempty"` // Phase 3 Improvement: execution-deadlines
 }
 
 type Plan struct {

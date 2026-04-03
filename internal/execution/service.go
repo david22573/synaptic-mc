@@ -4,28 +4,32 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
+	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 )
 
 type Service struct {
-	bus         domain.EventBus
-	engine      *TaskExecutionEngine
-	taskManager *TaskManager
-	ctrlManager *ControllerManager
-	logger      *slog.Logger
+	bus          domain.EventBus
+	engine       *TaskExecutionEngine
+	taskManager  *TaskManager
+	ctrlManager  *ControllerManager
+	logger       *slog.Logger
+	activeTimers map[string]*time.Timer
+	timersMu     sync.Mutex
 }
 
 func NewService(bus domain.EventBus, engine *TaskExecutionEngine, tm *TaskManager, cm *ControllerManager, logger *slog.Logger) *Service {
 	s := &Service{
-		bus:         bus,
-		engine:      engine,
-		taskManager: tm,
-		ctrlManager: cm,
-		logger:      logger.With(slog.String("component", "execution_service")),
+		bus:          bus,
+		engine:       engine,
+		taskManager:  tm,
+		ctrlManager:  cm,
+		logger:       logger.With(slog.String("component", "execution_service")),
+		activeTimers: make(map[string]*time.Timer),
 	}
 
-	// Subscribe to the bus
 	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(s.handlePlanCreated))
 	bus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
 	bus.Subscribe(domain.EventTypeTaskStart, domain.FuncHandler(s.handleTaskStart))
@@ -43,8 +47,6 @@ func (s *Service) handlePlanCreated(ctx context.Context, event domain.DomainEven
 		return
 	}
 
-	// For Phase 1, we just enqueue the first task immediately to keep the agent moving.
-	// In Phase 4 (Humanization), this is where we'll inject the execution noise.
 	if len(plan.Tasks) > 0 {
 		_ = s.taskManager.Enqueue(ctx, plan.Tasks[0])
 	}
@@ -52,14 +54,17 @@ func (s *Service) handlePlanCreated(ctx context.Context, event domain.DomainEven
 
 func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.DomainEvent) {
 	_ = s.taskManager.Halt(ctx, "plan_invalidated")
+	s.clearAllWatchdogs()
 }
 
 func (s *Service) handlePanic(ctx context.Context, event domain.DomainEvent) {
 	_ = s.taskManager.Halt(ctx, "panic_triggered")
+	s.clearAllWatchdogs()
 }
 
 func (s *Service) handleBotDeath(ctx context.Context, event domain.DomainEvent) {
 	_ = s.taskManager.Halt(ctx, "bot_died")
+	s.clearAllWatchdogs()
 }
 
 func (s *Service) handleTaskStart(ctx context.Context, event domain.DomainEvent) {
@@ -68,6 +73,39 @@ func (s *Service) handleTaskStart(ctx context.Context, event domain.DomainEvent)
 	}
 	if err := json.Unmarshal(event.Payload, &payload); err == nil {
 		s.engine.OnTaskStart(payload.CommandID)
+
+		// Phase 3 Improvement: execution-deadlines Watchdog
+		inFlight := s.engine.GetInFlight()
+		if inFlight != nil && inFlight.ID == payload.CommandID {
+			timeout := inFlight.Timeout
+			if timeout == 0 {
+				timeout = 45 * time.Second // Fallback default
+			}
+
+			timer := time.AfterFunc(timeout, func() {
+				s.logger.Warn("Execution deadline exceeded, aborting task", slog.String("task_id", payload.CommandID))
+
+				_ = s.ctrlManager.AbortCurrent(context.Background(), "DEADLINE_EXCEEDED")
+
+				failedPayload, _ := json.Marshal(map[string]string{
+					"status":     "FAILED",
+					"command_id": payload.CommandID,
+					"cause":      "DEADLINE_EXCEEDED",
+				})
+
+				s.bus.Publish(context.Background(), domain.DomainEvent{
+					SessionID: event.SessionID,
+					Trace:     event.Trace,
+					Type:      domain.EventTypeTaskEnd,
+					Payload:   failedPayload,
+					CreatedAt: time.Now(),
+				})
+			})
+
+			s.timersMu.Lock()
+			s.activeTimers[payload.CommandID] = timer
+			s.timersMu.Unlock()
+		}
 	}
 }
 
@@ -80,7 +118,25 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 	if err := json.Unmarshal(event.Payload, &payload); err == nil {
 		success := payload.Status == "COMPLETED"
+
+		// Stop and remove the watchdog timer
+		s.timersMu.Lock()
+		if timer, ok := s.activeTimers[payload.CommandID]; ok {
+			timer.Stop()
+			delete(s.activeTimers, payload.CommandID)
+		}
+		s.timersMu.Unlock()
+
 		s.engine.OnTaskEnd(payload.CommandID, success)
 		_ = s.taskManager.Complete(ctx, payload.CommandID, success)
+	}
+}
+
+func (s *Service) clearAllWatchdogs() {
+	s.timersMu.Lock()
+	defer s.timersMu.Unlock()
+	for id, timer := range s.activeTimers {
+		timer.Stop()
+		delete(s.activeTimers, id)
 	}
 }
