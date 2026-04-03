@@ -346,10 +346,15 @@ func getEnvFloat(key string, fallback float64) float64 {
 func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			// Programmatic clients (like our Node.js bot) usually don't send an Origin header.
+			if origin == "" {
+				return true
+			}
 			allowedOrigins := map[string]bool{
 				"http://localhost:3000": true,
 			}
-			return allowedOrigins[r.Header.Get("Origin")]
+			return allowedOrigins[origin]
 		},
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
