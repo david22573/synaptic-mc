@@ -333,8 +333,13 @@ async function executeIntent(intent: models.ActionIntent) {
                 }
 
                 pushState();
-                if (activeTask && currentTask?.id === activeTask.id) {
+                
+                // CRITICAL FIX: Ensure Go is notified even if local state is slightly drifted
+                if (activeTask) {
                     completeTask(activeTask, "task_failed", normalizedCause);
+                } else if (intent.id) {
+                    // Fallback: Notify Go using the ID from the intent we were trying to execute
+                    client.sendEvent("task_failed", intent.action, intent.id, normalizedCause, Date.now());
                 }
             }
         } finally {

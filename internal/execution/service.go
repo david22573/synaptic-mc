@@ -222,9 +222,15 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 		}
 		s.timersMu.Unlock()
 
+		// ALWAYS signal task engine and manager that the current attempt is finished
+		// to prevent deadlocks in the dispatch queue.
+		s.engine.OnTaskEnd(payload.CommandID, success)
+		_ = s.taskManager.Complete(ctx, payload.CommandID, success)
+
 		if !isActive {
-			s.logger.Debug("Ignoring duplicate or untracked TASK_END event", slog.String("task_id", payload.CommandID))
-			return
+			s.logger.Debug("Cleaning up untracked or timed-out task", slog.String("task_id", payload.CommandID))
+			// We still continue to clean up failure records, but we don't trigger new adaptation
+			// if it was already handled by the watchdog or is a duplicate.
 		}
 
 		if !success && payload.Cause != "preempted_by_priority" && payload.Cause != "plan_invalidated" {
@@ -259,10 +265,6 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 				slog.Duration("delay", directive.Delay),
 			)
 
-			// Signal task engine and manager that the current attempt is finished
-			s.engine.OnTaskEnd(payload.CommandID, false)
-			_ = s.taskManager.Complete(ctx, payload.CommandID, false)
-
 			if actionToRetry.ID == "" {
 				return
 			}
@@ -292,9 +294,6 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 			if success {
 				s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
 			}
-
-			s.engine.OnTaskEnd(payload.CommandID, success)
-			_ = s.taskManager.Complete(ctx, payload.CommandID, success)
 		}
 	}
 }

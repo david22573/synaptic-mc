@@ -76,7 +76,7 @@ class EngageState implements FSMState {
                     );
                 }
 
-                if (Date.now() - sCtx.lastHitTime > 5000) {
+                if (Date.now() - sCtx.lastHitTime > 10000) {
                     const isActuallyDead = !bot.entities[target.id];
                     if (isActuallyDead) {
                         break;
