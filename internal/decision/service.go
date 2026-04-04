@@ -32,6 +32,7 @@ type Service struct {
 	curriculum    voyager.Curriculum
 	critic        voyager.Critic
 	stateProvider StateProvider
+	worldModel    *domain.WorldModel
 	logger        *slog.Logger
 
 	mu            sync.Mutex
@@ -51,6 +52,7 @@ func NewService(
 	curriculum voyager.Curriculum,
 	critic voyager.Critic,
 	stateProvider StateProvider,
+	worldModel *domain.WorldModel,
 	logger *slog.Logger,
 ) *Service {
 	s := &Service{
@@ -61,6 +63,7 @@ func NewService(
 		curriculum:    curriculum,
 		critic:        critic,
 		stateProvider: stateProvider,
+		worldModel:    worldModel,
 		logger:        logger.With(slog.String("component", "decision_service")),
 		evalSemaphore: make(chan struct{}, 1),
 		taskHistory:   make([]domain.TaskHistory, 0),
@@ -159,9 +162,22 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	if intent != nil && beforePtr != nil && intent.ID == payload.CommandID {
 		after := s.stateProvider.GetCurrentState().State
 		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after)
+
 		if !success {
 			successCritic = false
 			critique = fmt.Sprintf("TS Failed: %s. %s", payload.Cause, critique)
+
+			// Learn from failure: penalize the action and the location
+			if s.worldModel != nil {
+				s.worldModel.PenalizeAction(intent.Action, 1.0)
+				loc := domain.Location{X: beforePtr.Position.X, Y: beforePtr.Position.Y, Z: beforePtr.Position.Z}
+				s.worldModel.PenalizeZone(loc, 0.5)
+			}
+		} else {
+			// Learn from success: reward the action
+			if s.worldModel != nil {
+				s.worldModel.RecordSuccess(intent.Action, intent.Target)
+			}
 		}
 
 		s.mu.Lock()

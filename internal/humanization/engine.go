@@ -76,7 +76,7 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 			task.Priority = 5
 		}
 
-		noisyTask := ApplyNoise(task, ctx, e.cfg)
+		noisyTask := ApplyNoise(task, ctx, e.state, e.cfg)
 		hesitation := time.Duration(0)
 
 		if i == 0 || !isCritical {

@@ -376,7 +376,11 @@ function pushState() {
         time_of_day: bot.time?.timeOfDay ?? 0,
         experience: bot.experience?.points ?? 0,
         level: bot.experience?.level ?? 0,
-        has_bed_nearby: false, // Could be implemented by checking nearby blocks
+        has_bed_nearby:
+            bot.findBlock({
+                matching: (b) => b.name.includes("bed"),
+                maxDistance: 5,
+            }) !== null,
         position: { x: px, y: py, z: pz },
         inventory: bot.inventory
             ? bot.inventory.items().map((i) => ({
@@ -384,11 +388,22 @@ function pushState() {
                   count: i.count,
               }))
             : [],
-        hotbar: [], // Could be implemented by checking slots 36-44
-        offhand: null,
+        hotbar: bot.inventory
+            ? bot.inventory.slots.slice(36, 45).map((s) => {
+                  if (!s) return null;
+                  return { name: s.name, count: s.count };
+              })
+            : [],
+        offhand:
+            bot.inventory && bot.inventory.slots[45]
+                ? {
+                      name: bot.inventory.slots[45].name,
+                      count: bot.inventory.slots[45].count,
+                  }
+                : null,
         active_slot: bot.quickBarSlot || 0,
-        threats: [], // Could be filtered from POIs
         pois: hasValidPos ? getPOIs(bot) : [],
+        threats: [], // Populated below
         current_task: currentTask,
         task_progress: isPathfinding
             ? pathProgress
@@ -396,6 +411,12 @@ function pushState() {
               ? 0.5
               : 0,
     };
+
+    // Filter threats from POIs
+    state.threats = state.pois
+        .filter((p) => p.type === "threat")
+        .map((p) => ({ name: p.name, distance: p.distance }));
+
 
     client.sendState(state);
 }

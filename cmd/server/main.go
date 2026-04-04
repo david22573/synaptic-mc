@@ -130,8 +130,9 @@ func main() {
 
 	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger, dynFlags.Get())
 	planManager := decision.NewPlanManager()
+	worldModel := domain.NewWorldModel()
 
-	decisionSvc := decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, logger)
+	decisionSvc := decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, worldModel, logger)
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
