@@ -1,6 +1,7 @@
 // js/lib/network/client.ts
 import WebSocket from "ws";
 import { EventEmitter } from "events";
+import * as models from "../models.js";
 
 interface ClientConfig {
     url: string;
@@ -71,7 +72,7 @@ export class SynapticClient extends EventEmitter {
                 this.emit("message", msg);
 
                 if (msg.type === "DISPATCH_TASK") {
-                    this.emit("dispatch", msg.payload);
+                    this.emit("dispatch", msg.payload as models.Action);
                 } else if (msg.type === "ABORT_TASK") {
                     this.emit("abort", msg.payload);
                 }
@@ -144,10 +145,11 @@ export class SynapticClient extends EventEmitter {
         }
     }
 
-    public sendState(state: any): void {
+    public sendState(state: models.GameState): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         this.ws.send(JSON.stringify({ type: "STATE_UPDATE", payload: state }));
     }
+
 
     public sendPanic(error: Error): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;

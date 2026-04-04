@@ -1,4 +1,4 @@
-import type { Task } from "./task-commitment";
+import type { Task, Target } from "./models";
 
 export class Prefetcher {
     private loadedChunks: Set<string> = new Set();
@@ -7,7 +7,7 @@ export class Prefetcher {
     onTaskStart(task: Task) {
         if (task.next) {
             if (task.next.target) {
-                this.preloadChunks(task.next.target);
+                this.preloadChunks(task.next.target as any);
             }
             if (task.next.resources) {
                 this.preloadResources(task.next.resources);
@@ -15,18 +15,30 @@ export class Prefetcher {
         }
     }
 
-    private preloadChunks(target: { x?: number; z?: number }) {
-        if (target.x === undefined || target.z === undefined) return;
+    private preloadChunks(target: { x?: number; z?: number } & Target) {
+        // If it's a structured target with coordinates (future-proofing)
+        if (target.x !== undefined && target.z !== undefined) {
+            this.doPreload(target.x, target.z);
+            return;
+        }
 
+        // If it's a location target, try to parse coordinates from name if they exist
+        if (target.type === "location" && target.name) {
+            const match = target.name.match(/(-?\d+),\s*(-?\d+)/);
+            if (match) {
+                this.doPreload(parseInt(match[1]), parseInt(match[2]));
+            }
+        }
+    }
+
+    private doPreload(x: number, z: number) {
         // Naive chunk coordinate calculation
-        const chunkX = Math.floor(target.x / 16);
-        const chunkZ = Math.floor(target.z / 16);
+        const chunkX = Math.floor(x / 16);
+        const chunkZ = Math.floor(z / 16);
         const chunkId = `${chunkX},${chunkZ}`;
 
         if (!this.loadedChunks.has(chunkId)) {
             console.debug(`[Prefetcher] Preloading chunk: ${chunkId}`);
-            // Fire off background request to the Go backend or local cache
-            // to ensure block data is ready before the bot gets there.
             this.loadedChunks.add(chunkId);
         }
     }

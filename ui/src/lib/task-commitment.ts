@@ -1,13 +1,4 @@
-// ui/src/lib/task-commitment.ts
-export interface Task {
-    id: string;
-    type: string;
-    completed: boolean;
-    priority?: number;
-    next?: Task;
-    target?: any;
-    resources?: any[];
-}
+import type { Task } from "./models";
 
 export class TaskCommitment {
     private commitmentTicks: number = 0;

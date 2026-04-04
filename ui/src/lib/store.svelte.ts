@@ -1,32 +1,9 @@
 import { AgentController } from "./agent-controller";
 import { Prefetcher } from "./prefetcher";
 import { TaskCommitment } from "./task-commitment";
+import type { GameState, Action, Target, Task } from "./models";
 
-// Types for the game state
-export interface GameState {
-    health: number;
-    food: number;
-    saturation: number;
-    xp: number;
-    experience?: number;
-    level?: number;
-    position: { x: number; y: number; z: number };
-    inventory: Array<{ name: string; count: number }>;
-    hotbar?: Array<{ name: string; count: number } | null>;
-    offhand?: { name: string; count: number } | null;
-    active_slot?: number;
-    entities: string[];
-    threats?: Array<any>;
-    pois?: Array<any>;
-    time_of_day?: number;
-}
-
-export interface Task {
-    id: string;
-    type: string;
-    completed: boolean;
-    target?: string | null;
-}
+export type { GameState, Task };
 
 export interface BotEvent {
     type: string;

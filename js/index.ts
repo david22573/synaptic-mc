@@ -269,15 +269,8 @@ async function executeIntent(intent: models.ActionIntent) {
         const localController = taskAbortController;
 
         currentTask = {
-            id: intent.id,
-            action: intent.action,
-            target: intent.target || { type: "none", name: "none" },
-            count: intent.count || 1,
+            ...intent,
             startTime: Date.now(),
-            trace: intent.trace || {
-                trace_id: "unknown",
-                action_id: intent.id,
-            },
         };
 
         isPathfinding = false;
@@ -376,27 +369,36 @@ function pushState() {
     lastStateSig = sig;
     lastStatePushTime = now;
 
-    client.sendState({
+    const state: models.GameState = {
         health: Math.round(bot.health || 0),
         food: Math.round(bot.food || 0),
         time_of_day: bot.time?.timeOfDay ?? 0,
+        experience: bot.experience?.points ?? 0,
+        level: bot.experience?.level ?? 0,
+        has_bed_nearby: false, // Could be implemented by checking nearby blocks
         position: { x: px, y: py, z: pz },
         inventory: bot.inventory
-            ? bot.inventory
-                  .items()
-                  .map((i) => ({ name: i.name, count: i.count }))
+            ? bot.inventory.items().map((i) => ({
+                  name: i.name,
+                  count: i.count,
+              }))
             : [],
-        current_task: currentTask
-            ? { ...currentTask, priority: 0, rationale: "", source: "client" }
-            : null,
+        hotbar: [], // Could be implemented by checking slots 36-44
+        offhand: null,
+        active_slot: bot.quickBarSlot || 0,
+        threats: [], // Could be filtered from POIs
+        pois: hasValidPos ? getPOIs(bot) : [],
+        current_task: currentTask,
         task_progress: isPathfinding
             ? pathProgress
             : bot.pathfinder?.isMoving()
               ? 0.5
               : 0,
-        pois: hasValidPos ? getPOIs(bot) : [],
-    });
+    };
+
+    client.sendState(state);
 }
+
 
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {

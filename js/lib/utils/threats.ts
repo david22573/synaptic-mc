@@ -86,9 +86,11 @@ export function computeSafeRetreat(
         totalWeight = 0;
 
     for (const threat of threats) {
-        cx += threat.position.x * threat.threatScore!;
-        cz += threat.position.z * threat.threatScore!;
-        totalWeight += threat.threatScore!;
+        if (threat.position && threat.threatScore) {
+            cx += threat.position.x * threat.threatScore;
+            cz += threat.position.z * threat.threatScore;
+            totalWeight += threat.threatScore;
+        }
     }
 
     let baseAngle = 0;

@@ -1,5 +1,4 @@
-// ui/src/lib/agent-controller.ts
-export type Vec3 = { x: number; y: number; z: number };
+import type { Vec3, GameState } from "./models";
 
 function getDistance(a: Vec3, b: Vec3): number {
     const dx = a.x - b.x;
@@ -8,16 +7,20 @@ function getDistance(a: Vec3, b: Vec3): number {
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// Week 6 Observability sync
-export interface AgentState {
+// Week 6 Observability sync - UI specific extensions to GameState
+export interface AgentState extends GameState {
     path?: Vec3[];
-    position: Vec3;
-    health: number;
-    food: number;
-    threats: number;
-    timestamp?: number;
     isPanicMode?: boolean;
     isStuck?: boolean;
+    timestamp?: number;
+}
+
+// Helper to handle both GameState and VersionedState (from Go)
+function extractState(payload: any): AgentState {
+    if (payload && payload.State) {
+        return { ...payload.State, timestamp: Date.now() };
+    }
+    return payload;
 }
 
 export class AgentController {
@@ -37,7 +40,8 @@ export class AgentController {
         this.lastServerUpdate = performance.now();
     }
 
-    onStateUpdate(state: AgentState) {
+    onStateUpdate(payload: any) {
+        const state = extractState(payload);
         this.lastServerUpdate = state.timestamp || performance.now();
         this.path = state.path || null;
 

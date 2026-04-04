@@ -17,7 +17,7 @@ function getDirectionLabel(
 let staticBlockCache: Vec3[] = [];
 let lastBlockSearchPos: Vec3 | null = null;
 
-let poiCache: any[] = [];
+let poiCache: models.POI[] = [];
 let lastPos: Vec3 | null = null;
 let lastYaw: number = 0;
 let lastUpdate: number = 0;
@@ -32,7 +32,7 @@ export function clearPOICache() {
     lastUpdate = 0;
 }
 
-export function getPOIs(bot: Bot, radius: number = 32): any[] {
+export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
     if (!bot.entity) return [];
 
     const now = Date.now();
@@ -49,7 +49,7 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         return poiCache;
     }
 
-    const pois: any[] = [];
+    const pois: models.POI[] = [];
     const lookDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
 
     for (const id in bot.entities) {
@@ -106,15 +106,15 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
             },
             maxDistance: radius,
             count: 24,
-        });
-        lastBlockSearchPos = pos.clone();
+        }) as unknown as Vec3[];
+        lastBlockSearchPos = pos.clone() as unknown as Vec3;
     }
 
     for (const bPos of staticBlockCache) {
-        const block = bot.blockAt(bPos);
+        const block = bot.blockAt(bPos as any);
         if (!block) continue;
 
-        const dist = pos.distanceTo(bPos);
+        const dist = pos.distanceTo(bPos as any);
         if (dist > radius) continue;
 
         const dx = bPos.x - pos.x;
@@ -143,11 +143,11 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
     pois.sort((a, b) => b.score - a.score);
 
     const seenCounts: Record<string, number> = {};
-    const diversePOIs: any[] = [];
+    const diversePOIs: models.POI[] = [];
 
     for (const poi of pois) {
         seenCounts[poi.name] = (seenCounts[poi.name] || 0) + 1;
-        if (poi.type === "resource" && seenCounts[poi.name]! > 3) {
+        if (poi.type === "resource" && (seenCounts[poi.name] ?? 0) > 3) {
             continue;
         }
 
@@ -155,10 +155,11 @@ export function getPOIs(bot: Bot, radius: number = 32): any[] {
         if (diversePOIs.length >= 15) break;
     }
 
-    lastPos = pos.clone();
+    lastPos = pos.clone() as unknown as Vec3;
     lastYaw = yaw;
     lastUpdate = now;
     poiCache = diversePOIs;
 
     return diversePOIs;
 }
+
