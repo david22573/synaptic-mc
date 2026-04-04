@@ -1,4 +1,4 @@
-// internal/policy/survival.go  (FIXED)
+// internal/policy/survival.go
 package policy
 
 import (
@@ -17,14 +17,8 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 		return Decision{IsApproved: true}
 	}
 
-	// --- tuned thresholds -------------------------------------------------
-	const criticalHealth = 4.0 // was 6.0  -> fewer false positives
-	const minFoodForHunt = 8   // was 12 -> align with JS panic threshold
-	const maxThreatDist = 12.0 // was 16 -> ignore far-away mobs
-	// ---------------------------------------------------------------------
-
 	// 1. Critical-health override
-	if input.State.Health < criticalHealth {
+	if input.State.Health < domain.SurvivalCriticalHealth {
 		isValidEscape := false
 		for _, t := range input.Plan.Tasks {
 			if t.Action == "retreat" || t.Action == "eat" || t.Action == "gather" || t.Action == "explore" {
@@ -46,7 +40,7 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 	// 2. Threat proximity override
 	if len(input.State.Threats) > 0 {
 		for _, t := range input.State.Threats {
-			if t.Distance <= maxThreatDist {
+			if t.Distance <= domain.SurvivalMaxThreatDist {
 				isValidEscape := false
 				for _, task := range input.Plan.Tasks {
 					if task.Action == "retreat" || task.Action == "eat" {
@@ -71,7 +65,7 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 	// 3. Hunt safety check
 	for _, t := range input.Plan.Tasks {
 		if t.Action == "hunt" {
-			if input.State.Health < minFoodForHunt {
+			if input.State.Health < domain.SurvivalMinFoodForHunt {
 				return Decision{
 					IsApproved: false,
 					Reason:     "POLICY: health < 8; too weak to hunt",

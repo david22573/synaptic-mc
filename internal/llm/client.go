@@ -1,3 +1,4 @@
+// internal/llm/client.go
 package llm
 
 import (
@@ -30,15 +31,12 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		config: cfg,
 		http: &http.Client{
-			// Base transport timeout; context timeouts will override this per-call
 			Timeout: 45 * time.Second,
 		},
 	}
 }
 
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	// 1. Enforce strict timeout for the entire generation process
-	// Phase 2 Improvement: llm-timeout-and-circuit-breaker
 	genCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -60,23 +58,22 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 }
 
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
-	// Robustly convert the chat completion endpoint into an embeddings endpoint
 	parsedURL, err := url.Parse(c.config.APIURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid APIURL configured: %w", err)
 	}
 
-	// Handles variations like /v1/chat/completions -> /v1/embeddings
-	pathParts := strings.Split(parsedURL.Path, "/")
-	if len(pathParts) > 0 {
-		pathParts = pathParts[:len(pathParts)-2] // strip off "chat/completions" or similar
+	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/chat/completions")
+	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/completions")
+	if !strings.HasSuffix(parsedURL.Path, "/embeddings") {
+		if !strings.HasSuffix(parsedURL.Path, "/") && parsedURL.Path != "" {
+			parsedURL.Path += "/"
+		}
+		parsedURL.Path += "embeddings"
 	}
-	pathParts = append(pathParts, "embeddings")
-	parsedURL.Path = strings.Join(pathParts, "/")
 
 	embedURL := parsedURL.String()
 
-	// Embeddings should be fast; enforce a tighter timeout
 	embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -123,7 +120,6 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
-			// Network errors are transient, proceed to retry
 			continue
 		}
 
@@ -134,15 +130,12 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 			continue
 		}
 
-		// Phase 2 Improvement: Circuit Breaker / Strict Retry Policy
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 
-			// 4xx errors (Auth, Bad Request) are terminal. Do NOT retry.
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 				return nil, lastErr
 			}
-			// 5xx errors (Gateway timeout, server overload) are transient. Proceed to retry.
 			continue
 		}
 
@@ -153,12 +146,10 @@ func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, 
 		}
 
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			// Schema validation failures are terminal. Do NOT retry.
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Data) == 0 {
-			// Bad API response payload is terminal. Do NOT retry.
 			return nil, fmt.Errorf("empty embedding array returned")
 		}
 
@@ -202,7 +193,6 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
-			// Network errors are transient, proceed to retry
 			continue
 		}
 
@@ -213,15 +203,12 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 			continue
 		}
 
-		// Phase 2 Improvement: Circuit Breaker / Strict Retry Policy
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 
-			// 4xx errors (Auth, Bad Request) are terminal. Do NOT retry.
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 				return "", lastErr
 			}
-			// 5xx errors (Gateway timeout, server overload) are transient. Proceed to retry.
 			continue
 		}
 
@@ -234,12 +221,10 @@ func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) 
 		}
 
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			// Schema validation failures are terminal. Do NOT retry.
 			return "", fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Choices) == 0 {
-			// Bad API response payload is terminal. Do NOT retry.
 			return "", fmt.Errorf("empty choices array returned")
 		}
 

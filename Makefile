@@ -5,8 +5,11 @@
 
 ifeq ($(OS),Windows_NT)
 	BIN_NAME = bin/synaptic-server.exe
+	# Use taskkill on Windows to unlock the binary before rebuilding
+	PRE_BUILD = -taskkill /F /IM synaptic-server.exe /T 2>NUL || true
 else
 	BIN_NAME = bin/synaptic-server
+	PRE_BUILD = pkill -f $(BIN_NAME) 2>/NUL || true
 endif
 
 help: ## Show help
@@ -28,6 +31,7 @@ build-ts: ## Compile TypeScript bot to dist/
 
 build-go: ## Build Go control plane
 	@echo "==> Building Go binary..."
+	@$(PRE_BUILD)
 	go build -ldflags="-s -w -X main.buildTime=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)" -o $(BIN_NAME) ./cmd/server
 
 build: build-ui build-ts build-go ## Full production build (recommended)

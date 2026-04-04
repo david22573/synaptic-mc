@@ -1,5 +1,4 @@
 <script lang="ts">
-    import ItemIcon from "./ItemIcon.svelte";
     import { botStore, uiStore } from "../lib/store.svelte";
 
     const health = $derived(botStore.gameState?.health ?? 20);
@@ -56,13 +55,13 @@
 
             <div class="mc-bar-half right-align">
                 {#each Array(emptyFood) as _}
-                    <span class="mc-icon-stat empty">🍖</span>
+                    <span class="mc-icon-stat empty">🍗</span>
                 {/each}
                 {#each Array(halfFood) as _}
-                    <span class="mc-icon-stat">🍗</span>
+                    <span class="mc-icon-stat">🍖</span>
                 {/each}
                 {#each Array(fullFood) as _}
-                    <span class="mc-icon-stat">🍖</span>
+                    <span class="mc-icon-stat">🍗</span>
                 {/each}
             </div>
         </div>
@@ -88,7 +87,11 @@
                 onmouseleave={clearTooltip}
             >
                 {#if offhand}
-                    <ItemIcon name={offhand.name} size={24} />
+                    <img
+                        src="/assets/{offhand.name}.png"
+                        alt={offhand.name}
+                        class="item-icon"
+                    />
                     {#if offhand.count > 1}
                         <span class="slot-count">{offhand.count}</span>
                     {/if}
@@ -105,7 +108,11 @@
                         onmouseleave={clearTooltip}
                     >
                         {#if slot}
-                            <ItemIcon name={slot.name} size={24} />
+                            <img
+                                src="/assets/{slot.name}.png"
+                                alt={slot.name}
+                                class="item-icon"
+                            />
                             {#if slot.count > 1}
                                 <span class="slot-count">{slot.count}</span>
                             {/if}
@@ -271,6 +278,13 @@
             inset 0 0 0 2px #fff,
             0 0 6px rgba(255, 255, 255, 0.6);
         z-index: 10;
+    }
+
+    .item-icon {
+        width: 24px;
+        height: 24px;
+        image-rendering: pixelated;
+        pointer-events: none;
     }
 
     .slot-count {

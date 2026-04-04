@@ -31,6 +31,16 @@ const (
 	CauseUnknown                 = "UNKNOWN"
 )
 
+// Survival & Decision Thresholds
+const (
+	SurvivalCriticalHealth = 4.0
+	SurvivalMinFoodForHunt = 8.0
+	SurvivalMaxThreatDist  = 12.0
+	DecisionHealthSafe     = 10.0
+	DecisionHealthHunt     = 12.0
+	DecisionFoodMax        = 20.0
+)
+
 type ExecutionResult struct {
 	Action   Action  `json:"action"`
 	Success  bool    `json:"success"`

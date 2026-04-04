@@ -1,3 +1,4 @@
+// internal/execution/engine.go
 package execution
 
 import (
@@ -119,9 +120,6 @@ func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action)
 	}
 	e.recentActions[dedupKey] = time.Now()
 
-	// REMOVED: The silent drop for Priority < 0 tasks to prevent TaskManager deadlocks
-	// Let the priority queue handle the execution order naturally
-
 	heap.Push(&e.queue, queuedAction{
 		ctx:        ctx,
 		action:     action,
@@ -168,62 +166,70 @@ func (e *TaskExecutionEngine) pump() {
 	}
 	e.mu.Unlock()
 
-	if qa.action.Priority < 10 && e.noiseLevel > 0.01 {
-		maxJitter := int64(e.noiseLevel * 5000)
-		if maxJitter > 0 {
-			jitter := time.Duration(rand.Int63n(maxJitter)) * time.Millisecond
-			time.Sleep(jitter)
+	go func(qa queuedAction) {
+		if qa.action.Priority < 10 && e.noiseLevel > 0.01 {
+			maxJitter := int64(e.noiseLevel * 5000)
+			if maxJitter > 0 {
+				jitter := time.Duration(rand.Int63n(maxJitter)) * time.Millisecond
+				select {
+				case <-qa.ctx.Done():
+					e.mu.Lock()
+					e.inFlight = nil
+					e.retryCount = 0
+					e.mu.Unlock()
+					return
+				case <-time.After(jitter):
+				}
+			}
 		}
-	}
 
-	dispatchCtx := qa.ctx
+		err := e.controller.Dispatch(qa.ctx, qa.action)
+		if err != nil {
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				e.logger.Debug("Task aborted cleanly", slog.String("action", qa.action.Action), slog.Any("reason", err))
+				e.mu.Lock()
+				e.inFlight = nil
+				e.retryCount = 0
+				e.mu.Unlock()
+				return
+			}
 
-	err := e.controller.Dispatch(dispatchCtx, qa.action)
-	if err != nil {
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			e.logger.Debug("Task aborted cleanly", slog.String("action", qa.action.Action), slog.Any("reason", err))
 			e.mu.Lock()
-			e.inFlight = nil
-			e.retryCount = 0
+			if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
+				e.inFlight.Status = StatusFailed
+				e.inFlight.Error = err.Error()
+				e.inFlight = nil
+			}
+
+			e.retryCount++
+			shouldRetry := e.retryCount < 5
 			e.mu.Unlock()
+
+			if err.Error() != "no active controller" {
+				e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action), slog.Int("retry", e.retryCount))
+			}
+
+			if shouldRetry {
+				backoff := time.Duration(e.retryCount*100) * time.Millisecond
+				time.Sleep(backoff)
+
+				e.mu.Lock()
+				qa.enqueuedAt = time.Now()
+				heap.Push(&e.queue, qa)
+				e.mu.Unlock()
+			} else {
+				e.logger.Error("Max dispatch retries exceeded, dropping task", slog.String("action", qa.action.Action))
+				e.mu.Lock()
+				e.retryCount = 0
+				e.mu.Unlock()
+			}
 			return
 		}
 
 		e.mu.Lock()
-		if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
-			e.inFlight.Status = StatusFailed
-			e.inFlight.Error = err.Error()
-			e.inFlight = nil
-		}
-
-		e.retryCount++
-		shouldRetry := e.retryCount < 5
+		e.retryCount = 0
 		e.mu.Unlock()
-
-		if err.Error() != "no active controller" {
-			e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action), slog.Int("retry", e.retryCount))
-		}
-
-		if shouldRetry {
-			backoff := time.Duration(e.retryCount*100) * time.Millisecond
-			time.Sleep(backoff)
-
-			e.mu.Lock()
-			qa.enqueuedAt = time.Now()
-			heap.Push(&e.queue, qa)
-			e.mu.Unlock()
-		} else {
-			e.logger.Error("Max dispatch retries exceeded, dropping task", slog.String("action", qa.action.Action))
-			e.mu.Lock()
-			e.retryCount = 0
-			e.mu.Unlock()
-		}
-		return
-	}
-
-	e.mu.Lock()
-	e.retryCount = 0
-	e.mu.Unlock()
+	}(qa)
 }
 
 func (e *TaskExecutionEngine) OnTaskStart(actionID string) {

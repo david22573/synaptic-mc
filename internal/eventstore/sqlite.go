@@ -1,3 +1,4 @@
+// internal/eventstore/sqlite.go
 package eventstore
 
 import (
@@ -35,6 +36,7 @@ type SQLiteStore struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
+	mu     sync.Mutex
 }
 
 func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
@@ -272,6 +274,9 @@ func (s *SQLiteStore) insertBatch(ctx context.Context, events []pendingEvent) er
 	if len(events) == 0 {
 		return nil
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

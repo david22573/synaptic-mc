@@ -32,7 +32,7 @@ interface CombatContext extends StateContext {
     hasShield: boolean;
     isBlocking: boolean;
     lastAttackTime: number;
-    lastHitTime: number; // Added to track actual connection for timeout fallback
+    lastHitTime: number;
     stopMovement: () => void;
 }
 
@@ -49,11 +49,10 @@ class EngageState implements FSMState {
         const combatStartTime = Date.now();
         const maxCombatDurationMs = 60000;
         let lastValidation = Date.now();
-        sCtx.lastHitTime = Date.now(); // Initialize
+        sCtx.lastHitTime = Date.now();
 
         bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
 
-        // Listen for actual damage to update lastHitTime
         const onEntityHurt = (entity: any) => {
             if (entity.id === target.id) {
                 sCtx.lastHitTime = Date.now();
@@ -71,20 +70,17 @@ class EngageState implements FSMState {
                     );
                 }
 
-                // FIX: Fallback timeout if health isn't updating but we haven't landed a hit in 10s
-                if (Date.now() - sCtx.lastHitTime > 10000) {
-                    // Check if it's actually dead but metadata lagged
+                if (Date.now() - sCtx.lastHitTime > 5000) {
                     const isActuallyDead = !bot.entities[target.id];
                     if (isActuallyDead) {
                         break;
                     } else {
                         throw new Error(
-                            "TARGET_LOST: Failed to damage target for 10s, assuming unreachable.",
+                            "TARGET_LOST: Failed to damage target for 5s, assuming unreachable.",
                         );
                     }
                 }
 
-                // Add periodic re-validation to prevent swinging at ghosts
                 if (Date.now() - lastValidation > 1000) {
                     const filter = (entity: any) =>
                         entity.name === sCtx.targetName &&
@@ -159,7 +155,7 @@ class EngageState implements FSMState {
             }
             throw err;
         } finally {
-            bot.removeListener("entityHurt", onEntityHurt); // Cleanup
+            bot.removeListener("entityHurt", onEntityHurt);
             bot.pathfinder.setGoal(null);
             bot.clearControlStates();
             if (sCtx.hasShield && sCtx.isBlocking) {
@@ -168,7 +164,6 @@ class EngageState implements FSMState {
             }
         }
 
-        // If we broke out of the loop normally, or via the fallback, count it as a kill
         sCtx.killCount++;
 
         const deathPos = target.position.clone();
@@ -259,7 +254,7 @@ class SearchState implements FSMState {
 
             attempts++;
             const angle = Math.random() * Math.PI * 2;
-            const radius = 8 * attempts; // Expands outward: 8, 16, 24...
+            const radius = 8 * attempts;
 
             const pos = bot.entity.position
                 .clone()
@@ -268,7 +263,6 @@ class SearchState implements FSMState {
             try {
                 bot.pathfinder.setGoal(new goals.GoalNearXZ(pos.x, pos.z, 4));
 
-                // Walk for roughly 3 seconds to let chunks load / targets enter vision
                 for (let i = 0; i < 60; i++) {
                     if (sCtx.signal.aborted) throw new Error("aborted");
 
@@ -278,7 +272,6 @@ class SearchState implements FSMState {
                     await bot.waitForTicks(1);
                 }
             } catch (e) {
-                // If pathing fails to random point, pause and retry next angle
                 await bot.waitForTicks(10);
             }
         }

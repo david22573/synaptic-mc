@@ -1,3 +1,4 @@
+// internal/execution/ws_controller.go
 package execution
 
 import (
@@ -72,7 +73,6 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 	}
 	c.mu.Unlock()
 
-	// Phase 3 Fix #8: Trace log the flow
 	c.logger.Info("Dispatching action",
 		slog.String("action", action.Action),
 		slog.String("target_name", action.Target.Name),
@@ -90,14 +90,13 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 		Payload: payload,
 	}
 
-	// Phase 3 Fix #7: Drop-with-warn on full channel instead of returning error
 	select {
 	case c.sendCh <- msg:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	default:
-		c.logger.Warn("Send channel full, dropping dispatch message to avoid blocking", slog.String("action", action.Action))
+	case <-time.After(2 * time.Second):
+		c.logger.Warn("Send channel timeout, dropping dispatch message to avoid blocking", slog.String("action", action.Action))
 		return nil
 	}
 }
@@ -117,12 +116,13 @@ func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
 		return errors.New("websocket closed")
 	}
 
-	// Phase 3 Fix #7: Apply the same drop-with-warn logic to the abort channel push
 	select {
 	case c.sendCh <- msg:
 		return nil
-	default:
-		c.logger.Warn("Send channel full, dropping abort message to avoid blocking", slog.String("reason", reason))
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+		c.logger.Warn("Send channel timeout, dropping abort message to avoid blocking", slog.String("reason", reason))
 		return nil
 	}
 }
@@ -167,7 +167,6 @@ func (c *WSController) readPump() {
 			continue
 		}
 
-		// Phase 1/5: Parse and log the ExecutionResult directly for observability
 		if msg.Type == "TASK_END" {
 			var res domain.ExecutionResult
 			if err := json.Unmarshal(msg.Payload, &res); err == nil {
@@ -179,7 +178,6 @@ func (c *WSController) readPump() {
 			}
 		}
 
-		// Route to manager/engine
 		if c.onMessage != nil {
 			c.onMessage(msg.Type, msg.Payload)
 		}

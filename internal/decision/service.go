@@ -97,7 +97,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 	for _, task := range plan.Tasks {
 		switch task.Action {
 		case "eat":
-			if state.Food >= 20 {
+			if state.Food >= domain.DecisionFoodMax {
 				return false
 			}
 		case "craft":
@@ -112,7 +112,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 				return false
 			}
 		case "hunt":
-			if state.Health < 12 {
+			if state.Health < domain.DecisionHealthHunt {
 				return false
 			}
 		}
@@ -226,7 +226,7 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 
 	if currCommitment := s.commitment.Load(); currCommitment != nil {
 		if time.Since(currCommitment.StartTime) < currCommitment.MinDuration {
-			if state.Health >= 10 && len(state.Threats) == 0 {
+			if state.Health >= domain.DecisionHealthSafe && len(state.Threats) == 0 {
 				return
 			}
 			s.logger.Info("Breaking commitment lock for critical survival event")
@@ -235,7 +235,7 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 
 	var plan domain.Plan
 
-	if len(state.Threats) > 0 || state.Health < 12 {
+	if len(state.Threats) > 0 || state.Health < domain.DecisionHealthHunt {
 		s.logger.Warn("Survival priority override active")
 		plan = s.planner.reactivePlan(state)
 	} else {

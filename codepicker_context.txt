@@ -1,462 +1,992 @@
-Project Context Dump (03 Apr 26 17:35 PDT)
+Project Context Dump (03 Apr 26 19:24 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 8
+Total Files: 3
 
 # Project Structure
 <file_tree>
-- internal\humanization\attention.go
-- internal\humanization\config.go
-- internal\humanization\context.go
-- internal\humanization\engine.go
-- internal\humanization\hesitation.go
-- internal\humanization\intent.go
-- internal\humanization\noise.go
-- internal\humanization\state.go
+- internal\execution\task_manager.go
+- ui\src\App.svelte
+- ui\src\components\HUD.svelte
 </file_tree>
 
 # File Contents
-<file path="internal\humanization\attention.go">
-// internal/humanization/attention.go
-package humanization
+<file path="internal\execution\task_manager.go">
+package execution
 
 import (
-	"math/rand"
-	"time"
-)
-
-type AttentionModel struct {
-	FocusLevel float64 // 1.0 = locked in, 0.0 = completely scatterbrained
-	LastUpdate time.Time
-}
-
-func NewAttentionModel() *AttentionModel {
-	return &AttentionModel{
-		FocusLevel: 1.0,
-		LastUpdate: time.Now(),
-	}
-}
-
-// Decay reduces focus over time to simulate boredom or fatigue.
-func (a *AttentionModel) Decay() {
-	elapsed := time.Since(a.LastUpdate).Seconds()
-	decayAmount := (elapsed / 60.0) * 0.05 // Drops 5% per minute
-
-	a.FocusLevel -= decayAmount
-	if a.FocusLevel < 0.2 {
-		a.FocusLevel = 0.2 // Floor the focus so it doesn't break entirely
-	}
-	a.LastUpdate = time.Now()
-}
-
-// CheckDistraction rolls the dice to see if the bot abandons its current thought track.
-func (a *AttentionModel) CheckDistraction() bool {
-	a.Decay()
-	// The lower the focus, the higher the chance of being distracted
-	distractionChance := (1.0 - a.FocusLevel) * 0.25
-	return rand.Float64() < distractionChance
-}
-
-// Refocus snaps the bot back to 100% (e.g., after taking damage, sleeping, or finishing a major task).
-func (a *AttentionModel) Refocus() {
-	a.FocusLevel = 1.0
-	a.LastUpdate = time.Now()
-}
-
-</file>
-
-<file path="internal\humanization\config.go">
-package humanization
-
-import "time"
-
-// Config holds the tuning parameters for the humanization engine.
-type Config struct {
-	// AttentionDecay is the rate at which focus drops per second (0.0 to 1.0)
-	AttentionDecay float64
-
-	// HesitationBase is the minimum reaction time before executing an action
-	HesitationBase time.Duration
-
-	// NoiseLevel dictates the probability/severity of input jitter (0.0 to 1.0)
-	NoiseLevel float64
-
-	// BaseDriftRate dictates the probability of background idle actions
-	BaseDriftRate float64
-
-	// MaxDriftDelay bounds how far into the future a drift action is scheduled
-	MaxDriftDelay time.Duration
-
-	DistractionThreshold float64 // How close is "close enough" for pathing and interactions
-}
-
-</file>
-
-<file path="internal\humanization\context.go">
-package humanization
-
-import "david22573/synaptic-mc/internal/domain"
-
-// Context provides the situational awareness required for behavioral modifiers.
-type Context struct {
-	State   domain.GameState
-	IsStuck bool
-}
-
-// BuildContext constructs a new behavioral context from the orchestrator's state.
-func BuildContext(state domain.GameState, isStuck bool) Context {
-	return Context{
-		State:   state,
-		IsStuck: isStuck,
-	}
-}
-
-</file>
-
-<file path="internal\humanization\engine.go">
-// internal/humanization/engine.go
-package humanization
-
-import (
+	"container/heap"
+	"context"
 	"fmt"
-	"math/rand"
+	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type ScheduledAction struct {
-	Action    domain.Action
-	ExecuteAt time.Time
+type ActionPriorityQueue []*domain.Action
+
+func (pq ActionPriorityQueue) Len() int { return len(pq) }
+
+func (pq ActionPriorityQueue) Less(i, j int) bool {
+	return pq[i].Priority > pq[j].Priority
 }
 
-type Engine struct {
-	cfg         Config
-	state       *State
-	intentModel *IntentModel
+func (pq ActionPriorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
 }
 
-func NewEngine(cfg Config) *Engine {
-	return &Engine{
-		cfg:         cfg,
-		state:       NewState(cfg),
-		intentModel: NewIntentModel(),
-	}
+func (pq *ActionPriorityQueue) Push(x interface{}) {
+	item := x.(*domain.Action)
+	*pq = append(*pq, item)
 }
 
-func (e *Engine) State() *State {
-	return e.state
+func (pq *ActionPriorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	*pq = old[0 : n-1]
+	return item
 }
 
-func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
-	var scheduled []ScheduledAction
-	now := time.Now()
-	currentDelay := time.Duration(0)
+type scheduledItem struct {
+	action    domain.Action
+	executeAt time.Time
+}
 
-	approvedTasks := e.intentModel.Apply(plan.Tasks, e.state, ctx)
-	if len(approvedTasks) == 0 {
-		return scheduled
+type TaskManager struct {
+	engine      *TaskExecutionEngine
+	ctrlManager *ControllerManager
+	logger      *slog.Logger
+	timeouts    map[string]time.Duration
+	OnDrain     func()
+
+	queue       ActionPriorityQueue
+	mu          sync.Mutex
+	activeTask  *domain.Action
+	activeCtx   context.Context
+	cancelTask  context.CancelFunc
+	signalCh    chan struct{}
+	idleSince   time.Time
+	lastFailure time.Time
+
+	scheduleMu  sync.Mutex
+	scheduled   []scheduledItem
+	scheduleSig chan struct{}
+
+	isSystemLocked func() bool
+	isBotReady     func() bool
+}
+
+func NewTaskManager(
+	engine *TaskExecutionEngine,
+	ctrlManager *ControllerManager,
+	timeouts map[string]time.Duration,
+	logger *slog.Logger,
+) *TaskManager {
+	if timeouts == nil {
+		timeouts = make(map[string]time.Duration)
+	}
+	tm := &TaskManager{
+		engine:      engine,
+		ctrlManager: ctrlManager,
+		logger:      logger.With(slog.String("component", "task_manager")),
+		timeouts:    timeouts,
+		queue:       make(ActionPriorityQueue, 0, 10),
+		signalCh:    make(chan struct{}, 1),
+		scheduleSig: make(chan struct{}, 1),
 	}
 
-	// Week 5: Panic Mode (Pure reflex + escape, disable humanization noise)
-	isCritical := false
-	if ctx.State.CurrentTask != nil {
-		action := ctx.State.CurrentTask.Action
-		if action == "combat" || action == "retreat" || action == "eat" || action == "mine" {
-			isCritical = true
-		}
-	}
-	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
-		isCritical = true
-	}
+	heap.Init(&tm.queue)
+	return tm
+}
 
-	// Only drift if we aren't in a life-or-death situation
-	if !isCritical {
-		driftActions := ProcessAttentionDrift(ctx, e.state, now)
-		scheduled = append(scheduled, driftActions...)
+func (tm *TaskManager) SetLockChecker(checker func() bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.isSystemLocked = checker
+}
 
-		if rand.Float64() < e.cfg.BaseDriftRate {
-			driftAction := e.generateDrift(ctx)
-			if driftAction != nil {
-				driftDelay := time.Duration(rand.Int63n(int64(e.cfg.MaxDriftDelay)))
-				scheduled = append(scheduled, ScheduledAction{
-					Action:    *driftAction,
-					ExecuteAt: now.Add(driftDelay),
-				})
+func (tm *TaskManager) SetReadyChecker(checker func() bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.isBotReady = checker
+}
+
+func (tm *TaskManager) Run(ctx context.Context) {
+	idleCheck := time.NewTicker(1 * time.Second)
+	defer idleCheck.Stop()
+
+	scheduleTicker := time.NewTicker(100 * time.Millisecond)
+	defer scheduleTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-idleCheck.C:
+			tm.mu.Lock()
+			if time.Since(tm.lastFailure) < 5*time.Second {
+				tm.mu.Unlock()
+				continue
 			}
+
+			systemLocked := tm.isSystemLocked != nil && tm.isSystemLocked()
+			hasController := tm.engine.HasController()
+			botReady := tm.isBotReady == nil || tm.isBotReady()
+
+			shouldRunCuriosity := tm.activeTask == nil && tm.queue.Len() == 0 && !systemLocked && hasController && botReady
+
+			if shouldRunCuriosity {
+				if tm.idleSince.IsZero() {
+					tm.idleSince = time.Now()
+				} else if time.Since(tm.idleSince) > 5*time.Second {
+					tm.logger.Info("Curiosity loop triggered: autonomous exploration")
+					exploreTask := domain.Action{
+						// FIX: Append timestamp to ensure unique task ID for idempotency cache bypass
+						ID:        fmt.Sprintf("explore-curiosity-%d", time.Now().UnixNano()),
+						Action:    "explore",
+						Target:    domain.Target{Type: "category", Name: "surroundings"},
+						Priority:  -1,
+						Rationale: "Curiosity loop: self-starting exploration",
+					}
+					t := exploreTask
+					heap.Push(&tm.queue, &t)
+					tm.idleSince = time.Time{}
+					select {
+					case tm.signalCh <- struct{}{}:
+					default:
+					}
+				}
+			} else {
+				tm.idleSince = time.Time{}
+			}
+			tm.mu.Unlock()
+
+		case <-scheduleTicker.C:
+			tm.processScheduled()
+
+		case <-tm.scheduleSig:
+			tm.processScheduled()
+
+		case <-tm.signalCh:
+			tm.mu.Lock()
+			if tm.queue.Len() > 0 {
+				peek := tm.queue[0]
+				if tm.activeTask == nil || peek.Priority > tm.activeTask.Priority {
+					next := heap.Pop(&tm.queue).(*domain.Action)
+
+					if tm.queue.Len() > 0 {
+						peekNext := tm.queue[0]
+						tm.warmStartNext(ctx, peekNext)
+					}
+
+					tm.idleSince = time.Time{}
+					tm.mu.Unlock()
+					tm.dispatchCurrent(ctx, *next)
+					continue
+				}
+			}
+			tm.mu.Unlock()
 		}
 	}
-
-	for i, task := range approvedTasks {
-		if task.Priority == 0 {
-			task.Priority = 5
-		}
-
-		noisyTask := ApplyNoise(task, ctx, e.cfg)
-		hesitation := time.Duration(0)
-
-		if i == 0 || !isCritical {
-			hesitation = CalculateHesitation(noisyTask, ctx, e.state, e.cfg)
-		}
-
-		if i > 0 && !isCritical {
-			hesitation = hesitation / 2
-		}
-
-		// In Panic Mode, reaction time is instantaneous
-		if isCritical {
-			hesitation = 0
-		}
-
-		currentDelay += hesitation
-
-		scheduled = append(scheduled, ScheduledAction{
-			Action:    noisyTask,
-			ExecuteAt: now.Add(currentDelay),
-		})
-
-		currentDelay += 100 * time.Millisecond
-	}
-
-	return scheduled
 }
 
-func (e *Engine) generateDrift(ctx Context) *domain.Action {
-	roll := rand.Float64()
+func (tm *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
+	tm.logger.Debug("Warm starting next task in background", slog.String("action", nextTask.Action))
+}
 
-	action := domain.Action{
-		ID:       fmt.Sprintf("drift-%d", time.Now().UnixNano()),
-		Priority: -1,
+func (tm *TaskManager) IsIdle() bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.activeTask == nil && tm.queue.Len() == 0
+}
+
+func (tm *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	for _, task := range tasks {
+		t := task
+		heap.Push(&tm.queue, &t)
+	}
+	tm.idleSince = time.Time{}
+
+	select {
+	case tm.signalCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (tm *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
+	tm.scheduleMu.Lock()
+	tm.scheduled = append(tm.scheduled, scheduledItem{action, executeAt})
+	sort.Slice(tm.scheduled, func(i, j int) bool {
+		return tm.scheduled[i].executeAt.Before(tm.scheduled[j].executeAt)
+	})
+	tm.scheduleMu.Unlock()
+
+	select {
+	case tm.scheduleSig <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (tm *TaskManager) processScheduled() {
+	tm.scheduleMu.Lock()
+	defer tm.scheduleMu.Unlock()
+
+	if len(tm.scheduled) == 0 {
+		return
 	}
 
-	if roll < 0.5 {
-		action.Action = "look"
-		action.Target = domain.Target{Type: "relative", Name: "random_yaw"}
-		action.Rationale = "Humanization: idle looking around"
-	} else if roll < 0.8 {
-		action.Action = "inventory"
-		action.Target = domain.Target{Type: "ui", Name: "open_close"}
-		action.Rationale = "Humanization: nervously checking inventory"
-	} else {
+	now := time.Now()
+	ready := make([]domain.Action, 0)
+
+	for len(tm.scheduled) > 0 && tm.scheduled[0].executeAt.Before(now) {
+		ready = append(ready, tm.scheduled[0].action)
+		tm.scheduled = tm.scheduled[1:]
+	}
+
+	if len(ready) > 0 {
+		tm.mu.Lock()
+		for _, action := range ready {
+			t := action
+			heap.Push(&tm.queue, &t)
+		}
+		tm.mu.Unlock()
+
+		select {
+		case tm.signalCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if tm.activeTask == nil || tm.activeTask.ID != taskID {
 		return nil
 	}
 
-	return &action
-}
+	if tm.cancelTask != nil {
+		tm.cancelTask()
+		tm.cancelTask = nil
+		tm.activeCtx = nil
+	}
+	tm.activeTask = nil
 
-</file>
-
-<file path="internal\humanization\hesitation.go">
-// internal/humanization/hesitation.go
-package humanization
-
-import (
-	"math/rand"
-	"time"
-
-	"david22573/synaptic-mc/internal/domain"
-)
-
-// CalculateHesitation determines how long the bot should pause before acting.
-func CalculateHesitation(action domain.Action, ctx Context, state *State, cfg Config) time.Duration {
-	base := float64(cfg.HesitationBase.Milliseconds())
-
-	// 1. Complexity Scaling
-	switch action.Action {
-	case "hunt", "combat", "retreat", "build":
-		base += 600.0
-	case "craft", "smelt", "store":
-		base += 300.0
-	case "explore":
-		base += 100.0
+	if !success {
+		tm.lastFailure = time.Now()
+		if tm.ctrlManager != nil {
+			if idm := tm.ctrlManager.GetIdempotent(); idm != nil {
+				idm.Clear(taskID)
+			}
+		}
+		tm.queue = make(ActionPriorityQueue, 0, 10)
+		heap.Init(&tm.queue)
+		if tm.OnDrain != nil {
+			go tm.OnDrain()
+		}
+		return nil
 	}
 
-	// 2. Confusion Scaling
-	if ctx.IsStuck {
-		base += 1200.0
-	}
-
-	// 3. Attention Scaling
-	attentionModifier := 1.0 + (1.0 - state.GetAttention())
-	base *= attentionModifier
-
-	// 4. Week 5: Risk-Based Hesitation (Caution factor)
-	// Base delay + (risk * factor). High risk environments cause the bot to pause
-	// and "think" before acting (simulating stealth/caution), unless panic mode overrides.
-	risk := 0.0
-	if ctx.State.Health < 20 {
-		risk += (20.0 - ctx.State.Health) * 0.5
-	}
-	risk += float64(len(ctx.State.Threats) * 2.0)
-
-	factor := 45.0 // ms added per unit of risk
-	base += (risk * factor)
-
-	// 5. Natural Jitter
-	jitterLimit := int64(base * 0.5)
-	var jitter int64
-	if jitterLimit > 0 {
-		jitter = rand.Int63n(jitterLimit)
-	}
-
-	finalMs := int64(base) + jitter
-	return time.Duration(finalMs) * time.Millisecond
-}
-
-</file>
-
-<file path="internal\humanization\intent.go">
-// internal/humanization/intent.go
-package humanization
-
-import (
-	"time"
-
-	"david22573/synaptic-mc/internal/domain"
-)
-
-// IntentState tracks the bot's emotional commitment to its current goal.
-type IntentState struct {
-	CurrentGoal    string
-	Commitment     float64
-	Frustration    float64
-	CommitmentTime time.Time
-}
-
-type IntentModel struct{}
-
-func NewIntentModel() *IntentModel {
-	return &IntentModel{}
-}
-
-// Apply evaluates frustration and decides whether to proceed with the tasks or abandon them.
-func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []domain.Action {
-	if len(tasks) == 0 {
-		return tasks
-	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	// Week 5: Panic Mode
-	// If survival is threatened, drop all frustration and lock strictly into the plan
-	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
-		state.Intent.Frustration = 0.0
-		state.Intent.Commitment = 1.0
-		return tasks
-	}
-
-	// 1. Calculate Frustration
-	if ctx.IsStuck {
-		state.Intent.Frustration += 0.01
+	if tm.queue.Len() == 0 {
+		if tm.OnDrain != nil {
+			go tm.OnDrain()
+		}
 	} else {
-		state.Intent.Frustration -= 0.05
-		if state.Intent.Frustration < 0 {
-			state.Intent.Frustration = 0
+		select {
+		case tm.signalCh <- struct{}{}:
+		default:
 		}
 	}
 
-	// 2. Rage Quit Threshold
-	if state.Intent.Frustration > 0.8 {
-		state.Intent.CurrentGoal = ""
-		state.Intent.Commitment = 0.0
-		state.Intent.Frustration = 0.0
-		return []domain.Action{}
+	return nil
+}
+
+func (tm *TaskManager) Halt(ctx context.Context, reason string) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tm.queue = make(ActionPriorityQueue, 0, 10)
+	heap.Init(&tm.queue)
+	return tm.abortActiveLocked(ctx, reason)
+}
+
+func (tm *TaskManager) abortActiveLocked(ctx context.Context, reason string) error {
+	if tm.activeTask == nil {
+		return nil
+	}
+	if tm.cancelTask != nil {
+		tm.cancelTask()
+		tm.cancelTask = nil
+		tm.activeCtx = nil
 	}
 
-	// 3. Lock in new goals
-	primaryTask := tasks[0]
-	if state.Intent.CurrentGoal != primaryTask.Action {
-		state.Intent.CurrentGoal = primaryTask.Action
-		state.Intent.Commitment = 1.0
-		state.Intent.Frustration = 0.0
-		state.Intent.CommitmentTime = time.Now()
-	} else {
-		// Strengthen emotional commitment the longer a task runs
-		if time.Since(state.Intent.CommitmentTime) > 3*time.Second {
-			state.Intent.Commitment = 1.0
+	err := tm.engine.AbortCurrent(ctx, reason)
+	tm.activeTask = nil
+	return err
+}
+
+func (tm *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action) {
+	tm.mu.Lock()
+
+	if tm.activeTask != nil && !tm.engine.HasController() {
+		tm.logger.Warn("Controller missing, preserving active task")
+		tm.mu.Unlock()
+		return
+	}
+
+	if tm.activeTask != nil && action.Priority > tm.activeTask.Priority {
+		if action.Priority-tm.activeTask.Priority > 5 {
+			_ = tm.abortActiveLocked(ctx, "preempted_by_priority")
+		} else {
+			t := action
+			heap.Push(&tm.queue, &t)
+			tm.mu.Unlock()
+			return
 		}
+	} else if tm.activeTask != nil {
+		tm.mu.Unlock()
+		return
 	}
 
-	return tasks
+	derivedCtx, cancel := context.WithCancel(ctx)
+	tm.activeTask = &action
+	tm.activeCtx = derivedCtx
+	tm.cancelTask = cancel
+	tm.mu.Unlock()
+
+	tm.engine.Enqueue(derivedCtx, action)
 }
 
 </file>
 
-<file path="internal\humanization\noise.go">
-package humanization
+<file path="ui\src\App.svelte">
+<script lang="ts">
+    import { onMount } from "svelte";
+    import {
+        botStore,
+        uiStore,
+        connectToBot,
+        disconnectBot,
+        sendCameraControl,
+    } from "./lib/store.svelte";
+    import { controller } from "./lib/store.svelte";
+    import HUD from "./components/HUD.svelte";
+    import Sidebar from "./components/Sidebar.svelte";
 
-import (
-	"david22573/synaptic-mc/internal/domain"
-)
+    let viewerUrl = $state("about:blank");
+    let isSidebarOpen = $state(true);
+    let viewerIframe = $state<HTMLIFrameElement>();
 
-// ApplyNoise lightly fuzzes the intent parameters.
-// Currently acts as a passthrough for structural safety, but is hooked up
-// for future vector/coordinate fuzzing when actions carry explicit Vec3s.
-func ApplyNoise(action domain.Action, ctx Context, cfg Config) domain.Action {
-	if cfg.NoiseLevel <= 0.01 {
-		return action
-	}
+    // 60 FPS Interpolation State
+    let renderPosition = $state({ x: 0, y: 0, z: 0 });
+    let animationFrameId: number;
 
-	noisyAction := action
+    const position = $derived(
+        botStore.gameState?.position || { x: 0, y: 0, z: 0 },
+    );
+    const timeOfDay = $derived(botStore.gameState?.time_of_day ?? 0);
 
-	// Example: If the action involves a specific coordinate, we would
-	// apply +/- NoiseLevel to X/Z here so the bot doesn't walk perfectly straight.
-	// Since our current target types are mostly entity names (e.g., "oak_log"),
-	// we rely on the TS client (Movements config) for physical path jitter.
+    const timeDisplay = $derived(formatTimeOfDay(timeOfDay));
 
-	return noisyAction
-}
+    const rawCoordsDisplay = $derived(
+        `Raw X: ${Math.round(position.x)} Y: ${Math.round(position.y)} Z: ${Math.round(position.z)}`,
+    );
+    const smoothCoordsDisplay = $derived(
+        `X: ${renderPosition.x.toFixed(2)} Y: ${renderPosition.y.toFixed(2)} Z: ${renderPosition.z.toFixed(2)}`,
+    );
+
+    function formatTimeOfDay(time: number): string {
+        const hours = Math.floor((time / 1000 + 6) % 24);
+        const minutes = Math.floor(((time % 1000) / 1000) * 60);
+        return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}`;
+    }
+
+    function renderLoop() {
+        controller.update();
+        renderPosition = { ...controller.entityPosition };
+        animationFrameId = requestAnimationFrame(renderLoop);
+    }
+
+    onMount(() => {
+        viewerUrl = `http://${window.location.hostname}:3000`;
+        connectToBot();
+        renderLoop();
+
+        let lastMouseMove = 0;
+        const onMouseMove = (e: MouseEvent) => {
+            // FIX: Only hijack the camera if the user is explicitly clicking and dragging.
+            // Hovering passively shouldn't spam the pathfinder into paralysis.
+            if (e.buttons !== 1) return;
+
+            const now = performance.now();
+            if (now - lastMouseMove < 50) return; // Throttle to roughly 20 FPS
+
+            lastMouseMove = now;
+
+            if (viewerIframe) {
+                const rect = viewerIframe.getBoundingClientRect();
+                const relativeX = e.clientX - rect.left;
+                const relativeY = e.clientY - rect.top;
+
+                if (
+                    relativeX >= 0 &&
+                    relativeX <= rect.width &&
+                    relativeY >= 0 &&
+                    relativeY <= rect.height
+                ) {
+                    // FIX: Mineflayer expects Radians, not Degrees
+                    const yaw = (relativeX / rect.width - 0.5) * Math.PI;
+                    const pitch =
+                        (relativeY / rect.height - 0.5) * (Math.PI / 2);
+                    sendCameraControl(yaw, pitch);
+                }
+            }
+        };
+
+        window.addEventListener("mousemove", onMouseMove);
+
+        return () => {
+            disconnectBot();
+            window.removeEventListener("mousemove", onMouseMove);
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+        };
+    });
+</script>
+
+<main class="fullscreen">
+    {#if botStore.connectionStatus === "connected"}
+        <iframe
+            bind:this={viewerIframe}
+            src={viewerUrl}
+            title="Mineflayer Viewer"
+            class="viewer-iframe"
+        ></iframe>
+    {:else}
+        <div class="viewer-iframe placeholder">
+            <span class="indicator connecting"></span>
+            <p>Waiting for bot to initialize viewer on port 3000...</p>
+        </div>
+    {/if}
+
+    <div class="floating-header">
+        <div class="title-group">
+            <h1>Synaptic MC</h1>
+            <div class="coords-container">
+                <span class="coords-badge"
+                    >{timeDisplay} | {smoothCoordsDisplay} (60 FPS)</span
+                >
+                <span class="raw-coords">{rawCoordsDisplay} (50ms tick)</span>
+            </div>
+        </div>
+        <div class="status">
+            <span class="indicator {botStore.connectionStatus}"></span>
+            <span class="status-text">
+                {#if botStore.connectionStatus === "connecting"}
+                    Connecting...
+                {:else if botStore.connectionStatus === "connected"}
+                    Connected
+                {:else}
+                    Disconnected
+                {/if}
+            </span>
+        </div>
+    </div>
+
+    <HUD />
+    <Sidebar isOpen={isSidebarOpen} />
+
+    <button
+        class="sidebar-toggle"
+        class:sidebar-closed={!isSidebarOpen}
+        onclick={() => (isSidebarOpen = !isSidebarOpen)}
+        title="Toggle Sidebar"
+    >
+        {isSidebarOpen ? "◀" : "▶"}
+    </button>
+
+    {#if uiStore.tooltip}
+        <div
+            class="mc-tooltip"
+            style="left: {uiStore.mouseX + 15}px; top: {uiStore.mouseY + 15}px;"
+        >
+            {uiStore.tooltip}
+        </div>
+    {/if}
+</main>
+
+<style>
+    :global(body) {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+            sans-serif;
+        background: #000;
+        color: #e2e8f0;
+    }
+
+    .fullscreen {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+    }
+
+    .viewer-iframe {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: none;
+        z-index: 1;
+        pointer-events: auto;
+    }
+
+    .placeholder {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #0f172a;
+        color: #94a3b8;
+        font-family: monospace;
+        gap: 1rem;
+    }
+
+    .floating-header {
+        position: absolute;
+        top: 1rem;
+        left: 1rem;
+        z-index: 20;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        background: rgba(15, 23, 42, 0.7);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        padding: 0.75rem 1.25rem;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        pointer-events: auto;
+    }
+
+    .title-group {
+        display: flex;
+        align-items: flex-start;
+        gap: 1rem;
+    }
+
+    .floating-header h1 {
+        margin: 0;
+        font-size: 1.25rem;
+        color: #38bdf8;
+        line-height: 1.2;
+    }
+
+    .coords-container {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+
+    .coords-badge {
+        background: rgba(30, 41, 59, 0.8);
+        padding: 0.25rem 0.5rem;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.875rem;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        color: #60a5fa;
+    }
+
+    .raw-coords {
+        font-family: monospace;
+        font-size: 0.7rem;
+        color: #94a3b8;
+        padding-left: 0.25rem;
+    }
+
+    .status {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.875rem;
+    }
+
+    .indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        display: inline-block;
+    }
+    .indicator.connecting {
+        background: #fbbf24;
+        animation: pulse 1s infinite;
+    }
+    .indicator.connected {
+        background: #34d399;
+    }
+    .indicator.disconnected {
+        background: #ef4444;
+    }
+
+    .sidebar-toggle {
+        position: absolute;
+        top: 1rem;
+        right: 430px;
+        z-index: 25;
+        background: rgba(15, 23, 42, 0.8);
+        color: white;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+        width: 40px;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        backdrop-filter: blur(4px);
+        transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .sidebar-toggle:hover {
+        background: rgba(30, 41, 59, 0.9);
+    }
+
+    .sidebar-toggle.sidebar-closed {
+        right: 10px;
+    }
+
+    .mc-tooltip {
+        position: fixed;
+        background: rgba(16, 0, 16, 0.95);
+        border: 2px solid #3700b3;
+        border-radius: 3px;
+        color: #fff;
+        padding: 4px 8px;
+        font-family: monospace;
+        font-size: 14px;
+        white-space: nowrap;
+        z-index: 9999;
+        pointer-events: none;
+        text-shadow: 1px 1px 0 #000;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+    }
+
+    @keyframes pulse {
+        0%,
+        100% {
+            opacity: 1;
+        }
+        50% {
+            opacity: 0.5;
+        }
+    }
+</style>
 
 </file>
 
-<file path="internal\humanization\state.go">
-package humanization
+<file path="ui\src\components\HUD.svelte">
+<script lang="ts">
+    import ItemIcon from "./ItemIcon.svelte";
+    import { botStore, uiStore } from "../lib/store.svelte";
 
-import (
-	"sync"
-	"time"
-)
+    const health = $derived(botStore.gameState?.health ?? 20);
+    const food = $derived(botStore.gameState?.food ?? 20);
+    const xpProgress = $derived(botStore.gameState?.experience ?? 0);
+    const xpLevel = $derived(botStore.gameState?.level ?? 0);
+    const hotbarSlots = $derived(
+        botStore.gameState?.hotbar || Array(9).fill(null),
+    );
+    const offhand = $derived(botStore.gameState?.offhand || null);
+    const activeSlot = $derived(botStore.gameState?.active_slot ?? 0);
 
-// State tracks the evolving internal conditions of the agent.
-type State struct {
-	mu             sync.Mutex
-	AttentionLevel float64
-	Fatigue        float64
-	Intent         IntentState // NEW: Hooked in from intent.go
-	cfg            Config
-}
+    const fullHearts = $derived(Math.max(0, Math.floor(health / 2)));
+    const halfHearts = $derived(health % 2 !== 0 && health > 0 ? 1 : 0);
+    const emptyHearts = $derived(Math.max(0, 10 - fullHearts - halfHearts));
 
-func NewState(cfg Config) *State {
-	return &State{
-		AttentionLevel: 1.0,
-		Fatigue:        0.0,
-		Intent:         IntentState{},
-		cfg:            cfg,
-	}
-}
+    const fullFood = $derived(Math.max(0, Math.floor(food / 2)));
+    const halfFood = $derived(food % 2 !== 0 && food > 0 ? 1 : 0);
+    const emptyFood = $derived(Math.max(0, 10 - fullFood - halfFood));
 
-func (s *State) Evolve(ctx Context, dt time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+    function formatName(name: string) {
+        if (!name) return "";
+        return name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    }
 
-	decay := s.cfg.AttentionDecay * dt.Seconds()
-	s.AttentionLevel -= decay
+    function setTooltip(e: MouseEvent, text: string) {
+        if (!text) return;
+        uiStore.mouseX = e.clientX;
+        uiStore.mouseY = e.clientY;
+        uiStore.tooltip = text;
+    }
 
-	if ctx.State.Health < 15 || ctx.IsStuck {
-		s.AttentionLevel = 1.0
-	}
+    function clearTooltip() {
+        uiStore.tooltip = "";
+    }
+</script>
 
-	if s.AttentionLevel < 0.2 {
-		s.AttentionLevel = 0.2
-	}
-}
+<div class="mc-overlay">
+    <div class="mc-crosshair"></div>
 
-func (s *State) GetAttention() float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.AttentionLevel
-}
+    <div class="mc-hud">
+        <div class="mc-bars">
+            <div class="mc-bar-half left-align">
+                {#each Array(fullHearts) as _}
+                    <span class="mc-icon-stat">❤️</span>
+                {/each}
+                {#each Array(halfHearts) as _}
+                    <span class="mc-icon-stat">💔</span>
+                {/each}
+                {#each Array(emptyHearts) as _}
+                    <span class="mc-icon-stat empty">🖤</span>
+                {/each}
+            </div>
+
+            <div class="mc-bar-half right-align">
+                {#each Array(emptyFood) as _}
+                    <span class="mc-icon-stat empty">🍖</span>
+                {/each}
+                {#each Array(halfFood) as _}
+                    <span class="mc-icon-stat">🍗</span>
+                {/each}
+                {#each Array(fullFood) as _}
+                    <span class="mc-icon-stat">🍖</span>
+                {/each}
+            </div>
+        </div>
+
+        <div class="mc-xp-bar-container">
+            {#if xpLevel > 0}
+                <span class="mc-xp-level">{xpLevel}</span>
+            {/if}
+            <div class="mc-xp-bar">
+                <div
+                    class="mc-xp-fill"
+                    style="width: {xpProgress * 100}%;"
+                ></div>
+            </div>
+        </div>
+
+        <div class="mc-hotbar-container">
+            <div
+                class="mc-offhand slot"
+                role="presentation"
+                onmousemove={(e) =>
+                    setTooltip(e, offhand ? formatName(offhand.name) : "")}
+                onmouseleave={clearTooltip}
+            >
+                {#if offhand}
+                    <ItemIcon name={offhand.name} size={24} />
+                    {#if offhand.count > 1}
+                        <span class="slot-count">{offhand.count}</span>
+                    {/if}
+                {/if}
+            </div>
+
+            <div class="mc-hotbar">
+                {#each hotbarSlots as slot, i}
+                    <div
+                        class="slot {i === activeSlot ? 'active' : ''}"
+                        role="presentation"
+                        onmousemove={(e) =>
+                            setTooltip(e, slot ? formatName(slot.name) : "")}
+                        onmouseleave={clearTooltip}
+                    >
+                        {#if slot}
+                            <ItemIcon name={slot.name} size={24} />
+                            {#if slot.count > 1}
+                                <span class="slot-count">{slot.count}</span>
+                            {/if}
+                        {/if}
+                    </div>
+                {/each}
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .mc-overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        align-items: center;
+        padding-bottom: 24px;
+        z-index: 10;
+    }
+
+    .mc-crosshair {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 16px;
+        height: 16px;
+        pointer-events: none;
+    }
+
+    .mc-crosshair::before,
+    .mc-crosshair::after {
+        content: "";
+        position: absolute;
+        background: rgba(255, 255, 255, 0.6);
+        mix-blend-mode: difference;
+    }
+
+    .mc-crosshair::before {
+        top: 7px;
+        left: 0;
+        width: 16px;
+        height: 2px;
+    }
+
+    .mc-crosshair::after {
+        top: 0;
+        left: 7px;
+        width: 2px;
+        height: 16px;
+    }
+
+    .mc-hud {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .mc-bars {
+        display: flex;
+        justify-content: space-between;
+        width: 364px;
+        gap: 1rem;
+        margin-bottom: 6px;
+        padding: 0 4px;
+    }
+
+    .mc-bar-half {
+        display: flex;
+        gap: 1px;
+    }
+
+    .mc-icon-stat {
+        font-size: 14px;
+        line-height: 1;
+        filter: drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
+    }
+
+    .mc-icon-stat.empty {
+        filter: grayscale(1) brightness(0.2)
+            drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
+    }
+
+    .mc-xp-bar-container {
+        position: relative;
+        width: 364px;
+        display: flex;
+        justify-content: center;
+        margin-bottom: 6px;
+    }
+
+    .mc-xp-bar {
+        width: 100%;
+        height: 10px;
+        background: #222;
+        border: 2px solid #111;
+        box-shadow: inset 1px 1px 0px rgba(0, 0, 0, 0.5);
+    }
+
+    .mc-xp-fill {
+        height: 100%;
+        background: #84e84b;
+        box-shadow: inset 0px 2px 0px rgba(255, 255, 255, 0.3);
+    }
+
+    .mc-xp-level {
+        position: absolute;
+        top: -16px;
+        color: #84e84b;
+        font-family: monospace;
+        font-size: 16px;
+        font-weight: bold;
+        text-shadow:
+            2px 2px 0 #000,
+            -1px -1px 0 #000,
+            1px -1px 0 #000,
+            -1px 1px 0 #000;
+        z-index: 15;
+    }
+
+    .mc-hotbar-container {
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
+    }
+
+    .mc-hotbar {
+        display: flex;
+        background: #8b8b8b;
+        border: 2px solid #111;
+        padding: 2px;
+        box-shadow:
+            inset 2px 2px 0px rgba(255, 255, 255, 0.4),
+            inset -2px -2px 0px rgba(0, 0, 0, 0.4);
+    }
+
+    .slot {
+        width: 36px;
+        height: 36px;
+        background: #8b8b8b;
+        border-style: solid;
+        border-width: 2px;
+        border-color: #373737 #fff #fff #373737;
+        position: relative;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        cursor: help;
+        pointer-events: auto;
+    }
+
+    .mc-offhand {
+        border-color: #373737 #fff #fff #373737;
+    }
+
+    .slot.active {
+        border-color: #fff;
+        box-shadow:
+            inset 0 0 0 2px #fff,
+            0 0 6px rgba(255, 255, 255, 0.6);
+        z-index: 10;
+    }
+
+    .slot-count {
+        position: absolute;
+        bottom: -2px;
+        right: 1px;
+        font-size: 14px;
+        font-weight: 900;
+        color: white;
+        text-shadow:
+            2px 2px 0 #3f3f3f,
+            -1px -1px 0 #3f3f3f,
+            1px -1px 0 #3f3f3f,
+            -1px 1px 0 #3f3f3f;
+    }
+</style>
 
 </file>
 
@@ -464,10 +994,10 @@ func (s *State) GetAttention() float64 {
 
 ```json
 {
-  "total_bytes": 10433,
-  "file_count": 8,
-  "estimated_tokens": 2815,
+  "total_bytes": 25239,
+  "file_count": 3,
+  "estimated_tokens": 6394,
   "mode": "full",
-  "generated_at": "2026-04-03T17:35:40.8889796-07:00"
+  "generated_at": "2026-04-03T19:24:40.3708965-07:00"
 }
 ```

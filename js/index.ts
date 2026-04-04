@@ -404,75 +404,60 @@ async function executeIntent(intent: models.ActionIntent) {
 }
 
 function pushState() {
-    if (!client) return;
+    if (!client || !bot) return;
 
-    if (!bot?.entity || !isValidPosition(bot.entity?.position)) {
-        const now = Date.now();
-        if (now - lastStatePushTime < 3000) return;
-        lastStatePushTime = now;
-        client.sendState({
-            health: 0,
-            food: 0,
-            time_of_day: 0,
-            experience: 0,
-            level: 0,
-            position: { x: 0, y: 0, z: 0 },
-            threats: [],
-            pois: [],
-            inventory: [],
-            hotbar: Array(9).fill(null),
-            offhand: null,
-            active_slot: 0,
-            known_chests: {},
-            current_task: null,
-            task_progress: 0.0,
-        });
-        return;
-    }
+    const now = Date.now();
+    const pos = bot.entity?.position;
+    const hasValidPos = isValidPosition(pos);
 
-    const hotbarStart = bot.inventory.hotbarStart || 36;
+    const hotbarStart = bot.inventory?.hotbarStart || 36;
     const hotbar = Array.from({ length: 9 }, (_, i) => {
-        const item = bot.inventory.slots[hotbarStart + i];
+        const item = bot.inventory?.slots[hotbarStart + i];
         return item ? { name: item.name, count: item.count } : null;
     });
 
-    const offhandItem = bot.inventory.slots[45];
+    const offhandItem = bot.inventory?.slots[45];
 
-    const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
-        .items()
-        .map((i) => `${i.name}:${i.count}`)
-        .sort()
-        .join(",")}|${Object.keys(knownChests).length}`;
+    const px = hasValidPos ? Math.round(pos.x) : 0;
+    const py = hasValidPos ? Math.round(pos.y) : 0;
+    const pz = hasValidPos ? Math.round(pos.z) : 0;
 
-    const now = Date.now();
+    const inventoryItems = bot.inventory
+        ? bot.inventory
+              .items()
+              .map((i) => `${i.name}:${i.count}`)
+              .sort()
+              .join(",")
+        : "";
+
+    const sig = `${bot.health}|${bot.food}|${px},${py},${pz}|${bot.quickBarSlot}|${inventoryItems}|${Object.keys(knownChests).length}`;
+
     if (sig === lastStateSig && now - lastStatePushTime < 3000) return;
 
     lastStateSig = sig;
     lastStatePushTime = now;
 
     client.sendState({
-        health: Math.round(bot.health),
-        food: Math.round(bot.food),
-        time_of_day: bot.time.timeOfDay,
+        health: bot.health ? Math.round(bot.health) : 0,
+        food: bot.food ? Math.round(bot.food) : 0,
+        time_of_day: bot.time?.timeOfDay ?? 0,
         experience: bot.experience?.progress ?? 0,
         level: bot.experience?.level ?? 0,
-        position: {
-            x: bot.entity.position.x,
-            y: bot.entity.position.y,
-            z: bot.entity.position.z,
-        },
+        position: { x: px, y: py, z: pz },
         threats: getThreats(bot)
             .slice(0, 3)
             .map((t) => ({ name: t.name })),
-        pois: getPOIs(bot),
+        pois: hasValidPos ? getPOIs(bot) : [],
         inventory: bot.inventory
-            .items()
-            .map((i) => ({ name: i.name, count: i.count })),
+            ? bot.inventory
+                  .items()
+                  .map((i) => ({ name: i.name, count: i.count }))
+            : [],
         hotbar: hotbar,
         offhand: offhandItem
             ? { name: offhandItem.name, count: offhandItem.count }
             : null,
-        active_slot: bot.quickBarSlot,
+        active_slot: bot.quickBarSlot || 0,
         known_chests: knownChests,
         current_task: currentTask
             ? {
@@ -625,8 +610,7 @@ async function connectWithRetry(maxAttempts = 10) {
             log.warn(
                 "Warning: No scaffolding blocks available. Registry may be empty.",
             );
-            // Fallback to dirt if registry is empty
-            movements.scafoldingBlocks = [3]; // dirt block ID
+            movements.scafoldingBlocks = [3];
         }
 
         bot.pathfinder.setMovements(movements);
@@ -638,6 +622,12 @@ async function connectWithRetry(maxAttempts = 10) {
 
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
+
+        bot.on("blockUpdate", (oldBlock, newBlock) => {
+            if (oldBlock && newBlock && oldBlock.type !== newBlock.type) {
+                clearPOICache();
+            }
+        });
 
         bot.on("path_update", (r: any) => {
             isPathfinding = true;

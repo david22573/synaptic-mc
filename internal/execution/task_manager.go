@@ -3,7 +3,6 @@ package execution
 import (
 	"container/heap"
 	"context"
-	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
@@ -132,8 +131,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 				} else if time.Since(tm.idleSince) > 5*time.Second {
 					tm.logger.Info("Curiosity loop triggered: autonomous exploration")
 					exploreTask := domain.Action{
-						// FIX: Append timestamp to ensure unique task ID for idempotency cache bypass
-						ID:        fmt.Sprintf("explore-curiosity-%d", time.Now().UnixNano()),
+						ID:        "explore-curiosity-stable",
 						Action:    "explore",
 						Target:    domain.Target{Type: "category", Name: "surroundings"},
 						Priority:  -1,

@@ -52,12 +52,10 @@
 
         let lastMouseMove = 0;
         const onMouseMove = (e: MouseEvent) => {
-            // FIX: Only hijack the camera if the user is explicitly clicking and dragging.
-            // Hovering passively shouldn't spam the pathfinder into paralysis.
             if (e.buttons !== 1) return;
 
             const now = performance.now();
-            if (now - lastMouseMove < 50) return; // Throttle to roughly 20 FPS
+            if (now - lastMouseMove < 50) return;
 
             lastMouseMove = now;
 
@@ -72,8 +70,7 @@
                     relativeY >= 0 &&
                     relativeY <= rect.height
                 ) {
-                    // FIX: Mineflayer expects Radians, not Degrees
-                    const yaw = (relativeX / rect.width - 0.5) * Math.PI;
+                    const yaw = (relativeX / rect.width - 0.5) * Math.PI * 2;
                     const pitch =
                         (relativeY / rect.height - 0.5) * (Math.PI / 2);
                     sendCameraControl(yaw, pitch);

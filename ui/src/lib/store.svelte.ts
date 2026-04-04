@@ -70,8 +70,8 @@ export function connectToBot() {
                     }
                     break;
                 case "STATE_UPDATE":
-                    botStore.gameState = message.payload;
-                    controller.onStateUpdate(message.payload);
+                    botStore.gameState = message.payload.State;
+                    controller.onStateUpdate(message.payload.State);
                     break;
 
                 case "EVENT_STREAM": {
@@ -82,17 +82,12 @@ export function connectToBot() {
 
                     if (rawPayload) {
                         try {
-                            const decoded = atob(rawPayload);
-                            innerPayload = JSON.parse(decoded);
+                            innerPayload =
+                                typeof rawPayload === "string"
+                                    ? JSON.parse(rawPayload)
+                                    : rawPayload;
                         } catch {
-                            try {
-                                innerPayload =
-                                    typeof rawPayload === "string"
-                                        ? JSON.parse(rawPayload)
-                                        : rawPayload;
-                            } catch {
-                                innerPayload = rawPayload;
-                            }
+                            innerPayload = rawPayload;
                         }
                     }
 

@@ -1,6 +1,8 @@
+// js/lib/tasks/handlers/smelt.ts
 import { type TaskContext } from "../registry.js";
 import pkg from "mineflayer-pathfinder";
 import { log } from "../../logger.js";
+import { makeRoomInInventory } from "../utils.js"; // or adjust this path to wherever your inventory helpers live
 
 const { goals } = pkg;
 
@@ -227,6 +229,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 await bot.unequip("hand");
             }
             try {
+                await makeRoomInInventory(bot, 1);
                 await bot.dig(furnaceBlock);
             } catch (e) {
                 log.warn("Failed to retrieve placed furnace", { err: e });

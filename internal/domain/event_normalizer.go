@@ -14,8 +14,8 @@ func NormalizeEventType(s string) EventType {
 	case "TASK_END", "TASKEND", "TASK_COMPLETED", "TASK_FAILED", "TASK_ABORTED":
 		return EventTypeTaskEnd
 
-	case "STATE_UPDATED", "STATEUPDATE":
-		return EventTypeStateUpdated
+	case "STATE_UPDATED", "STATEUPDATE", "STATE_UPDATE":
+		return EventTypeStateTick
 
 	case "STATE_TICK", "STATETICK":
 		return EventTypeStateTick
