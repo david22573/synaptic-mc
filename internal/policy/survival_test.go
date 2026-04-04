@@ -14,7 +14,7 @@ func TestSurvivalPolicy_Decide(t *testing.T) {
 
 	t.Run("Rejects low health without retreat", func(t *testing.T) {
 		input := DecisionInput{
-			State: domain.GameState{Health: 5.0},
+			State: domain.GameState{Health: 3.0},
 			Plan: &domain.Plan{
 				Tasks: []domain.Action{{Action: "mine"}},
 			},
@@ -27,7 +27,7 @@ func TestSurvivalPolicy_Decide(t *testing.T) {
 
 	t.Run("Approves low health with eat", func(t *testing.T) {
 		input := DecisionInput{
-			State: domain.GameState{Health: 5.0},
+			State: domain.GameState{Health: 3.0},
 			Plan: &domain.Plan{
 				Tasks: []domain.Action{{Action: "eat"}},
 			},

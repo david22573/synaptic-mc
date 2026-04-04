@@ -9,7 +9,7 @@ ifeq ($(OS),Windows_NT)
 	PRE_BUILD = -taskkill /F /IM synaptic-server.exe /T 2>NUL || true
 else
 	BIN_NAME = bin/synaptic-server
-	PRE_BUILD = pkill -f $(BIN_NAME) 2>/NUL || true
+	PRE_BUILD = pkill -f $(BIN_NAME) 2>/dev/null || true
 endif
 
 help: ## Show help

@@ -387,6 +387,7 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	})
 
 	finalPlan := &domain.Plan{
+		ID:        fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Objective: parsed.Objective,
 		Tasks:     scored[0].tasks,
 	}
@@ -404,6 +405,7 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {
 	clone := &domain.Plan{
+		ID:        fmt.Sprintf("cached-plan-%d", time.Now().UnixNano()),
 		Objective: original.Objective,
 		Tasks:     make([]domain.Action, len(original.Tasks)),
 	}

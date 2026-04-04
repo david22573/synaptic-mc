@@ -24,6 +24,11 @@ func TestPipelineStages_Integration(t *testing.T) {
 			Inventory: []domain.Item{{Name: "wooden_pickaxe", Count: 1}},
 			POIs:      []domain.POI{{Name: "stone", Distance: 5.0}},
 		},
+		Perception: &PerceptionResult{
+			RankedPOIs: []ScoredPOI{
+				{POI: domain.POI{Name: "stone", Distance: 5.0}, Score: 100},
+			},
+		},
 		Trace: domain.TraceContext{TraceID: "tr-123", ActionID: "act-1"},
 		Plan:  rawPlan,
 	}

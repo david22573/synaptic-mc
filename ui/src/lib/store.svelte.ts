@@ -8,9 +8,16 @@ export interface GameState {
     food: number;
     saturation: number;
     xp: number;
+    experience?: number;
+    level?: number;
     position: { x: number; y: number; z: number };
     inventory: Array<{ name: string; count: number }>;
+    hotbar?: Array<{ name: string; count: number } | null>;
+    offhand?: { name: string; count: number } | null;
+    active_slot?: number;
     entities: string[];
+    threats?: Array<any>;
+    pois?: Array<any>;
     time_of_day?: number;
 }
 

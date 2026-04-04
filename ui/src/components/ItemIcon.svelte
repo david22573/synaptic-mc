@@ -14,7 +14,7 @@
     style="image-rendering: pixelated; object-fit: contain;"
     onerror={(e) => {
         // Fallback to the classic missing texture checkerboard if the local file is missing
-        e.currentTarget.src =
+        (e.currentTarget as HTMLImageElement).src =
             "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAKElEQVR42mP8z8DAwMgwEAwUMAK1M1Ero7RmcGjAwEBz1DCqGAYAAI8Z/8H/h7i+AAAAAElFTkSuQmCC";
     }}
 />

@@ -96,8 +96,7 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(2 * time.Second):
-		c.logger.Warn("Send channel timeout, dropping dispatch message to avoid blocking", slog.String("action", action.Action))
-		return nil
+		return errors.New("websocket send channel timeout")
 	}
 }
 
@@ -110,11 +109,11 @@ func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.isClosed {
+		c.mu.Unlock()
 		return errors.New("websocket closed")
 	}
+	c.mu.Unlock()
 
 	select {
 	case c.sendCh <- msg:
@@ -122,8 +121,7 @@ func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(2 * time.Second):
-		c.logger.Warn("Send channel timeout, dropping abort message to avoid blocking", slog.String("reason", reason))
-		return nil
+		return errors.New("websocket send channel timeout")
 	}
 }
 

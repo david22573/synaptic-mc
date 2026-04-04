@@ -140,37 +140,42 @@ func (m *ControllerManager) EvaluateFailure(
 	}
 
 	directive := RetryDirective{
-		Strategy: StrategyAbort,
+		Strategy: StrategyRetrySame,
 		Delay:    delay,
 	}
 
-	if attempts > 3 {
-		directive.Strategy = StrategyDegrade
-		directive.Fallback = m.getDegradedAction(res.Action)
-		return directive
-	}
-
-	// Phase 1 + 3: If we are making progress or had partial success, retry same target fast
+	// 1. If we are making clear progress, KEEP RETRYING even if attempts are high
 	if res.Progress > 0.3 || res.Cause == domain.CausePartial {
 		directive.Strategy = StrategyRetrySame
 		directive.Delay = 100 * time.Millisecond
 		return directive
 	}
 
-	// Phase 3: Hard block / Timeout means try a different target entirely
+	// 2. Critical failures or too many attempts -> Degrade or Abort
+	if attempts > 3 {
+		directive.Strategy = StrategyAbort
+		return directive
+	}
+
+	if attempts > 1 {
+		directive.Strategy = StrategyDegrade
+		directive.Fallback = m.getDegradedAction(res.Action)
+		return directive
+	}
+
+	// 3. Environment/Internal blocks -> Try different target
 	if res.Cause == domain.CauseTimeout || res.Cause == domain.CauseBlocked ||
 		res.Cause == domain.CauseStuck {
 		directive.Strategy = StrategyRetryDifferent
 		return directive
 	}
 
-	directive.Strategy = StrategyDegrade
-	directive.Fallback = m.getDegradedAction(res.Action)
+	// Default to StrategyRetrySame for the first failure
 	return directive
 }
 
 func (m *ControllerManager) getDegradedAction(action domain.Action) string {
-	if fallback, exists := DegradationMap[action.Type]; exists {
+	if fallback, exists := DegradationMap[action.Action]; exists {
 		return fallback
 	}
 	return "idle" // Ultimate safe fallback

@@ -29,7 +29,7 @@ func TestPipelineWithSurvivalOverride(t *testing.T) {
 
 	// 2. Evaluate with critical health but some food in inventory
 	evalState := domain.GameState{
-		Health: 4.0,
+		Health: 3.0,
 		Food:   2.0,
 		Inventory: []domain.Item{
 			{Name: "bread", Count: 2},
