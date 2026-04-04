@@ -375,6 +375,7 @@ function pushState() {
         food: Math.round(bot.food || 0),
         time_of_day: bot.time?.timeOfDay ?? 0,
         experience: bot.experience?.points ?? 0,
+        experience_progress: bot.experience?.progress ?? 0,
         level: bot.experience?.level ?? 0,
         has_bed_nearby:
             bot.findBlock({

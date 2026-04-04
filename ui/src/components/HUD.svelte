@@ -3,7 +3,7 @@
 
     const health = $derived(botStore.gameState?.health ?? 20);
     const food = $derived(botStore.gameState?.food ?? 20);
-    const xpProgress = $derived(botStore.gameState?.experience ?? 0);
+    const xpProgress = $derived(botStore.gameState?.experience_progress ?? 0);
     const xpLevel = $derived(botStore.gameState?.level ?? 0);
     const hotbarSlots = $derived(
         botStore.gameState?.hotbar || Array(9).fill(null),

@@ -120,6 +120,7 @@ export interface GameState {
     food: number;
     time_of_day: number;
     experience: number;
+    experience_progress: number;
     level: number;
     has_bed_nearby: boolean;
     position: Vec3;

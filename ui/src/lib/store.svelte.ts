@@ -79,6 +79,20 @@ export function connectToBot() {
 
             const type = message.type.toUpperCase();
 
+            // Helper to unwrap Go's VersionedState { Version: 1, State: { ... } }
+            const unwrapState = (payload: any) => {
+                if (payload && payload.State) return payload.State;
+                if (payload && payload.state) return payload.state;
+                return payload;
+            };
+
+            if (type === "STATE_UPDATE" || type === "STATE_SYNC") {
+                const state = unwrapState(message.payload);
+                botStore.gameState = state;
+                controller.onStateUpdate(state);
+                return;
+            }
+
             if (type === "EVENT_STREAM") {
                 const goEvent = message.payload;
                 let innerPayload: any = {};
@@ -105,8 +119,12 @@ export function connectToBot() {
                     eventType === "STATE_UPDATED" ||
                     eventType === "STATE_TICK"
                 ) {
-                    botStore.gameState = innerPayload;
-                    controller.onStateUpdate(innerPayload);
+                    const state = unwrapState(innerPayload);
+                    botStore.gameState = state;
+                    controller.onStateUpdate(state);
+
+                    // Overwrite innerPayload with unwrapped state for the event log
+                    innerPayload = state;
                 }
 
                 if (eventType === "PLAN_CREATED" && innerPayload.objective) {
@@ -118,7 +136,6 @@ export function connectToBot() {
                     payload: innerPayload,
                     timestamp: new Date().toLocaleTimeString(),
                 });
-
                 if (eventType === "TASK_START" && innerPayload.action) {
                     const task: Task = {
                         id:

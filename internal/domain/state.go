@@ -84,9 +84,10 @@ type Feedback struct {
 type GameState struct {
 	Health       float64           `json:"health"`
 	Food         float64           `json:"food"`
-	TimeOfDay    int               `json:"time_of_day"`
-	Experience   float64           `json:"experience"`
-	Level        int               `json:"level"`
+	TimeOfDay          int               `json:"time_of_day"`
+	Experience         float64           `json:"experience"`
+	ExperienceProgress float64           `json:"experience_progress"`
+	Level              int               `json:"level"`
 	HasBedNearby bool              `json:"has_bed_nearby"`
 	Position     Vec3              `json:"position"`
 	Threats      []Threat          `json:"threats"`
