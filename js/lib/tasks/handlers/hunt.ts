@@ -62,8 +62,13 @@ class EngageState implements FSMState {
         bot.on("entityHurt", onEntityHurt);
 
         try {
-            while (target && target.isValid && target.health > 0) {
+            while (target && target.isValid && (target.health === undefined || target.health > 0)) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
+
+                // Survivability check: abort if health drops too low
+                if (bot.health < 8) {
+                    throw new Error("SURVIVAL: Health dropped too low during hunt");
+                }
 
                 if (Date.now() - combatStartTime > maxCombatDurationMs) {
                     throw new Error(
@@ -83,10 +88,15 @@ class EngageState implements FSMState {
                 }
 
                 if (Date.now() - lastValidation > 1000) {
+                    const distToTarget = bot.entity.position.distanceTo(target.position);
+                    if (distToTarget > 48) {
+                        throw new Error("TARGET_LOST: Target moved too far away (>48 blocks)");
+                    }
+
                     const filter = (entity: any) =>
                         entity.name === sCtx.targetName &&
-                        entity.type === "mob" &&
-                        entity.health > 0;
+                        (entity.type === "mob" || entity.type === "player" || entity.type === "hostile") &&
+                        (entity.health === undefined || entity.health > 0);
 
                     const revalidate = bot.nearestEntity(filter);
                     if (!revalidate || revalidate.id !== target.id) {
@@ -252,8 +262,8 @@ class SearchState implements FSMState {
 
         const filter = (entity: any) =>
             entity.name === sCtx.targetName &&
-            entity.type === "mob" &&
-            entity.health > 0;
+            (entity.type === "mob" || entity.type === "player" || entity.type === "hostile") &&
+            (entity.health === undefined || entity.health > 0);
 
         let attempts = 0;
         const maxAttempts = 6;
@@ -322,6 +332,10 @@ export async function handleHunt(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
 
     await escapeTree(bot, signal);
+
+    if (bot.health < 10) {
+        throw new Error("SURVIVAL: Health too low to start hunting");
+    }
 
     const targetName = intent.target?.name;
     if (!targetName) {

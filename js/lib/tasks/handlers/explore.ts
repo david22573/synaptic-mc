@@ -88,15 +88,15 @@ class PickDirectionState implements FSMState {
             return null;
         }
 
-        const dist = 12 + Math.random() * 8;
+        const dist = 16 + Math.random() * 16;
         let bestTarget = null;
         let maxRepulsionScore = -1;
 
         const pos = eCtx.bot.entity.position.floored();
 
-        for (let i = 0; i < 12; i++) {
+        for (let i = 0; i < 24; i++) {
             // Yield to the event loop to prevent blocking physics and network ticks
-            if (i > 0 && i % 3 === 0) {
+            if (i > 0 && i % 4 === 0) {
                 await new Promise((r) => setTimeout(r, 0));
             }
 
@@ -114,7 +114,7 @@ class PickDirectionState implements FSMState {
 
                 let foundSurface = false;
 
-                for (let yOffset = 2; yOffset >= -2; yOffset--) {
+                for (let yOffset = 2; yOffset >= -3; yOffset--) {
                     const block = eCtx.bot.blockAt(
                         new Vec3(checkX, ty + yOffset, checkZ),
                     );
@@ -133,7 +133,9 @@ class PickDirectionState implements FSMState {
                         blockAbove2.name === "air" &&
                         block.name !== "water" &&
                         block.name !== "lava" &&
-                        block.name !== "magma_block"
+                        block.name !== "magma_block" &&
+                        block.name !== "cactus" &&
+                        block.name !== "sweet_berry_bush"
                     ) {
                         tx = checkX;
                         tz = checkZ;
@@ -146,7 +148,7 @@ class PickDirectionState implements FSMState {
                 if (!foundSurface) break;
             }
 
-            if (validLength < 2) continue;
+            if (validLength < 4) continue;
 
             let minDistanceToHistory = 999999;
             for (const pt of eCtx.visitedPoints) {
@@ -156,8 +158,11 @@ class PickDirectionState implements FSMState {
             if (eCtx.visitedPoints.length === 0)
                 minDistanceToHistory = validLength;
 
-            if (minDistanceToHistory > maxRepulsionScore) {
-                maxRepulsionScore = minDistanceToHistory;
+            // Combine distance and repulsion
+            const score = validLength * 0.3 + minDistanceToHistory * 0.7;
+
+            if (score > maxRepulsionScore) {
+                maxRepulsionScore = score;
                 bestTarget = { x: tx, z: tz };
             }
         }

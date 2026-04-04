@@ -21,6 +21,7 @@ import { handleStore } from "./handlers/store.js";
 import { handleRetrieve } from "./handlers/retrieve.js";
 
 import { ExecutionError } from "./primitives.js"; // Phase 1 update
+import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
@@ -134,9 +135,48 @@ export async function runTask(
             case "idle":
                 await waitForMs(1500, signal);
                 break;
-            case "look":
-                await waitForMs(500, signal);
+            case "look": {
+                if (intent.target.type === "location") {
+                    try {
+                        const data = JSON.parse(intent.target.name);
+                        if (data.x !== undefined) {
+                            await bot.lookAt(
+                                new Vec3(data.x, data.y || 64, data.z),
+                                true,
+                            );
+                        } else if (data.yaw !== undefined) {
+                            await bot.look(data.yaw, data.pitch || 0, true);
+                        }
+                    } catch (e) {
+                        const yawMap: Record<string, number> = {
+                            north: Math.PI,
+                            south: 0,
+                            east: Math.PI / 2,
+                            west: -Math.PI / 2,
+                        };
+                        if (yawMap[intent.target.name.toLowerCase()] !== undefined) {
+                            await bot.look(
+                                yawMap[intent.target.name.toLowerCase()],
+                                0,
+                                true,
+                            );
+                        }
+                    }
+                } else if (intent.target.type === "entity") {
+                    const e = bot.nearestEntity((e) => e.name === intent.target.name);
+                    if (e) {
+                        await bot.lookAt(e.position.offset(0, e.height || 1.5, 0), true);
+                    }
+                } else {
+                    const startYaw = bot.entity.yaw;
+                    await bot.look(startYaw + Math.PI / 4, 0, true);
+                    await waitForMs(400, signal);
+                    await bot.look(startYaw - Math.PI / 4, 0, true);
+                    await waitForMs(400, signal);
+                    await bot.look(startYaw, 0, true);
+                }
                 break;
+            }
             case "sleep": {
                 await escapeTree(bot, signal);
 
@@ -205,7 +245,14 @@ export async function runTask(
             case "retreat": {
                 await escapeTree(bot, signal);
 
-                const pos = computeSafeRetreat(getThreats());
+                const threats = taskCtx.getThreats ? taskCtx.getThreats() : [];
+                const pos = taskCtx.computeSafeRetreat ? taskCtx.computeSafeRetreat(threats) : { x: bot.entity.position.x + 5, z: bot.entity.position.z + 5 };
+                
+                log.info("Retreating to safe position", {
+                    threatCount: threats.length,
+                    target: pos,
+                });
+
                 await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
                     signal,
                     timeoutMs: 15000,
