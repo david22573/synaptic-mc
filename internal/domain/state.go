@@ -2,6 +2,8 @@ package domain
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -17,10 +19,49 @@ const (
 	PlanStatusBlocked     PlanStatus = "BLOCKED" // Week 3: Plan State Machine
 )
 
+// Phase 1 & 5: Execution Result Protocol
+const (
+	CauseTimeout                 = "TIMEOUT"
+	CauseBlocked                 = "BLOCKED"
+	CauseStuck                   = "STUCK"
+	CausePartial                 = "PARTIAL"
+	CauseFailed                  = "FAILED"
+	CauseDistracted              = "DISTRACTED"
+	CauseAbortedDuringHesitation = "ABORTED_DURING_HESITATION"
+	CauseUnknown                 = "UNKNOWN"
+)
+
+type ExecutionResult struct {
+	Action   Action  `json:"action"`
+	Success  bool    `json:"success"`
+	Cause    string  `json:"cause"`
+	Progress float64 `json:"progress"`
+}
+
 type Vec3 struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
 	Z float64 `json:"z"`
+}
+
+func (v Vec3) DistanceTo(other Vec3) float64 {
+	dx := v.X - other.X
+	dy := v.Y - other.Y
+	dz := v.Z - other.Z
+	return math.Sqrt(dx*dx + dy*dy + dz*dz)
+}
+
+// Phase 5: World Model Alignment Structs
+type ChunkCoord struct {
+	X int `json:"x"`
+	Z int `json:"z"`
+}
+
+type DangerZone struct {
+	Center Vec3    `json:"center"`
+	Radius float64 `json:"radius"`
+	Reason string  `json:"reason"` // e.g., "failed_path", "lava", "mob_cluster"
+	Risk   float64 `json:"risk"`   // 0.0 to 1.0
 }
 
 type Feedback struct {
@@ -48,6 +89,30 @@ type GameState struct {
 	Feedback     []Feedback        `json:"feedback,omitempty"`
 	CurrentTask  *Action           `json:"current_task,omitempty"`
 	TaskProgress float64           `json:"task_progress,omitempty"`
+
+	// Phase 5: State Fidelity
+	DangerZones      []DangerZone       `json:"danger_zones,omitempty"`
+	VisitedChunks    []ChunkCoord       `json:"visited_chunks,omitempty"`
+	TerrainRoughness map[string]float64 `json:"terrain_roughness,omitempty"` // map["x,z"] -> 0.0-1.0
+}
+
+// Phase 5.2: Feed execution feedback into state
+func (s *GameState) MarkAreaRisky(pos Vec3, reason string, risk float64) {
+	s.DangerZones = append(s.DangerZones, DangerZone{
+		Center: pos,
+		Radius: 8.0,
+		Reason: reason,
+		Risk:   risk,
+	})
+}
+
+func (s *GameState) RecordChunkVisit(x, z int) {
+	for _, c := range s.VisitedChunks {
+		if c.X == x && c.Z == z {
+			return // Already tracked
+		}
+	}
+	s.VisitedChunks = append(s.VisitedChunks, ChunkCoord{X: x, Z: z})
 }
 
 type VersionedState struct {
@@ -85,6 +150,7 @@ type Action struct {
 	ControllerID string        `json:"controller_id,omitempty"`
 	Source       string        `json:"source"`
 	Trace        TraceContext  `json:"trace"`
+	Type         string        `json:"type,omitempty"`
 	Action       string        `json:"action"`
 	Target       Target        `json:"target"`
 	Count        int           `json:"count"`
@@ -130,34 +196,45 @@ type CompactTask struct {
 	Progress float64 `json:"progress"`
 }
 
+type CompactDangerZone struct {
+	Distance float64 `json:"distance"`
+	Reason   string  `json:"reason"`
+	Risk     float64 `json:"risk"`
+}
+
 func FormatStateForLLM(state GameState) string {
 	compact := struct {
-		Health       float64                   `json:"health"`
-		Food         float64                   `json:"food"`
-		TimeOfDay    int                       `json:"time_of_day"`
-		Experience   float64                   `json:"experience"`
-		Level        int                       `json:"level"`
-		HasBedNearby bool                      `json:"has_bed_nearby"`
-		Inventory    map[string]int            `json:"inventory"`
-		Threats      []CompactThreat           `json:"threats"`
-		POIs         []CompactPOI              `json:"pois"`
-		HasPickaxe   bool                      `json:"has_pickaxe"`
-		HasWeapon    bool                      `json:"has_weapon"`
-		KnownChests  map[string]map[string]int `json:"known_chests,omitempty"`
-		Feedback     []Feedback                `json:"feedback,omitempty"`
-		CurrentTask  *CompactTask              `json:"current_task,omitempty"`
+		Health                  float64                   `json:"health"`
+		Food                    float64                   `json:"food"`
+		TimeOfDay               int                       `json:"time_of_day"`
+		Experience              float64                   `json:"experience"`
+		Level                   int                       `json:"level"`
+		HasBedNearby            bool                      `json:"has_bed_nearby"`
+		Inventory               map[string]int            `json:"inventory"`
+		Threats                 []CompactThreat           `json:"threats"`
+		POIs                    []CompactPOI              `json:"pois"`
+		HasPickaxe              bool                      `json:"has_pickaxe"`
+		HasWeapon               bool                      `json:"has_weapon"`
+		KnownChests             map[string]map[string]int `json:"known_chests,omitempty"`
+		Feedback                []Feedback                `json:"feedback,omitempty"`
+		CurrentTask             *CompactTask              `json:"current_task,omitempty"`
+		CurrentTerrainRoughness float64                   `json:"current_terrain_roughness,omitempty"`
+		NearbyDangerZones       []CompactDangerZone       `json:"nearby_danger_zones,omitempty"`
+		VisitedChunksCount      int                       `json:"visited_chunks_count"`
 	}{
-		Health:       state.Health,
-		Food:         state.Food,
-		TimeOfDay:    state.TimeOfDay,
-		Experience:   state.Experience,
-		Level:        state.Level,
-		HasBedNearby: state.HasBedNearby,
-		Inventory:    make(map[string]int),
-		Threats:      make([]CompactThreat, 0),
-		POIs:         make([]CompactPOI, 0),
-		KnownChests:  make(map[string]map[string]int),
-		Feedback:     state.Feedback,
+		Health:             state.Health,
+		Food:               state.Food,
+		TimeOfDay:          state.TimeOfDay,
+		Experience:         state.Experience,
+		Level:              state.Level,
+		HasBedNearby:       state.HasBedNearby,
+		Inventory:          make(map[string]int),
+		Threats:            make([]CompactThreat, 0),
+		POIs:               make([]CompactPOI, 0),
+		KnownChests:        make(map[string]map[string]int),
+		Feedback:           state.Feedback,
+		NearbyDangerZones:  make([]CompactDangerZone, 0),
+		VisitedChunksCount: len(state.VisitedChunks),
 	}
 
 	if state.CurrentTask != nil {
@@ -165,6 +242,23 @@ func FormatStateForLLM(state GameState) string {
 			Action:   state.CurrentTask.Action,
 			Target:   state.CurrentTask.Target.Name,
 			Progress: state.TaskProgress,
+		}
+	}
+
+	// Phase 5: Inject local world context
+	chunkKey := fmt.Sprintf("%d,%d", int(state.Position.X)>>4, int(state.Position.Z)>>4)
+	if roughness, exists := state.TerrainRoughness[chunkKey]; exists {
+		compact.CurrentTerrainRoughness = roughness
+	}
+
+	for _, dz := range state.DangerZones {
+		dist := state.Position.DistanceTo(dz.Center)
+		if dist < 64.0 { // Only burden the prompt with localized danger
+			compact.NearbyDangerZones = append(compact.NearbyDangerZones, CompactDangerZone{
+				Distance: dist,
+				Reason:   dz.Reason,
+				Risk:     dz.Risk,
+			})
 		}
 	}
 

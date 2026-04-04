@@ -15,7 +15,7 @@ import (
 
 const (
 	writeWait           = 10 * time.Second
-	pongWait            = 15 * time.Second // Synced with WSController timeout tolerance
+	pongWait            = 15 * time.Second
 	pingPeriod          = (pongWait * 9) / 10
 	maxMessageSize      = 512 * 1024
 	MsgTypeControlInput = "CONTROL_INPUT"
@@ -27,7 +27,7 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Relaxed for local agent UI development
+		return true
 	},
 }
 
@@ -105,7 +105,6 @@ func (h *Hub) Run(ctx context.Context) {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
 				h.logger.Info("UI Client disconnected", slog.Int("active_clients", len(h.clients)))
 			}
 			h.mu.Unlock()
@@ -178,7 +177,6 @@ func (h *Hub) shutdown() {
 }
 
 func (h *Hub) Broadcast(msgType string, payload any) {
-	// ---- produce the exact JSON the UI expects ----
 	env := struct {
 		Type    string `json:"type"`
 		Payload any    `json:"payload"`

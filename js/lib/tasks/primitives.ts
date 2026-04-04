@@ -1,9 +1,22 @@
+// js/lib/tasks/primitives.ts
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import pkg from "mineflayer-pathfinder";
-import { moveToGoal, type MoveOptions } from "./utils.js";
+import { type MoveOptions } from "./utils.js";
+import { navigateWithFallbacks } from "../movement/navigator.js";
 
 const { goals } = pkg;
+
+export class ExecutionError extends Error {
+    constructor(
+        message: string,
+        public cause: string,
+        public progress: number,
+    ) {
+        super(message);
+        this.name = "ExecutionError";
+    }
+}
 
 export async function gotoEntity(
     bot: Bot,
@@ -13,24 +26,29 @@ export async function gotoEntity(
 ): Promise<boolean> {
     const goal = new goals.GoalFollow(entity, range);
 
-    try {
-        await moveToGoal(bot, goal, {
-            ...opts,
-            dynamic: true,
-            stuckTimeoutMs: 3000, // Chasing shouldn't stall for long
-        });
+    // Phase 1: Track distance to calculate partial success
+    const startPos = bot.entity.position.clone();
+    const startDist = startPos.distanceTo(entity.position);
 
+    try {
+        await navigateWithFallbacks(bot, goal, {
+            timeoutMs: opts.timeoutMs ?? 15000,
+            signal: opts.signal,
+            stopMovement: opts.stopMovement,
+            maxRetries: 3,
+        });
         return true;
     } catch (err: any) {
-        if (err.message === "aborted") {
-            throw err;
-            // Bubble up explicit aborts immediately
-        }
+        // Phase 1/5: Catch failure, measure progress, and throw structured ExecutionError
+        const currentDist = bot.entity.position.distanceTo(entity.position);
+        const progress =
+            startDist > 0 ? Math.max(0, 1 - currentDist / startDist) : 0;
 
-        // Suppress general pathing/stuck errors for entity chasing
-        bot.pathfinder.setGoal(null);
-        bot.clearControlStates();
-        return false;
+        throw new ExecutionError(
+            err.message || "Failed to reach entity",
+            err.cause || "BLOCKED",
+            progress,
+        );
     }
 }
 

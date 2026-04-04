@@ -32,6 +32,9 @@ func NewService(bus domain.EventBus, logger *slog.Logger) *Service {
 	// Catch UI-driven updates if they come through as STATE_UPDATE
 	bus.Subscribe(domain.EventType("STATE_UPDATE"), domain.FuncHandler(s.handleStateTick))
 
+	// Phase 5: Listen for task completion to alter the world model
+	bus.Subscribe(domain.EventType("TASK_END"), domain.FuncHandler(s.handleTaskEnd))
+
 	return s
 }
 
@@ -49,6 +52,43 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 		return
 	}
 
+	// Phase 5: Build world model - Track chunks visited from heartbeat
+	newState.RecordChunkVisit(int(newState.Position.X)>>4, int(newState.Position.Z)>>4)
+
+	// Preserve existing DangerZones and VisitedChunks across ticks
+	curr := s.GetCurrentState()
+	newState.DangerZones = curr.State.DangerZones
+	if len(curr.State.VisitedChunks) > len(newState.VisitedChunks) {
+		newState.VisitedChunks = curr.State.VisitedChunks
+	}
+
+	s.saveState(ctx, newState, event)
+}
+
+// Phase 5: Mutate state actively based on execution feedback
+func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
+	var result domain.ExecutionResult
+	if err := json.Unmarshal(event.Payload, &result); err != nil {
+		return
+	}
+
+	// If we got stuck or pathfinding failed, permanently mark that area as bad for the planner
+	if !result.Success && (result.Cause == domain.CauseBlocked || result.Cause == domain.CauseStuck) {
+		curr := s.GetCurrentState()
+
+		// Copy slice to avoid race condition during mutation
+		newState := curr.State
+		newState.DangerZones = append([]domain.DangerZone{}, curr.State.DangerZones...)
+		newState.VisitedChunks = append([]domain.ChunkCoord{}, curr.State.VisitedChunks...)
+
+		s.logger.Info("Marking area as risky due to execution failure", slog.String("cause", result.Cause))
+		newState.MarkAreaRisky(newState.Position, result.Cause, 0.85)
+
+		s.saveState(ctx, newState, event)
+	}
+}
+
+func (s *Service) saveState(ctx context.Context, newState domain.GameState, triggerEvent domain.DomainEvent) {
 	vState := domain.VersionedState{
 		Version: s.stateVersion.Add(1),
 		State:   newState,
@@ -60,8 +100,8 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 
 	// Emit the normalized internal event so the rest of the system can react
 	s.bus.Publish(ctx, domain.DomainEvent{
-		SessionID: event.SessionID,
-		Trace:     event.Trace,
+		SessionID: triggerEvent.SessionID,
+		Trace:     triggerEvent.Trace,
 		Type:      domain.EventTypeStateUpdated,
 		Payload:   payload,
 		CreatedAt: time.Now(),

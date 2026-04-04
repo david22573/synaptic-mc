@@ -32,6 +32,7 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 	}
 
 	var validationErrors []error
+	spatialShifted := false
 
 	for i, task := range input.Normalized.Tasks {
 		// 1. Check logical state (Inventory, Tools, Recipes)
@@ -40,12 +41,17 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 		}
 
 		// 2. Check spatial reality (Perception)
-		if err := validateSpatialReality(task, input); err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) physics rejected: %w", i+1, task.Action, err))
+		// Bypass if a previous task in the chain moved the bot
+		if !spatialShifted {
+			if err := validateSpatialReality(task, input); err != nil {
+				validationErrors = append(validationErrors, fmt.Errorf("task %d (%s) physics rejected: %w", i+1, task.Action, err))
+			}
 		}
 
-		// Simulate inventory changes for chained tasks
+		// Simulate changes for chained tasks
 		switch task.Action {
+		case "explore", "retreat":
+			spatialShifted = true
 		case "gather", "mine":
 			simInv[task.Target.Name]++
 		case "eat":
@@ -67,7 +73,6 @@ func (s *ValidateStage) Process(ctx context.Context, input PipelineState) (Pipel
 	return output, nil
 }
 
-// validateSpatialReality ensures the bot doesn't hallucinate objects that aren't loaded in its chunk.
 func validateSpatialReality(task domain.Action, input PipelineState) error {
 	switch task.Action {
 	case "mine", "gather", "hunt", "farm":
@@ -78,7 +83,6 @@ func validateSpatialReality(task domain.Action, input PipelineState) error {
 		target := strings.ToLower(task.Target.Name)
 		found := false
 
-		// Loosen exact matching for generic requests
 		for _, poi := range input.Perception.RankedPOIs {
 			poiName := strings.ToLower(poi.Name)
 			if strings.Contains(poiName, target) || strings.Contains(target, poiName) {

@@ -18,4 +18,6 @@ type Config struct {
 
 	// MaxDriftDelay bounds how far into the future a drift action is scheduled
 	MaxDriftDelay time.Duration
+
+	DistractionThreshold float64 // How close is "close enough" for pathing and interactions
 }

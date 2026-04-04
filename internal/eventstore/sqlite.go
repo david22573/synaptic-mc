@@ -131,7 +131,8 @@ func (s *SQLiteStore) Append(ctx context.Context, sessionID string, trace domain
 
 func (s *SQLiteStore) GetStream(ctx context.Context, sessionID string) ([]domain.DomainEvent, error) {
 	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
-	          FROM events WHERE session_id = ? ORDER BY id ASC`
+	          FROM events WHERE session_id = ?
+	          ORDER BY id ASC`
 	return s.queryEvents(ctx, query, sessionID)
 }
 
@@ -149,7 +150,8 @@ func (s *SQLiteStore) GetRecentStream(ctx context.Context, sessionID string, lim
 
 func (s *SQLiteStore) GetStreamSince(ctx context.Context, sessionID string, sinceID int64) ([]domain.DomainEvent, error) {
 	query := `SELECT id, session_id, trace_id, action_id, event_type, payload, created_at 
-	          FROM events WHERE session_id = ? AND id > ? ORDER BY id ASC`
+	          FROM events WHERE session_id = ?
+	          AND id > ? ORDER BY id ASC`
 	return s.queryEvents(ctx, query, sessionID, sinceID)
 }
 
@@ -229,19 +231,22 @@ func (s *SQLiteStore) batchWorker() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			close(s.buffer)
-			for ev := range s.buffer {
-				batch = append(batch, ev)
-				if len(batch) >= batchSize {
-					drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Safely drain remaining without closing the channel to prevent writer panics
+			drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			for {
+				select {
+				case ev := <-s.buffer:
+					batch = append(batch, ev)
+					if len(batch) >= batchSize {
+						flush(drainCtx)
+					}
+				default:
 					flush(drainCtx)
-					cancel()
+					return
 				}
 			}
-			drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			flush(drainCtx)
-			cancel()
-			return
 
 		case ev := <-s.buffer:
 			batch = append(batch, ev)

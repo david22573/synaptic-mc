@@ -1,3 +1,4 @@
+// js/lib/network/client.ts
 import WebSocket from "ws";
 import { EventEmitter } from "events";
 
@@ -170,6 +171,7 @@ export class SynapticClient extends EventEmitter {
         commandId?: string,
         cause?: string,
         startTime?: number,
+        progress?: number,
     ): void;
     public sendEvent(event: string, payload: Record<string, any>): void;
     public sendEvent(
@@ -178,6 +180,7 @@ export class SynapticClient extends EventEmitter {
         commandId = "",
         cause = "",
         startTime = 0,
+        progress = 0,
     ): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
@@ -186,7 +189,6 @@ export class SynapticClient extends EventEmitter {
 
         if (typeof arg2 === "object") {
             payload = arg2;
-            // FIX: Don't swallow the event type if an object payload is passed!
             if (event === "death") msgType = "BOT_DEATH";
             else if (event === "bot_respawn") msgType = "BOT_RESPAWN";
             else if (event === "panic_retreat_start")
@@ -209,12 +211,17 @@ export class SynapticClient extends EventEmitter {
             if (event === "task_failed") status = "FAILED";
             if (event === "task_aborted") status = "ABORTED";
 
+            // Phase 1/5: Enforce strict boolean success for Go's ExecutionResult contract
+            const success = event === "task_completed";
+
             payload = {
+                success: success,
                 status: status,
                 action: actionStr,
                 command_id: commandId,
                 cause: cause,
                 duration_ms: duration_ms,
+                progress: progress || 0.0,
             };
         }
 

@@ -119,9 +119,8 @@ func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action)
 	}
 	e.recentActions[dedupKey] = time.Now()
 
-	if action.Priority < 0 && (e.inFlight != nil || len(e.queue) > 0) {
-		return
-	}
+	// REMOVED: The silent drop for Priority < 0 tasks to prevent TaskManager deadlocks
+	// Let the priority queue handle the execution order naturally
 
 	heap.Push(&e.queue, queuedAction{
 		ctx:        ctx,

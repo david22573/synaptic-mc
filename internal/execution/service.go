@@ -1,3 +1,4 @@
+// internal/execution/service.go
 package execution
 
 import (
@@ -114,10 +115,17 @@ func (s *ControlService) handleTaskStart(ctx context.Context, event domain.Domai
 
 		inFlight := s.engine.GetInFlight()
 		if inFlight != nil && inFlight.ID == payload.CommandID {
-			timeout := inFlight.Timeout
-			if timeout == 0 {
-				timeout = 45 * time.Second
+			s.failuresMu.Lock()
+			if _, exists := s.failures[payload.CommandID]; !exists {
+				s.failures[payload.CommandID] = &FailureRecord{
+					IntentID: payload.CommandID,
+					Action:   *inFlight,
+				}
 			}
+			s.failuresMu.Unlock()
+
+			// Safely access Timeout if it exists on Action, otherwise default
+			timeout := 45 * time.Second
 
 			// Padded by 15s to allow organic JS timeout to hit the bus first
 			timeout += 15 * time.Second
@@ -138,10 +146,11 @@ func (s *ControlService) handleTaskStart(ctx context.Context, event domain.Domai
 func (s *ControlService) triggerRecovery(sessionID string, taskID string, cause string) {
 	_ = s.ctrlManager.AbortCurrent(context.Background(), cause)
 
-	failedPayload, _ := json.Marshal(map[string]string{
+	failedPayload, _ := json.Marshal(map[string]interface{}{
 		"status":     "FAILED",
 		"command_id": taskID,
 		"cause":      cause,
+		"progress":   0.0,
 	})
 
 	s.bus.Publish(context.Background(), domain.DomainEvent{
@@ -154,9 +163,10 @@ func (s *ControlService) triggerRecovery(sessionID string, taskID string, cause 
 
 func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	var payload struct {
-		Status    string `json:"status"`
-		CommandID string `json:"command_id"`
-		Cause     string `json:"cause"`
+		Status    string  `json:"status"`
+		CommandID string  `json:"command_id"`
+		Cause     string  `json:"cause"`
+		Progress  float64 `json:"progress"` // Phase 1 & 3: Read execution progress
 	}
 
 	if err := json.Unmarshal(event.Payload, &payload); err == nil {
@@ -169,8 +179,8 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 		}
 		s.timersMu.Unlock()
 
-		s.failuresMu.Lock()
 		if !success && payload.Cause != "preempted_by_priority" && payload.Cause != "plan_invalidated" {
+			s.failuresMu.Lock()
 			record, exists := s.failures[payload.CommandID]
 			if !exists {
 				record = &FailureRecord{IntentID: payload.CommandID}
@@ -179,16 +189,66 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 			record.Count++
 			record.LastFailure = time.Now()
 
-			if record.Count > 3 {
-				s.logger.Error("Task infinite failure loop detected, blacklisting", slog.String("task_id", payload.CommandID))
+			// Phase 1 + 3: Full execution result mapping using domain struct
+			res := domain.ExecutionResult{
+				Success:  false,
+				Cause:    payload.Cause,
+				Progress: payload.Progress,
+				Action:   record.Action,
 			}
-		} else if success {
-			delete(s.failures, payload.CommandID)
-		}
-		s.failuresMu.Unlock()
 
-		s.engine.OnTaskEnd(payload.CommandID, success)
-		_ = s.taskManager.Complete(ctx, payload.CommandID, success)
+			directive := s.ctrlManager.EvaluateFailure(res, record.Count)
+			actionToRetry := record.Action
+			s.failuresMu.Unlock()
+
+			// Keep the planner in the loop with the actual failure reason
+			s.ctrlManager.RecordResult(res)
+
+			s.logger.Warn("Task failed, applying adaptation strategy",
+				slog.String("task_id", payload.CommandID),
+				slog.String("cause", payload.Cause),
+				slog.Float64("progress", payload.Progress),
+				slog.String("strategy", string(directive.Strategy)),
+				slog.Duration("delay", directive.Delay),
+			)
+
+			// Close the current failed instance so the queue unblocks
+			s.engine.OnTaskEnd(payload.CommandID, false)
+			_ = s.taskManager.Complete(ctx, payload.CommandID, false)
+
+			if actionToRetry.ID == "" {
+				s.logger.Warn("Task dropped, missing action details for retry", slog.String("task_id", payload.CommandID))
+				return
+			}
+
+			switch directive.Strategy {
+			case StrategyRetrySame, StrategyRetryDifferent:
+				executeAt := time.Now().Add(directive.Delay)
+				_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
+
+			case StrategyDegrade:
+				actionToRetry.Action = directive.Fallback
+				actionToRetry.ID = actionToRetry.ID + "-degraded"
+				executeAt := time.Now().Add(directive.Delay)
+				_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
+
+			case StrategyAbort:
+				// Already aborted and completed above
+			}
+
+		} else {
+			// Clean up success states
+			s.failuresMu.Lock()
+			delete(s.failures, payload.CommandID)
+			s.failuresMu.Unlock()
+
+			if success {
+				s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
+			}
+
+			s.engine.OnTaskEnd(payload.CommandID, success)
+			_ = s.taskManager.Complete(ctx, payload.CommandID, success)
+		}
 	}
 }
 

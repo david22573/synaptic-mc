@@ -1,12 +1,15 @@
+// js/lib/tasks/handlers/explore.ts
 import {
     type FSMState,
     type StateContext,
     StateMachineRunner,
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal } from "../utils.js";
+import { escapeTree } from "../utils.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { log } from "../../logger.js";
 import pkg from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
@@ -27,24 +30,22 @@ class NavigateState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
         try {
-            await moveToGoal(
+            await navigateWithFallbacks(
                 eCtx.bot,
                 new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
                 {
                     signal: eCtx.signal,
-                    timeoutMs: 12000, // Reduced from 15s to fit within global limit better
+                    timeoutMs: 12000,
                     stopMovement: eCtx.stopMovement,
-                    dynamic: false,
+                    maxRetries: 2,
                 },
             );
 
-            // Successfully reached new area. Record it to repel future exploration.
             eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
                 z: eCtx.bot.entity.position.z,
             });
 
-            // In-place truncation to preserve array reference bound to bot instance
             while (eCtx.visitedPoints.length > MAX_HISTORY_POINTS) {
                 eCtx.visitedPoints.shift();
             }
@@ -74,8 +75,7 @@ class PickDirectionState implements FSMState {
         const eCtx = ctx as ExploreContext;
         eCtx.attempts++;
 
-        // Reduced from 4 attempts to 2 to prevent hitting global 25s FSM timeout
-        if (eCtx.attempts > 2) {
+        if (eCtx.attempts > 3) {
             eCtx.result = {
                 status: "FAILED",
                 reason: "SURROUNDED_BY_OBSTACLES_OR_WATER",
@@ -83,34 +83,88 @@ class PickDirectionState implements FSMState {
             return null;
         }
 
-        const dist = 16 + Math.random() * 16;
-        let bestAngle = 0;
+        const dist = 12 + Math.random() * 8;
+        let bestTarget = null;
         let maxRepulsionScore = -1;
 
-        // Sample 8 angles and pick the one furthest from our visited history
-        for (let i = 0; i < 8; i++) {
+        const pos = eCtx.bot.entity.position.floored();
+
+        for (let i = 0; i < 12; i++) {
             const testAngle = Math.random() * Math.PI * 2;
-            const tx = eCtx.bot.entity.position.x + Math.cos(testAngle) * dist;
-            const tz = eCtx.bot.entity.position.z + Math.sin(testAngle) * dist;
+            let tx = pos.x;
+            let tz = pos.z;
+            let ty = pos.y;
+            let validLength = 0;
+
+            for (let step = 1; step <= dist; step++) {
+                const checkX = Math.floor(pos.x + Math.cos(testAngle) * step);
+                const checkZ = Math.floor(pos.z + Math.sin(testAngle) * step);
+
+                let foundSurface = false;
+
+                for (let yOffset = 2; yOffset >= -2; yOffset--) {
+                    const block = eCtx.bot.blockAt(
+                        new Vec3(checkX, ty + yOffset, checkZ),
+                    );
+                    const blockAbove = eCtx.bot.blockAt(
+                        new Vec3(checkX, ty + yOffset + 1, checkZ),
+                    );
+                    const blockAbove2 = eCtx.bot.blockAt(
+                        new Vec3(checkX, ty + yOffset + 2, checkZ),
+                    );
+
+                    if (!block || !blockAbove || !blockAbove2) break;
+
+                    if (
+                        block.boundingBox === "block" &&
+                        blockAbove.name === "air" &&
+                        blockAbove2.name === "air" &&
+                        block.name !== "water" &&
+                        block.name !== "lava" &&
+                        block.name !== "magma_block"
+                    ) {
+                        tx = checkX;
+                        tz = checkZ;
+                        ty = ty + yOffset;
+                        validLength = step;
+                        foundSurface = true;
+                        break;
+                    }
+                }
+                if (!foundSurface) break;
+            }
+
+            if (validLength < 2) continue;
 
             let minDistanceToHistory = 999999;
             for (const pt of eCtx.visitedPoints) {
                 const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
                 if (d < minDistanceToHistory) minDistanceToHistory = d;
             }
+            if (eCtx.visitedPoints.length === 0)
+                minDistanceToHistory = validLength;
 
-            if (eCtx.visitedPoints.length === 0) minDistanceToHistory = 1;
             if (minDistanceToHistory > maxRepulsionScore) {
                 maxRepulsionScore = minDistanceToHistory;
-                bestAngle = testAngle;
+                bestTarget = { x: tx, z: tz };
             }
         }
 
-        eCtx.targetX = eCtx.bot.entity.position.x + Math.cos(bestAngle) * dist;
-        eCtx.targetZ = eCtx.bot.entity.position.z + Math.sin(bestAngle) * dist;
+        if (!bestTarget) {
+            log.warn(
+                "Exploration raymarch failed, picking random fallback target",
+                { attempt: eCtx.attempts },
+            );
+            bestTarget = {
+                x: pos.x + (Math.random() * 16 - 8),
+                z: pos.z + (Math.random() * 16 - 8),
+            };
+        }
+
+        eCtx.targetX = bestTarget.x;
+        eCtx.targetZ = bestTarget.z;
 
         log.info("Picked exploration vector", {
-            dist: Math.round(dist),
             targetX: Math.round(eCtx.targetX),
             targetZ: Math.round(eCtx.targetZ),
             attempt: eCtx.attempts,
@@ -121,32 +175,30 @@ class PickDirectionState implements FSMState {
 
 export async function handleExplore(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
-    await escapeTree(bot, signal);
 
-    // Bind the history array to the bot instance itself.
-    const botRef = bot as any;
-    botRef.explorationHistory = botRef.explorationHistory || [];
+    try {
+        await escapeTree(bot, signal);
 
-    const fsmCtx: ExploreContext = {
-        bot,
-        targetName: "explore",
-        targetEntity: null,
-        searchRadius: 0,
-        timeoutMs: timeouts.explore ?? 25000,
-        startTime: 0,
-        signal,
-        targetX: 0,
-        targetZ: 0,
-        attempts: 0,
-        stopMovement,
-        visitedPoints: botRef.explorationHistory,
-    };
+        const botRef = bot as any;
+        botRef.explorationHistory = botRef.explorationHistory || [];
 
-    const result = await new StateMachineRunner(
-        new PickDirectionState(),
-        fsmCtx,
-    ).run();
+        const fsmCtx: ExploreContext = {
+            bot,
+            targetName: "explore",
+            targetEntity: null,
+            searchRadius: 0,
+            timeoutMs: timeouts.explore ?? 25000,
+            startTime: 0,
+            signal,
+            targetX: 0,
+            targetZ: 0,
+            attempts: 0,
+            stopMovement,
+            visitedPoints: botRef.explorationHistory,
+        };
 
-    if (result.status === "FAILED")
-        throw new Error(result.reason || "unknown_fsm_failure");
+        await new StateMachineRunner(new PickDirectionState(), fsmCtx).run();
+    } catch (err: any) {
+        log.warn("Explore task aborted or crashed", { reason: err.message });
+    }
 }

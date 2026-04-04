@@ -71,7 +71,6 @@ func NewService(
 	return s
 }
 
-// Validate filters out impossible plans based on local state
 func Validate(plan *domain.Plan, state domain.GameState) bool {
 	if plan == nil || len(plan.Tasks) == 0 {
 		return false
@@ -85,6 +84,12 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 			hasPickaxe = true
 		}
 		if item.Name == "crafting_table" {
+			hasCraftingTable = true
+		}
+	}
+
+	for _, poi := range state.POIs {
+		if poi.Name == "crafting_table" {
 			hasCraftingTable = true
 		}
 	}
@@ -243,7 +248,6 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		return
 	}
 
-	// FIX: Use robust IsFallback boolean instead of string checking
 	if plan.IsFallback && s.curriculum != nil {
 		s.logger.Info("Planner cache empty, falling back to curriculum")
 

@@ -1,3 +1,4 @@
+// internal/domain/event_normalizer.go
 package domain
 
 import "strings"
@@ -9,7 +10,8 @@ func NormalizeEventType(s string) EventType {
 	case "TASK_START", "TASKSTART":
 		return EventTypeTaskStart
 
-	case "TASK_END", "TASKEND":
+	// Mapped the TS FSM terminal states to the Go TASK_END handler
+	case "TASK_END", "TASKEND", "TASK_COMPLETED", "TASK_FAILED", "TASK_ABORTED":
 		return EventTypeTaskEnd
 
 	case "STATE_UPDATED", "STATEUPDATE":

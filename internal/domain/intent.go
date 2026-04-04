@@ -1,13 +1,15 @@
+// internal/domain/intent.go
 package domain
 
 // ActionIntent replaces the lower-level Action struct for the Voyager loop.
 // It enforces strict expectations so the Critic knows exactly what to measure.
 type ActionIntent struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`    // "mine", "craft", "explore", "hunt"
-	Target    string `json:"target"`    // e.g., "iron_ore", "oak_planks"
-	Count     int    `json:"count"`     // Expected quantity change
-	Rationale string `json:"rationale"` // LLM's reasoning for this intent
+	ID             string    `json:"id"`
+	Action         string    `json:"action"`                    // "mine", "craft", "explore", "hunt"
+	Target         string    `json:"target"`                    // e.g., "iron_ore", "oak_planks"
+	Count          int       `json:"count"`                     // Expected quantity change
+	Rationale      string    `json:"rationale"`                 // LLM's reasoning for this intent
+	TargetLocation *Location `json:"target_location,omitempty"` // Pointer so it can be nil for non-spatial tasks like crafting
 }
 
 // TaskHistory stores the full lifecycle of a task for Phase 4 Vector Memory.

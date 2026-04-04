@@ -2,6 +2,7 @@
 
 import { AgentController } from "./agent-controller";
 import { TaskCommitment } from "./task-commitment";
+import type { Task } from "./task-commitment";
 import { Prefetcher } from "./prefetcher";
 
 const maxEvents = 50;
@@ -77,7 +78,6 @@ export function connectToBot() {
                     const goEvent = message.payload;
 
                     let innerPayload: any = {};
-                    // FIX: Go broadcast payload uses lowercase 'payload'
                     const rawPayload = goEvent.payload || goEvent.Payload;
 
                     if (rawPayload) {
@@ -97,7 +97,6 @@ export function connectToBot() {
                     }
 
                     const newEvent = {
-                        // FIX: Go broadcast payload uses lowercase 'type'
                         type: goEvent.type || goEvent.Type || "UNKNOWN",
                         payload: innerPayload,
                         timestamp: new Date().toLocaleTimeString(),
@@ -107,10 +106,16 @@ export function connectToBot() {
 
                     if (
                         newEvent.type === "TASK_START" &&
-                        newEvent.payload.task
+                        newEvent.payload?.action
                     ) {
-                        if (commitment.shouldCommit(newEvent.payload.task)) {
-                            prefetcher.onTaskStart(newEvent.payload.task);
+                        const task: Task = {
+                            id: newEvent.payload.command_id ?? "",
+                            type: newEvent.payload.action,
+                            completed: newEvent.payload.status === "completed",
+                            target: newEvent.payload.target ?? null,
+                        };
+                        if (commitment.shouldCommit(task)) {
+                            prefetcher.onTaskStart(task);
                         }
                     }
                     if (newEvent.type === "TASK_END") commitment.reset();

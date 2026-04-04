@@ -72,6 +72,14 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 	}
 	c.mu.Unlock()
 
+	// Phase 3 Fix #8: Trace log the flow
+	c.logger.Info("Dispatching action",
+		slog.String("action", action.Action),
+		slog.String("target_name", action.Target.Name),
+		slog.String("target_type", action.Target.Type),
+		slog.String("task_id", action.ID),
+	)
+
 	payload, err := json.Marshal(action)
 	if err != nil {
 		return err
@@ -82,13 +90,15 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 		Payload: payload,
 	}
 
+	// Phase 3 Fix #7: Drop-with-warn on full channel instead of returning error
 	select {
 	case c.sendCh <- msg:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		return errors.New("send channel full")
+		c.logger.Warn("Send channel full, dropping dispatch message to avoid blocking", slog.String("action", action.Action))
+		return nil
 	}
 }
 
@@ -107,11 +117,13 @@ func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
 		return errors.New("websocket closed")
 	}
 
+	// Phase 3 Fix #7: Apply the same drop-with-warn logic to the abort channel push
 	select {
 	case c.sendCh <- msg:
 		return nil
 	default:
-		return errors.New("send channel full")
+		c.logger.Warn("Send channel full, dropping abort message to avoid blocking", slog.String("reason", reason))
+		return nil
 	}
 }
 
@@ -121,7 +133,6 @@ func (c *WSController) Close() error {
 		c.isClosed = true
 		c.mu.Unlock()
 
-		close(c.sendCh)
 		c.conn.Close()
 		if c.onClose != nil {
 			c.onClose()
@@ -156,6 +167,19 @@ func (c *WSController) readPump() {
 			continue
 		}
 
+		// Phase 1/5: Parse and log the ExecutionResult directly for observability
+		if msg.Type == "TASK_END" {
+			var res domain.ExecutionResult
+			if err := json.Unmarshal(msg.Payload, &res); err == nil {
+				c.logger.Info("Execution result parsed",
+					slog.Bool("success", res.Success),
+					slog.String("cause", res.Cause),
+					slog.Float64("progress", res.Progress),
+				)
+			}
+		}
+
+		// Route to manager/engine
 		if c.onMessage != nil {
 			c.onMessage(msg.Type, msg.Payload)
 		}

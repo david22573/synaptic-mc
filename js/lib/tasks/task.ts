@@ -20,7 +20,16 @@ import { handleInteract } from "./handlers/interact.js";
 import { handleStore } from "./handlers/store.js";
 import { handleRetrieve } from "./handlers/retrieve.js";
 
+import { ExecutionError } from "./primitives.js"; // Phase 1 update
+
 const { goals } = pkg;
+
+// Phase 1: Define TS representation of ExecutionResult
+export interface ExecutionResult {
+    success: boolean;
+    cause: string;
+    progress: number;
+}
 
 function calculateDynamicTimeout(
     intent: models.ActionIntent,
@@ -45,7 +54,7 @@ export async function runTask(
         z: number;
     },
     stopMovement: () => void,
-): Promise<void> {
+): Promise<ExecutionResult> {
     const intent = normalizeIntent(bot, rawIntent);
 
     const dynamicTimeouts = { ...timeouts };
@@ -66,7 +75,7 @@ export async function runTask(
     };
 
     if (signal.aborted) {
-        throw new Error("aborted");
+        return { success: false, cause: "aborted", progress: 0.0 };
     }
 
     try {
@@ -112,15 +121,13 @@ export async function runTask(
                     .items()
                     .find((i) => i.name === intent.target.name);
 
-                if (!food) throw new Error(`NO_FOOD: ${intent.target.name}`);
+                if (!food) throw new ExecutionError(`NO_FOOD`, "error", 0);
 
                 try {
                     await bot.equip(food.type, "hand");
                     await bot.consume();
                 } catch (err) {
-                    throw new Error(
-                        `CONSUME_FAILED: ${err instanceof Error ? err.message : String(err)}`,
-                    );
+                    throw new ExecutionError(`CONSUME_FAILED`, "error", 0);
                 }
                 break;
             }
@@ -138,7 +145,7 @@ export async function runTask(
                     matching: (b: any) => b?.name.includes("bed"),
                 });
 
-                if (!bed) throw new Error("no bed found");
+                if (!bed) throw new ExecutionError("no bed found", "error", 0);
 
                 await moveToGoal(
                     bot,
@@ -153,11 +160,15 @@ export async function runTask(
 
                 let onWake: (() => void) | undefined;
                 let onAbort: (() => void) | undefined;
+                let timeoutId: NodeJS.Timeout | undefined;
 
                 try {
                     const wakePromise = new Promise<void>((resolve, reject) => {
-                        onWake = () => resolve();
-                        onAbort = () => reject(new Error("aborted"));
+                        onWake = resolve;
+                        onAbort = () =>
+                            reject(
+                                new ExecutionError("aborted", "aborted", 1.0),
+                            );
 
                         bot.on("wake", onWake);
                         signal.addEventListener("abort", onAbort, {
@@ -165,13 +176,26 @@ export async function runTask(
                         });
                     });
 
+                    // Phase 2 Fix #6: Replace raw setTimeout abort with AbortController + clearTimeout
+                    const sleepAbortCtrl = new AbortController();
+                    const timeoutPromise = new Promise<void>((_, reject) => {
+                        timeoutId = setTimeout(() => {
+                            sleepAbortCtrl.abort();
+                            reject(
+                                new ExecutionError(
+                                    "sleep timeout",
+                                    "timeout",
+                                    1.0,
+                                ),
+                            );
+                        }, 12000);
+                    });
+
                     const sleepPromise = bot.sleep(bed).then(() => wakePromise);
-                    const timeoutPromise = new Promise<void>((resolve) =>
-                        setTimeout(resolve, 12000),
-                    );
 
                     await Promise.race([sleepPromise, timeoutPromise]);
                 } finally {
+                    if (timeoutId) clearTimeout(timeoutId);
                     if (onWake) bot.removeListener("wake", onWake);
                     if (onAbort) signal.removeEventListener("abort", onAbort);
                 }
@@ -199,14 +223,33 @@ export async function runTask(
                 await waitForMs(500, signal);
                 break;
             default:
-                throw new Error(`unsupported: ${intent.action}`);
+                throw new ExecutionError(
+                    `unsupported: ${intent.action}`,
+                    "error",
+                    0,
+                );
         }
+
+        // Return a clean 100% success state if we clear the switch block cleanly
+        return { success: true, cause: "", progress: 1.0 };
     } catch (err: any) {
         stopMovement();
+
+        // Phase 1: Return the structured result back so we can pipe it over websockets
+        if (err instanceof ExecutionError || err.name === "ExecutionError") {
+            return {
+                success: err.cause === "partial", // True if we accept partial paths
+                cause: err.cause,
+                progress: err.progress,
+            };
+        }
+
         log.error(`Task handler error in ${intent.action}`, {
             error: err.message,
             stack: err.stack,
         });
-        throw err;
+
+        // Fallback for unhandled/raw node errors
+        return { success: false, cause: "error", progress: 0.0 };
     }
 }

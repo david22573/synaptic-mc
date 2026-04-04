@@ -1,3 +1,4 @@
+// js/lib/tasks/utils.ts
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
@@ -165,9 +166,9 @@ export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 export interface MoveOptions {
-    signal: AbortSignal;
+    signal?: AbortSignal;
     timeoutMs: number;
-    stopMovement: () => void;
+    stopMovement?: () => void; // Made optional to fix the mismatch with navigator.ts
     dynamic?: boolean;
     stuckTimeoutMs?: number;
 }
@@ -186,7 +187,7 @@ export function moveToGoal(
     } = opts;
 
     return new Promise((resolve, reject) => {
-        if (signal.aborted) {
+        if (signal?.aborted) {
             reject(new Error("aborted"));
             return;
         }
@@ -198,6 +199,7 @@ export function moveToGoal(
         let settled = false;
         let lastPos = bot.entity.position.clone();
         let stuckTimer: NodeJS.Timeout | null = null;
+        let mainTimer: NodeJS.Timeout | null = null;
         const listeners = new Map<string, any>();
 
         const cleanup = () => {
@@ -206,6 +208,7 @@ export function moveToGoal(
             );
             listeners.clear();
             if (stuckTimer) clearInterval(stuckTimer);
+            if (mainTimer) clearTimeout(mainTimer);
         };
 
         const finish = (err?: Error) => {
@@ -213,12 +216,11 @@ export function moveToGoal(
             settled = true;
             cleanup();
 
-            try {
-                // FIX: Force physical halt via stopMovement so goal actually clears
-                stopMovement();
-            } catch (_err) {}
-
             if (err) {
+                try {
+                    // Only hard-stop if we actually failed or aborted, allowing smooth waypoints
+                    if (stopMovement) stopMovement();
+                } catch (_err) {}
                 reject(err);
                 return;
             }
@@ -243,30 +245,35 @@ export function moveToGoal(
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
+
             if (dist < 0.5) {
                 stuckStrikes++;
-                if (stuckStrikes >= 2) {
+                if (stuckStrikes >= 4) {
                     finish(new Error("stuck"));
                 }
             } else {
                 stuckStrikes = 0;
-                lastPos = currentPos.clone();
             }
+
+            // Unconditionally update lastPos so slow drifts don't bypass the stuck detection
+            lastPos = currentPos.clone();
         }, stuckTimeoutMs);
 
         listeners.set("goal_reached", onGoalReached);
         listeners.set("path_update", onPathUpdate);
 
-        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+        }
+
         bot.once("goal_reached", onGoalReached);
         bot.on("path_update", onPathUpdate);
 
-        const timer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
+        mainTimer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
 
         try {
             bot.pathfinder.setGoal(goal, dynamic);
         } catch (err) {
-            clearTimeout(timer);
             finish(err instanceof Error ? err : new Error(String(err)));
         }
     });
@@ -287,7 +294,6 @@ export async function makeRoomInInventory(
 
     const inventory = bot.inventory.items();
 
-    // Pre-filter the inventory to only sort and process trash items
     const trashItems = inventory.filter((i: any) => TRASH_ITEMS.has(i.name));
     trashItems.sort((a: any, b: any) => a.count - b.count);
 

@@ -1,391 +1,461 @@
-Project Context Dump (03 Apr 26 02:44 PDT)
+Project Context Dump (03 Apr 26 17:35 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 2
+Total Files: 8
 
 # Project Structure
 <file_tree>
-- js\lib\tasks\task.ts
-- ui\src\lib\store.svelte.ts
+- internal\humanization\attention.go
+- internal\humanization\config.go
+- internal\humanization\context.go
+- internal\humanization\engine.go
+- internal\humanization\hesitation.go
+- internal\humanization\intent.go
+- internal\humanization\noise.go
+- internal\humanization\state.go
 </file_tree>
 
 # File Contents
-<file path="js\lib\tasks\task.ts">
-import type { Bot } from "mineflayer";
-import pkg from "mineflayer-pathfinder";
-import * as models from "../models.js";
-import { type TaskContext } from "./registry.js";
-import { log } from "../logger.js";
+<file path="internal\humanization\attention.go">
+// internal/humanization/attention.go
+package humanization
 
-import { handleGather } from "./handlers/gather.js";
-import { handleCraft } from "./handlers/craft.js";
-import { handleHunt } from "./handlers/hunt.js";
-import { handleBuild } from "./handlers/build.js";
-import { handleExplore } from "./handlers/explore.js";
-import { handleSmelt } from "./handlers/smelt.js";
-import { handleMine } from "./handlers/mine.js";
-import { handleFarm } from "./handlers/farm.js";
-import { escapeTree, moveToGoal, waitForMs } from "./utils.js";
-import { normalizeIntent } from "./normalize.js";
-import { handleInteract } from "./handlers/interact.js";
-import { handleStore } from "./handlers/store.js";
-import { handleRetrieve } from "./handlers/retrieve.js";
+import (
+	"math/rand"
+	"time"
+)
 
-const { goals } = pkg;
-
-function calculateDynamicTimeout(
-    intent: models.ActionIntent,
-    bot: Bot,
-    baseTimeouts: Record<string, number>,
-): number {
-    const baseTimeout = baseTimeouts[intent.action] || 15000;
-    const invCount = bot.inventory.items().length;
-    const healthFactor = Math.max(bot.health, 1) / 20;
-
-    // FIX: Health factor now properly scales timeout up when healthy, down when dying
-    return baseTimeout * (1 + invCount * 0.02) * (0.5 + healthFactor);
+type AttentionModel struct {
+	FocusLevel float64 // 1.0 = locked in, 0.0 = completely scatterbrained
+	LastUpdate time.Time
 }
 
-export async function runTask(
-    bot: Bot,
-    rawIntent: models.ActionIntent,
-    signal: AbortSignal,
-    timeouts: Record<string, number>,
-    getThreats: () => models.ThreatInfo[],
-    computeSafeRetreat: (threats: models.ThreatInfo[]) => {
-        x: number;
-        z: number;
-    },
-    stopMovement: () => void,
-): Promise<void> {
-    const intent = normalizeIntent(bot, rawIntent);
+func NewAttentionModel() *AttentionModel {
+	return &AttentionModel{
+		FocusLevel: 1.0,
+		LastUpdate: time.Now(),
+	}
+}
 
-    const dynamicTimeouts = { ...timeouts };
-    dynamicTimeouts[intent.action] = calculateDynamicTimeout(
-        intent,
-        bot,
-        timeouts,
-    );
+// Decay reduces focus over time to simulate boredom or fatigue.
+func (a *AttentionModel) Decay() {
+	elapsed := time.Since(a.LastUpdate).Seconds()
+	decayAmount := (elapsed / 60.0) * 0.05 // Drops 5% per minute
 
-    const taskCtx: TaskContext = {
-        bot,
-        intent,
-        signal,
-        timeouts: dynamicTimeouts,
-        getThreats,
-        computeSafeRetreat,
-        stopMovement,
-    };
+	a.FocusLevel -= decayAmount
+	if a.FocusLevel < 0.2 {
+		a.FocusLevel = 0.2 // Floor the focus so it doesn't break entirely
+	}
+	a.LastUpdate = time.Now()
+}
 
-    if (signal.aborted) {
-        throw new Error("aborted");
-    }
+// CheckDistraction rolls the dice to see if the bot abandons its current thought track.
+func (a *AttentionModel) CheckDistraction() bool {
+	a.Decay()
+	// The lower the focus, the higher the chance of being distracted
+	distractionChance := (1.0 - a.FocusLevel) * 0.25
+	return rand.Float64() < distractionChance
+}
 
-    try {
-        switch (intent.action) {
-            case "hunt":
-                await handleHunt(taskCtx);
-                break;
-            case "gather":
-                await handleGather(taskCtx);
-                break;
-            case "craft":
-                await handleCraft(taskCtx);
-                break;
-            case "build":
-                await handleBuild(taskCtx);
-                break;
-            case "smelt":
-                await handleSmelt(taskCtx);
-                break;
-            case "mine":
-                await handleMine(taskCtx);
-                break;
-            case "farm":
-                await handleFarm(taskCtx);
-                break;
-            case "explore":
-                await handleExplore(taskCtx);
-                break;
-            case "store":
-                await handleStore(taskCtx);
-                break;
-            case "retrieve":
-                await handleRetrieve(taskCtx);
-                break;
-            case "eat": {
-                const food = bot.inventory
-                    .items()
-                    .find((i) => i.name === intent.target.name);
-
-                if (!food) throw new Error(`NO_FOOD: ${intent.target.name}`);
-
-                try {
-                    await bot.equip(food.type, "hand");
-                    await bot.consume();
-                } catch (err) {
-                    throw new Error(
-                        `CONSUME_FAILED: ${err instanceof Error ? err.message : String(err)}`,
-                    );
-                }
-                break;
-            }
-            case "idle":
-                await waitForMs(1500, signal);
-                break;
-            case "look":
-                await waitForMs(500, signal);
-                break;
-            case "sleep": {
-                await escapeTree(bot, signal);
-
-                const bed = bot.findBlock({
-                    maxDistance: 32,
-                    matching: (b: any) => b?.name.includes("bed"),
-                });
-
-                if (!bed) throw new Error("no bed found");
-
-                await moveToGoal(
-                    bot,
-                    new goals.GoalNear(
-                        bed.position.x,
-                        bed.position.y,
-                        bed.position.z,
-                        1.5,
-                    ),
-                    { signal, timeoutMs: 20000, stopMovement },
-                );
-
-                let onWake: (() => void) | undefined;
-                let onAbort: (() => void) | undefined;
-
-                try {
-                    const wakePromise = new Promise<void>((resolve, reject) => {
-                        onWake = () => resolve();
-                        onAbort = () => reject(new Error("aborted"));
-
-                        bot.on("wake", onWake);
-                        signal.addEventListener("abort", onAbort, {
-                            once: true,
-                        });
-                    });
-
-                    const sleepPromise = bot.sleep(bed).then(() => wakePromise);
-                    const timeoutPromise = new Promise<void>((resolve) =>
-                        setTimeout(resolve, 12000),
-                    );
-
-                    await Promise.race([sleepPromise, timeoutPromise]);
-                } finally {
-                    if (onWake) bot.removeListener("wake", onWake);
-                    if (onAbort) signal.removeEventListener("abort", onAbort);
-                }
-
-                break;
-            }
-            case "retreat": {
-                await escapeTree(bot, signal);
-
-                const pos = computeSafeRetreat(getThreats());
-                await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
-                    signal,
-                    timeoutMs: 15000,
-                    stopMovement,
-                });
-
-                await waitForMs(1000, signal);
-                break;
-            }
-            case "interact":
-                await handleInteract(taskCtx);
-                break;
-            case "mark_location":
-            case "recall_location":
-                await waitForMs(500, signal);
-                break;
-            default:
-                throw new Error(`unsupported: ${intent.action}`);
-        }
-    } catch (err: any) {
-        stopMovement();
-        log.error(`Task handler error in ${intent.action}`, {
-            error: err.message,
-            stack: err.stack,
-        });
-        throw err;
-    }
+// Refocus snaps the bot back to 100% (e.g., after taking damage, sleeping, or finishing a major task).
+func (a *AttentionModel) Refocus() {
+	a.FocusLevel = 1.0
+	a.LastUpdate = time.Now()
 }
 
 </file>
 
-<file path="ui\src\lib\store.svelte.ts">
-import { AgentController } from "./agent-controller";
-import { TaskCommitment } from "./task-commitment";
-import { Prefetcher } from "./prefetcher";
+<file path="internal\humanization\config.go">
+package humanization
 
-const maxEvents = 50;
-const EVENT_TTL_MS = 5 * 60 * 1000;
+import "time"
 
-export const botStore = $state({
-    gameState: null as any,
-    events: [] as any[],
-    objective: "Initializing...",
-    connectionStatus: "connecting" as
-        | "connecting"
-        | "connected"
-        | "disconnected",
+// Config holds the tuning parameters for the humanization engine.
+type Config struct {
+	// AttentionDecay is the rate at which focus drops per second (0.0 to 1.0)
+	AttentionDecay float64
 
-    addEvent(event: any) {
-        const now = Date.now();
-        this.events = [
-            { ...event, ingestTime: now },
-            ...this.events.filter(
-                (e) => now - (e.ingestTime || now) < EVENT_TTL_MS,
-            ),
-        ].slice(0, maxEvents);
-    },
-});
+	// HesitationBase is the minimum reaction time before executing an action
+	HesitationBase time.Duration
 
-export const uiStore = $state({
-    tooltip: "",
-    mouseX: 0,
-    mouseY: 0,
-});
+	// NoiseLevel dictates the probability/severity of input jitter (0.0 to 1.0)
+	NoiseLevel float64
 
-export const controller = new AgentController();
-export const commitment = new TaskCommitment();
-export const prefetcher = new Prefetcher();
+	// BaseDriftRate dictates the probability of background idle actions
+	BaseDriftRate float64
 
-let ws: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectAttempts = 0;
+	// MaxDriftDelay bounds how far into the future a drift action is scheduled
+	MaxDriftDelay time.Duration
 
-export function connectToBot() {
-    botStore.connectionStatus = "connecting";
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ui/ws`;
-
-    ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-        botStore.connectionStatus = "connected";
-        reconnectAttempts = 0;
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-    };
-
-    ws.onmessage = (event) => {
-        try {
-            const message = JSON.parse(event.data);
-            if (!message.type || !message.payload) return;
-
-            // FIX: Normalize to uppercase to catch Go backend enums
-            switch (message.type.toUpperCase()) {
-                case "SYNC_REQUEST":
-                    if (message.payload?.authoritative_state) {
-                        controller.reconcileState(
-                            message.payload.authoritative_state,
-                        );
-                    }
-                    break;
-                case "STATE_UPDATE":
-                    botStore.gameState = message.payload;
-                    controller.onStateUpdate(message.payload);
-                    break;
-
-                case "EVENT_STREAM": {
-                    const goEvent = message.payload;
-
-                    // Go sends a b64-encoded raw JSON string; decode it once
-                    let innerPayload: any = {};
-                    if (goEvent.Payload) {
-                        try {
-                            const decoded = atob(goEvent.Payload); // b64 -> string
-                            innerPayload = JSON.parse(decoded); // string -> object
-                        } catch {
-                            // fallback for plain JSON string (dev sanity)
-                            try {
-                                innerPayload =
-                                    typeof goEvent.Payload === "string"
-                                        ? JSON.parse(goEvent.Payload)
-                                        : goEvent.Payload;
-                            } catch {
-                                innerPayload = goEvent.Payload;
-                            }
-                        }
-                    }
-
-                    const newEvent = {
-                        type: goEvent.Type || "UNKNOWN",
-                        payload: innerPayload,
-                        timestamp: new Date().toLocaleTimeString(),
-                    };
-
-                    botStore.addEvent(newEvent);
-
-                    if (
-                        newEvent.type === "TASK_START" &&
-                        newEvent.payload.task
-                    ) {
-                        if (commitment.shouldCommit(newEvent.payload.task)) {
-                            prefetcher.onTaskStart(newEvent.payload.task);
-                        }
-                    }
-                    if (newEvent.type === "TASK_END") commitment.reset();
-                    break;
-                }
-                case "OBJECTIVE_UPDATE":
-                    botStore.objective = message.payload;
-                    break;
-            }
-        } catch (err) {
-            console.error("Failed to parse message:", err);
-        }
-    };
-
-    ws.onclose = () => {
-        botStore.connectionStatus = "disconnected";
-        scheduleReconnect();
-    };
-
-    ws.onerror = () => {
-        botStore.connectionStatus = "disconnected";
-    };
+	DistractionThreshold float64 // How close is "close enough" for pathing and interactions
 }
 
-function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    const delay = Math.min(3000 * Math.pow(1.5, reconnectAttempts), 30000);
-    reconnectAttempts++;
-    reconnectTimer = setTimeout(() => {
-        connectToBot();
-    }, delay);
+</file>
+
+<file path="internal\humanization\context.go">
+package humanization
+
+import "david22573/synaptic-mc/internal/domain"
+
+// Context provides the situational awareness required for behavioral modifiers.
+type Context struct {
+	State   domain.GameState
+	IsStuck bool
 }
 
-export function sendCameraControl(yaw: number, pitch: number) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    ws.send(
-        JSON.stringify({
-            type: "CONTROL_INPUT",
-            payload: {
-                action: "camera_move",
-                yaw,
-                pitch,
-                timestamp: performance.now(),
-            },
-        }),
-    );
+// BuildContext constructs a new behavioral context from the orchestrator's state.
+func BuildContext(state domain.GameState, isStuck bool) Context {
+	return Context{
+		State:   state,
+		IsStuck: isStuck,
+	}
 }
 
-export function clearEventLog() {
-    botStore.events = [];
+</file>
+
+<file path="internal\humanization\engine.go">
+// internal/humanization/engine.go
+package humanization
+
+import (
+	"fmt"
+	"math/rand"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type ScheduledAction struct {
+	Action    domain.Action
+	ExecuteAt time.Time
 }
 
-export function disconnectBot() {
-    if (ws) ws.close();
-    if (reconnectTimer) clearTimeout(reconnectTimer);
+type Engine struct {
+	cfg         Config
+	state       *State
+	intentModel *IntentModel
+}
+
+func NewEngine(cfg Config) *Engine {
+	return &Engine{
+		cfg:         cfg,
+		state:       NewState(cfg),
+		intentModel: NewIntentModel(),
+	}
+}
+
+func (e *Engine) State() *State {
+	return e.state
+}
+
+func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
+	var scheduled []ScheduledAction
+	now := time.Now()
+	currentDelay := time.Duration(0)
+
+	approvedTasks := e.intentModel.Apply(plan.Tasks, e.state, ctx)
+	if len(approvedTasks) == 0 {
+		return scheduled
+	}
+
+	// Week 5: Panic Mode (Pure reflex + escape, disable humanization noise)
+	isCritical := false
+	if ctx.State.CurrentTask != nil {
+		action := ctx.State.CurrentTask.Action
+		if action == "combat" || action == "retreat" || action == "eat" || action == "mine" {
+			isCritical = true
+		}
+	}
+	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
+		isCritical = true
+	}
+
+	// Only drift if we aren't in a life-or-death situation
+	if !isCritical {
+		driftActions := ProcessAttentionDrift(ctx, e.state, now)
+		scheduled = append(scheduled, driftActions...)
+
+		if rand.Float64() < e.cfg.BaseDriftRate {
+			driftAction := e.generateDrift(ctx)
+			if driftAction != nil {
+				driftDelay := time.Duration(rand.Int63n(int64(e.cfg.MaxDriftDelay)))
+				scheduled = append(scheduled, ScheduledAction{
+					Action:    *driftAction,
+					ExecuteAt: now.Add(driftDelay),
+				})
+			}
+		}
+	}
+
+	for i, task := range approvedTasks {
+		if task.Priority == 0 {
+			task.Priority = 5
+		}
+
+		noisyTask := ApplyNoise(task, ctx, e.cfg)
+		hesitation := time.Duration(0)
+
+		if i == 0 || !isCritical {
+			hesitation = CalculateHesitation(noisyTask, ctx, e.state, e.cfg)
+		}
+
+		if i > 0 && !isCritical {
+			hesitation = hesitation / 2
+		}
+
+		// In Panic Mode, reaction time is instantaneous
+		if isCritical {
+			hesitation = 0
+		}
+
+		currentDelay += hesitation
+
+		scheduled = append(scheduled, ScheduledAction{
+			Action:    noisyTask,
+			ExecuteAt: now.Add(currentDelay),
+		})
+
+		currentDelay += 100 * time.Millisecond
+	}
+
+	return scheduled
+}
+
+func (e *Engine) generateDrift(ctx Context) *domain.Action {
+	roll := rand.Float64()
+
+	action := domain.Action{
+		ID:       fmt.Sprintf("drift-%d", time.Now().UnixNano()),
+		Priority: -1,
+	}
+
+	if roll < 0.5 {
+		action.Action = "look"
+		action.Target = domain.Target{Type: "relative", Name: "random_yaw"}
+		action.Rationale = "Humanization: idle looking around"
+	} else if roll < 0.8 {
+		action.Action = "inventory"
+		action.Target = domain.Target{Type: "ui", Name: "open_close"}
+		action.Rationale = "Humanization: nervously checking inventory"
+	} else {
+		return nil
+	}
+
+	return &action
+}
+
+</file>
+
+<file path="internal\humanization\hesitation.go">
+// internal/humanization/hesitation.go
+package humanization
+
+import (
+	"math/rand"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// CalculateHesitation determines how long the bot should pause before acting.
+func CalculateHesitation(action domain.Action, ctx Context, state *State, cfg Config) time.Duration {
+	base := float64(cfg.HesitationBase.Milliseconds())
+
+	// 1. Complexity Scaling
+	switch action.Action {
+	case "hunt", "combat", "retreat", "build":
+		base += 600.0
+	case "craft", "smelt", "store":
+		base += 300.0
+	case "explore":
+		base += 100.0
+	}
+
+	// 2. Confusion Scaling
+	if ctx.IsStuck {
+		base += 1200.0
+	}
+
+	// 3. Attention Scaling
+	attentionModifier := 1.0 + (1.0 - state.GetAttention())
+	base *= attentionModifier
+
+	// 4. Week 5: Risk-Based Hesitation (Caution factor)
+	// Base delay + (risk * factor). High risk environments cause the bot to pause
+	// and "think" before acting (simulating stealth/caution), unless panic mode overrides.
+	risk := 0.0
+	if ctx.State.Health < 20 {
+		risk += (20.0 - ctx.State.Health) * 0.5
+	}
+	risk += float64(len(ctx.State.Threats) * 2.0)
+
+	factor := 45.0 // ms added per unit of risk
+	base += (risk * factor)
+
+	// 5. Natural Jitter
+	jitterLimit := int64(base * 0.5)
+	var jitter int64
+	if jitterLimit > 0 {
+		jitter = rand.Int63n(jitterLimit)
+	}
+
+	finalMs := int64(base) + jitter
+	return time.Duration(finalMs) * time.Millisecond
+}
+
+</file>
+
+<file path="internal\humanization\intent.go">
+// internal/humanization/intent.go
+package humanization
+
+import (
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// IntentState tracks the bot's emotional commitment to its current goal.
+type IntentState struct {
+	CurrentGoal    string
+	Commitment     float64
+	Frustration    float64
+	CommitmentTime time.Time
+}
+
+type IntentModel struct{}
+
+func NewIntentModel() *IntentModel {
+	return &IntentModel{}
+}
+
+// Apply evaluates frustration and decides whether to proceed with the tasks or abandon them.
+func (m *IntentModel) Apply(tasks []domain.Action, state *State, ctx Context) []domain.Action {
+	if len(tasks) == 0 {
+		return tasks
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Week 5: Panic Mode
+	// If survival is threatened, drop all frustration and lock strictly into the plan
+	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
+		state.Intent.Frustration = 0.0
+		state.Intent.Commitment = 1.0
+		return tasks
+	}
+
+	// 1. Calculate Frustration
+	if ctx.IsStuck {
+		state.Intent.Frustration += 0.01
+	} else {
+		state.Intent.Frustration -= 0.05
+		if state.Intent.Frustration < 0 {
+			state.Intent.Frustration = 0
+		}
+	}
+
+	// 2. Rage Quit Threshold
+	if state.Intent.Frustration > 0.8 {
+		state.Intent.CurrentGoal = ""
+		state.Intent.Commitment = 0.0
+		state.Intent.Frustration = 0.0
+		return []domain.Action{}
+	}
+
+	// 3. Lock in new goals
+	primaryTask := tasks[0]
+	if state.Intent.CurrentGoal != primaryTask.Action {
+		state.Intent.CurrentGoal = primaryTask.Action
+		state.Intent.Commitment = 1.0
+		state.Intent.Frustration = 0.0
+		state.Intent.CommitmentTime = time.Now()
+	} else {
+		// Strengthen emotional commitment the longer a task runs
+		if time.Since(state.Intent.CommitmentTime) > 3*time.Second {
+			state.Intent.Commitment = 1.0
+		}
+	}
+
+	return tasks
+}
+
+</file>
+
+<file path="internal\humanization\noise.go">
+package humanization
+
+import (
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// ApplyNoise lightly fuzzes the intent parameters.
+// Currently acts as a passthrough for structural safety, but is hooked up
+// for future vector/coordinate fuzzing when actions carry explicit Vec3s.
+func ApplyNoise(action domain.Action, ctx Context, cfg Config) domain.Action {
+	if cfg.NoiseLevel <= 0.01 {
+		return action
+	}
+
+	noisyAction := action
+
+	// Example: If the action involves a specific coordinate, we would
+	// apply +/- NoiseLevel to X/Z here so the bot doesn't walk perfectly straight.
+	// Since our current target types are mostly entity names (e.g., "oak_log"),
+	// we rely on the TS client (Movements config) for physical path jitter.
+
+	return noisyAction
+}
+
+</file>
+
+<file path="internal\humanization\state.go">
+package humanization
+
+import (
+	"sync"
+	"time"
+)
+
+// State tracks the evolving internal conditions of the agent.
+type State struct {
+	mu             sync.Mutex
+	AttentionLevel float64
+	Fatigue        float64
+	Intent         IntentState // NEW: Hooked in from intent.go
+	cfg            Config
+}
+
+func NewState(cfg Config) *State {
+	return &State{
+		AttentionLevel: 1.0,
+		Fatigue:        0.0,
+		Intent:         IntentState{},
+		cfg:            cfg,
+	}
+}
+
+func (s *State) Evolve(ctx Context, dt time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	decay := s.cfg.AttentionDecay * dt.Seconds()
+	s.AttentionLevel -= decay
+
+	if ctx.State.Health < 15 || ctx.IsStuck {
+		s.AttentionLevel = 1.0
+	}
+
+	if s.AttentionLevel < 0.2 {
+		s.AttentionLevel = 0.2
+	}
+}
+
+func (s *State) GetAttention() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AttentionLevel
 }
 
 </file>
@@ -394,10 +464,10 @@ export function disconnectBot() {
 
 ```json
 {
-  "total_bytes": 12395,
-  "file_count": 2,
-  "estimated_tokens": 3160,
+  "total_bytes": 10433,
+  "file_count": 8,
+  "estimated_tokens": 2815,
   "mode": "full",
-  "generated_at": "2026-04-03T02:44:11.7127578-07:00"
+  "generated_at": "2026-04-03T17:35:40.8889796-07:00"
 }
 ```

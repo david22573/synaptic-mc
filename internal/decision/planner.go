@@ -16,6 +16,7 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
+	"david22573/synaptic-mc/internal/policy"
 	"david22573/synaptic-mc/internal/strategy"
 )
 
@@ -121,7 +122,7 @@ func hashState(state domain.GameState) uint64 {
 	var items []string
 	for _, item := range state.Inventory {
 		if item.Count > 0 {
-			items = append(items, item.Name)
+			items = append(items, fmt.Sprintf("%s:%d", item.Name, item.Count))
 		}
 	}
 	sort.Strings(items)
@@ -208,12 +209,61 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 }
 
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
-	if plan := p.currentPlan.Swap(nil); plan != nil {
-		if len(plan.Tasks) > 0 {
-			return *plan
+	current := p.currentPlan.Load()
+
+	// Phase 2: Unify Survival Authority
+	survPolicy := policy.NewSurvivalPolicy()
+	input := policy.DecisionInput{
+		State: state,
+		Plan:  current,
+	}
+
+	decision := survPolicy.Decide(context.Background(), input)
+
+	if !decision.IsApproved {
+		if decision.OverridePlan != nil {
+			p.logger.Warn("Survival reflex triggered, overriding planner", slog.String("reason", decision.Reason))
+			p.currentPlan.Store(nil) // clear stale plan
+			return *decision.OverridePlan
+		}
+		p.logger.Warn("Plan rejected by survival policy", slog.String("reason", decision.Reason))
+		p.currentPlan.Store(nil)
+		return p.reactivePlan(state)
+	}
+
+	// Phase 3: Action Degradation & Loop Prevention
+	if current != nil {
+		p.failMu.Lock()
+		fails := p.failures[current.Objective]
+		p.failMu.Unlock()
+
+		if fails > 3 {
+			p.logger.Warn("Plan stuck in failure loop, degrading behavior", slog.String("objective", current.Objective))
+			p.currentPlan.Store(nil)
+			p.RecordSuccess(current.Objective) // Reset count so we don't infinitely trigger degraded state
+			return p.degradedPlan(state)
 		}
 	}
+
+	if current != nil && len(current.Tasks) > 0 {
+		return *current
+	}
 	return p.reactivePlan(state)
+}
+
+func (p *AdvancedPlanner) degradedPlan(state domain.GameState) domain.Plan {
+	return domain.Plan{
+		Objective: "Degraded Recovery state",
+		Tasks: []domain.Action{
+			{
+				ID:        fmt.Sprintf("recover-walk-%d", time.Now().UnixNano()),
+				Action:    "random_walk",
+				Target:    domain.Target{Name: "none", Type: "none"},
+				Priority:  50,
+				Rationale: "System stuck in loop: falling back to random walk to break deadlock",
+			},
+		},
+	}
 }
 
 func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {

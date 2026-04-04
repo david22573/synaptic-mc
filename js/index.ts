@@ -2,18 +2,22 @@ import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
 import { plugin as collectBlock } from "mineflayer-collectblock";
+
 import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
+
 import { runTask } from "./lib/tasks/task.js";
 import { SynapticClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 import { getPOIs, clearPOICache } from "./lib/utils/perception.js";
 import { Vec3 } from "vec3";
+
 const { pathfinder, Movements, goals } = pkg;
 
 let viewerStarted = false;
+
 function isValidPosition(pos: any): boolean {
     if (!pos) return false;
     const { x, y, z } = pos;
@@ -35,6 +39,7 @@ const isIgnorableError = (err: Error | any): boolean => {
     const msg = String(err?.message || err?.stack || err);
     const name = String(err?.name || "");
     const code = String(err?.code || "");
+
     return (
         name.includes("PartialReadError") ||
         msg.includes("Read error for undefined") ||
@@ -59,12 +64,14 @@ console.error = (...args: any[]) => {
         typeof firstArg === "object"
             ? String(firstArg?.err?.message || firstArg?.message || "")
             : String(firstArg);
+
     if (
         isIgnorableError(firstArg) ||
         msg.includes("PartialReadError") ||
         msg.includes("protodef")
     )
         return;
+
     originalConsoleError.apply(console, args);
 };
 
@@ -76,6 +83,7 @@ process.on("uncaughtException", (err: Error | any) => {
     });
     process.exit(1);
 });
+
 process.on("unhandledRejection", (reason: any) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
@@ -83,10 +91,12 @@ process.on("unhandledRejection", (reason: any) => {
 
 let currentTask: models.ActiveTask | null = null;
 let taskAbortController: AbortController | null = null;
+
 let bot: mineflayer.Bot;
 let client: SynapticClient;
 let survival: SurvivalSystem;
 let runtimeConfig: config.Config;
+
 let lastDeathMessage: string = "unknown causes";
 let lastStateSig = "";
 let lastStatePushTime = 0;
@@ -95,9 +105,10 @@ let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 let isBotSpawned = false;
 let hasDied = false;
-const knownChests: Record<string, { name: string; count: number }[]> = {};
-let lastVelocity = { x: 0, y: 0, z: 0 };
 
+const knownChests: Record<string, { name: string; count: number }[]> = {};
+
+let lastVelocity = { x: 0, y: 0, z: 0 };
 let isPathfinding = false;
 let pathProgress = 0.0;
 
@@ -120,7 +131,9 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
+
     if (currentTask?.id === task.id) currentTask = null;
+
     client.sendEvent(
         status,
         `${task.action} ${task.target?.name || "none"}`,
@@ -142,6 +155,7 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
+
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -150,13 +164,16 @@ function normalizeFailureCause(err: any): string {
         msg.includes("collect_failed")
     )
         return "PATH_FAILED";
+
     if (
         msg.includes("timeout") ||
         msg.includes("fsm_global_timeout") ||
         msg.includes("furnace_timeout_or_lag")
     )
         return "TIMEOUT";
+
     if (msg.includes("stuck")) return "STUCK";
+
     if (
         msg.includes("no_entity") ||
         msg.includes("missing_entity") ||
@@ -164,15 +181,19 @@ function normalizeFailureCause(err: any): string {
         msg.includes("no_interactable_found")
     )
         return "NO_ENTITY";
+
     if (msg.includes("no_pickaxe_equipped") || msg.includes("no_tool"))
         return "NO_TOOL";
+
     if (
         msg.includes("no_furnace_available") ||
         msg.includes("failed_to_reach_furnace") ||
         msg.includes("no_chest")
     )
         return "NO_FURNACE";
+
     if (msg.includes("no_mature_")) return "NO_MATURE_CROP";
+
     if (
         msg.includes("missing_ingredients") ||
         msg.includes("missing_crafting_table") ||
@@ -180,6 +201,7 @@ function normalizeFailureCause(err: any): string {
         msg.includes("not_in_inventory")
     )
         return "MISSING_INGREDIENTS";
+
     if (
         msg.includes("exhausted") ||
         msg.includes("no_") ||
@@ -187,11 +209,13 @@ function normalizeFailureCause(err: any): string {
         msg.includes("unknown_")
     )
         return "NO_BLOCKS";
+
     return "UNKNOWN";
 }
 
 async function executeAntiStuckReflex() {
     if (!bot || !bot.entity || bot.health <= 0) return;
+
     try {
         bot.setControlState("jump", true);
         await new Promise((r) => setTimeout(r, 200));
@@ -232,6 +256,7 @@ async function executeAntiStuckReflex() {
 async function executeIntent(intent: models.ActionIntent) {
     try {
         if (!intent?.action || isShuttingDown) return;
+
         if (!bot || !bot.entity || bot.health <= 0 || !isBotSpawned) {
             log.warn("Task execution blocked: invalid bot state", {
                 action: intent.action,
@@ -272,9 +297,11 @@ async function executeIntent(intent: models.ActionIntent) {
         }
 
         abortActiveTask("preempted");
+
         taskAbortController = new AbortController();
         const signal = taskAbortController.signal;
         const localController = taskAbortController;
+
         currentTask = {
             id: intent.id,
             action: intent.action,
@@ -286,6 +313,7 @@ async function executeIntent(intent: models.ActionIntent) {
                 action_id: intent.id,
             },
         };
+
         isPathfinding = false;
         pathProgress = 0.0;
 
@@ -296,6 +324,7 @@ async function executeIntent(intent: models.ActionIntent) {
             "",
             Date.now(),
         );
+
         const activeTask = currentTask;
         let timeoutId: NodeJS.Timeout | undefined;
 
@@ -307,82 +336,17 @@ async function executeIntent(intent: models.ActionIntent) {
             "retreat",
             "explore",
         ];
+
         if (highStakes.includes(intent.action)) {
             const jitterMs = 50 + Math.random() * 100;
             await new Promise((r) => setTimeout(r, jitterMs));
-        }
-
-        if (intent.action === "explore") {
-            log.info("Executing native curiosity exploration");
-            if (!isValidPosition(bot.entity.position)) {
-                log.error("Invalid position during explore, aborting");
-                completeTask(activeTask, "task_failed", "INVALID_POSITION");
-                return;
-            }
-            const goalX = Math.round(
-                bot.entity.position.x + (Math.random() - 0.5) * 60,
-            );
-            const goalZ = Math.round(
-                bot.entity.position.z + (Math.random() - 0.5) * 60,
-            );
-            try {
-                const timeouts =
-                    runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-                const timeoutMs = timeouts["explore"] || 30000;
-                await Promise.race([
-                    bot.pathfinder.goto(new goals.GoalXZ(goalX, goalZ)),
-                    new Promise((_, r) => {
-                        timeoutId = setTimeout(() => {
-                            localController.abort("timeout");
-                            stopMovement();
-                            r(new Error("timeout"));
-                        }, timeoutMs);
-                    }),
-                    new Promise((_, r) => {
-                        signal.addEventListener("abort", () => {
-                            stopMovement();
-                            r(new Error("aborted"));
-                        });
-                    }),
-                ]);
-                if (!signal.aborted && activeTask) {
-                    pushState();
-                    completeTask(activeTask, "task_completed");
-                }
-            } catch (err: any) {
-                if (!signal.aborted || err.message === "timeout") {
-                    const normalizedCause = normalizeFailureCause(err);
-                    log.error("Task failed, evaluating reflex", {
-                        cause: normalizedCause,
-                    });
-
-                    if (
-                        normalizedCause === "STUCK" ||
-                        normalizedCause === "PATH_FAILED"
-                    ) {
-                        await executeAntiStuckReflex();
-                        await new Promise((r) => setTimeout(r, 500));
-                        pushState();
-                    }
-
-                    if (activeTask) {
-                        completeTask(
-                            activeTask,
-                            "task_failed",
-                            normalizedCause,
-                        );
-                    }
-                }
-            } finally {
-                if (timeoutId) clearTimeout(timeoutId);
-            }
-            return;
         }
 
         try {
             const timeouts =
                 runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
             const timeoutMs = timeouts[intent.action] || 30000;
+
             await Promise.race([
                 runTask(
                     bot,
@@ -401,6 +365,7 @@ async function executeIntent(intent: models.ActionIntent) {
                     }, timeoutMs);
                 }),
             ]);
+
             if (!signal.aborted && activeTask) {
                 await new Promise((r) => setTimeout(r, 500));
                 pushState();
@@ -415,13 +380,16 @@ async function executeIntent(intent: models.ActionIntent) {
                     raw_error: err.message,
                     normalized_cause: normalizedCause,
                 });
+
                 if (
                     normalizedCause === "STUCK" ||
                     normalizedCause === "PATH_FAILED"
                 ) {
                     await executeAntiStuckReflex();
                 }
+
                 pushState();
+
                 if (activeTask)
                     completeTask(activeTask, "task_failed", normalizedCause);
             }
@@ -437,6 +405,7 @@ async function executeIntent(intent: models.ActionIntent) {
 
 function pushState() {
     if (!client) return;
+
     if (!bot?.entity || !isValidPosition(bot.entity?.position)) {
         const now = Date.now();
         if (now - lastStatePushTime < 3000) return;
@@ -460,21 +429,27 @@ function pushState() {
         });
         return;
     }
+
     const hotbarStart = bot.inventory.hotbarStart || 36;
     const hotbar = Array.from({ length: 9 }, (_, i) => {
         const item = bot.inventory.slots[hotbarStart + i];
         return item ? { name: item.name, count: item.count } : null;
     });
+
     const offhandItem = bot.inventory.slots[45];
+
     const sig = `${bot.health}|${bot.food}|${Math.round(bot.entity.position.x)},${Math.round(bot.entity.position.y)},${Math.round(bot.entity.position.z)}|${bot.quickBarSlot}|${bot.inventory
         .items()
         .map((i) => `${i.name}:${i.count}`)
         .sort()
         .join(",")}|${Object.keys(knownChests).length}`;
+
     const now = Date.now();
     if (sig === lastStateSig && now - lastStatePushTime < 3000) return;
+
     lastStateSig = sig;
     lastStatePushTime = now;
+
     client.sendState({
         health: Math.round(bot.health),
         food: Math.round(bot.food),
@@ -527,6 +502,7 @@ async function connectWithRetry(maxAttempts = 10) {
         isShuttingDown = true;
         process.exit(1);
     }
+
     if (bot) {
         try {
             if ((bot as any).viewer) {
@@ -537,18 +513,22 @@ async function connectWithRetry(maxAttempts = 10) {
             bot.quit();
         } catch (e) {}
     }
+
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
         username: "CraftBot",
         version: "1.19",
     });
+
     bot.loadPlugin(pathfinder);
     bot.loadPlugin(collectBlock);
+
     if (!client) {
         client = new SynapticClient({
             url: runtimeConfig.bot_ws_url || runtimeConfig.ws_url,
         });
+
         client.on("dispatch", (i) => void executeIntent(i));
         client.on("abort", () => {
             if (survival?.isPanickingNow()) {
@@ -563,9 +543,10 @@ async function connectWithRetry(maxAttempts = 10) {
         });
         client.connect();
     }
+
     if (!survival) {
-        survival = new SurvivalSystem(bot, client, {
-            onInterrupt: (r) => {
+        survival = new SurvivalSystem(bot, {
+            onInterrupt: (r: string) => {
                 if (r === "panic_flee") abortActiveTask("survival_panic");
             },
             stopMovement: () => stopMovement(),
@@ -573,19 +554,23 @@ async function connectWithRetry(maxAttempts = 10) {
     } else {
         survival.bot = bot;
     }
+
     bot.on("error", (err: Error) => {
         if (isIgnorableError(err)) return;
         log.warn("Mineflayer bot emitted error", { err: err.message });
     });
+
     bot.on("end", (reason) => {
         isBotSpawned = false;
         abortActiveTask("bot_disconnected");
         clearPOICache();
         if (survival) survival.stop();
+
         if (isShuttingDown) {
             log.info("Bot disconnected cleanly for shutdown.");
             return;
         }
+
         const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
         setTimeout(
             () => {
@@ -595,6 +580,7 @@ async function connectWithRetry(maxAttempts = 10) {
             backoffMs + Math.random() * 1000,
         );
     });
+
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         isBotSpawned = true;
@@ -612,6 +598,7 @@ async function connectWithRetry(maxAttempts = 10) {
         }
 
         log.info("Bot spawned successfully.");
+
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allow1by1towers = true;
@@ -624,6 +611,7 @@ async function connectWithRetry(maxAttempts = 10) {
             ].filter((id) => id !== undefined) as number[],
         );
         movements.digCost = 1.5;
+
         movements.scafoldingBlocks = [
             "dirt",
             "cobblestone",
@@ -633,15 +621,24 @@ async function connectWithRetry(maxAttempts = 10) {
             .map((name) => bot.registry.blocksByName[name]?.id)
             .filter((id) => id !== undefined);
 
+        if (movements.scafoldingBlocks.length === 0) {
+            log.warn(
+                "Warning: No scaffolding blocks available. Registry may be empty.",
+            );
+            // Fallback to dirt if registry is empty
+            movements.scafoldingBlocks = [3]; // dirt block ID
+        }
+
         bot.pathfinder.setMovements(movements);
 
         // @ts-ignore
         if (bot.collectBlock) bot.collectBlock.movements = movements;
 
-        bot.pathfinder.thinkTimeout = 30000;
+        bot.pathfinder.thinkTimeout = 60000;
 
         bot.inventory.removeAllListeners("updateSlot");
         bot.inventory.on("updateSlot", pushState);
+
         bot.on("path_update", (r: any) => {
             isPathfinding = true;
             const nodesLeft = r.path?.length || 0;
@@ -651,14 +648,15 @@ async function connectWithRetry(maxAttempts = 10) {
                 pathProgress = 0.05;
             }
         });
+
         bot.on("goal_reached", () => {
             isPathfinding = false;
             pathProgress = 1.0;
         });
 
-        // Initialize connection first, state will be pushed by the connected event listener
         client.connect();
         survival.start();
+
         lastStatePushTime = 0;
         pushState();
 
@@ -672,9 +670,11 @@ async function connectWithRetry(maxAttempts = 10) {
                 viewerStarted = true;
             } catch (err) {}
         }
+
         bot.removeAllListeners("physicsTick");
         bot.on("physicsTick", () => {
             if (!bot || !bot.entity || bot.health <= 0) return;
+
             if (bot.entity.velocity) {
                 lastVelocity = {
                     x: bot.entity.velocity.x,
@@ -682,6 +682,7 @@ async function connectWithRetry(maxAttempts = 10) {
                     z: bot.entity.velocity.z,
                 };
             }
+
             if (!currentTask && !bot.pathfinder?.isMoving()) {
                 if (Math.random() < 0.05) {
                     const entity = bot.nearestEntity(
@@ -699,21 +700,26 @@ async function connectWithRetry(maxAttempts = 10) {
             }
         });
     });
+
     bot.on("message", (msg) => {
         const text = msg.toString();
         if (text.includes(bot.username) && !text.startsWith("<"))
             lastDeathMessage = text;
     });
+
     bot.on("death", () => {
         isBotSpawned = false;
         hasDied = true;
         abortActiveTask("bot_died");
         if (survival) survival.reset();
+
         client.sendEvent("death", {
             error: "bot_died",
             stack: lastDeathMessage,
         });
+
         lastDeathMessage = "unknown causes";
+
         setTimeout(() => {
             if (bot && !isShuttingDown) {
                 log.info("Attempting to respawn...");
@@ -721,6 +727,7 @@ async function connectWithRetry(maxAttempts = 10) {
             }
         }, 3000);
     });
+
     bot.on("windowOpen", (window) => {
         if (
             String(window.type).includes("chest") ||
@@ -730,6 +737,7 @@ async function connectWithRetry(maxAttempts = 10) {
                 matching: bot.registry.blocksByName.chest?.id ?? -1,
                 maxDistance: 6,
             });
+
             if (chestBlock) {
                 const posKey = `${chestBlock.position.x},${chestBlock.position.y},${chestBlock.position.z}`;
                 knownChests[posKey] = window
@@ -739,10 +747,13 @@ async function connectWithRetry(maxAttempts = 10) {
             }
         }
     });
+
     bot.on("health", pushState);
     bot.on("experience", pushState);
+
     // @ts-ignore
     bot.on("heldItemChanged", pushState);
+
     if (stateInterval) clearInterval(stateInterval);
     stateInterval = setInterval(pushState, 3000);
 }
@@ -750,6 +761,7 @@ async function connectWithRetry(maxAttempts = 10) {
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
     log.info("Bot configuration loaded", { ws_url: runtimeConfig.ws_url });
+
     await connectWithRetry();
 }
 

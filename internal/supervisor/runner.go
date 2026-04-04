@@ -48,8 +48,8 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		}
 
 		workDir := filepath.Dir(absScriptPath)
-		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir))
 
+		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir))
 		cmd := exec.CommandContext(ctx, "node", absScriptPath)
 		cmd.Dir = workDir
 		cmd.Stdout = r.loggerWriter("STDOUT")
@@ -73,8 +73,8 @@ func (r *NodeRunner) Start(ctx context.Context) {
 					return
 				case <-ticker.C:
 					last := time.Unix(0, r.lastPing.Load())
-					if time.Since(last) > 15*time.Second {
-						r.logger.Warn("TS process starved (no state tick for 15s). Sending SIGKILL.")
+					if time.Since(last) > 45*time.Second {
+						r.logger.Warn("TS process starved (no state tick for 45s). Sending SIGKILL.")
 						_ = cmd.Process.Kill()
 						return
 					}
@@ -110,7 +110,8 @@ func (w *streamWriter) Write(p []byte) (n int, err error) {
 	if w.stream == "STDERR" {
 		w.logger.Warn("TS Engine Error", slog.String("msg", string(p)))
 	} else {
-		w.logger.Debug("TS Engine Output", slog.String("msg", string(p)))
+		// FIX: Use Info level here so standard TS logs aren't swallowed by Go's default log filter
+		w.logger.Info("TS Engine Output", slog.String("msg", string(p)))
 	}
 	return len(p), nil
 }

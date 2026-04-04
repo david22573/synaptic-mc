@@ -48,7 +48,8 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	);
 
 	CREATE TABLE IF NOT EXISTS world_nodes (
-		name TEXT PRIMARY KEY,
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
 		type TEXT NOT NULL,
 		x REAL,
 		y REAL,
@@ -64,13 +65,15 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 }
 
 func (s *SQLiteStore) MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error {
+	// Create a positional composite key so the bot can remember thousands of unique blocks
+	id := fmt.Sprintf("%s_%d_%d_%d", name, int(pos.X), int(pos.Y), int(pos.Z))
+
 	query := `
-	INSERT INTO world_nodes (name, type, x, y, z, last_seen) 
-	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(name) DO UPDATE SET 
-		x=excluded.x, y=excluded.y, z=excluded.z, 
+	INSERT INTO world_nodes (id, name, type, x, y, z, last_seen) 
+	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(id) DO UPDATE SET 
 		last_seen=CURRENT_TIMESTAMP;`
-	_, err := s.db.ExecContext(ctx, query, name, nodeType, pos.X, pos.Y, pos.Z)
+	_, err := s.db.ExecContext(ctx, query, id, name, nodeType, pos.X, pos.Y, pos.Z)
 	return err
 }
 

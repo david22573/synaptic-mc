@@ -102,8 +102,6 @@ func main() {
 		MaxRetries: 3,
 	})
 
-	// === CORE ARCHITECTURE WIRING ===
-
 	eventBus := domain.NewEventBus()
 	uiHub := observability.NewHub(logger)
 
@@ -120,10 +118,7 @@ func main() {
 		return humanizer.State().GetAttention()
 	}
 
-	// 1. State Service
 	stateSvc := state.NewService(eventBus, logger)
-
-	// 2. Execution Service
 	ctrlManager := execution.NewControllerManager()
 	execEngine := execution.NewTaskExecutionEngine(ctrlManager, cfg.NoiseLevel, getAttention, logger)
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
@@ -131,7 +126,6 @@ func main() {
 
 	uiHub.SetOrchestrator(execService)
 
-	// 3. Decision Service
 	evaluator := strategy.NewEvaluator()
 	critic := voyager.NewStateCritic()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore)
@@ -141,14 +135,11 @@ func main() {
 	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger, dynFlags.Get())
 	planManager := decision.NewPlanManager()
 
-	// FIX: Capture and retain the Decision Service reference
 	decisionSvc := decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, logger)
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
 	}
-
-	// === SYSTEM INTEGRATION HOOKS ===
 
 	eventBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		var stateUpdate struct {
@@ -174,18 +165,15 @@ func main() {
 	}))
 
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
-		// 🚨 DROP invalid events early
 		if ev.Type == "" {
 			logger.Error("Dropping event with empty type")
 			return
 		}
 
-		// Ensure payload is never nil
 		if len(ev.Payload) == 0 {
 			ev.Payload = []byte(`{}`)
 		}
 
-		// Validate JSON payload
 		var payloadObj interface{}
 		if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
 			logger.Warn("Invalid JSON payload, coercing to empty object",
@@ -196,29 +184,21 @@ func main() {
 			payloadObj = map[string]any{}
 		}
 
-		// Persist event
 		if err := eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
 			logger.Error("Failed to persist event", slog.Any("error", err))
 			return
 		}
 
-		// Broadcast clean event to UI
 		broadcastEv := map[string]interface{}{
 			"id":         ev.ID,
 			"session_id": ev.SessionID,
-			"type":       string(ev.Type), // force string
+			"type":       string(ev.Type),
 			"trace":      ev.Trace,
 			"payload":    payloadObj,
 			"created_at": ev.CreatedAt,
 		}
 
 		uiHub.Broadcast("event_stream", broadcastEv)
-
-		// 🔍 Debug (temporary but HIGH value)
-		logger.Debug("Event broadcasted",
-			slog.String("type", string(ev.Type)),
-			slog.Any("payload", payloadObj),
-		)
 	})
 
 	eventTypes := []domain.EventType{
@@ -244,7 +224,11 @@ func main() {
 
 	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
-	g, ctx := errgroup.WithContext(context.Background())
+	// Bind context cancellation to the OS signals for clean teardown
+	rootCtx, cancelRoot := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancelRoot()
+
+	g, ctx := errgroup.WithContext(rootCtx)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
@@ -314,13 +298,14 @@ func main() {
 
 	g.Go(func() error {
 		logger.Info("Starting HTTP server", slog.String("addr", cfg.HTTPAddr))
-		return server.ListenAndServe()
+		err := server.ListenAndServe()
+		if err != http.ErrServerClosed {
+			return err
+		}
+		return nil
 	})
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-
+	<-ctx.Done()
 	logger.Info("Shutdown signal received - graceful shutdown starting")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -403,14 +388,7 @@ func getEnvFloat(key string, fallback float64) float64 {
 func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				return true
-			}
-			allowedOrigins := map[string]bool{
-				"http://localhost:3000": true,
-			}
-			return allowedOrigins[origin]
+			return true
 		},
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -430,10 +408,7 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 
 		onMessage := func(msgType string, payload []byte) {
 			runner.Ping()
-
 			normalizedType := domain.NormalizeEventType(msgType)
-
-			// Defensive: ensure payload is valid JSON
 			cleanPayload := payload
 			if len(cleanPayload) == 0 {
 				cleanPayload = []byte(`{}`)
