@@ -1,59 +1,91 @@
-// ui/src/lib/store.svelte.ts
-
 import { AgentController } from "./agent-controller";
-import { TaskCommitment } from "./task-commitment";
-import type { Task } from "./task-commitment";
 import { Prefetcher } from "./prefetcher";
+import { TaskCommitment } from "./task-commitment";
 
-const maxEvents = 50;
-const EVENT_TTL_MS = 5 * 60 * 1000;
+// Types for the game state
+export interface GameState {
+    health: number;
+    food: number;
+    saturation: number;
+    xp: number;
+    position: { x: number; y: number; z: number };
+    inventory: Array<{ name: string; count: number }>;
+    entities: string[];
+    time_of_day?: number;
+}
 
-export const botStore = $state({
-    gameState: null as any,
-    events: [] as any[],
-    objective: "Initializing...",
-    connectionStatus: "connecting" as
-        | "connecting"
-        | "connected"
-        | "disconnected",
+export interface Task {
+    id: string;
+    type: string;
+    completed: boolean;
+    target?: string | null;
+}
 
-    addEvent(event: any) {
-        const now = Date.now();
-        this.events = [
-            { ...event, ingestTime: now },
-            ...this.events.filter(
-                (e) => now - (e.ingestTime || now) < EVENT_TTL_MS,
-            ),
-        ].slice(0, maxEvents);
-    },
-});
+export interface BotEvent {
+    type: string;
+    payload: any;
+    timestamp: string;
+}
 
-export const uiStore = $state({
-    tooltip: "",
-    mouseX: 0,
-    mouseY: 0,
-});
-
+// Global instances for logic management
 export const controller = new AgentController();
-export const commitment = new TaskCommitment();
-export const prefetcher = new Prefetcher();
+const prefetcher = new Prefetcher();
+const commitment = new TaskCommitment();
+
+class BotStore {
+    gameState = $state<GameState | null>(null);
+    objective = $state<string>("Initializing...");
+    events = $state<BotEvent[]>([]);
+    connectionStatus = $state<"connected" | "connecting" | "disconnected">(
+        "disconnected",
+    );
+
+    addEvent(event: BotEvent) {
+        this.events = [event, ...this.events].slice(0, 100);
+    }
+}
+
+class UIStore {
+    tooltip = $state<string | null>(null);
+    mouseX = $state(0);
+    mouseY = $state(0);
+
+    constructor() {
+        if (typeof window !== "undefined") {
+            window.addEventListener("mousemove", (e) => {
+                this.mouseX = e.clientX;
+                this.mouseY = e.clientY;
+            });
+        }
+    }
+}
+
+export const botStore = new BotStore();
+export const uiStore = new UIStore();
 
 let ws: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectAttempts = 0;
+
+export function clearEventLog() {
+    botStore.events = [];
+}
 
 export function connectToBot() {
+    if (ws) ws.close();
+
     botStore.connectionStatus = "connecting";
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ui/ws`;
-
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket(`${protocol}//${host}/ui/ws`);
 
     ws.onopen = () => {
         botStore.connectionStatus = "connected";
-        reconnectAttempts = 0;
-        if (reconnectTimer) clearTimeout(reconnectTimer);
+        console.log("Connected to Synaptic-MC Gateway");
+    };
+
+    ws.onclose = () => {
+        botStore.connectionStatus = "disconnected";
+        console.log("Disconnected from Gateway, retrying...");
+        setTimeout(connectToBot, 2000);
     };
 
     ws.onmessage = (event) => {
@@ -61,110 +93,83 @@ export function connectToBot() {
             const message = JSON.parse(event.data);
             if (!message.type || !message.payload) return;
 
-            switch (message.type.toUpperCase()) {
-                case "SYNC_REQUEST":
-                    if (message.payload?.authoritative_state) {
-                        controller.reconcileState(
-                            message.payload.authoritative_state,
-                        );
+            const type = message.type.toUpperCase();
+
+            if (type === "EVENT_STREAM") {
+                const goEvent = message.payload;
+                let innerPayload: any = {};
+
+                const rawPayload = goEvent.payload || goEvent.Payload;
+                if (rawPayload) {
+                    try {
+                        innerPayload =
+                            typeof rawPayload === "string"
+                                ? JSON.parse(rawPayload)
+                                : rawPayload;
+                    } catch {
+                        innerPayload = rawPayload;
                     }
-                    break;
-                case "STATE_UPDATE":
-                    botStore.gameState = message.payload.State;
-                    controller.onStateUpdate(message.payload.State);
-                    break;
-
-                case "EVENT_STREAM": {
-                    const goEvent = message.payload;
-
-                    let innerPayload: any = {};
-                    const rawPayload = goEvent.payload || goEvent.Payload;
-
-                    if (rawPayload) {
-                        try {
-                            innerPayload =
-                                typeof rawPayload === "string"
-                                    ? JSON.parse(rawPayload)
-                                    : rawPayload;
-                        } catch {
-                            innerPayload = rawPayload;
-                        }
-                    }
-
-                    const newEvent = {
-                        type: goEvent.type || goEvent.Type || "UNKNOWN",
-                        payload: innerPayload,
-                        timestamp: new Date().toLocaleTimeString(),
-                    };
-
-                    botStore.addEvent(newEvent);
-
-                    if (
-                        newEvent.type === "TASK_START" &&
-                        newEvent.payload?.action
-                    ) {
-                        const task: Task = {
-                            id: newEvent.payload.command_id ?? "",
-                            type: newEvent.payload.action,
-                            completed: newEvent.payload.status === "completed",
-                            target: newEvent.payload.target ?? null,
-                        };
-                        if (commitment.shouldCommit(task)) {
-                            prefetcher.onTaskStart(task);
-                        }
-                    }
-                    if (newEvent.type === "TASK_END") commitment.reset();
-                    break;
                 }
-                case "OBJECTIVE_UPDATE":
-                    botStore.objective = message.payload;
-                    break;
+
+                const eventType = (
+                    goEvent.type ||
+                    goEvent.Type ||
+                    "UNKNOWN"
+                ).toUpperCase();
+
+                if (
+                    eventType === "STATE_UPDATED" ||
+                    eventType === "STATE_TICK"
+                ) {
+                    botStore.gameState = innerPayload;
+                    controller.onStateUpdate(innerPayload);
+                }
+
+                if (eventType === "PLAN_CREATED" && innerPayload.objective) {
+                    botStore.objective = innerPayload.objective;
+                }
+
+                botStore.addEvent({
+                    type: eventType,
+                    payload: innerPayload,
+                    timestamp: new Date().toLocaleTimeString(),
+                });
+
+                if (eventType === "TASK_START" && innerPayload.action) {
+                    const task: Task = {
+                        id:
+                            innerPayload.command_id ||
+                            innerPayload.id ||
+                            "task-" + Date.now(),
+                        type: innerPayload.action,
+                        completed: false,
+                        target: innerPayload.target ?? null,
+                    };
+                    if (commitment.shouldCommit(task)) {
+                        prefetcher.onTaskStart(task);
+                    }
+                }
+
+                if (eventType === "TASK_END") {
+                    commitment.reset();
+                }
             }
         } catch (err) {
-            console.error("Failed to parse message:", err);
+            console.error("WS Message Error:", err);
         }
     };
-
-    ws.onclose = () => {
-        botStore.connectionStatus = "disconnected";
-        scheduleReconnect();
-    };
-
-    ws.onerror = () => {
-        botStore.connectionStatus = "disconnected";
-    };
-}
-
-function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    const delay = Math.min(3000 * Math.pow(1.5, reconnectAttempts), 30000);
-    reconnectAttempts++;
-    reconnectTimer = setTimeout(() => {
-        connectToBot();
-    }, delay);
-}
-
-export function sendCameraControl(yaw: number, pitch: number) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    ws.send(
-        JSON.stringify({
-            type: "CONTROL_INPUT",
-            payload: {
-                action: "camera_move",
-                yaw,
-                pitch,
-                timestamp: performance.now(),
-            },
-        }),
-    );
-}
-
-export function clearEventLog() {
-    botStore.events = [];
 }
 
 export function disconnectBot() {
-    if (ws) ws.close();
-    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (ws) {
+        ws.close();
+        ws = null;
+    }
+    botStore.connectionStatus = "disconnected";
+}
+
+export function sendCommand(type: string, payload: any) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type, payload }));
+    }
 }

@@ -114,7 +114,6 @@ func hashState(state domain.GameState) uint64 {
 	healthBucket := int(state.Health) / 4
 	foodBucket := int(state.Food) / 4
 	threatLevel := len(state.Threats)
-	// FIX: Include chunk coordinates to invalidate cache when the bot moves biomes
 	chunkX := int(state.Position.X) >> 4
 	chunkZ := int(state.Position.Z) >> 4
 
@@ -137,7 +136,7 @@ func hashState(state domain.GameState) uint64 {
 
 func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState) bool {
 	if prev.Health == 0 {
-		return true // Initial state
+		return true
 	}
 
 	dx := prev.Position.X - curr.Position.X
@@ -164,7 +163,6 @@ func (p *AdvancedPlanner) RecordSuccess(objective string) {
 	p.failMu.Unlock()
 }
 
-// FIX: Allow service to drop the current plan to prevent Groundhog Day loops
 func (p *AdvancedPlanner) ClearCurrentPlan() {
 	p.currentPlan.Store(nil)
 }
@@ -186,11 +184,14 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 			}
 			latestState = state
 		case <-ticker.C:
-			if latestState.Health == 0 {
+			if latestState.Position.X == 0 && latestState.Position.Z == 0 {
+				// Only skip if we truly have no data at all
 				continue
 			}
 
-			if !p.stateChangedSignificantly(lastPlannedState, latestState) {
+			needsReplan := p.currentPlan.Load() == nil || p.stateChangedSignificantly(lastPlannedState, latestState)
+
+			if !needsReplan {
 				continue
 			}
 
@@ -286,7 +287,7 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 			ID:        fmt.Sprintf("react-idle-%d", time.Now().UnixNano()),
 			Action:    "idle",
 			Target:    domain.Target{Name: "none", Type: "none"},
-			Priority:  0,
+			Priority:  -2,
 			Rationale: "Reactive fast-path fallback: Awaiting LLM instruction",
 		})
 	}
@@ -354,10 +355,11 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		return nil, fmt.Errorf("planner returned zero candidates")
 	}
 
+	now := time.Now().UnixNano()
 	for i := range parsed.Candidates {
 		for j := range parsed.Candidates[i] {
 			if parsed.Candidates[i][j].ID == "" {
-				parsed.Candidates[i][j].ID = fmt.Sprintf("plan-%d-%d", time.Now().UnixNano(), j)
+				parsed.Candidates[i][j].ID = fmt.Sprintf("plan-%d-c%d-t%d", now, i, j)
 			}
 		}
 	}
@@ -409,14 +411,14 @@ func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Pla
 	now := time.Now().UnixNano()
 	for i, t := range original.Tasks {
 		clone.Tasks[i] = t
-		clone.Tasks[i].ID = fmt.Sprintf("cached-plan-%d-%d", now, i)
+		clone.Tasks[i].ID = fmt.Sprintf("cached-plan-%d-t%d", now, i)
 	}
 
-	for _, fallback := range original.Fallbacks {
+	for fIdx, fallback := range original.Fallbacks {
 		newFallback := make([]domain.Action, len(fallback))
 		for i, t := range fallback {
 			newFallback[i] = t
-			newFallback[i].ID = fmt.Sprintf("cached-plan-fb-%d-%d", now, i)
+			newFallback[i].ID = fmt.Sprintf("cached-plan-fb-%d-f%d-t%d", now, fIdx, i)
 		}
 		clone.Fallbacks = append(clone.Fallbacks, newFallback)
 	}

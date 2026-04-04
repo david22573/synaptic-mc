@@ -162,57 +162,40 @@ func main() {
 
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		if ev.Type == "" {
-			logger.Error("Dropping event with empty type")
 			return
 		}
 
-		if len(ev.Payload) == 0 {
-			ev.Payload = []byte(`{}`)
-		}
+		// Persist to SQLite
+		_ = eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload)
 
 		var payloadObj interface{}
-		if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
-			logger.Warn("Invalid JSON payload, coercing to empty object",
-				slog.String("type", string(ev.Type)),
-				slog.String("raw_payload", string(ev.Payload)),
-				slog.Any("error", err),
-			)
-			payloadObj = map[string]any{}
-		}
+		_ = json.Unmarshal(ev.Payload, &payloadObj)
 
-		if err := eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
-			logger.Error("Failed to persist event", slog.Any("error", err))
-			return
-		}
-
-		// Injecting a timestamp here since the ID is handled async by the DB layer
+		// BroadcastEv structure
 		broadcastEv := map[string]interface{}{
-			"id":         time.Now().UnixNano(),
-			"session_id": ev.SessionID,
-			"type":       string(ev.Type),
-			"trace":      ev.Trace,
-			"payload":    payloadObj,
-			"created_at": ev.CreatedAt,
+			"type":      string(ev.Type),
+			"payload":   payloadObj,
+			"timestamp": ev.CreatedAt.Format(time.Kitchen),
 		}
 
-		uiHub.Broadcast("event_stream", broadcastEv)
+		// Identify if this is a high-frequency state update or a discrete event
+		isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
+
+		if isState {
+			// Send as a dedicated STATE_UPDATE to keep HUD snappy
+			uiHub.Broadcast("STATE_UPDATE", broadcastEv)
+		} else {
+			// Send to the log/sidebar stream
+			uiHub.Broadcast("EVENT_STREAM", broadcastEv)
+		}
 	})
 
 	eventTypes := []domain.EventType{
-		domain.EventTypeStateTick,
-		domain.EventTypeStateUpdated,
-		domain.EventTypeTaskStart,
-		domain.EventTypeTaskEnd,
-		domain.EventTypePlanCreated,
-		domain.EventTypePlanInvalidated,
-		domain.EventTypePlanCompleted,
-		domain.EventTypePlanFailed,
-		domain.EventTypePanic,
-		domain.EventTypePanicResolved,
-		domain.EventBotDeath,
-		domain.EventBotRespawn,
-		domain.EventType("STATE_UPDATE"),
-		domain.EventType("DISPATCH_TASK"),
+		domain.EventTypeStateTick, domain.EventTypeStateUpdated,
+		domain.EventTypeTaskStart, domain.EventTypeTaskEnd,
+		domain.EventTypePlanCreated, domain.EventTypePlanInvalidated,
+		domain.EventTypePlanCompleted, domain.EventTypePlanFailed,
+		domain.EventBotDeath, domain.EventBotRespawn,
 	}
 
 	for _, et := range eventTypes {

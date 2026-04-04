@@ -96,6 +96,7 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 
 		s.failuresMu.RLock()
 		if record, exists := s.failures[task.ID]; exists {
+			// Check if the specific task is currently in a retry backoff window
 			backoff := time.Duration(record.Count) * time.Second
 			if time.Since(record.LastFailure) < backoff {
 				s.failuresMu.RUnlock()
@@ -118,10 +119,9 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 		hCtx := humanization.BuildContext(gameState, isStuck)
 		s.humanizer.State().Evolve(hCtx, dt)
 
-		// Package the single dispatched task so the humanizer doesn't aggressively queue the whole plan
+		// Process the task through the humanizer to add natural delays/noise
 		singleTaskPlan := plan
 		singleTaskPlan.Tasks = []domain.Action{task}
-
 		scheduled := s.humanizer.Process(singleTaskPlan, hCtx)
 
 		for _, sa := range scheduled {
@@ -169,11 +169,8 @@ func (s *ControlService) handleTaskStart(ctx context.Context, event domain.Domai
 			}
 			s.failuresMu.Unlock()
 
-			// Safely access Timeout if it exists on Action, otherwise default
-			timeout := 45 * time.Second
-
-			// Padded by 15s to allow organic JS timeout to hit the bus first
-			timeout += 15 * time.Second
+			// Default timeout: 45s base + 15s grace for network/server lag
+			timeout := 60 * time.Second
 			sessionID := event.SessionID
 
 			timer := time.AfterFunc(timeout, func() {
@@ -211,7 +208,7 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 		Status    string  `json:"status"`
 		CommandID string  `json:"command_id"`
 		Cause     string  `json:"cause"`
-		Progress  float64 `json:"progress"` // Phase 1 & 3: Read execution progress
+		Progress  float64 `json:"progress"`
 	}
 
 	if err := json.Unmarshal(event.Payload, &payload); err == nil {
@@ -226,7 +223,7 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 		s.timersMu.Unlock()
 
 		if !isActive {
-			s.logger.Debug("Ignoring duplicate TASK_END event", slog.String("task_id", payload.CommandID))
+			s.logger.Debug("Ignoring duplicate or untracked TASK_END event", slog.String("task_id", payload.CommandID))
 			return
 		}
 
@@ -240,7 +237,6 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 			record.Count++
 			record.LastFailure = time.Now()
 
-			// Phase 1 + 3: Full execution result mapping using domain struct
 			res := domain.ExecutionResult{
 				Success:  false,
 				Cause:    payload.Cause,
@@ -248,11 +244,11 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 				Action:   record.Action,
 			}
 
+			// Evaluate if we should retry, degrade, or abort based on failure cause/progress
 			directive := s.ctrlManager.EvaluateFailure(res, record.Count)
 			actionToRetry := record.Action
 			s.failuresMu.Unlock()
 
-			// Keep the planner in the loop with the actual failure reason
 			s.ctrlManager.RecordResult(res)
 
 			s.logger.Warn("Task failed, applying adaptation strategy",
@@ -263,15 +259,15 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 				slog.Duration("delay", directive.Delay),
 			)
 
-			// Close the current failed instance so the queue unblocks
+			// Signal task engine and manager that the current attempt is finished
 			s.engine.OnTaskEnd(payload.CommandID, false)
 			_ = s.taskManager.Complete(ctx, payload.CommandID, false)
 
 			if actionToRetry.ID == "" {
-				s.logger.Warn("Task dropped, missing action details for retry", slog.String("task_id", payload.CommandID))
 				return
 			}
 
+			// Execute the adaptation directive
 			switch directive.Strategy {
 			case StrategyRetrySame, StrategyRetryDifferent:
 				executeAt := time.Now().Add(directive.Delay)
@@ -284,11 +280,11 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 				_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
 
 			case StrategyAbort:
-				// Already aborted and completed above
+				// No further action, task is dropped from execution pipeline
 			}
 
 		} else {
-			// Clean up success states
+			// Clean up failure history for this specific ID on success or controlled stop
 			s.failuresMu.Lock()
 			delete(s.failures, payload.CommandID)
 			s.failuresMu.Unlock()

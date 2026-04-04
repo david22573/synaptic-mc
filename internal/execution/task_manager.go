@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"log/slog"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -49,14 +50,15 @@ type TaskManager struct {
 	timeouts    map[string]time.Duration
 	OnDrain     func()
 
-	queue       ActionPriorityQueue
-	mu          sync.Mutex
-	activeTask  *domain.Action
-	activeCtx   context.Context
-	cancelTask  context.CancelFunc
-	signalCh    chan struct{}
-	idleSince   time.Time
-	lastFailure time.Time
+	queue        ActionPriorityQueue
+	mu           sync.Mutex
+	activeTask   *domain.Action
+	activeCtx    context.Context
+	cancelTask   context.CancelFunc
+	signalCh     chan struct{}
+	idleSince    time.Time
+	lastFailure  time.Time
+	failureCount int
 
 	scheduleMu  sync.Mutex
 	scheduled   []scheduledItem
@@ -114,7 +116,9 @@ func (tm *TaskManager) Run(ctx context.Context) {
 			return
 		case <-idleCheck.C:
 			tm.mu.Lock()
-			if time.Since(tm.lastFailure) < 5*time.Second {
+
+			backoffSec := math.Min(300, 5*math.Pow(2, float64(tm.failureCount)))
+			if time.Since(tm.lastFailure) < time.Duration(backoffSec)*time.Second {
 				tm.mu.Unlock()
 				continue
 			}
@@ -129,7 +133,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 				if tm.idleSince.IsZero() {
 					tm.idleSince = time.Now()
 				} else if time.Since(tm.idleSince) > 5*time.Second {
-					tm.logger.Info("Curiosity loop triggered: autonomous exploration")
+					tm.logger.Info("Curiosity loop triggered: autonomous exploration", slog.Int("failure_count", tm.failureCount))
 					exploreTask := domain.Action{
 						ID:        "explore-curiosity-stable",
 						Action:    "explore",
@@ -269,18 +273,27 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 
 	if !success {
 		tm.lastFailure = time.Now()
+		tm.failureCount++
+
 		if tm.ctrlManager != nil {
 			if idm := tm.ctrlManager.GetIdempotent(); idm != nil {
 				idm.Clear(taskID)
 			}
 		}
+
+		// We clear the queue to prevent "failure waterfalls", but now backoff
+		// handles the curiosity loop "vibration".
 		tm.queue = make(ActionPriorityQueue, 0, 10)
 		heap.Init(&tm.queue)
+
 		if tm.OnDrain != nil {
 			go tm.OnDrain()
 		}
 		return nil
 	}
+
+	// Reset failure count on success
+	tm.failureCount = 0
 
 	if tm.queue.Len() == 0 {
 		if tm.OnDrain != nil {

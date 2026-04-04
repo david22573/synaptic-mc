@@ -5,7 +5,6 @@
         uiStore,
         connectToBot,
         disconnectBot,
-        sendCameraControl,
     } from "./lib/store.svelte";
     import { controller } from "./lib/store.svelte";
     import HUD from "./components/HUD.svelte";
@@ -50,39 +49,8 @@
         connectToBot();
         renderLoop();
 
-        let lastMouseMove = 0;
-        const onMouseMove = (e: MouseEvent) => {
-            if (e.buttons !== 1) return;
-
-            const now = performance.now();
-            if (now - lastMouseMove < 50) return;
-
-            lastMouseMove = now;
-
-            if (viewerIframe) {
-                const rect = viewerIframe.getBoundingClientRect();
-                const relativeX = e.clientX - rect.left;
-                const relativeY = e.clientY - rect.top;
-
-                if (
-                    relativeX >= 0 &&
-                    relativeX <= rect.width &&
-                    relativeY >= 0 &&
-                    relativeY <= rect.height
-                ) {
-                    const yaw = (relativeX / rect.width - 0.5) * Math.PI * 2;
-                    const pitch =
-                        (relativeY / rect.height - 0.5) * (Math.PI / 2);
-                    sendCameraControl(yaw, pitch);
-                }
-            }
-        };
-
-        window.addEventListener("mousemove", onMouseMove);
-
         return () => {
             disconnectBot();
-            window.removeEventListener("mousemove", onMouseMove);
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
         };
     });
