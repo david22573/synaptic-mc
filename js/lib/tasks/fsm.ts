@@ -48,12 +48,28 @@ export class StateMachineRunner {
                 return { status: "FAILED", reason: "aborted" };
             }
 
-            if (Date.now() - this.context.startTime > this.context.timeoutMs) {
+            const elapsed = Date.now() - this.context.startTime;
+            const remaining = this.context.timeoutMs - elapsed;
+
+            if (remaining <= 0) {
                 return { status: "FAILED", reason: "FSM_GLOBAL_TIMEOUT" };
             }
 
+            let timeoutId: NodeJS.Timeout | undefined;
+            const timeoutPromise = new Promise<never>((_, reject) => {
+                timeoutId = setTimeout(() => {
+                    reject(new Error("FSM_GLOBAL_TIMEOUT"));
+                }, remaining);
+            });
+
             try {
-                const nextState = await this.currentState.execute(this.context);
+                const nextState = await Promise.race([
+                    this.currentState.execute(this.context),
+                    timeoutPromise,
+                ]);
+
+                if (timeoutId) clearTimeout(timeoutId);
+
                 if (nextState !== this.currentState) {
                     if (nextState) {
                         await nextState.enter(this.context);
@@ -61,9 +77,20 @@ export class StateMachineRunner {
                     this.currentState = nextState;
                 }
             } catch (err: unknown) {
+                if (timeoutId) clearTimeout(timeoutId);
+                const msg = getErrorMessage(err);
+
+                if (msg === "FSM_GLOBAL_TIMEOUT") {
+                    return { status: "FAILED", reason: "FSM_GLOBAL_TIMEOUT" };
+                }
+
+                if (msg === "aborted" || this.context.signal.aborted) {
+                    return { status: "FAILED", reason: "aborted" };
+                }
+
                 return {
                     status: "FAILED",
-                    reason: `FSM_CRASH: ${getErrorMessage(err)}`,
+                    reason: `FSM_CRASH: ${msg}`,
                 };
             }
         }

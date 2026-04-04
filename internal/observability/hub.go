@@ -1,3 +1,4 @@
+// internal/observability/hub.go
 package observability
 
 import (
@@ -78,18 +79,13 @@ func (h *Hub) SetOrchestrator(orch ControlOrchestrator) {
 }
 
 func (h *Hub) Run(ctx context.Context) {
-	ticker := time.NewTicker(pingPeriod)
-	defer ticker.Stop()
-
+	// FIX: Removed the redundant pingAll timer that deadlocked the main loop.
 	for {
 		select {
 		case <-ctx.Done():
 			h.logger.Info("UI Hub shutting down")
 			h.shutdown()
 			return
-
-		case <-ticker.C:
-			h.pingAll()
 
 		case client := <-h.register:
 			h.mu.Lock()
@@ -105,55 +101,27 @@ func (h *Hub) Run(ctx context.Context) {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
+				close(client.send) // FIX: Terminate writePump to release connections and goroutines
 				h.logger.Info("UI Client disconnected", slog.Int("active_clients", len(h.clients)))
 			}
 			h.mu.Unlock()
 
 		case message := <-h.broadcast:
 			h.mu.RLock()
-			clients := make([]*UIClient, 0, len(h.clients))
 			for client := range h.clients {
-				clients = append(clients, client)
-			}
-			h.mu.RUnlock()
-
-			for _, client := range clients {
 				select {
 				case client.send <- message:
 				default:
 					h.logger.Warn("UI Client buffer full, scheduling drop")
-					go func(c *UIClient) {
-						select {
-						case h.unregister <- c:
-						default:
-						}
-					}(client)
+					// FIX: Non-blocking push to unregister channel without spawning excessive goroutines
+					select {
+					case h.unregister <- client:
+					default:
+					}
 				}
 			}
+			h.mu.RUnlock()
 		}
-	}
-}
-
-func (h *Hub) pingAll() {
-	h.mu.RLock()
-	clients := make([]*UIClient, 0, len(h.clients))
-	for client := range h.clients {
-		clients = append(clients, client)
-	}
-	h.mu.RUnlock()
-
-	for _, client := range clients {
-		client.mu.Lock()
-		if err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
-			h.logger.Warn("Failed to ping client, will unregister", slog.Any("error", err))
-			go func(c *UIClient) {
-				select {
-				case h.unregister <- c:
-				default:
-				}
-			}(client)
-		}
-		client.mu.Unlock()
 	}
 }
 
@@ -172,6 +140,7 @@ func (h *Hub) shutdown() {
 		client.mu.Unlock()
 
 		client.conn.Close()
+		close(client.send) // FIX: Prevent leaking channels on shutdown
 		delete(h.clients, client)
 	}
 }

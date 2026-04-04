@@ -25,10 +25,12 @@ interface ExploreContext extends StateContext {
 
 class NavigateState implements FSMState {
     name = "NAVIGATING";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
+
         try {
             await navigateWithFallbacks(
                 eCtx.bot,
@@ -54,6 +56,7 @@ class NavigateState implements FSMState {
             return null;
         } catch (err: any) {
             const msg = String(err?.message ?? err);
+
             if (eCtx.signal.aborted || msg.includes("aborted")) {
                 eCtx.result = { status: "FAILED", reason: "aborted" };
                 return null;
@@ -62,6 +65,7 @@ class NavigateState implements FSMState {
             log.warn("Exploration path failed, picking new direction", {
                 reason: msg,
             });
+
             return new PickDirectionState();
         }
     }
@@ -69,6 +73,7 @@ class NavigateState implements FSMState {
 
 class PickDirectionState implements FSMState {
     name = "PICKING_DIRECTION";
+
     async enter() {}
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
@@ -90,6 +95,13 @@ class PickDirectionState implements FSMState {
         const pos = eCtx.bot.entity.position.floored();
 
         for (let i = 0; i < 12; i++) {
+            // Yield to the event loop to prevent blocking physics and network ticks
+            if (i > 0 && i % 3 === 0) {
+                await new Promise((r) => setTimeout(r, 0));
+            }
+
+            if (eCtx.signal.aborted) throw new Error("aborted");
+
             const testAngle = Math.random() * Math.PI * 2;
             let tx = pos.x;
             let tz = pos.z;
@@ -169,6 +181,7 @@ class PickDirectionState implements FSMState {
             targetZ: Math.round(eCtx.targetZ),
             attempt: eCtx.attempts,
         });
+
         return new NavigateState();
     }
 }

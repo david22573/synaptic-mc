@@ -70,6 +70,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
 
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
         if (signal.aborted) throw new Error("aborted");
+
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
@@ -168,7 +169,7 @@ export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
 export interface MoveOptions {
     signal?: AbortSignal;
     timeoutMs: number;
-    stopMovement?: () => void; // Made optional to fix the mismatch with navigator.ts
+    stopMovement?: () => void;
     dynamic?: boolean;
     stuckTimeoutMs?: number;
 }
@@ -197,6 +198,7 @@ export function moveToGoal(
         }
 
         let settled = false;
+
         let lastPos = bot.entity.position.clone();
         let stuckTimer: NodeJS.Timeout | null = null;
         let mainTimer: NodeJS.Timeout | null = null;
@@ -229,7 +231,6 @@ export function moveToGoal(
 
         const onAbort = () => finish(new Error("aborted"));
         const onGoalReached = () => finish();
-
         const onPathUpdate = (results: any) => {
             if (results.status === "noPath") {
                 setTimeout(() => {
@@ -241,7 +242,6 @@ export function moveToGoal(
         };
 
         let stuckStrikes = 0;
-
         stuckTimer = setInterval(() => {
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
@@ -293,15 +293,21 @@ export async function makeRoomInInventory(
     if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
 
     const inventory = bot.inventory.items();
-
     const trashItems = inventory.filter((i: any) => TRASH_ITEMS.has(i.name));
     trashItems.sort((a: any, b: any) => a.count - b.count);
 
     let slotsFreed = 0;
     for (const item of trashItems) {
         if (slotsFreed >= slotsNeeded) break;
+
         try {
+            // Adjust pitch to toss the item slightly forward/up instead of straight down
+            const yaw = bot.entity.yaw;
+            await bot.look(yaw, -0.3, true);
             await bot.tossStack(item);
+
+            // Wait for item to clear the pickup hitbox
+            await new Promise((r) => setTimeout(r, 300));
             slotsFreed++;
         } catch (err) {
             // Ignore failure, try next item

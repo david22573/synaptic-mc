@@ -102,6 +102,7 @@ class ConstructState implements FSMState {
 
             const node = sCtx.blueprint[sCtx.currentIndex];
             if (!node) break;
+
             const targetPos = origin.offset(node.dx, node.dy, node.dz);
             const targetBlock = bot.blockAt(targetPos);
 
@@ -109,6 +110,18 @@ class ConstructState implements FSMState {
                 sCtx.currentIndex++;
                 consecutiveFailures = 0;
                 continue;
+            }
+
+            // Check if we actually still have the block
+            const hasMaterial = bot.inventory
+                .items()
+                .some((i) => i.type === sCtx.materialType);
+            if (!hasMaterial) {
+                sCtx.result = {
+                    status: "FAILED",
+                    reason: "MISSING_INGREDIENTS: Ran out of building materials mid-construction.",
+                };
+                return null;
             }
 
             await bot.equip(sCtx.materialType, "hand");
@@ -145,13 +158,13 @@ class ConstructState implements FSMState {
             }
 
             const distToBot = bot.entity.position.distanceTo(targetPos);
+
             if (distToBot < 1.5) {
-                // FIX: Perform placeBlock atomically WITH the jump, instead of sequentially after waiting
                 if (node.dx === 0 && node.dz === 0 && node.dy >= 0) {
                     const localRef = this.findReferenceBlock(bot, targetPos);
                     if (localRef) {
                         bot.setControlState("jump", true);
-                        await bot.waitForTicks(2); // allow height to accumulate
+                        await bot.waitForTicks(2);
 
                         try {
                             const faceVector = targetPos.minus(
@@ -282,6 +295,7 @@ class PrepareBuildState implements FSMState {
 
 export async function handleBuild(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const targetName = intent.target?.name?.toLowerCase() || "shelter";

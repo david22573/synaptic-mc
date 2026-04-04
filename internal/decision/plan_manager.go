@@ -26,20 +26,50 @@ func NewPlanManager() *PlanManager {
 func (pm *PlanManager) GetCurrent() *domain.Plan {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	return pm.current
+
+	if pm.current == nil {
+		return nil
+	}
+
+	// FIX: Return a deep copy to prevent slice mutation data races
+	cp := *pm.current
+	cp.Tasks = make([]domain.Action, len(pm.current.Tasks))
+	copy(cp.Tasks, pm.current.Tasks)
+
+	// Clone fallbacks too
+	cp.Fallbacks = make([][]domain.Action, len(pm.current.Fallbacks))
+	for i, fb := range pm.current.Fallbacks {
+		cp.Fallbacks[i] = make([]domain.Action, len(fb))
+		copy(cp.Fallbacks[i], fb)
+	}
+
+	return &cp
 }
 
 func (pm *PlanManager) SetPlan(plan *domain.Plan) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	// Enforce initial state on injection
 	plan.Status = domain.PlanStatusPending
 	pm.current = plan
 }
 
-// NextFallback pops the next best candidate from the multi-plan list
-// and prepares it for execution without going back to the LLM.
+// FIX: Safe, locked mutation for task progression
+func (pm *PlanManager) PopTask(taskID string) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.current == nil || len(pm.current.Tasks) == 0 {
+		return false
+	}
+
+	if pm.current.Tasks[0].ID == taskID {
+		pm.current.Tasks = pm.current.Tasks[1:]
+	}
+
+	return len(pm.current.Tasks) > 0
+}
+
 func (pm *PlanManager) NextFallback() bool {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()

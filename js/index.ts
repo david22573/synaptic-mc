@@ -2,11 +2,9 @@ import pkg from "mineflayer-pathfinder";
 import mineflayer from "mineflayer";
 import { mineflayer as viewer } from "prismarine-viewer";
 import { plugin as collectBlock } from "mineflayer-collectblock";
-
 import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
-
 import { runTask } from "./lib/tasks/task.js";
 import { SynapticClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
@@ -100,14 +98,15 @@ let runtimeConfig: config.Config;
 let lastDeathMessage: string = "unknown causes";
 let lastStateSig = "";
 let lastStatePushTime = 0;
+
 let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 let isBotSpawned = false;
+
 let hasDied = false;
 
 const knownChests: Record<string, { name: string; count: number }[]> = {};
-
 let lastVelocity = { x: 0, y: 0, z: 0 };
 let isPathfinding = false;
 let pathProgress = 0.0;
@@ -131,7 +130,6 @@ function completeTask(
     cause: string = "",
 ) {
     if (!task || !client) return;
-
     if (currentTask?.id === task.id) currentTask = null;
 
     client.sendEvent(
@@ -155,7 +153,6 @@ function abortActiveTask(reason: string) {
 
 function normalizeFailureCause(err: any): string {
     const msg = String(err?.message || err).toLowerCase();
-
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -215,7 +212,6 @@ function normalizeFailureCause(err: any): string {
 
 async function executeAntiStuckReflex() {
     if (!bot || !bot.entity || bot.health <= 0) return;
-
     try {
         bot.setControlState("jump", true);
         await new Promise((r) => setTimeout(r, 200));
@@ -366,10 +362,19 @@ async function executeIntent(intent: models.ActionIntent) {
                 }),
             ]);
 
-            if (!signal.aborted && activeTask) {
+            // Verify task wasn't aborted or replaced during the completion wait
+            if (
+                !signal.aborted &&
+                activeTask &&
+                currentTask?.id === activeTask.id
+            ) {
                 await new Promise((r) => setTimeout(r, 500));
                 pushState();
-                completeTask(activeTask, "task_completed");
+
+                // Check again after push delay
+                if (!signal.aborted && currentTask?.id === activeTask.id) {
+                    completeTask(activeTask, "task_completed");
+                }
             }
         } catch (err: any) {
             if (!signal.aborted || err.message === "timeout") {
@@ -390,8 +395,9 @@ async function executeIntent(intent: models.ActionIntent) {
 
                 pushState();
 
-                if (activeTask)
+                if (activeTask && currentTask?.id === activeTask.id) {
                     completeTask(activeTask, "task_failed", normalizedCause);
+                }
             }
         } finally {
             if (timeoutId) clearTimeout(timeoutId);
@@ -522,10 +528,12 @@ async function connectWithRetry(maxAttempts = 10) {
             }
             abortActiveTask("unlock");
         });
+
         client.on("connected", () => {
             lastStatePushTime = 0;
             if (isBotSpawned) pushState();
         });
+
         client.connect();
     }
 
@@ -614,7 +622,6 @@ async function connectWithRetry(maxAttempts = 10) {
         }
 
         bot.pathfinder.setMovements(movements);
-
         // @ts-ignore
         if (bot.collectBlock) bot.collectBlock.movements = movements;
 
@@ -661,7 +668,6 @@ async function connectWithRetry(maxAttempts = 10) {
             } catch (err) {}
         }
 
-        bot.removeAllListeners("physicsTick");
         bot.on("physicsTick", () => {
             if (!bot || !bot.entity || bot.health <= 0) return;
 

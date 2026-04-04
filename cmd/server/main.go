@@ -114,15 +114,11 @@ func main() {
 	}
 	humanizer := humanization.NewEngine(humanCfg)
 
-	getAttention := func() float64 {
-		return humanizer.State().GetAttention()
-	}
-
 	stateSvc := state.NewService(eventBus, logger)
 	ctrlManager := execution.NewControllerManager()
-	execEngine := execution.NewTaskExecutionEngine(ctrlManager, cfg.NoiseLevel, getAttention, logger)
+	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger)
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
-	execService := execution.NewControlService(eventBus, execEngine, taskManager, ctrlManager, logger)
+	execService := execution.NewControlService(eventBus, execEngine, taskManager, ctrlManager, humanizer, stateSvc, logger)
 
 	uiHub.SetOrchestrator(execService)
 
@@ -189,8 +185,9 @@ func main() {
 			return
 		}
 
+		// Injecting a timestamp here since the ID is handled async by the DB layer
 		broadcastEv := map[string]interface{}{
-			"id":         ev.ID,
+			"id":         time.Now().UnixNano(),
 			"session_id": ev.SessionID,
 			"type":       string(ev.Type),
 			"trace":      ev.Trace,
@@ -224,19 +221,28 @@ func main() {
 
 	runner := supervisor.NewNodeRunner(cfg.BotScript, logger)
 
-	// Bind context cancellation to the OS signals for clean teardown
 	rootCtx, cancelRoot := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancelRoot()
 
 	g, ctx := errgroup.WithContext(rootCtx)
 	mux := http.NewServeMux()
 
+	// FIX: Dynamically construct the WebSocket host based on the client's HTTP request
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		scheme := "ws://"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "wss://"
+		}
+		host := r.Host
+		if host == "" {
+			host = "localhost:8080"
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		json.NewEncoder(w).Encode(map[string]any{
-			"ws_url":        "ws://localhost:8080/ui/ws",
-			"bot_ws_url":    "ws://localhost:8080/bot/ws",
+			"ws_url":        fmt.Sprintf("%s%s/ui/ws", scheme, host),
+			"bot_ws_url":    fmt.Sprintf("%s%s/bot/ws", scheme, host),
 			"viewer_port":   3000,
 			"enable_viewer": true,
 		})
@@ -250,7 +256,9 @@ func main() {
 	if !filepath.IsAbs(uiPath) {
 		uiPath = filepath.Join(".", uiPath)
 	}
-	mux.Handle("/", http.FileServer(http.Dir(uiPath)))
+
+	// FIX: Serve the SPA correctly, falling back to index.html for unknown routes
+	mux.Handle("/", serveSPA(uiPath))
 
 	server := &http.Server{
 		Addr:         cfg.HTTPAddr,
@@ -320,6 +328,20 @@ func main() {
 	}
 
 	logger.Info("Synaptic MC shutdown complete")
+}
+
+// serveSPA wraps the standard file server to redirect 404s to index.html for Svelte routing
+func serveSPA(dir string) http.HandlerFunc {
+	fs := http.FileServer(http.Dir(dir))
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := filepath.Join(dir, filepath.Clean(r.URL.Path))
+		_, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+			return
+		}
+		fs.ServeHTTP(w, r)
+	}
 }
 
 func parseConfig() Config {

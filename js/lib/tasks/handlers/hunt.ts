@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/hunt.ts
 import {
     type FSMState,
     type StateContext,
@@ -112,6 +113,8 @@ class EngageState implements FSMState {
 
                     const now = Date.now();
                     if (now - sCtx.lastAttackTime >= cooldown) {
+                        bot.clearControlStates();
+
                         if (sCtx.hasShield && sCtx.isBlocking) {
                             bot.deactivateItem();
                             sCtx.isBlocking = false;
@@ -126,12 +129,22 @@ class EngageState implements FSMState {
                             sCtx.isBlocking = true;
                         }
                     } else {
+                        // Kiting logic: Backpedal and strafe while weapon is on cooldown
+                        if (dist < 2.5) {
+                            bot.setControlState("back", true);
+                            bot.setControlState("left", Math.random() > 0.5);
+                            bot.setControlState("right", Math.random() > 0.5);
+                        } else {
+                            bot.clearControlStates();
+                        }
+
                         if (sCtx.hasShield && !sCtx.isBlocking) {
                             bot.activateItem(true);
                             sCtx.isBlocking = true;
                         }
                     }
                 } else {
+                    bot.clearControlStates();
                     if (sCtx.hasShield && sCtx.isBlocking) {
                         bot.deactivateItem();
                         sCtx.isBlocking = false;
@@ -158,6 +171,7 @@ class EngageState implements FSMState {
             bot.removeListener("entityHurt", onEntityHurt);
             bot.pathfinder.setGoal(null);
             bot.clearControlStates();
+
             if (sCtx.hasShield && sCtx.isBlocking) {
                 bot.deactivateItem();
                 sCtx.isBlocking = false;
@@ -194,6 +208,7 @@ class EngageState implements FSMState {
         }
 
         const currentWeapon = bot.heldItem;
+
         if (
             bestWeapon &&
             (!currentWeapon || currentWeapon.type !== bestWeapon.type)
@@ -204,10 +219,12 @@ class EngageState implements FSMState {
         }
 
         const offhand = bot.inventory.slots[45];
+
         if (!offhand || offhand.name !== "shield") {
             const shield = bot.inventory
                 .items()
                 .find((i: any) => i.name === "shield");
+
             if (shield) {
                 try {
                     await bot.equip(shield.type, "off-hand");
@@ -253,9 +270,9 @@ class SearchState implements FSMState {
             }
 
             attempts++;
+
             const angle = Math.random() * Math.PI * 2;
             const radius = 8 * attempts;
-
             const pos = bot.entity.position
                 .clone()
                 .offset(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
@@ -277,6 +294,7 @@ class SearchState implements FSMState {
         }
 
         bot.pathfinder.setGoal(null);
+
         sCtx.result = {
             status: "FAILED",
             reason: `NO_ENTITY: Could not find any ${sCtx.targetName} nearby after exploring.`,
@@ -293,13 +311,16 @@ class PrepareCombatState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as CombatContext;
         const engager = new EngageState();
+
         await engager["ensureBestEquipment"](sCtx.bot, sCtx);
+
         return new SearchState();
     }
 }
 
 export async function handleHunt(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const targetName = intent.target?.name;

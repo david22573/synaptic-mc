@@ -2,7 +2,8 @@
 import { type TaskContext } from "../registry.js";
 import pkg from "mineflayer-pathfinder";
 import { log } from "../../logger.js";
-import { makeRoomInInventory } from "../utils.js"; // or adjust this path to wherever your inventory helpers live
+import { makeRoomInInventory } from "../utils.js";
+import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
@@ -48,10 +49,12 @@ const FUEL_TYPES = [
 
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, stopMovement } = ctx;
+
     const targetName = intent.target.name.toLowerCase();
     const targetCount = intent.count || 1;
 
     const acceptedInputs = SMELT_RECIPES[targetName];
+
     if (!acceptedInputs) {
         throw new Error(
             `UNKNOWN_RECIPE: Don't know how to smelt into ${targetName}`,
@@ -61,6 +64,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const inputItem = bot.inventory
         .items()
         .find((item) => acceptedInputs.includes(item.name));
+
     if (!inputItem || inputItem.count < targetCount) {
         throw new Error(
             `MISSING_INGREDIENTS: Need at least ${targetCount} of ${acceptedInputs.join(" or ")}`,
@@ -70,6 +74,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const fuelItem = bot.inventory
         .items()
         .find((item) => FUEL_TYPES.includes(item.name));
+
     if (!fuelItem) {
         throw new Error(
             "MISSING_INGREDIENTS: No valid fuel source in inventory",
@@ -87,6 +92,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         const furnaceInInv = bot.inventory
             .items()
             .find((item) => item.name === "furnace");
+
         if (!furnaceInInv) {
             throw new Error(
                 "NO_FURNACE: No furnace nearby and none in inventory",
@@ -94,21 +100,31 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         }
 
         const refBlock = bot.findBlock({
-            matching: (b) =>
-                b.name !== "air" && b.name !== "water" && b.name !== "lava",
+            matching: (b: any): boolean => {
+                if (
+                    !b ||
+                    b.name === "air" ||
+                    b.name === "water" ||
+                    b.name === "lava"
+                )
+                    return false;
+                const above = bot.blockAt(b.position.offset(0, 1, 0));
+                if (!above) return false;
+                return above.name === "air" || above.name === "cave_air";
+            },
             maxDistance: 4,
         });
 
         if (!refBlock) {
-            throw new Error("PATH_FAILED: Nowhere to place the furnace");
+            throw new Error(
+                "PATH_FAILED: Nowhere to place the furnace. Need an exposed solid block.",
+            );
         }
 
         await bot.equip(furnaceInInv.type, "hand");
+
         try {
-            await bot.placeBlock(
-                refBlock,
-                bot.entity.position.offset(0, 1, 0).minus(refBlock.position),
-            );
+            await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
             placedFurnace = true;
         } catch (err: any) {
             throw new Error(
@@ -179,6 +195,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 const currentFuel = bot.inventory
                     .items()
                     .find((item) => FUEL_TYPES.includes(item.name));
+
                 if (!currentFuel)
                     throw new Error(
                         "MISSING_INGREDIENTS: Ran out of fuel during smelting",
@@ -191,6 +208,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 const currentInput = bot.inventory
                     .items()
                     .find((item) => acceptedInputs.includes(item.name));
+
                 if (!currentInput)
                     throw new Error(
                         "MISSING_INGREDIENTS: Ran out of raw materials during smelting",
@@ -200,10 +218,12 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                     currentInput.count,
                     targetCount - collectedCount,
                 );
+
                 await furnace.putInput(currentInput.type, null, amountToPut);
             }
 
             const output = furnace.outputItem();
+
             if (output && output.name === targetName) {
                 const taken = await furnace.takeOutput();
                 if (taken) {
@@ -223,11 +243,13 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
             const pickType =
                 bot.registry.itemsByName.wooden_pickaxe?.id ||
                 bot.registry.itemsByName.stone_pickaxe?.id;
+
             if (pickType) {
                 await bot.equip(pickType, "hand");
             } else {
                 await bot.unequip("hand");
             }
+
             try {
                 await makeRoomInInventory(bot, 1);
                 await bot.dig(furnaceBlock);

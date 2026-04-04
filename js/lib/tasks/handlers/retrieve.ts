@@ -39,13 +39,22 @@ class WithdrawState implements FSMState {
 
             for (const item of targetItems) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
+
                 const needed = sCtx.targetCount - sCtx.collectedCount;
                 if (needed <= 0) break;
 
                 const amountToTake = Math.min(item.count, needed);
+
                 try {
                     await chestWindow.withdraw(item.type, null, amountToTake);
                     sCtx.collectedCount += amountToTake;
+
+                    // Jitter delay to prevent Mineflayer's chest UI from desyncing with the server
+                    // when withdrawing multiple stacks sequentially.
+                    await new Promise((r) =>
+                        setTimeout(r, 100 + Math.random() * 50),
+                    );
+
                     syncFailures = 0;
                 } catch (err: any) {
                     syncFailures++;
@@ -154,6 +163,7 @@ class LocateChestState implements FSMState {
 
 export async function handleRetrieve(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const targetName = intent.target?.name;

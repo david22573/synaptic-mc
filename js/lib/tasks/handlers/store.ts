@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/store.ts
 import {
     type FSMState,
     type StateContext,
@@ -28,6 +29,7 @@ class DepositState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as StoreContext;
         let chestWindow: any = null;
+
         let syncFailures = 0;
 
         try {
@@ -36,11 +38,20 @@ class DepositState implements FSMState {
 
             for (const item of sCtx.targetItems) {
                 if (sCtx.signal.aborted) throw new Error("aborted");
+
                 try {
                     await chestWindow.deposit(item.type, null, item.count);
+
+                    // Jitter delay to prevent Mineflayer's chest UI from desyncing with the server
+                    // when dumping multiple stacks at once.
+                    await new Promise((r) =>
+                        setTimeout(r, 100 + Math.random() * 50),
+                    );
+
                     syncFailures = 0;
                 } catch (err: any) {
                     syncFailures++;
+
                     if (syncFailures > 3) {
                         throw new Error(
                             `PANIC: Repeated chest sync failures during deposit. Chest UI state corrupted: ${err.message}`,
@@ -152,6 +163,7 @@ class LocateChestState implements FSMState {
         }
 
         sCtx.chestBlock = chest;
+
         return new ApproachChestState();
     }
 }
@@ -164,6 +176,7 @@ class CheckItemsState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as StoreContext;
         const targetName = sCtx.targetName;
+
         const inventory = sCtx.bot.inventory.items();
 
         if (targetName === "all" || targetName === "dump") {
@@ -175,6 +188,7 @@ class CheckItemsState implements FSMState {
                 "crafting_table",
                 "coal",
             ]);
+
             sCtx.targetItems = inventory
                 .filter(
                     (i: any) =>
@@ -185,6 +199,7 @@ class CheckItemsState implements FSMState {
                 .map((i: any) => ({ type: i.type, count: i.count }));
         } else {
             const items = inventory.filter((i: any) => i.name === targetName);
+
             if (items.length === 0) {
                 sCtx.result = {
                     status: "FAILED",
@@ -193,7 +208,6 @@ class CheckItemsState implements FSMState {
                 return null;
             }
 
-            // FIX: Accumulate count correctly across multiple stacks of the target item
             let remainingToStore =
                 sCtx.targetCount > 0
                     ? sCtx.targetCount
@@ -202,6 +216,7 @@ class CheckItemsState implements FSMState {
             sCtx.targetItems = [];
             for (const item of items) {
                 if (remainingToStore <= 0) break;
+
                 const toStoreFromStack = Math.min(item.count, remainingToStore);
                 sCtx.targetItems.push({
                     type: item.type,
@@ -222,6 +237,7 @@ class CheckItemsState implements FSMState {
 
 export async function handleStore(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
+
     await escapeTree(bot, signal);
 
     const fsmCtx: StoreContext = {

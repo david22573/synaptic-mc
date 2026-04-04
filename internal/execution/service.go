@@ -1,4 +1,3 @@
-// internal/execution/service.go
 package execution
 
 import (
@@ -9,13 +8,20 @@ import (
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/humanization"
 )
+
+type StateProvider interface {
+	GetCurrentState() domain.VersionedState
+}
 
 type ControlService struct {
 	bus         domain.EventBus
 	engine      *TaskExecutionEngine
 	taskManager *TaskManager
 	ctrlManager *ControllerManager
+	humanizer   *humanization.Engine
+	stateProv   StateProvider
 	logger      *slog.Logger
 
 	// Control Layer State
@@ -26,14 +32,27 @@ type ControlService struct {
 
 	activeTimers map[string]*time.Timer
 	timersMu     sync.Mutex
+
+	lastEvolve time.Time
+	evolveMu   sync.Mutex
 }
 
-func NewControlService(bus domain.EventBus, engine *TaskExecutionEngine, tm *TaskManager, cm *ControllerManager, logger *slog.Logger) *ControlService {
+func NewControlService(
+	bus domain.EventBus,
+	engine *TaskExecutionEngine,
+	tm *TaskManager,
+	cm *ControllerManager,
+	humanizer *humanization.Engine,
+	sp StateProvider,
+	logger *slog.Logger,
+) *ControlService {
 	s := &ControlService{
 		bus:          bus,
 		engine:       engine,
 		taskManager:  tm,
 		ctrlManager:  cm,
+		humanizer:    humanizer,
+		stateProv:    sp,
 		logger:       logger.With(slog.String("component", "control_service")),
 		failures:     make(map[string]*FailureRecord),
 		activeTimers: make(map[string]*time.Timer),
@@ -58,6 +77,7 @@ func (s *ControlService) SetReflexActive(active bool) {
 func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.DomainEvent) {
 	s.stabilityMu.RLock()
 	reflexActive := s.stability.ReflexActive
+	isStuck := s.stability.IsStuck
 	s.stabilityMu.RUnlock()
 
 	if reflexActive {
@@ -85,7 +105,32 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 		}
 		s.failuresMu.RUnlock()
 
-		_ = s.taskManager.Enqueue(ctx, task)
+		// Update psychological state tick
+		s.evolveMu.Lock()
+		if s.lastEvolve.IsZero() {
+			s.lastEvolve = time.Now()
+		}
+		dt := time.Since(s.lastEvolve)
+		s.lastEvolve = time.Now()
+		s.evolveMu.Unlock()
+
+		gameState := s.stateProv.GetCurrentState().State
+		hCtx := humanization.BuildContext(gameState, isStuck)
+		s.humanizer.State().Evolve(hCtx, dt)
+
+		// Package the single dispatched task so the humanizer doesn't aggressively queue the whole plan
+		singleTaskPlan := plan
+		singleTaskPlan.Tasks = []domain.Action{task}
+
+		scheduled := s.humanizer.Process(singleTaskPlan, hCtx)
+
+		for _, sa := range scheduled {
+			if sa.ExecuteAt.IsZero() || sa.ExecuteAt.Before(time.Now()) {
+				_ = s.taskManager.Enqueue(ctx, sa.Action)
+			} else {
+				_ = s.taskManager.EnqueueScheduled(ctx, sa.Action, sa.ExecuteAt)
+			}
+		}
 	}
 }
 
@@ -173,11 +218,17 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 		success := payload.Status == "COMPLETED"
 
 		s.timersMu.Lock()
-		if timer, ok := s.activeTimers[payload.CommandID]; ok {
+		timer, isActive := s.activeTimers[payload.CommandID]
+		if isActive {
 			timer.Stop()
 			delete(s.activeTimers, payload.CommandID)
 		}
 		s.timersMu.Unlock()
+
+		if !isActive {
+			s.logger.Debug("Ignoring duplicate TASK_END event", slog.String("task_id", payload.CommandID))
+			return
+		}
 
 		if !success && payload.Cause != "preempted_by_priority" && payload.Cause != "plan_invalidated" {
 			s.failuresMu.Lock()

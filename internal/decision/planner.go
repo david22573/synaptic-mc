@@ -43,7 +43,7 @@ type AdvancedPlanner struct {
 	planCache map[uint64]*domain.Plan
 	cacheMu   sync.RWMutex
 
-	failures map[string]int // objective -> failure count
+	failures map[string]int
 	failMu   sync.Mutex
 }
 
@@ -72,12 +72,11 @@ func NewAdvancedPlanner(
 
 const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
 CRITICAL GAME MECHANIC RULES:
-
 1.  Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
 2.  You CANNOT gather stone or coal without a wooden_pickaxe.
 3.  Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per candidate.
 4.  SURVIVAL: You CANNOT 'eat' if your inventory has no food.
-You CANNOT 'hunt' if health is under 12.
+    You CANNOT 'hunt' if health is under 12.
 5.  CRAFTING RECIPES:
       - oak_planks: requires 1 oak_log (yields 4)
       - stick: requires 2 oak_planks (yields 4)
@@ -86,10 +85,10 @@ You CANNOT 'hunt' if health is under 12.
       - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
 6.  If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
 VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
-    VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
+VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
 OUTPUT REQUIREMENT (ADVANCED PLANNING):
     You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective.
-Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
+    Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
 Response format (JSON only):
     {
     "objective": "Sub-goal description",
@@ -115,8 +114,11 @@ func hashState(state domain.GameState) uint64 {
 	healthBucket := int(state.Health) / 4
 	foodBucket := int(state.Food) / 4
 	threatLevel := len(state.Threats)
+	// FIX: Include chunk coordinates to invalidate cache when the bot moves biomes
+	chunkX := int(state.Position.X) >> 4
+	chunkZ := int(state.Position.Z) >> 4
 
-	str := fmt.Sprintf("h:%d|f:%d|t:%d", healthBucket, foodBucket, threatLevel)
+	str := fmt.Sprintf("h:%d|f:%d|t:%d|cx:%d|cz:%d", healthBucket, foodBucket, threatLevel, chunkX, chunkZ)
 	h.Write([]byte(str))
 
 	var items []string
@@ -162,6 +164,11 @@ func (p *AdvancedPlanner) RecordSuccess(objective string) {
 	p.failMu.Unlock()
 }
 
+// FIX: Allow service to drop the current plan to prevent Groundhog Day loops
+func (p *AdvancedPlanner) ClearCurrentPlan() {
+	p.currentPlan.Store(nil)
+}
+
 func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -204,14 +211,12 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 	select {
 	case p.replanCh <- state:
 	default:
-		// Channel full, drop to avoid blocking
 	}
 }
 
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 	current := p.currentPlan.Load()
 
-	// Phase 2: Unify Survival Authority
 	survPolicy := policy.NewSurvivalPolicy()
 	input := policy.DecisionInput{
 		State: state,
@@ -223,7 +228,7 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 	if !decision.IsApproved {
 		if decision.OverridePlan != nil {
 			p.logger.Warn("Survival reflex triggered, overriding planner", slog.String("reason", decision.Reason))
-			p.currentPlan.Store(nil) // clear stale plan
+			p.currentPlan.Store(nil)
 			return *decision.OverridePlan
 		}
 		p.logger.Warn("Plan rejected by survival policy", slog.String("reason", decision.Reason))
@@ -231,7 +236,6 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 		return p.reactivePlan(state)
 	}
 
-	// Phase 3: Action Degradation & Loop Prevention
 	if current != nil {
 		p.failMu.Lock()
 		fails := p.failures[current.Objective]
@@ -240,7 +244,7 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 		if fails > 3 {
 			p.logger.Warn("Plan stuck in failure loop, degrading behavior", slog.String("objective", current.Objective))
 			p.currentPlan.Store(nil)
-			p.RecordSuccess(current.Objective) // Reset count so we don't infinitely trigger degraded state
+			p.RecordSuccess(current.Objective)
 			return p.degradedPlan(state)
 		}
 	}
@@ -435,7 +439,6 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 		explorationBonus *= 2.5
 	}
 
-	// Add exploration bonus exactly ONCE per candidate plan
 	hasExplored := false
 	var totalRisk float64
 
@@ -457,7 +460,6 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 		}
 	}
 
-	// Apply average risk penalty, not additive per step
 	score -= (totalRisk / float64(len(tasks)))
 
 	return score

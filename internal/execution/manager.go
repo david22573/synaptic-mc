@@ -1,4 +1,3 @@
-// internal/execution/manager.go
 package execution
 
 import (
@@ -9,7 +8,6 @@ import (
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
-	"david22573/synaptic-mc/internal/humanization"
 )
 
 var ErrDraining = errors.New("controller is draining")
@@ -116,62 +114,6 @@ func (m *ControllerManager) Dispatch(ctx context.Context, action domain.Action) 
 	return vc.Ctrl.Dispatch(ctx, action)
 }
 
-// ExecuteAction runs the humanization pipeline (distraction check, hesitation)
-// before dispatching to the active controller.
-func (m *ControllerManager) ExecuteAction(
-	ctx context.Context,
-	action domain.Action,
-	hCtx humanization.Context,
-	state *humanization.State,
-	cfg humanization.Config,
-) (domain.ExecutionResult, error) {
-	// 1. Attention Model Check (Phase 6.2)
-	if state.GetAttention() < cfg.DistractionThreshold {
-		return domain.ExecutionResult{
-			Success:  false,
-			Cause:    domain.CauseDistracted,
-			Progress: 0,
-		}, nil
-	}
-
-	// 2. Calculate and apply hesitation (Phase 6.1)
-	if delay := humanization.CalculateHesitation(action, hCtx, state, cfg); delay > 0 {
-		select {
-		case <-time.After(delay):
-			// Hesitation complete, proceed naturally
-		case <-ctx.Done():
-			return domain.ExecutionResult{
-				Success:  false,
-				Cause:    domain.CauseAbortedDuringHesitation,
-				Progress: 0,
-			}, ctx.Err()
-		}
-	}
-
-	// 3. Fire to TS
-	return m.dispatchToTS(ctx, action)
-}
-
-// dispatchToTS wraps Dispatch into the ExecutionResult shape.
-func (m *ControllerManager) dispatchToTS(
-	ctx context.Context,
-	action domain.Action,
-) (domain.ExecutionResult, error) {
-	if err := m.Dispatch(ctx, action); err != nil {
-		return domain.ExecutionResult{
-			Success:  false,
-			Cause:    domain.CauseBlocked,
-			Progress: 0,
-			Action:   action,
-		}, err
-	}
-	return domain.ExecutionResult{
-		Success:  true,
-		Progress: 1.0,
-		Action:   action,
-	}, nil
-}
-
 func (m *ControllerManager) AbortCurrent(ctx context.Context, reason string) error {
 	vc := m.current.Load()
 	if vc == nil {
@@ -216,8 +158,7 @@ func (m *ControllerManager) EvaluateFailure(
 	}
 
 	// Phase 3: Hard block / Timeout means try a different target entirely
-	if res.Cause == domain.CauseTimeout ||
-		res.Cause == domain.CauseBlocked ||
+	if res.Cause == domain.CauseTimeout || res.Cause == domain.CauseBlocked ||
 		res.Cause == domain.CauseStuck {
 		directive.Strategy = StrategyRetryDifferent
 		return directive

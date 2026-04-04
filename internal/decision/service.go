@@ -191,21 +191,20 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		return
 	}
 
-	currentPlan := s.planManager.GetCurrent()
-	if currentPlan != nil && len(currentPlan.Tasks) > 0 {
-		if currentPlan.Tasks[0].ID == payload.CommandID {
-			currentPlan.Tasks = currentPlan.Tasks[1:]
-		}
-
-		if len(currentPlan.Tasks) > 0 {
-			s.dispatchActivePlan(ctx)
-			return
-		}
+	// FIX: Use thread-safe PopTask to progress the plan, avoiding the manual slice race condition
+	hasMoreTasks := s.planManager.PopTask(payload.CommandID)
+	if hasMoreTasks {
+		s.dispatchActivePlan(ctx)
+		return
 	}
 
+	currentPlan := s.planManager.GetCurrent()
 	if currentPlan != nil {
 		s.planner.RecordSuccess(currentPlan.Objective)
 	}
+
+	// FIX: Tell the planner we finished the plan so it stops serving stale cached pointers
+	s.planner.ClearCurrentPlan()
 
 	_ = s.planManager.Transition(domain.PlanStatusCompleted)
 	go s.evaluateNextPlan(context.Background())

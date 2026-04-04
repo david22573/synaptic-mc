@@ -1,11 +1,9 @@
-// internal/execution/engine.go
 package execution
 
 import (
 	"container/heap"
 	"context"
 	"log/slog"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -46,12 +44,9 @@ type TaskExecutionEngine struct {
 	inFlight      *ExecutionTask
 	maxInFlight   int
 	retryCount    int
-
-	noiseLevel   float64
-	getAttention func() float64
 }
 
-func NewTaskExecutionEngine(ctrl Controller, noiseLevel float64, getAttention func() float64, logger *slog.Logger) *TaskExecutionEngine {
+func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
 	e := &TaskExecutionEngine{
 		controller:    ctrl,
 		logger:        logger.With(slog.String("component", "task_execution_engine")),
@@ -59,8 +54,6 @@ func NewTaskExecutionEngine(ctrl Controller, noiseLevel float64, getAttention fu
 		recentActions: make(map[string]time.Time),
 		maxInFlight:   1,
 		retryCount:    0,
-		noiseLevel:    noiseLevel,
-		getAttention:  getAttention,
 	}
 	heap.Init(&e.queue)
 	return e
@@ -135,28 +128,6 @@ func (e *TaskExecutionEngine) pump() {
 		return
 	}
 
-	if e.getAttention != nil {
-		attention := e.getAttention()
-		if attention < 0.3 {
-			var filtered actionHeap
-			for _, qa := range e.queue {
-				if qa.action.Priority >= 5 {
-					filtered = append(filtered, qa)
-				} else {
-					e.logger.Debug("Dropped low-priority task due to low attention", slog.String("action", qa.action.Action))
-				}
-			}
-			if len(filtered) != len(e.queue) {
-				e.queue = filtered
-				heap.Init(&e.queue)
-			}
-			if len(e.queue) == 0 {
-				e.mu.Unlock()
-				return
-			}
-		}
-	}
-
 	qa := heap.Pop(&e.queue).(queuedAction)
 
 	e.inFlight = &ExecutionTask{
@@ -167,28 +138,14 @@ func (e *TaskExecutionEngine) pump() {
 	e.mu.Unlock()
 
 	go func(qa queuedAction) {
-		if qa.action.Priority < 10 && e.noiseLevel > 0.01 {
-			maxJitter := int64(e.noiseLevel * 5000)
-			if maxJitter > 0 {
-				jitter := time.Duration(rand.Int63n(maxJitter)) * time.Millisecond
-				select {
-				case <-qa.ctx.Done():
-					e.mu.Lock()
-					e.inFlight = nil
-					e.retryCount = 0
-					e.mu.Unlock()
-					return
-				case <-time.After(jitter):
-				}
-			}
-		}
-
 		err := e.controller.Dispatch(qa.ctx, qa.action)
 		if err != nil {
 			if err == context.Canceled || err == context.DeadlineExceeded {
 				e.logger.Debug("Task aborted cleanly", slog.String("action", qa.action.Action), slog.Any("reason", err))
 				e.mu.Lock()
-				e.inFlight = nil
+				if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
+					e.inFlight = nil
+				}
 				e.retryCount = 0
 				e.mu.Unlock()
 				return
