@@ -21,6 +21,10 @@ export class ProgressTracker {
         return Math.max(0, 1 - currentDistance / this.startDistance);
     }
 
+    public getDistance(bot: Bot): number {
+        return bot.entity.position.distanceTo(this.target);
+    }
+
     public checkStuck(bot: Bot): boolean {
         if (!bot.entity) return false;
         const dist = bot.entity.position.distanceTo(this.lastPos);

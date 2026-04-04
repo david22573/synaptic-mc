@@ -2,6 +2,7 @@
 package humanization
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"time"
@@ -113,11 +114,28 @@ func (e *Engine) generateDrift(ctx Context) *domain.Action {
 		Priority: -1,
 	}
 
-	if roll < 0.5 {
+	// Dynamic curiosity: Look at interesting things if they exist
+	if roll < 0.4 && len(ctx.State.POIs) > 0 {
+		poi := ctx.State.POIs[rand.Intn(len(ctx.State.POIs))]
+		
+		// Marshal POI coordinates for the TS look handler
+		poiData, _ := json.Marshal(map[string]float64{
+			"x": poi.Position.X,
+			"y": poi.Position.Y + 1.0, // Look at eye level
+			"z": poi.Position.Z,
+		})
+
+		action.Action = "look"
+		action.Target = domain.Target{Type: "location", Name: string(poiData)}
+		action.Rationale = fmt.Sprintf("Humanization: curious about %s", poi.Name)
+		return &action
+	}
+
+	if roll < 0.7 {
 		action.Action = "look"
 		action.Target = domain.Target{Type: "relative", Name: "random_yaw"}
 		action.Rationale = "Humanization: idle looking around"
-	} else if roll < 0.8 {
+	} else if roll < 0.85 {
 		action.Action = "inventory"
 		action.Target = domain.Target{Type: "ui", Name: "open_close"}
 		action.Rationale = "Humanization: nervously checking inventory"
