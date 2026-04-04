@@ -104,11 +104,16 @@ func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Curiosity tasks should never be deduplicated, they are a fallback for idleness
+	isCuriosity := action.ID == "explore-curiosity-stable"
+
 	dedupKey := action.Action + ":" + action.Target.Name
-	if lastSeen, exists := e.recentActions[dedupKey]; exists {
-		if time.Since(lastSeen) < 2*time.Second {
-			e.logger.Debug("Dropped duplicate action within dedup window", slog.String("action", action.Action))
-			return
+	if !isCuriosity {
+		if lastSeen, exists := e.recentActions[dedupKey]; exists {
+			if time.Since(lastSeen) < 2*time.Second {
+				e.logger.Debug("Dropped duplicate action within dedup window", slog.String("action", action.Action))
+				return
+			}
 		}
 	}
 	e.recentActions[dedupKey] = time.Now()

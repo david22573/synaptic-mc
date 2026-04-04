@@ -78,7 +78,9 @@ func (pm *PlanManager) NextFallback() bool {
 		return false
 	}
 
+	// Promote the first fallback candidate to the main task list
 	pm.current.Tasks = pm.current.Fallbacks[0]
+	// Remove the promoted candidate from the fallbacks slice
 	pm.current.Fallbacks = pm.current.Fallbacks[1:]
 	pm.current.Status = domain.PlanStatusPending
 	return true

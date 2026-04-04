@@ -311,14 +311,15 @@ async function executeIntent(intent: models.ActionIntent) {
                 }),
             ]);
 
-            if (
-                !signal.aborted &&
-                activeTask &&
-                currentTask?.id === activeTask.id
-            ) {
-                await new Promise((r) => setTimeout(r, 200));
-                pushState();
-                completeTask(activeTask, "task_completed");
+            if (activeTask && currentTask?.id === activeTask.id) {
+                if (!signal.aborted) {
+                    await new Promise((r) => setTimeout(r, 200));
+                    pushState();
+                    completeTask(activeTask, "task_completed");
+                } else {
+                    // Signal was aborted during execution but task finished or was caught by race
+                    completeTask(activeTask, "task_aborted", signal.reason || "preempted");
+                }
             }
         } catch (err: any) {
             if (!signal.aborted || err.message === "timeout") {

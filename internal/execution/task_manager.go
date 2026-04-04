@@ -132,8 +132,9 @@ func (tm *TaskManager) Run(ctx context.Context) {
 			if shouldRunCuriosity {
 				if tm.idleSince.IsZero() {
 					tm.idleSince = time.Now()
-				} else if time.Since(tm.idleSince) > 5*time.Second {
+				} else if time.Since(tm.idleSince) > 15*time.Second {
 					tm.logger.Info("Curiosity loop triggered: autonomous exploration", slog.Int("failure_count", tm.failureCount))
+
 					exploreTask := domain.Action{
 						ID:        "explore-curiosity-stable",
 						Action:    "explore",

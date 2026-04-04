@@ -44,3 +44,4 @@ synaptic-mc
 data/*.db-shm
 data/*.db-wal
 data/*.db-journal
+server

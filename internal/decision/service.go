@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,11 +77,15 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 		return false
 	}
 
+	// Only validate the FIRST task. We re-plan after each task completion anyway.
+	// Validating future tasks against the current state is too restrictive.
+	task := plan.Tasks[0]
+
 	hasPickaxe := false
 	hasCraftingTable := false
 
 	for _, item := range state.Inventory {
-		if item.Name == "wooden_pickaxe" || item.Name == "stone_pickaxe" || item.Name == "iron_pickaxe" || item.Name == "diamond_pickaxe" {
+		if strings.Contains(item.Name, "pickaxe") {
 			hasPickaxe = true
 		}
 		if item.Name == "crafting_table" {
@@ -94,29 +99,38 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 		}
 	}
 
-	for _, task := range plan.Tasks {
-		switch task.Action {
-		case "eat":
-			if state.Food >= domain.DecisionFoodMax {
-				return false
-			}
-		case "craft":
-			if len(state.Inventory) == 0 {
-				return false
-			}
-			if task.Target.Name == "wooden_pickaxe" && !hasCraftingTable {
-				return false
-			}
-		case "mine":
-			if !hasPickaxe {
-				return false
-			}
-		case "hunt":
-			if state.Health < domain.DecisionHealthHunt {
-				return false
+	switch task.Action {
+	case "eat":
+		if state.Food >= domain.DecisionFoodMax {
+			return false
+		}
+		// Check if we actually have food
+		hasFood := false
+		for _, item := range state.Inventory {
+			// Basic food check
+			if item.Name == "apple" || item.Name == "cooked_beef" || item.Name == "bread" || item.Name == "carrot" {
+				hasFood = true
+				break
 			}
 		}
+		return hasFood
+	case "craft":
+		if len(state.Inventory) == 0 {
+			return false
+		}
+		if strings.Contains(task.Target.Name, "pickaxe") && !hasCraftingTable {
+			return false
+		}
+	case "mine":
+		if !hasPickaxe {
+			return false
+		}
+	case "hunt":
+		if state.Health < domain.DecisionHealthHunt {
+			return false
+		}
 	}
+
 	return true
 }
 
@@ -243,11 +257,12 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 	}
 
 	if !Validate(&plan, state) {
-		s.logger.Warn("Generated plan failed validation, discarding", slog.String("objective", plan.Objective))
-		return
+		s.logger.Warn("Generated plan failed validation, falling back to curriculum", slog.String("objective", plan.Objective))
+		plan.IsFallback = true
+		plan.Tasks = nil
 	}
 
-	if plan.IsFallback && s.curriculum != nil {
+	if (plan.IsFallback || len(plan.Tasks) == 0) && s.curriculum != nil {
 		s.logger.Info("Planner cache empty, falling back to curriculum")
 
 		s.mu.Lock()
