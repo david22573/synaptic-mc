@@ -35,3 +35,12 @@ go.work.sum
 .codepicker/
 codepicker.yaml
 policy.json
+
+# Build Artifacts
+bin/
+synaptic-mc
+
+# Runtime State
+data/*.db-shm
+data/*.db-wal
+data/*.db-journal
