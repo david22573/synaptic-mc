@@ -30,6 +30,44 @@
         <p class="objective">{botStore.objective}</p>
     </section>
 
+    {#if botStore.gameState?.current_task}
+        <section class="card task-card">
+            <h3>🏃 Current Task</h3>
+            <div class="task-info">
+                <span class="task-action">{formatName(botStore.gameState.current_task.action)}</span>
+                {#if botStore.gameState.current_task.target}
+                    <span class="task-target">→ {formatName(botStore.gameState.current_task.target.name)}</span>
+                {/if}
+            </div>
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {(botStore.gameState.task_progress || 0) * 100}%"></div>
+                </div>
+                <span class="progress-text">{Math.round((botStore.gameState.task_progress || 0) * 100)}%</span>
+            </div>
+        </section>
+    {/if}
+
+    <section class="card stats-card">
+        <h3>🌍 World & Stats</h3>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <span class="stat-label">Bed Nearby:</span>
+                <span class="stat-value {botStore.gameState?.has_bed_nearby ? 'text-green' : 'text-red'}">
+                    {botStore.gameState?.has_bed_nearby ? 'YES' : 'NO'}
+                </span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Health:</span>
+                <span class="stat-value">{Math.round(botStore.gameState?.health || 0)}/20</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Food:</span>
+                <span class="stat-value">{Math.round(botStore.gameState?.food || 0)}/20</span>
+            </div>
+        </div>
+    </section>
+
     <section class="card">
         <h3>🎒 Inventory ({inventory.length} items)</h3>
         {#if inventory.length > 0}
@@ -202,6 +240,78 @@
         margin: 0;
         line-height: 1.4;
     }
+
+    .task-info {
+        display: flex;
+        gap: 0.5rem;
+        font-family: monospace;
+        margin-bottom: 0.75rem;
+        font-size: 1rem;
+    }
+
+    .task-action {
+        color: #fbbf24;
+        font-weight: bold;
+    }
+
+    .task-target {
+        color: #94a3b8;
+    }
+
+    .progress-container {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    .progress-bar {
+        flex-grow: 1;
+        height: 8px;
+        background: #1e293b;
+        border-radius: 4px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: #38bdf8;
+        transition: width 0.3s ease;
+    }
+
+    .progress-text {
+        font-family: monospace;
+        font-size: 0.75rem;
+        color: #94a3b8;
+        min-width: 35px;
+    }
+
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 0.75rem;
+    }
+
+    .stat-item {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+
+    .stat-label {
+        font-size: 0.7rem;
+        color: #64748b;
+        text-transform: uppercase;
+    }
+
+    .stat-value {
+        font-family: monospace;
+        font-size: 0.9rem;
+        font-weight: bold;
+    }
+
+    .text-green { color: #34d399; }
+    .text-red { color: #ef4444; }
 
     .inventory-grid {
         display: grid;
