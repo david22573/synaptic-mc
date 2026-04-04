@@ -43,14 +43,14 @@ export async function navigateWithFallbacks(
     // Breaks the perfect mechanical stare of the pathfinder.
     const noiseMonitor = setInterval(() => {
         if (!bot.pathfinder || !bot.pathfinder.isMoving()) return;
-        const yawNoise = (Math.random() - 0.5) * 0.15;
-        const pitchNoise = (Math.random() - 0.5) * 0.15;
+        const yawNoise = (Math.random() - 0.5) * 0.1;
+        const pitchNoise = (Math.random() - 0.5) * 0.1;
         bot.look(
             bot.entity.yaw + yawNoise,
             bot.entity.pitch + pitchNoise,
             true,
         ).catch(() => {});
-    }, 800);
+    }, 1200);
 
     try {
         while (attempts < maxRetries) {
@@ -73,7 +73,7 @@ export async function navigateWithFallbacks(
                 // Strategy 1: Pathfinder
                 await moveToGoal(bot, goal, {
                     timeoutMs: opts.timeoutMs ?? 15000,
-                    dynamic: true,
+                    dynamic: false, // Default to static for stability
                     signal: opts.signal,
                     stopMovement: opts.stopMovement,
                 });

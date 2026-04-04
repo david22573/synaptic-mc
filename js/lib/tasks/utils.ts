@@ -184,13 +184,12 @@ export function moveToGoal(
         timeoutMs,
         stopMovement,
         dynamic = false,
-        stuckTimeoutMs = 5000,
+        stuckTimeoutMs = 2000, // Reduced for faster detection
     } = opts;
 
     return new Promise((resolve, reject) => {
         if (signal?.aborted) {
-            reject(new Error("aborted"));
-            return;
+            return reject(new Error("aborted"));
         }
 
         if (goal.isEnd && goal.isEnd(bot.entity.position)) {
@@ -198,7 +197,6 @@ export function moveToGoal(
         }
 
         let settled = false;
-
         let lastPos = bot.entity.position.clone();
         let stuckTimer: NodeJS.Timeout | null = null;
         let mainTimer: NodeJS.Timeout | null = null;
@@ -219,10 +217,11 @@ export function moveToGoal(
             cleanup();
 
             if (err) {
-                try {
-                    // Only hard-stop if we actually failed or aborted, allowing smooth waypoints
-                    if (stopMovement) stopMovement();
-                } catch (_err) {}
+                if (stopMovement) {
+                    try {
+                        stopMovement();
+                    } catch (e) {}
+                }
                 reject(err);
                 return;
             }
@@ -230,12 +229,14 @@ export function moveToGoal(
         };
 
         const onAbort = () => finish(new Error("aborted"));
-        const onGoalReached = () => finish();
+        const onGoalReached = () => {
+            finish();
+        };
+
         const onPathUpdate = (results: any) => {
             if (results.status === "noPath") {
-                setTimeout(() => {
-                    if (!settled) finish(new Error("no_path"));
-                }, 3500);
+                // If no path found, don't wait 3.5s, it's usually definitive in current env
+                finish(new Error("no_path"));
             } else if (results.status === "timeout") {
                 finish(new Error("pathfinder_timeout"));
             }
@@ -243,19 +244,19 @@ export function moveToGoal(
 
         let stuckStrikes = 0;
         stuckTimer = setInterval(() => {
+            if (settled) return;
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
 
-            if (dist < 0.5) {
+            // If we are supposed to be moving but aren't
+            if (bot.pathfinder.isMoving() && dist < 0.1) {
                 stuckStrikes++;
-                if (stuckStrikes >= 4) {
+                if (stuckStrikes >= 3) {
                     finish(new Error("stuck"));
                 }
             } else {
                 stuckStrikes = 0;
             }
-
-            // Unconditionally update lastPos so slow drifts don't bypass the stuck detection
             lastPos = currentPos.clone();
         }, stuckTimeoutMs);
 
@@ -266,7 +267,7 @@ export function moveToGoal(
             signal.addEventListener("abort", onAbort, { once: true });
         }
 
-        bot.once("goal_reached", onGoalReached);
+        bot.on("goal_reached", onGoalReached);
         bot.on("path_update", onPathUpdate);
 
         mainTimer = setTimeout(() => finish(new Error("timeout")), timeoutMs);

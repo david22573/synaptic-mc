@@ -425,7 +425,14 @@ async function connectWithRetry(maxAttempts = 10) {
         client = new SynapticClient({
             url: runtimeConfig.bot_ws_url || runtimeConfig.ws_url,
         });
-        client.on("dispatch", (i) => void executeIntent(i));
+        client.on("dispatch", (i) => {
+            log.info("Received task dispatch", {
+                action: i.action,
+                target: i.target?.name,
+                id: i.id,
+            });
+            void executeIntent(i);
+        });
         client.on("abort", () => {
             if (!survival?.isPanickingNow()) abortActiveTask("unlock");
         });
@@ -448,11 +455,17 @@ async function connectWithRetry(maxAttempts = 10) {
         isBotSpawned = true;
         log.info("Bot spawned successfully.");
 
+        // FIXED: Enhanced Movements config for 1.19.1 stability
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allowSprinting = true;
+        movements.allowParkour = true;
+        movements.allow1by1towers = true;
+        movements.allowFreeMotion = true;
+
         bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 60000;
+        // Shortened thinkTimeout to prevent "infinite thinking" during path blocks
+        bot.pathfinder.thinkTimeout = 5000;
 
         survival.start();
         pushState();
