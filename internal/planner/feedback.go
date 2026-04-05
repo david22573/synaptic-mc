@@ -4,7 +4,6 @@ package planner
 import (
 	"log"
 	"math/rand"
-	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/execution"
@@ -17,9 +16,6 @@ type FeedbackAnalyzer struct {
 }
 
 func NewFeedbackAnalyzer(world *domain.WorldModel) *FeedbackAnalyzer {
-	// Seed the RNG for our spatial offsets
-	rand.Seed(time.Now().UnixNano())
-
 	return &FeedbackAnalyzer{
 		world: world,
 	}

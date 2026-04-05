@@ -19,6 +19,10 @@ export async function navigateWithFallbacks(
     goal: any,
     opts: NavOpts,
 ): Promise<void> {
+    if (!bot.entity || !bot.entity.position) {
+        throw new ExecutionError("Bot not spawned", "BLOCKED", 0);
+    }
+
     const maxRetries = opts.maxRetries ?? 3;
     let attempts = 0;
 

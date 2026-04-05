@@ -1,6 +1,8 @@
 package execution
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,4 +57,69 @@ func TestControllerManager_EvaluateFailure(t *testing.T) {
 			t.Errorf("Expected StrategyAbort after 4 failures, got %s", directive.Strategy)
 		}
 	})
+}
+
+type MockDrainingController struct {
+	isReady bool
+	closed  bool
+	mu      sync.Mutex
+}
+
+func (m *MockDrainingController) Dispatch(ctx context.Context, action domain.Action) error { return nil }
+func (m *MockDrainingController) AbortCurrent(ctx context.Context, reason string) error   { return nil }
+func (m *MockDrainingController) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	return nil
+}
+func (m *MockDrainingController) IsReady() bool { return m.isReady }
+
+func TestControllerManager_SetController(t *testing.T) {
+	m := NewControllerManager()
+	c1 := &MockDrainingController{}
+	c2 := &MockDrainingController{}
+
+	m.SetController("c1", c1)
+	if m.current.Load().ID != "c1" {
+		t.Errorf("Expected current controller ID to be c1, got %s", m.current.Load().ID)
+	}
+
+	m.SetController("c2", c2)
+	if m.current.Load().ID != "c2" {
+		t.Errorf("Expected current controller ID to be c2, got %s", m.current.Load().ID)
+	}
+
+	// Wait a bit for the async close to finish
+	time.Sleep(10 * time.Millisecond)
+
+	c1.mu.Lock()
+	if !c1.closed {
+		t.Error("Expected c1 to be closed after being replaced")
+	}
+	c1.mu.Unlock()
+}
+
+func TestControllerManager_Close(t *testing.T) {
+	m := NewControllerManager()
+	c1 := &MockDrainingController{}
+
+	m.SetController("c1", c1)
+	err := m.Close()
+	if err != nil {
+		t.Errorf("Expected no error on Close, got %v", err)
+	}
+
+	if m.current.Load() != nil {
+		t.Error("Expected current controller to be nil after Close")
+	}
+
+	// Wait a bit for the async close to finish
+	time.Sleep(10 * time.Millisecond)
+
+	c1.mu.Lock()
+	if !c1.closed {
+		t.Error("Expected c1 to be closed after manager Close")
+	}
+	c1.mu.Unlock()
 }

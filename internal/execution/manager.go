@@ -82,13 +82,9 @@ func (m *ControllerManager) GetIdempotent() *IdempotentController {
 
 func (m *ControllerManager) SetController(id string, ctrl Controller) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	old := m.current.Load()
 	if old != nil {
 		old.draining.Store(true)
-		old.active.Wait()
-		_ = old.Ctrl.Close()
 	}
 
 	vc := &VersionedController{
@@ -96,6 +92,13 @@ func (m *ControllerManager) SetController(id string, ctrl Controller) {
 		Ctrl: ctrl,
 	}
 	m.current.Store(vc)
+	m.mu.Unlock()
+
+	// Drain and close old controller outside the lock to avoid stalling the dispatch queue
+	if old != nil {
+		old.active.Wait()
+		_ = old.Ctrl.Close()
+	}
 }
 
 func (m *ControllerManager) Dispatch(ctx context.Context, action domain.Action) error {
@@ -204,11 +207,15 @@ func (m *ControllerManager) GetRecentFailures() []domain.ExecutionResult {
 
 func (m *ControllerManager) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	vc := m.current.Load()
 	if vc != nil {
 		vc.draining.Store(true)
+	}
+	m.current.Store(nil)
+	m.mu.Unlock()
+
+	// Drain and close outside the lock
+	if vc != nil {
 		vc.active.Wait()
 		return vc.Ctrl.Close()
 	}

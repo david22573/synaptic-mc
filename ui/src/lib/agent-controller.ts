@@ -18,7 +18,8 @@ export interface AgentState extends GameState {
 // Helper to handle both GameState and VersionedState (from Go)
 function extractState(payload: any): AgentState {
     if (payload && payload.State) {
-        return { ...payload.State, timestamp: Date.now() };
+        // Use performance.now() to match AgentController's time base for smooth interpolation
+        return { ...payload.State, timestamp: performance.now() };
     }
     return payload;
 }
@@ -42,6 +43,7 @@ export class AgentController {
 
     onStateUpdate(payload: any) {
         const state = extractState(payload);
+        // Ensure we always have a valid performance-based timestamp
         this.lastServerUpdate = state.timestamp || performance.now();
         this.path = state.path || null;
 
@@ -84,9 +86,12 @@ export class AgentController {
 
         // Snap faster if we are in panic mode
         const baseSpeed = this.isPanicMode ? 0.3 : 0.15;
+        
+        // Fix: If timeSinceUpdate is large, accelerate to catch up rather than slowing down.
+        // We scale the speed linearly up to 1.0 (snap) if lag exceeds 500ms.
         const dynamicSpeed = Math.min(
-            baseSpeed,
-            50 / Math.max(timeSinceUpdate, 50),
+            1.0,
+            Math.max(baseSpeed, timeSinceUpdate / 500)
         );
         this.smoothSpeed = dynamicSpeed;
 
