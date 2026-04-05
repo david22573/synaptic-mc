@@ -2,7 +2,9 @@ package domain
 
 import (
 	"context"
+	"log"
 	"sync"
+	"time"
 )
 
 // EventHandler defines how components react to domain events.
@@ -23,30 +25,58 @@ type EventBus interface {
 	Subscribe(eventType EventType, handler EventHandler)
 }
 
+type subscriber struct {
+	ch      chan DomainEvent
+	handler EventHandler
+}
+
 // LocalEventBus provides a simple, thread-safe, in-memory event bus.
+// It uses internal buffering and async dispatch to prevent slow subscribers
+// from deadlocking the event loop.
 type LocalEventBus struct {
 	mu       sync.RWMutex
-	handlers map[EventType][]EventHandler
+	handlers map[EventType][]*subscriber
 }
 
 func NewEventBus() *LocalEventBus {
 	return &LocalEventBus{
-		handlers: make(map[EventType][]EventHandler),
+		handlers: make(map[EventType][]*subscriber),
 	}
 }
 
 func (b *LocalEventBus) Publish(ctx context.Context, event DomainEvent) {
 	b.mu.RLock()
-	handlers := b.handlers[event.Type]
+	subs := b.handlers[event.Type]
 	b.mu.RUnlock()
 
-	for _, h := range handlers {
-		h.HandleEvent(ctx, event)
+	for _, sub := range subs {
+		select {
+		case sub.ch <- event:
+		case <-time.After(100 * time.Millisecond):
+			// Phase 6 Observability: Don't let a stalled listener kill the whole system.
+			// If we can't push into the buffer in 100ms, we drop the event to stay responsive.
+			log.Printf("[EventBus] CRITICAL: Dropping event %s for backed up subscriber. Buffer full.", event.Type)
+		}
 	}
 }
 
 func (b *LocalEventBus) Subscribe(eventType EventType, handler EventHandler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.handlers[eventType] = append(b.handlers[eventType], handler)
+
+	sub := &subscriber{
+		ch:      make(chan DomainEvent, 1024), // Large buffer to handle bursts
+		handler: handler,
+	}
+
+	b.handlers[eventType] = append(b.handlers[eventType], sub)
+
+	// Start a dedicated worker for this subscriber to process its queue asynchronously
+	go func() {
+		// Subscribers run in their own lifecycle.
+		// Using Background since the original Publish context is transient.
+		for ev := range sub.ch {
+			sub.handler.HandleEvent(context.Background(), ev)
+		}
+	}()
 }
