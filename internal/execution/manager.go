@@ -46,13 +46,13 @@ type ControllerManager struct {
 	mu      sync.Mutex
 
 	// Phase 1 & 3: Track execution feedback loop
-	lastFailures []domain.ExecutionResult
-	historyMu    sync.RWMutex
+	lastResults []domain.ExecutionResult
+	historyMu   sync.RWMutex
 }
 
 func NewControllerManager() *ControllerManager {
 	return &ControllerManager{
-		lastFailures: make([]domain.ExecutionResult, 0, 10),
+		lastResults: make([]domain.ExecutionResult, 0, 20),
 	}
 }
 
@@ -201,15 +201,13 @@ func (m *ControllerManager) getDegradedAction(action domain.Action) string {
 	return "idle" // Ultimate safe fallback
 }
 
-// RecordResult tracks failure trends for the planner
+// RecordResult tracks execution trends for the planner and humanizer
 func (m *ControllerManager) RecordResult(res domain.ExecutionResult) {
 	m.historyMu.Lock()
 	defer m.historyMu.Unlock()
-	if !res.Success || res.Progress < 1.0 {
-		m.lastFailures = append(m.lastFailures, res)
-		if len(m.lastFailures) > 10 { // Keep last 10
-			m.lastFailures = m.lastFailures[1:]
-		}
+	m.lastResults = append(m.lastResults, res)
+	if len(m.lastResults) > 20 { // Keep last 20
+		m.lastResults = m.lastResults[1:]
 	}
 }
 
@@ -217,9 +215,28 @@ func (m *ControllerManager) RecordResult(res domain.ExecutionResult) {
 func (m *ControllerManager) GetRecentFailures() []domain.ExecutionResult {
 	m.historyMu.RLock()
 	defer m.historyMu.RUnlock()
-	res := make([]domain.ExecutionResult, len(m.lastFailures))
-	copy(res, m.lastFailures)
-	return res
+	var failures []domain.ExecutionResult
+	for _, res := range m.lastResults {
+		if !res.Success || res.Progress < 1.0 {
+			failures = append(failures, res)
+		}
+	}
+	return failures
+}
+
+func (m *ControllerManager) GetSuccessRate() float64 {
+	m.historyMu.RLock()
+	defer m.historyMu.RUnlock()
+	if len(m.lastResults) == 0 {
+		return 1.0 // Default to perfect if no history
+	}
+	successes := 0
+	for _, res := range m.lastResults {
+		if res.Success && res.Progress >= 1.0 {
+			successes++
+		}
+	}
+	return float64(successes) / float64(len(m.lastResults))
 }
 
 func (m *ControllerManager) Close() error {

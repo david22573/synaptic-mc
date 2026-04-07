@@ -272,6 +272,10 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 
 			s.ctrlManager.RecordResult(res)
 
+			// Phase 6: Update humanizer with performance feedback
+			successRate := s.ctrlManager.GetSuccessRate()
+			s.humanizer.State().UpdateFeedback(record.Count, successRate)
+
 			s.logger.Warn("Task failed, applying adaptation strategy",
 				slog.String("task_id", payload.CommandID),
 				slog.String("cause", payload.Cause),
@@ -308,6 +312,10 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 
 			if success {
 				s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
+
+				// Phase 6: Update humanizer with success feedback
+				successRate := s.ctrlManager.GetSuccessRate()
+				s.humanizer.State().UpdateFeedback(0, successRate)
 			}
 		}
 	}
