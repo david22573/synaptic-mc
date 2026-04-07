@@ -38,6 +38,8 @@ type LocalEventBus struct {
 	handlers map[EventType][]*subscriber
 }
 
+const publishTimeout = 100 * time.Millisecond
+
 func NewEventBus() *LocalEventBus {
 	return &LocalEventBus{
 		handlers: make(map[EventType][]*subscriber),
@@ -50,11 +52,15 @@ func (b *LocalEventBus) Publish(ctx context.Context, event DomainEvent) {
 	b.mu.RUnlock()
 
 	for _, sub := range subs {
+		timer := time.NewTimer(publishTimeout)
 		select {
 		case sub.ch <- event:
-		case <-time.After(100 * time.Millisecond):
-			// Phase 6 Observability: Don't let a stalled listener kill the whole system.
-			// If we can't push into the buffer in 100ms, we drop the event to stay responsive.
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			// Keep delivery bounded so a stalled subscriber cannot wedge the bus,
+			// while still allowing brief bursts to drain without losing control-flow events.
 			log.Printf("[EventBus] CRITICAL: Dropping event %s for backed up subscriber. Buffer full.", event.Type)
 		}
 	}

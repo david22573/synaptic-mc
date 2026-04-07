@@ -4,7 +4,6 @@ import { TaskCommitment } from "./task-commitment";
 import type { GameState, Action, Target, Task } from "./models";
 
 export type { GameState, Task };
-
 export interface BotEvent {
     type: string;
     payload: any;
@@ -23,7 +22,6 @@ class BotStore {
     connectionStatus = $state<"connected" | "connecting" | "disconnected">(
         "disconnected",
     );
-
     addEvent(event: BotEvent) {
         this.events = [event, ...this.events].slice(0, 100);
     }
@@ -33,7 +31,6 @@ class UIStore {
     tooltip = $state<string | null>(null);
     mouseX = $state(0);
     mouseY = $state(0);
-
     constructor() {
         if (typeof window !== "undefined") {
             window.addEventListener("mousemove", (e) => {
@@ -48,13 +45,24 @@ export const botStore = new BotStore();
 export const uiStore = new UIStore();
 
 let ws: WebSocket | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null; // FIX: Track the timer
 
 export function clearEventLog() {
     botStore.events = [];
 }
 
 export function connectToBot() {
-    if (ws) ws.close();
+    // FIX: Clear pending timers and strip the onclose handler before closing
+    // to prevent the reconnection storm.
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    if (ws) {
+        ws.onclose = null;
+        ws.close();
+    }
 
     botStore.connectionStatus = "connecting";
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -69,13 +77,13 @@ export function connectToBot() {
     ws.onclose = () => {
         botStore.connectionStatus = "disconnected";
         console.log("Disconnected from Gateway, retrying...");
-        setTimeout(connectToBot, 2000);
+        reconnectTimer = setTimeout(connectToBot, 2000);
     };
 
     ws.onmessage = (event) => {
         try {
             const message = JSON.parse(event.data);
-            if (!message.type || !message.payload) return;
+            if (!message?.type || !("payload" in message)) return;
 
             const type = message.type.toUpperCase();
 
@@ -86,8 +94,17 @@ export function connectToBot() {
                 return payload;
             };
 
+            // The backend wraps socket messages as { type, payload, timestamp }.
+            // For state updates, the actual state lives in the nested payload field.
+            const unwrapBroadcastPayload = (payload: any) => {
+                if (payload && typeof payload === "object" && "payload" in payload) {
+                    return payload.payload;
+                }
+                return payload;
+            };
+
             if (type === "STATE_UPDATE" || type === "STATE_SYNC") {
-                const state = unwrapState(message.payload);
+                const state = unwrapState(unwrapBroadcastPayload(message.payload));
                 botStore.gameState = state;
                 controller.onStateUpdate(state);
                 return;
@@ -136,6 +153,7 @@ export function connectToBot() {
                     payload: innerPayload,
                     timestamp: new Date().toLocaleTimeString(),
                 });
+
                 if (eventType === "TASK_START" && innerPayload.action) {
                     const task: Task = {
                         id:
@@ -162,7 +180,12 @@ export function connectToBot() {
 }
 
 export function disconnectBot() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
     if (ws) {
+        ws.onclose = null;
         ws.close();
         ws = null;
     }
