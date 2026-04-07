@@ -465,7 +465,8 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 			logger.Warn("Bot connection closed", slog.String("controller_id", controllerID))
 			cm.RemoveController(controllerID)
 		}
-		botController := execution.NewWSController(appCtx, conn, logger, onMessage, onClose)		idempotentController := execution.NewIdempotentController(botController, 1000)
+		botController := execution.NewWSController(appCtx, conn, logger, onMessage, onClose)
+		idempotentController := execution.NewIdempotentController(botController, 1000)
 
 		cm.SetController(controllerID, idempotentController)
 	}
