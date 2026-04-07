@@ -44,6 +44,16 @@ type Service struct {
 	commitment atomic.Pointer[Commitment]
 }
 
+func isControlledStop(cause string) bool {
+	switch cause {
+	case "preempted_by_priority", "plan_invalidated", "survival_panic", "panic",
+		"panic_triggered", "unlock", "bot_died":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewService(
 	sessionID string,
 	bus domain.EventBus,
@@ -140,6 +150,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 }
 
 func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
+	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
 	if !s.planManager.HasActivePlan() {
 		go s.evaluateNextPlan(context.Background())
 	}
@@ -157,6 +168,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	}
 
 	success := payload.Status == "COMPLETED"
+	controlledStop := isControlledStop(payload.Cause)
 
 	intent := s.activeIntent.Load()
 	beforePtr := s.beforeState.Load()
@@ -196,7 +208,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		return
 	}
 
-	if !success {
+	if !success && !controlledStop {
 		s.logger.Warn("Plan failed due to task failure", slog.String("failed_task", payload.CommandID))
 		s.commitment.Store(nil)
 
@@ -219,6 +231,12 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			Type:      domain.EventTypePlanInvalidated,
 			CreatedAt: time.Now(),
 		})
+		go s.evaluateNextPlan(context.Background())
+		return
+	}
+
+	if controlledStop {
+		s.commitment.Store(nil)
 		go s.evaluateNextPlan(context.Background())
 		return
 	}

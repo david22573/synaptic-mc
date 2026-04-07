@@ -63,6 +63,7 @@ func NewControlService(
 	bus.Subscribe(domain.EventTypeTaskStart, domain.FuncHandler(s.handleTaskStart))
 	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
 	bus.Subscribe(domain.EventTypePanic, domain.FuncHandler(s.handlePanic))
+	bus.Subscribe(domain.EventTypePanicResolved, domain.FuncHandler(s.handlePanicResolved))
 	bus.Subscribe(domain.EventBotDeath, domain.FuncHandler(s.handleBotDeath))
 
 	return s
@@ -72,6 +73,16 @@ func (s *ControlService) SetReflexActive(active bool) {
 	s.stabilityMu.Lock()
 	defer s.stabilityMu.Unlock()
 	s.stability.ReflexActive = active
+}
+
+func isControlledStop(cause string) bool {
+	switch cause {
+	case "preempted_by_priority", "plan_invalidated", "survival_panic", "panic",
+		"panic_triggered", "unlock", "bot_died":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.DomainEvent) {
@@ -149,6 +160,10 @@ func (s *ControlService) handleBotDeath(ctx context.Context, event domain.Domain
 	s.SetReflexActive(false)
 	_ = s.taskManager.Halt(ctx, "bot_died")
 	s.clearAllWatchdogs()
+}
+
+func (s *ControlService) handlePanicResolved(ctx context.Context, event domain.DomainEvent) {
+	s.SetReflexActive(false)
 }
 
 func (s *ControlService) handleTaskStart(ctx context.Context, event domain.DomainEvent) {
@@ -233,7 +248,7 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 			// if it was already handled by the watchdog or is a duplicate.
 		}
 
-		if !success && payload.Cause != "preempted_by_priority" && payload.Cause != "plan_invalidated" {
+		if !success && !isControlledStop(payload.Cause) {
 			s.failuresMu.Lock()
 			record, exists := s.failures[payload.CommandID]
 			if !exists {

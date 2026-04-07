@@ -375,6 +375,8 @@ function pushState() {
     lastStateSig = sig;
     lastStatePushTime = now;
 
+    const liveThreats = getThreats(bot);
+
     const state: models.GameState = {
         health: Math.round(bot.health || 0),
         food: Math.round(bot.food || 0),
@@ -409,7 +411,10 @@ function pushState() {
                 : null,
         active_slot: bot.quickBarSlot || 0,
         pois: hasValidPos ? getPOIs(bot) : [],
-        threats: [], // Populated below
+        threats: liveThreats.map((t) => ({
+            name: t.name,
+            distance: t.distance,
+        })),
         current_task: currentTask,
         task_progress: isPathfinding
             ? pathProgress
@@ -417,12 +422,6 @@ function pushState() {
               ? 0.5
               : 0,
     };
-
-    // Filter threats from POIs
-    state.threats = state.pois
-        .filter((p) => p.type === "threat")
-        .map((p) => ({ name: p.name, distance: p.distance }));
-
 
     client.sendState(state);
 }
@@ -463,8 +462,19 @@ async function connectWithRetry(maxAttempts = 10) {
             });
             void executeIntent(i);
         });
-        client.on("abort", () => {
-            if (!survival?.isPanickingNow()) abortActiveTask("unlock");
+        client.on("abort", (payload?: { reason?: string }) => {
+            const reason = payload?.reason || "unlock";
+
+            // During survival handling, stale aborts from invalidated plans should not
+            // cancel the currently running retreat task.
+            if (
+                currentTask?.action === "retreat" &&
+                (survival?.isPanickingNow() || reason === "plan_invalidated")
+            ) {
+                return;
+            }
+
+            if (!survival?.isPanickingNow()) abortActiveTask(reason);
         });
         client.connect();
     }
@@ -496,6 +506,7 @@ async function connectWithRetry(maxAttempts = 10) {
         reconnectAttempt = 1;
         isBotSpawned = true;
         log.info("Bot spawned successfully.");
+        clearPOICache();
 
         // FIXED: Enhanced Movements config for 1.19.1 stability
         const movements = new Movements(bot);
@@ -529,6 +540,7 @@ async function connectWithRetry(maxAttempts = 10) {
         isBotSpawned = false;
         hasDied = true;
         survival.reset();
+        clearPOICache();
         abortActiveTask("bot_died");
         client.sendEvent("death", { error: "bot_died" });
         setTimeout(() => {
@@ -538,6 +550,7 @@ async function connectWithRetry(maxAttempts = 10) {
 
     bot.on("end", () => {
         isBotSpawned = false;
+        clearPOICache();
         if (isShuttingDown) return;
         const backoff = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
         setTimeout(() => {

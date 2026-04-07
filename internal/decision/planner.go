@@ -184,8 +184,10 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 			}
 			latestState = state
 		case <-ticker.C:
-			if latestState.Position.X == 0 && latestState.Position.Z == 0 {
-				// Only skip if we truly have no data at all
+			if latestState.Health == 0 && latestState.Food == 0 &&
+				latestState.Position.X == 0 && latestState.Position.Y == 0 && latestState.Position.Z == 0 &&
+				len(latestState.Inventory) == 0 {
+				// Only skip when we truly have not received any meaningful state yet.
 				continue
 			}
 
