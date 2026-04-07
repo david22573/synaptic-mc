@@ -10,6 +10,13 @@ export interface BotEvent {
     timestamp: string;
 }
 
+export interface FailureLog {
+    plan_id: string;
+    reason: string;
+    state_snapshot: string;
+    failure_count: number;
+}
+
 // Global instances for logic management
 export const controller = new AgentController();
 const prefetcher = new Prefetcher();
@@ -19,6 +26,7 @@ class BotStore {
     gameState = $state<GameState | null>(null);
     objective = $state<string>("Initializing...");
     events = $state<BotEvent[]>([]);
+    activeFailure = $state<FailureLog | null>(null);
     connectionStatus = $state<"connected" | "connecting" | "disconnected">(
         "disconnected",
     );
@@ -45,15 +53,14 @@ export const botStore = new BotStore();
 export const uiStore = new UIStore();
 
 let ws: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null; // FIX: Track the timer
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function clearEventLog() {
     botStore.events = [];
+    botStore.activeFailure = null;
 }
 
 export function connectToBot() {
-    // FIX: Clear pending timers and strip the onclose handler before closing
-    // to prevent the reconnection storm.
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -87,15 +94,12 @@ export function connectToBot() {
 
             const type = message.type.toUpperCase();
 
-            // Helper to unwrap Go's VersionedState { Version: 1, State: { ... } }
             const unwrapState = (payload: any) => {
                 if (payload && payload.State) return payload.State;
                 if (payload && payload.state) return payload.state;
                 return payload;
             };
 
-            // The backend wraps socket messages as { type, payload, timestamp }.
-            // For state updates, the actual state lives in the nested payload field.
             const unwrapBroadcastPayload = (payload: any) => {
                 if (payload && typeof payload === "object" && "payload" in payload) {
                     return payload.payload;
@@ -107,6 +111,18 @@ export function connectToBot() {
                 const state = unwrapState(unwrapBroadcastPayload(message.payload));
                 botStore.gameState = state;
                 controller.onStateUpdate(state);
+                return;
+            }
+
+            // Capture the failure log
+            if (type === "FAILURE_LOG") {
+                const failure = message.payload as FailureLog;
+                botStore.activeFailure = failure;
+                botStore.addEvent({
+                    type: "PLAN_FAILED",
+                    payload: { reason: failure.reason, count: failure.failure_count },
+                    timestamp: new Date().toLocaleTimeString(),
+                });
                 return;
             }
 
@@ -139,13 +155,13 @@ export function connectToBot() {
                     const state = unwrapState(innerPayload);
                     botStore.gameState = state;
                     controller.onStateUpdate(state);
-
-                    // Overwrite innerPayload with unwrapped state for the event log
                     innerPayload = state;
                 }
 
                 if (eventType === "PLAN_CREATED" && innerPayload.objective) {
                     botStore.objective = innerPayload.objective;
+                    // Clear the failure warning when a new plan is created
+                    botStore.activeFailure = null;
                 }
 
                 botStore.addEvent({

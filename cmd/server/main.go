@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -137,6 +138,11 @@ func main() {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
 	}
+	planner.SetOnPlanReady(decisionSvc.RequestEvaluation)
+	taskManager.OnDrain = decisionSvc.RequestEvaluation
+
+	// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
+	var latestStateUpdate atomic.Pointer[map[string]interface{}]
 
 	eventBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		var stateUpdate struct {
@@ -166,31 +172,39 @@ func main() {
 			return
 		}
 
-		// Persist to SQLite
-		_ = eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload)
+		// Phase 6: Non-blocking fan-out to prevent event bus bottleneck
 
-		var payloadObj interface{}
-		_ = json.Unmarshal(ev.Payload, &payloadObj)
+		// 1. Persist to SQLite (Async)
+		go func(e domain.DomainEvent) {
+			_ = eventStore.Append(context.Background(), e.SessionID, e.Trace, e.Type, e.Payload)
+		}(ev)
 
-		// BroadcastEv structure
-		broadcastEv := map[string]interface{}{
-			"type":      string(ev.Type),
-			"payload":   payloadObj,
-			"timestamp": ev.CreatedAt.Format(time.Kitchen),
-		}
+		// 2. UI Broadcasting (Async)
+		go func(e domain.DomainEvent) {
+			var payloadObj interface{}
+			if err := json.Unmarshal(e.Payload, &payloadObj); err != nil {
+				return
+			}
 
-		// Identify if this is a high-frequency state update or a discrete event
-		isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
+			// BroadcastEv structure
+			broadcastEv := map[string]interface{}{
+				"type":      string(e.Type),
+				"payload":   payloadObj,
+				"timestamp": e.CreatedAt.Format(time.Kitchen),
+			}
 
-		if isState {
-			// Send as a dedicated STATE_UPDATE to keep HUD snappy
-			uiHub.Broadcast("STATE_UPDATE", broadcastEv)
-		} else {
-			// Send to the log/sidebar stream
-			uiHub.Broadcast("EVENT_STREAM", broadcastEv)
-		}
+			// Identify if this is a high-frequency state update or a discrete event
+			isState := e.Type == domain.EventTypeStateUpdated || e.Type == domain.EventTypeStateTick
+
+			if isState {
+				// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
+				latestStateUpdate.Store(&broadcastEv)
+			} else {
+				// Send to the log/sidebar stream
+				uiHub.Broadcast("EVENT_STREAM", broadcastEv)
+			}
+		}(ev)
 	})
-
 	eventTypes := []domain.EventType{
 		domain.EventTypeStateTick, domain.EventTypeStateUpdated,
 		domain.EventTypeTaskStart, domain.EventTypeTaskEnd,
@@ -209,6 +223,23 @@ func main() {
 	defer cancelRoot()
 
 	g, ctx := errgroup.WithContext(rootCtx)
+
+	// Phase 6: Throttled UI state broadcast (10 FPS)
+	g.Go(func() error {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+				if state := latestStateUpdate.Swap(nil); state != nil {
+					uiHub.Broadcast("STATE_UPDATE", *state)
+				}
+			}
+		}
+	})
+
 	mux := http.NewServeMux()
 
 	// FIX: Dynamically construct the WebSocket host based on the client's HTTP request
@@ -413,27 +444,28 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 		runner.Ping()
 
 		onMessage := func(msgType string, payload []byte) {
-			runner.Ping()
-			normalizedType := domain.NormalizeEventType(msgType)
-			cleanPayload := payload
-			if len(cleanPayload) == 0 {
-				cleanPayload = []byte(`{}`)
-			}
+			// Phase 6: Non-blocking ingestion to prevent WebSocket thread from stalling
+			go func(mt string, p []byte) {
+				runner.Ping()
+				normalizedType := domain.NormalizeEventType(mt)
+				cleanPayload := p
+				if len(cleanPayload) == 0 {
+					cleanPayload = []byte(`{}`)
+				}
 
-			bus.Publish(appCtx, domain.DomainEvent{
-				SessionID: sessionID,
-				Type:      normalizedType,
-				Payload:   cleanPayload,
-				CreatedAt: time.Now(),
-			})
+				bus.Publish(appCtx, domain.DomainEvent{
+					SessionID: sessionID,
+					Type:      normalizedType,
+					Payload:   cleanPayload,
+					CreatedAt: time.Now(),
+				})
+			}(msgType, payload)
 		}
-
 		onClose := func() {
 			logger.Warn("Bot connection closed", slog.String("controller_id", controllerID))
+			cm.RemoveController(controllerID)
 		}
-
-		botController := execution.NewWSController(conn, logger, onMessage, onClose)
-		idempotentController := execution.NewIdempotentController(botController, 1000)
+		botController := execution.NewWSController(appCtx, conn, logger, onMessage, onClose)		idempotentController := execution.NewIdempotentController(botController, 1000)
 
 		cm.SetController(controllerID, idempotentController)
 	}

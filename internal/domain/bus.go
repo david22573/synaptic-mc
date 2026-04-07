@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"sync"
-	"time"
 )
 
 // EventHandler defines how components react to domain events.
@@ -25,64 +24,50 @@ type EventBus interface {
 	Subscribe(eventType EventType, handler EventHandler)
 }
 
-type subscriber struct {
-	ch      chan DomainEvent
-	handler EventHandler
-}
-
-// LocalEventBus provides a simple, thread-safe, in-memory event bus.
-// It uses internal buffering and async dispatch to prevent slow subscribers
-// from deadlocking the event loop.
+// LocalEventBus provides a bounded, asynchronous event bus with a drop policy.
+// It prevents slow subscribers or event bursts from stalling the entire system.
 type LocalEventBus struct {
-	mu       sync.RWMutex
-	handlers map[EventType][]*subscriber
+	mu          sync.RWMutex
+	subscribers map[EventType][]EventHandler
+	queue       chan DomainEvent
 }
-
-const publishTimeout = 100 * time.Millisecond
 
 func NewEventBus() *LocalEventBus {
-	return &LocalEventBus{
-		handlers: make(map[EventType][]*subscriber),
+	b := &LocalEventBus{
+		subscribers: make(map[EventType][]EventHandler),
+		queue:       make(chan DomainEvent, 1024), // Bounded buffer
 	}
+	go b.dispatcher()
+	return b
 }
 
 func (b *LocalEventBus) Publish(ctx context.Context, event DomainEvent) {
-	b.mu.RLock()
-	subs := b.handlers[event.Type]
-	b.mu.RUnlock()
-
-	for _, sub := range subs {
-		timer := time.NewTimer(publishTimeout)
-		select {
-		case sub.ch <- event:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-			// Keep delivery bounded so a stalled subscriber cannot wedge the bus,
-			// while still allowing brief bursts to drain without losing control-flow events.
-			log.Printf("[EventBus] CRITICAL: Dropping event %s for backed up subscriber. Buffer full.", event.Type)
-		}
+	select {
+	case b.queue <- event:
+		// Success
+	default:
+		// DROP: Prevents total system stall when the bus is overloaded.
+		// Usually happens if downstream consumers are blocked or LLM latency is extreme.
+		log.Printf("[EventBus] WARNING: Queue full, dropping event: %s", event.Type)
 	}
 }
 
 func (b *LocalEventBus) Subscribe(eventType EventType, handler EventHandler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.subscribers[eventType] = append(b.subscribers[eventType], handler)
+}
 
-	sub := &subscriber{
-		ch:      make(chan DomainEvent, 1024), // Large buffer to handle bursts
-		handler: handler,
-	}
+func (b *LocalEventBus) dispatcher() {
+	for ev := range b.queue {
+		b.mu.RLock()
+		handlers := b.subscribers[ev.Type]
+		b.mu.RUnlock()
 
-	b.handlers[eventType] = append(b.handlers[eventType], sub)
-
-	// Start a dedicated worker for this subscriber to process its queue asynchronously
-	go func() {
-		// Subscribers run in their own lifecycle.
-		// Using Background since the original Publish context is transient.
-		for ev := range sub.ch {
-			sub.handler.HandleEvent(context.Background(), ev)
+		for _, h := range handlers {
+			// Execute handler in its own goroutine to ensure isolation.
+			// One slow subscriber cannot block the central dispatcher.
+			go h.HandleEvent(context.Background(), ev)
 		}
-	}()
+	}
 }

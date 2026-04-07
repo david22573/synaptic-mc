@@ -2,7 +2,7 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import { ProgressTracker } from "./progress.js";
-import { straightLineMove, jumpRecovery, randomWalk } from "./recovery.js";
+import { straightLineMove, randomWalk } from "./recovery.js";
 import { moveToGoal } from "../tasks/utils.js";
 import { log } from "../logger.js";
 import { ExecutionError } from "../tasks/primitives.js";
@@ -33,36 +33,6 @@ export async function navigateWithFallbacks(
     );
 
     const tracker = new ProgressTracker(bot, targetVec);
-
-    const stuckMonitor = setInterval(() => {
-        if (tracker.checkStuck(bot)) {
-            log.warn(
-                "STUCK DETECTED in navigator: Triggering quick jump recovery",
-            );
-            jumpRecovery(bot, 500);
-        }
-    }, 3000);
-
-    // Phase 6: Humanization - Add natural looking camera noise
-    // Breaks the perfect mechanical stare of the pathfinder.
-    const noiseMonitor = setInterval(() => {
-        if (!bot.pathfinder || !bot.pathfinder.isMoving()) return;
-        
-        const dist = tracker.getDistance(bot);
-        // More concentration (less noise) when closer to goal
-        const concentration = Math.min(1.0, 5 / Math.max(dist, 1));
-        const noiseScale = 1.0 - (concentration * 0.7);
-
-        const isScanning = Math.random() < 0.1;
-        const yawNoise = (Math.random() - 0.5) * (isScanning ? 0.4 : 0.15) * noiseScale;
-        const pitchNoise = (Math.random() - 0.5) * (isScanning ? 0.2 : 0.1) * noiseScale;
-
-        bot.look(
-            bot.entity.yaw + yawNoise,
-            bot.entity.pitch + pitchNoise,
-            true,
-        ).catch(() => {});
-    }, 800);
 
     try {
         while (attempts < maxRetries) {
@@ -134,8 +104,6 @@ export async function navigateWithFallbacks(
             }
         }
     } finally {
-        clearInterval(stuckMonitor);
-        clearInterval(noiseMonitor);
         bot.clearControlStates();
     }
 }

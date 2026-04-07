@@ -47,11 +47,53 @@ type Service struct {
 func isControlledStop(cause string) bool {
 	switch cause {
 	case "preempted_by_priority", "plan_invalidated", "survival_panic", "panic",
-		"panic_triggered", "unlock", "bot_died":
+		"panic_triggered", "unlock", "bot_died", "planner_warmup":
 		return true
 	default:
 		return false
 	}
+}
+
+func shouldWaitForFreshState(cause string) bool {
+	switch cause {
+	case "survival_panic", "panic", "panic_triggered", "unlock":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasImmediateThreat(state domain.GameState) bool {
+	for _, threat := range state.Threats {
+		if threat.Distance <= domain.SurvivalMaxThreatDist {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent) bool {
+	if intent == nil || intent.Action == "" {
+		return false
+	}
+
+	target := strings.ToLower(strings.TrimSpace(intent.Target))
+	switch intent.Action {
+	case "gather":
+		switch target {
+		case "", "none", "air", "water", "lava":
+			return false
+		}
+	case "eat":
+		for _, item := range state.Inventory {
+			if strings.EqualFold(item.Name, target) && item.Count > 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	return true
 }
 
 func NewService(
@@ -175,7 +217,14 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 	if intent != nil && beforePtr != nil && intent.ID == payload.CommandID {
 		after := s.stateProvider.GetCurrentState().State
-		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after)
+
+		failureCount := 0
+		currentPlan := s.planManager.GetCurrent()
+		if currentPlan != nil {
+			failureCount = s.planner.GetFailureCount(currentPlan.Objective)
+		}
+
+		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after, failureCount)
 
 		if !success {
 			successCritic = false
@@ -237,7 +286,9 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 	if controlledStop {
 		s.commitment.Store(nil)
-		go s.evaluateNextPlan(context.Background())
+		if !shouldWaitForFreshState(payload.Cause) {
+			go s.evaluateNextPlan(context.Background())
+		}
 		return
 	}
 
@@ -273,6 +324,10 @@ func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent
 	go s.evaluateNextPlan(context.Background())
 }
 
+func (s *Service) RequestEvaluation() {
+	go s.evaluateNextPlan(context.Background())
+}
+
 func (s *Service) evaluateNextPlan(ctx context.Context) {
 	select {
 	case s.evalSemaphore <- struct{}{}:
@@ -286,6 +341,17 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		return
 	}
 
+	survivalOverride := hasImmediateThreat(state) ||
+		(state.Health < domain.SurvivalCriticalHealth) ||
+		(state.Health < domain.DecisionHealthSafe && state.Food < domain.SurvivalMinFoodForHunt)
+
+	// Keep the current plan/task flowing unless survival needs to interrupt it.
+	if !survivalOverride {
+		if s.activeIntent.Load() != nil || s.planManager.HasActivePlan() {
+			return
+		}
+	}
+
 	if currCommitment := s.commitment.Load(); currCommitment != nil {
 		if time.Since(currCommitment.StartTime) < currCommitment.MinDuration {
 			if state.Health >= domain.DecisionHealthSafe && len(state.Threats) == 0 {
@@ -297,7 +363,7 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 
 	var plan domain.Plan
 
-	if len(state.Threats) > 0 || state.Health < domain.DecisionHealthHunt {
+	if survivalOverride {
 		s.logger.Warn("Survival priority override active")
 		plan = s.planner.reactivePlan(state)
 	} else {
@@ -320,7 +386,7 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 		s.mu.Unlock()
 
 		intent, err := s.curriculum.ProposeTask(ctx, state, historyCopy, s.sessionID)
-		if err == nil && intent != nil {
+		if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
 			plan = domain.Plan{
 				Objective:  "Curriculum Fallback",
 				IsFallback: true,
@@ -335,10 +401,18 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 					},
 				},
 			}
+		} else if err == nil && intent != nil {
+			s.logger.Warn("Rejected invalid curriculum intent",
+				slog.String("action", intent.Action),
+				slog.String("target", intent.Target),
+			)
 		}
 	}
 
 	if len(plan.Tasks) == 0 {
+		if !survivalOverride {
+			s.logger.Debug("Planner warming up, waiting for background or curiosity loop")
+		}
 		return
 	}
 

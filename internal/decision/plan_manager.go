@@ -33,17 +33,29 @@ func (pm *PlanManager) GetCurrent() *domain.Plan {
 
 	// FIX: Return a deep copy to prevent slice mutation data races
 	cp := *pm.current
-	cp.Tasks = make([]domain.Action, len(pm.current.Tasks))
-	copy(cp.Tasks, pm.current.Tasks)
+	cp.Tasks = cloneActions(pm.current.Tasks)
 
 	// Clone fallbacks too
 	cp.Fallbacks = make([][]domain.Action, len(pm.current.Fallbacks))
 	for i, fb := range pm.current.Fallbacks {
-		cp.Fallbacks[i] = make([]domain.Action, len(fb))
-		copy(cp.Fallbacks[i], fb)
+		cp.Fallbacks[i] = cloneActions(fb)
 	}
 
 	return &cp
+}
+
+func cloneActions(src []domain.Action) []domain.Action {
+	if src == nil {
+		return nil
+	}
+	dst := make([]domain.Action, len(src))
+	for i, a := range src {
+		// Bitwise copy of the struct.
+		// If domain.Action ever grows to include pointers or slices,
+		// we must explicitly deep copy them here.
+		dst[i] = a
+	}
+	return dst
 }
 
 func (pm *PlanManager) SetPlan(plan *domain.Plan) {

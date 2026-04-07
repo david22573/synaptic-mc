@@ -80,6 +80,23 @@ func (m *ControllerManager) GetIdempotent() *IdempotentController {
 	return nil
 }
 
+func (m *ControllerManager) RemoveController(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current := m.current.Load()
+	if current != nil && current.ID == id {
+		current.draining.Store(true)
+		m.current.Store(nil)
+
+		// Close in background to avoid blocking
+		go func(vc *VersionedController) {
+			vc.active.Wait()
+			_ = vc.Ctrl.Close()
+		}(current)
+	}
+}
+
 func (m *ControllerManager) SetController(id string, ctrl Controller) {
 	m.mu.Lock()
 	old := m.current.Load()

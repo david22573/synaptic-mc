@@ -5,6 +5,17 @@ import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
+export const LOG_BLOCK_NAMES = [
+    "oak_log",
+    "birch_log",
+    "spruce_log",
+    "jungle_log",
+    "acacia_log",
+    "dark_oak_log",
+    "mangrove_log",
+    "cherry_log",
+] as const;
+
 const TREE_BLOCKS = new Set([
     "oak_leaves",
     "birch_leaves",
@@ -16,13 +27,7 @@ const TREE_BLOCKS = new Set([
     "azalea_leaves",
     "flowering_azalea_leaves",
     "cherry_leaves",
-    "oak_log",
-    "birch_log",
-    "spruce_log",
-    "jungle_log",
-    "acacia_log",
-    "dark_oak_log",
-    "mangrove_log",
+    ...LOG_BLOCK_NAMES,
 ]);
 
 const TRASH_ITEMS = new Set([

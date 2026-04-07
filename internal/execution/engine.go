@@ -25,7 +25,7 @@ func (h actionHeap) Less(i, j int) bool {
 	}
 	return h[i].action.Priority > h[j].action.Priority
 }
-func (h actionHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h actionHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *actionHeap) Push(x interface{}) { *h = append(*h, x.(queuedAction)) }
 func (h *actionHeap) Pop() interface{} {
 	old := *h
@@ -44,7 +44,6 @@ type TaskExecutionEngine struct {
 	recentActions map[string]time.Time
 	inFlight      *ExecutionTask
 	maxInFlight   int
-	retryCount    int
 }
 
 func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
@@ -54,25 +53,26 @@ func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecution
 		queue:         make(actionHeap, 0),
 		recentActions: make(map[string]time.Time),
 		maxInFlight:   1,
-		retryCount:    0,
 	}
 	heap.Init(&e.queue)
 	return e
 }
 
 func (e *TaskExecutionEngine) Start(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	cleanupTicker := time.NewTicker(30 * time.Second)
+	defer cleanupTicker.Stop()
+
+	pumpTicker := time.NewTicker(10 * time.Millisecond)
+	defer pumpTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-cleanupTicker.C:
 			e.cleanupRecentActions()
-		default:
+		case <-pumpTicker.C:
 			e.pump()
-			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -92,7 +92,6 @@ func (e *TaskExecutionEngine) HasController() bool {
 	return e.controller.IsReady()
 }
 
-// FIX: Return a value copy to prevent data races after the lock is released
 func (e *TaskExecutionEngine) GetInFlight() *domain.Action {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -107,7 +106,6 @@ func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Curiosity tasks should never be deduplicated, they are a fallback for idleness
 	isCuriosity := action.ID == "explore-curiosity-stable"
 
 	dedupKey := action.Action + ":" + action.Target.Name
@@ -154,7 +152,6 @@ func (e *TaskExecutionEngine) pump() {
 				if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
 					e.inFlight = nil
 				}
-				e.retryCount = 0
 				e.mu.Unlock()
 				return
 			}
@@ -165,35 +162,13 @@ func (e *TaskExecutionEngine) pump() {
 				e.inFlight.Error = err.Error()
 				e.inFlight = nil
 			}
-
-			e.retryCount++
-			shouldRetry := e.retryCount < 5
 			e.mu.Unlock()
 
 			if err.Error() != "no active controller" {
-				e.logger.Error("Failed to dispatch task", slog.Any("error", err), slog.String("action", qa.action.Action), slog.Int("retry", e.retryCount))
-			}
-
-			if shouldRetry {
-				backoff := time.Duration(e.retryCount*100) * time.Millisecond
-				time.Sleep(backoff)
-
-				e.mu.Lock()
-				qa.enqueuedAt = time.Now()
-				heap.Push(&e.queue, qa)
-				e.mu.Unlock()
-			} else {
-				e.logger.Error("Max dispatch retries exceeded, dropping task", slog.String("action", qa.action.Action))
-				e.mu.Lock()
-				e.retryCount = 0
-				e.mu.Unlock()
+				e.logger.Error("Task execution failed, notifying planner", slog.Any("error", err), slog.String("action", qa.action.Action))
 			}
 			return
 		}
-
-		e.mu.Lock()
-		e.retryCount = 0
-		e.mu.Unlock()
 	}(qa)
 }
 

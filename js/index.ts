@@ -52,6 +52,7 @@ const isIgnorableError = (err: Error | any): boolean => {
             "Protocol parsing error detected. World state may be inconsistent.",
             { error: msg },
         );
+        recordProtocolError(msg);
         return true;
     }
 
@@ -115,6 +116,11 @@ let reconnectAttempt = 1;
 let stateInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 let isBotSpawned = false;
+let protocolErrorTimestamps: number[] = [];
+let protocolRecoveryInProgress = false;
+let manualReconnectPending = false;
+let lastProtocolErrorAt = 0;
+let lastProtocolLogAt = 0;
 
 let hasDied = false;
 
@@ -130,6 +136,85 @@ function stopMovement() {
             bot.pathfinder.setGoal(null);
         }
     } catch (e) {}
+}
+
+function scheduleProtocolRecovery(reason: string) {
+    if (!bot || isShuttingDown || protocolRecoveryInProgress) return;
+
+    protocolRecoveryInProgress = true;
+    manualReconnectPending = true;
+    protocolErrorTimestamps = [];
+    isBotSpawned = false;
+    clearPOICache();
+    survival?.reset();
+    abortActiveTask("protocol_desync");
+
+    log.warn("Protocol stream desynced; forcing reconnect", { reason });
+
+    try {
+        bot.removeAllListeners();
+        bot.quit(reason);
+    } catch {
+        try {
+            bot.end(reason);
+        } catch {}
+    }
+
+    setTimeout(() => {
+        if (!isShuttingDown) {
+            reconnectAttempt = 1;
+            void connectWithRetry();
+        }
+    }, 1500);
+}
+
+function recordProtocolError(reason: string) {
+    const now = Date.now();
+    lastProtocolErrorAt = now;
+    protocolErrorTimestamps.push(now);
+    protocolErrorTimestamps = protocolErrorTimestamps.filter(
+        (ts) => now - ts < 5000,
+    );
+
+    const isSpawnBurst = !isBotSpawned && protocolErrorTimestamps.length >= 3;
+    const isSustainedBurst = protocolErrorTimestamps.length >= 5;
+
+    if (isSpawnBurst || isSustainedBurst) {
+        scheduleProtocolRecovery(reason);
+    }
+}
+
+function handleBotProtocolError(err: Error | any) {
+    if (!err) return;
+
+    const msg = String(err?.message || err?.stack || err);
+    const name = String(err?.name || "");
+    const isProtocolError =
+        name.includes("PartialReadError") ||
+        msg.includes("PartialReadError") ||
+        msg.includes("VarInt") ||
+        msg.includes("protodef") ||
+        msg.includes("entity_metadata");
+
+    if (!isProtocolError) {
+        log.error("Bot runtime error", {
+            err: err?.message || String(err),
+            stack: err?.stack,
+        });
+        return;
+    }
+
+    recordProtocolError(msg);
+
+    // Keep the logs high signal while malformed packets are flooding in.
+    if (Date.now() - lastProtocolLogAt < 250) return;
+    lastProtocolLogAt = Date.now();
+
+    log.warn("Malformed Minecraft protocol packet received", {
+        error: msg,
+        version: bot?.version,
+        protocolVersion: bot?.protocolVersion,
+    });
 }
 
 function completeTask(
@@ -439,16 +524,21 @@ async function connectWithRetry(maxAttempts = 10) {
         } catch (e) {}
     }
 
-    // FIXED: Explicitly set version to 1.19.1 to stabilize protodef parsing
+    const mcVersion = process.env.MC_VERSION || undefined;
+
     bot = mineflayer.createBot({
         host: "127.0.0.1",
         port: 25565,
         username: "SynapticBot",
-        version: "1.19.1",
+        // Prefer protocol autodetection unless explicitly pinned by the user.
+        version: mcVersion,
+        hideErrors: true,
+        logErrors: false,
     });
 
     bot.loadPlugin(pathfinder);
     bot.loadPlugin(collectBlock);
+    bot.on("error", handleBotProtocolError);
 
     if (!client) {
         client = new SynapticClient({
@@ -493,6 +583,9 @@ async function connectWithRetry(maxAttempts = 10) {
                 pushState();
             },
             onPanicEnd: (cause: string) => {
+                if (currentTask?.action === "retreat") {
+                    abortActiveTask("unlock");
+                }
                 client.sendEvent("panic_retreat_end", "evasion_complete", "", cause, 0);
                 pushState();
             },
@@ -505,7 +598,15 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.on("spawn", () => {
         reconnectAttempt = 1;
         isBotSpawned = true;
-        log.info("Bot spawned successfully.");
+        protocolRecoveryInProgress = false;
+        manualReconnectPending = false;
+        protocolErrorTimestamps = [];
+        lastProtocolErrorAt = 0;
+        lastProtocolLogAt = 0;
+        log.info("Bot spawned successfully.", {
+            version: bot.version,
+            protocolVersion: bot.protocolVersion,
+        });
         clearPOICache();
 
         // FIXED: Enhanced Movements config for 1.19.1 stability
@@ -552,6 +653,7 @@ async function connectWithRetry(maxAttempts = 10) {
         isBotSpawned = false;
         clearPOICache();
         if (isShuttingDown) return;
+        if (manualReconnectPending) return;
         const backoff = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
         setTimeout(() => {
             reconnectAttempt++;

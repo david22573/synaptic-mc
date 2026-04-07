@@ -10,6 +10,9 @@
     );
     const offhand = $derived(botStore.gameState?.offhand || null);
     const activeSlot = $derived(botStore.gameState?.active_slot ?? 0);
+    
+    // Derived state for the warning banner
+    const failureWarning = $derived(botStore.activeFailure);
 
     const fullHearts = $derived(Math.max(0, Math.floor(health / 2)));
     const halfHearts = $derived(health % 2 !== 0 && health > 0 ? 1 : 0);
@@ -38,6 +41,16 @@
 
 <div class="mc-overlay">
     <div class="mc-crosshair"></div>
+
+    {#if failureWarning && failureWarning.failure_count > 1}
+        <div class="mc-alert-banner" class:critical={failureWarning.failure_count >= 3}>
+            <span class="mc-alert-icon">⚠️</span>
+            <div class="mc-alert-text">
+                <strong>Plan Stalled ({failureWarning.failure_count}/3):</strong> 
+                {failureWarning.reason}
+            </div>
+        </div>
+    {/if}
 
     <div class="mc-hud">
         <div class="mc-bars">
@@ -131,9 +144,9 @@
         pointer-events: none;
         display: flex;
         flex-direction: column;
-        justify-content: flex-end;
+        justify-content: flex-start;
         align-items: center;
-        padding-bottom: 24px;
+        padding-top: 24px;
         z-index: 10;
     }
 
@@ -167,6 +180,36 @@
         left: 7px;
         width: 2px;
         height: 16px;
+    }
+
+    .mc-alert-banner {
+        background: rgba(40, 0, 0, 0.85);
+        border: 2px solid #ff4444;
+        color: white;
+        padding: 8px 16px;
+        margin-bottom: 24px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-family: monospace;
+        font-size: 14px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        pointer-events: auto;
+    }
+
+    .mc-alert-banner.critical {
+        background: rgba(80, 0, 0, 0.95);
+        border-color: #ff0000;
+        animation: pulse 1s infinite alternate;
+    }
+
+    .mc-alert-icon {
+        font-size: 20px;
+    }
+
+    @keyframes pulse {
+        from { box-shadow: 0 0 4px #ff0000; }
+        to { box-shadow: 0 0 16px #ff0000; }
     }
 
     .mc-hud {

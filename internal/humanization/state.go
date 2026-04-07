@@ -11,7 +11,13 @@ type State struct {
 	AttentionLevel float64
 	Fatigue        float64
 	Intent         IntentState // NEW: Hooked in from intent.go
+	Feedback       Feedback    // Phase 6: Awareness of execution success/failure
 	cfg            Config
+}
+
+type Feedback struct {
+	Failures    int
+	SuccessRate float64
 }
 
 func NewState(cfg Config) *State {
@@ -19,6 +25,7 @@ func NewState(cfg Config) *State {
 		AttentionLevel: 1.0,
 		Fatigue:        0.0,
 		Intent:         IntentState{},
+		Feedback:       Feedback{SuccessRate: 1.0},
 		cfg:            cfg,
 	}
 }
@@ -39,8 +46,21 @@ func (s *State) Evolve(ctx Context, dt time.Duration) {
 	}
 }
 
+func (s *State) UpdateFeedback(failures int, successRate float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Feedback.Failures = failures
+	s.Feedback.SuccessRate = successRate
+}
+
 func (s *State) GetAttention() float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.AttentionLevel
+}
+
+func (s *State) GetFeedback() Feedback {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Feedback
 }

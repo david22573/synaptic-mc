@@ -28,6 +28,7 @@ type WSMessage struct {
 
 type WSController struct {
 	conn      *websocket.Conn
+	ctx       context.Context
 	logger    *slog.Logger
 	sendCh    chan WSMessage
 	onMessage func(msgType string, payload []byte)
@@ -38,12 +39,14 @@ type WSController struct {
 }
 
 func NewWSController(
+	ctx context.Context,
 	conn *websocket.Conn,
 	logger *slog.Logger,
 	onMessage func(msgType string, payload []byte),
 	onClose func(),
 ) *WSController {
 	c := &WSController{
+		ctx:       ctx,
 		conn:      conn,
 		logger:    logger.With(slog.String("component", "ws_controller")),
 		sendCh:    make(chan WSMessage, 256),
@@ -191,6 +194,9 @@ func (c *WSController) writePump() {
 
 	for {
 		select {
+		case <-c.ctx.Done():
+			return
+
 		case msg, ok := <-c.sendCh:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {

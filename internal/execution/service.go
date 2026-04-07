@@ -78,7 +78,7 @@ func (s *ControlService) SetReflexActive(active bool) {
 func isControlledStop(cause string) bool {
 	switch cause {
 	case "preempted_by_priority", "plan_invalidated", "survival_panic", "panic",
-		"panic_triggered", "unlock", "bot_died":
+		"panic_triggered", "unlock", "bot_died", "planner_warmup":
 		return true
 	default:
 		return false

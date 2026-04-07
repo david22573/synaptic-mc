@@ -10,7 +10,7 @@ import (
 )
 
 type Critic interface {
-	Evaluate(intent domain.ActionIntent, before, after domain.GameState) (bool, string)
+	Evaluate(intent domain.ActionIntent, before, after domain.GameState, failureCount int) (bool, string)
 }
 
 type StateCritic struct{}
@@ -19,7 +19,12 @@ func NewStateCritic() *StateCritic {
 	return &StateCritic{}
 }
 
-func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState) (bool, string) {
+func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, failureCount int) (bool, string) {
+	// If the planner has failed multiple times, explicitly tell the LLM it's stuck.
+	if failureCount >= 2 {
+		return false, fmt.Sprintf("Critique: Task '%s' has failed %d times in a row. The environment is blocking execution. ABANDON this task and choose a completely different approach.", intent.Action, failureCount)
+	}
+
 	if after.Health <= 0 {
 		return false, "Critique: Bot died while executing the task. Re-evaluate threat assessment and survival priorities."
 	}
@@ -166,6 +171,7 @@ func (c *StateCritic) GenerateRules(ctx context.Context, sessionID string) strin
 	rules.WriteString("- 'build' requires ≥20 blocks (dirt/planks/cobblestone)\n")
 	rules.WriteString("- 'smelt' requires raw material + fuel (coal/wood)\n")
 	rules.WriteString("- Movement actions should result in >3 block displacement\n")
+	rules.WriteString("- If an action fails repeatedly, do NOT try it again. Choose a different approach.\n")
 
 	return rules.String()
 }

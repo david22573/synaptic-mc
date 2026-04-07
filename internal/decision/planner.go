@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,14 +39,23 @@ type AdvancedPlanner struct {
 	flags     config.FeatureFlags
 
 	currentPlan atomic.Pointer[domain.Plan]
-	replanCh    chan domain.GameState
+	latestState atomic.Pointer[domain.GameState]
 
-	planCache map[uint64]*domain.Plan
+	planCache map[uint64]cachedPlan
 	cacheMu   sync.RWMutex
 
 	failures map[string]int
 	failMu   sync.Mutex
+
+	onPlanReady func()
 }
+
+type cachedPlan struct {
+	plan      *domain.Plan
+	createdAt time.Time
+}
+
+const maxPlanCacheSize = 500
 
 func NewAdvancedPlanner(
 	client LLMClient,
@@ -64,8 +74,7 @@ func NewAdvancedPlanner(
 		store:     store,
 		logger:    logger.With(slog.String("component", "advanced_planner")),
 		flags:     flags,
-		replanCh:  make(chan domain.GameState, 1),
-		planCache: make(map[uint64]*domain.Plan),
+		planCache: make(map[uint64]cachedPlan),
 		failures:  make(map[string]int),
 	}
 }
@@ -148,7 +157,11 @@ func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState)
 }
 
 func (p *AdvancedPlanner) Close() {
-	close(p.replanCh)
+	// No channels to close currently.
+}
+
+func (p *AdvancedPlanner) SetOnPlanReady(cb func()) {
+	p.onPlanReady = cb
 }
 
 func (p *AdvancedPlanner) RecordFailure(objective string) {
@@ -163,6 +176,12 @@ func (p *AdvancedPlanner) RecordSuccess(objective string) {
 	p.failMu.Unlock()
 }
 
+func (p *AdvancedPlanner) GetFailureCount(objective string) int {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	return p.failures[objective]
+}
+
 func (p *AdvancedPlanner) ClearCurrentPlan() {
 	p.currentPlan.Store(nil)
 }
@@ -171,50 +190,53 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	var latestState domain.GameState
+	var activeState *domain.GameState
 	var lastPlannedState domain.GameState
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case state, ok := <-p.replanCh:
-			if !ok {
-				return
-			}
-			latestState = state
 		case <-ticker.C:
-			if latestState.Health == 0 && latestState.Food == 0 &&
-				latestState.Position.X == 0 && latestState.Position.Y == 0 && latestState.Position.Z == 0 &&
-				len(latestState.Inventory) == 0 {
-				// Only skip when we truly have not received any meaningful state yet.
+			// Pull latest state if one was triggered
+			if s := p.latestState.Swap(nil); s != nil {
+				activeState = s
+			}
+
+			if activeState == nil {
 				continue
 			}
 
-			needsReplan := p.currentPlan.Load() == nil || p.stateChangedSignificantly(lastPlannedState, latestState)
+			if activeState.Health == 0 && activeState.Food == 0 &&
+				activeState.Position.X == 0 && activeState.Position.Y == 0 && activeState.Position.Z == 0 &&
+				len(activeState.Inventory) == 0 {
+				continue
+			}
+
+			needsReplan := p.currentPlan.Load() == nil || p.stateChangedSignificantly(lastPlannedState, *activeState)
 
 			if !needsReplan {
 				continue
 			}
 
-			plan, err := p.generateLLMPlan(ctx, sessionID, latestState)
+			plan, err := p.generateLLMPlan(ctx, sessionID, *activeState)
 			if err != nil {
 				p.logger.Error("Background LLM planning failed", slog.Any("error", err))
 				continue
 			}
 
 			p.currentPlan.Store(plan)
-			lastPlannedState = latestState
+			lastPlannedState = *activeState
 			p.logger.Info("Background replan complete", slog.String("objective", plan.Objective))
+			if p.onPlanReady != nil {
+				go p.onPlanReady()
+			}
 		}
 	}
 }
 
 func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
-	select {
-	case p.replanCh <- state:
-	default:
-	}
+	p.latestState.Store(&state)
 }
 
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
@@ -275,8 +297,36 @@ func (p *AdvancedPlanner) degradedPlan(state domain.GameState) domain.Plan {
 
 func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 	var tasks []domain.Action
+	hasFood := false
+	hasImmediateThreat := false
 
-	if state.Health < 10 || len(state.Threats) > 0 {
+	for _, item := range state.Inventory {
+		name := strings.ToLower(item.Name)
+		if item.Count > 0 && (strings.Contains(name, "bread") ||
+			strings.Contains(name, "apple") ||
+			strings.Contains(name, "berries") ||
+			strings.Contains(name, "carrot") ||
+			strings.Contains(name, "potato") ||
+			strings.Contains(name, "cooked_") ||
+			strings.Contains(name, "beef") ||
+			strings.Contains(name, "porkchop") ||
+			strings.Contains(name, "mutton") ||
+			strings.Contains(name, "chicken") ||
+			strings.Contains(name, "rabbit")) {
+			hasFood = true
+			break
+		}
+	}
+
+	for _, threat := range state.Threats {
+		if threat.Distance <= domain.SurvivalMaxThreatDist {
+			hasImmediateThreat = true
+			break
+		}
+	}
+
+	switch {
+	case hasImmediateThreat:
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-heal-%d", time.Now().UnixNano()),
 			Action:    "retreat",
@@ -284,13 +334,21 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 			Priority:  100,
 			Rationale: "Reactive fast-path fallback: Survival Critical",
 		})
-	} else {
+	case state.Health < domain.DecisionHealthSafe && hasFood:
 		tasks = append(tasks, domain.Action{
-			ID:        fmt.Sprintf("react-idle-%d", time.Now().UnixNano()),
-			Action:    "idle",
-			Target:    domain.Target{Name: "none", Type: "none"},
-			Priority:  -2,
-			Rationale: "Reactive fast-path fallback: Awaiting LLM instruction",
+			ID:        fmt.Sprintf("react-eat-%d", time.Now().UnixNano()),
+			Action:    "eat",
+			Target:    domain.Target{Name: "best_food", Type: "item"},
+			Priority:  95,
+			Rationale: "Reactive fast-path fallback: Recover health with available food",
+		})
+	case state.Health < domain.SurvivalCriticalHealth || state.Food < domain.SurvivalMinFoodForHunt:
+		tasks = append(tasks, domain.Action{
+			ID:        fmt.Sprintf("react-food-%d", time.Now().UnixNano()),
+			Action:    "explore",
+			Target:    domain.Target{Name: "food_source", Type: "category"},
+			Priority:  85,
+			Rationale: "Reactive fast-path fallback: Seek immediate food instead of looping retreat",
 		})
 	}
 
@@ -300,14 +358,43 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 	}
 }
 
+func (p *AdvancedPlanner) evictCache() {
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+
+	if len(p.planCache) < maxPlanCacheSize {
+		return
+	}
+
+	// Evict 20% of entries randomly to keep memory usage bounded.
+	// Go map iteration is naturally randomized.
+	count := 0
+	target := maxPlanCacheSize / 5
+	for k := range p.planCache {
+		delete(p.planCache, k)
+		count++
+		if count >= target {
+			break
+		}
+	}
+}
+
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	stateHash := hashState(state)
 
 	p.cacheMu.RLock()
-	if cachedPlan, ok := p.planCache[stateHash]; ok {
-		p.cacheMu.RUnlock()
-		p.logger.Info("Using cached plan for stable state", slog.String("objective", cachedPlan.Objective))
-		return p.clonePlanWithNewIDs(cachedPlan), nil
+	if entry, ok := p.planCache[stateHash]; ok {
+		cachedPlan := entry.plan
+		p.failMu.Lock()
+		fails := p.failures[cachedPlan.Objective]
+		p.failMu.Unlock()
+
+		// ONLY use the cache if this plan hasn't proven to be a failure
+		if fails == 0 {
+			p.cacheMu.RUnlock()
+			p.logger.Info("Using cached plan for stable state", slog.String("objective", cachedPlan.Objective))
+			return p.clonePlanWithNewIDs(cachedPlan), nil
+		}
 	}
 	p.cacheMu.RUnlock()
 
@@ -398,8 +485,12 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		finalPlan.Fallbacks = append(finalPlan.Fallbacks, scored[i].tasks)
 	}
 
+	p.evictCache()
 	p.cacheMu.Lock()
-	p.planCache[stateHash] = finalPlan
+	p.planCache[stateHash] = cachedPlan{
+		plan:      finalPlan,
+		createdAt: time.Now(),
+	}
 	p.cacheMu.Unlock()
 
 	return finalPlan, nil

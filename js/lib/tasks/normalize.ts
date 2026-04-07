@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import * as models from "../models.js";
 import { log } from "../logger.js";
+import { LOG_BLOCK_NAMES } from "./utils.js";
 
 const LOG_TO_PLANK_MAP: Record<string, string> = {
     oak_log: "oak_planks",
@@ -31,10 +32,10 @@ const TARGET_ALIASES: Record<string, string> = {
     cobble: "cobblestone",
 
     // Gathering Aliases
-    tree: "oak_log",
-    log: "oak_log",
-    timber: "oak_log",
-    wood: "oak_log",
+    tree: "log",
+    log: "log",
+    timber: "log",
+    wood: "log",
 };
 
 export function normalizeIntent(
@@ -91,11 +92,23 @@ export function normalizeIntent(
         if (targetName === "table" || targetName === "workbench") {
             targetName = "crafting_table";
         }
-    } else if (
-        action === "gather" &&
-        (targetName === "wood" || targetName === "oak_log")
-    ) {
-        // Handled naturally by the gather handler
+    } else if (action === "gather") {
+        if (targetName === "wood" || targetName === "log") {
+            targetName = "log";
+        } else if (targetName.endsWith("_log")) {
+            if (!LOG_TO_PLANK_MAP[targetName]) {
+                const inventoryLog = bot.inventory
+                    .items()
+                    .find((item) =>
+                        LOG_BLOCK_NAMES.includes(
+                            item.name as (typeof LOG_BLOCK_NAMES)[number],
+                        ),
+                    );
+                if (inventoryLog) {
+                    targetName = inventoryLog.name;
+                }
+            }
+        }
     }
 
     // 3. Log and apply changes if a normalization occurred

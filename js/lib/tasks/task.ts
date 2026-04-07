@@ -282,6 +282,10 @@ export async function runTask(
     } catch (err: any) {
         stopMovement();
 
+        if (err?.message === "aborted") {
+            return { success: false, cause: "aborted", progress: 1.0 };
+        }
+
         // Phase 1: Return the structured result back so we can pipe it over websockets
         if (err instanceof ExecutionError || err.name === "ExecutionError") {
             return {

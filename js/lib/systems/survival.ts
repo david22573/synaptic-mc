@@ -1,3 +1,4 @@
+// js/lib/systems/survival.ts
 import type { Bot } from "mineflayer";
 import { log } from "../logger.js";
 import { getThreats } from "../utils/threats.js";
@@ -83,7 +84,7 @@ export class SurvivalSystem {
                 return;
 
             this.isPanicking = true;
-            this.panicCooldownUntil = Date.now() + 5000; // 5-second cooldown
+            this.panicCooldownUntil = Date.now() + 15000; // 15-second cooldown to avoid retreat thrashing
 
             log.warn(
                 "SENSOR: Critical Threat Detected. Interrupting TS execution loop.",

@@ -63,6 +63,7 @@ export class StateMachineRunner {
             });
 
             try {
+                const prevState = this.currentState;
                 const nextState = await Promise.race([
                     this.currentState.execute(this.context),
                     timeoutPromise,
@@ -70,11 +71,15 @@ export class StateMachineRunner {
 
                 if (timeoutId) clearTimeout(timeoutId);
 
-                if (nextState !== this.currentState) {
+                if (nextState !== prevState) {
                     if (nextState) {
                         await nextState.enter(this.context);
                     }
                     this.currentState = nextState;
+                } else {
+                    // Safety: Yield to the event loop if we are staying in the same state
+                    // to prevent synchronous CPU pinning.
+                    await new Promise(resolve => setImmediate(resolve));
                 }
             } catch (err: unknown) {
                 if (timeoutId) clearTimeout(timeoutId);

@@ -13,14 +13,15 @@ type SurvivalPolicy struct{}
 func NewSurvivalPolicy() *SurvivalPolicy { return &SurvivalPolicy{} }
 
 func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decision {
-	if input.Plan == nil {
-		return Decision{IsApproved: true}
+	var tasks []domain.Action
+	if input.Plan != nil {
+		tasks = input.Plan.Tasks
 	}
 
 	// 1. Critical-health override
 	if input.State.Health < domain.SurvivalCriticalHealth {
 		isValidEscape := false
-		for _, t := range input.Plan.Tasks {
+		for _, t := range tasks {
 			if t.Action == "retreat" || t.Action == "eat" || t.Action == "gather" || t.Action == "explore" {
 				isValidEscape = true
 				break
@@ -30,7 +31,7 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 			override := p.buildEmergencyPlan(input.State)
 			return Decision{
 				IsApproved:      false,
-				Reason:          "POLICY: health < 4; forcing eat/retreat",
+				Reason:          "POLICY: health critical; forcing eat/retreat",
 				OverridePlan:    override,
 				ReflexTriggered: true,
 			}
@@ -42,7 +43,7 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 		for _, t := range input.State.Threats {
 			if t.Distance <= domain.SurvivalMaxThreatDist {
 				isValidEscape := false
-				for _, task := range input.Plan.Tasks {
+				for _, task := range tasks {
 					if task.Action == "retreat" || task.Action == "eat" {
 						isValidEscape = true
 						break
@@ -52,7 +53,7 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 					override := p.buildEmergencyPlan(input.State)
 					return Decision{
 						IsApproved:      false,
-						Reason:          "POLICY: hostile within 12 blocks; forcing eat/retreat",
+						Reason:          "POLICY: hostile within danger zone; forcing eat/retreat",
 						OverridePlan:    override,
 						ReflexTriggered: true,
 					}
@@ -63,12 +64,12 @@ func (p *SurvivalPolicy) Decide(ctx context.Context, input DecisionInput) Decisi
 	}
 
 	// 3. Hunt safety check
-	for _, t := range input.Plan.Tasks {
+	for _, t := range tasks {
 		if t.Action == "hunt" {
 			if input.State.Health < domain.SurvivalMinFoodForHunt {
 				return Decision{
 					IsApproved: false,
-					Reason:     "POLICY: health < 8; too weak to hunt",
+					Reason:     "POLICY: health too low; too weak to hunt",
 				}
 			}
 			if strings.Contains(t.Target.Name, "creeper") ||
