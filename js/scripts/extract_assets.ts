@@ -12,6 +12,32 @@ const DATA_DIR = path.resolve(
     "../node_modules/minecraft-assets/minecraft-assets/data",
 );
 const DEST_DIR = path.resolve(__dirname, "../public/assets/items");
+const COPY_RETRIES = 3;
+
+function copyFileWithRetry(srcFile: string, destFile: string) {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= COPY_RETRIES; attempt++) {
+        try {
+            fs.copyFileSync(srcFile, destFile);
+            return;
+        } catch (error) {
+            lastError = error;
+
+            try {
+                // Windows can intermittently fail `copyFileSync` against pnpm-managed
+                // hardlinked package files. Fall back to a plain read/write copy.
+                const data = fs.readFileSync(srcFile);
+                fs.writeFileSync(destFile, data);
+                return;
+            } catch (fallbackError) {
+                lastError = fallbackError;
+            }
+        }
+    }
+
+    throw lastError;
+}
 
 function findBestVersionFolder(): string | null {
     if (!fs.existsSync(DATA_DIR)) {
@@ -82,7 +108,7 @@ function extractAssets() {
                 const srcFile = path.join(srcDir, file);
                 const destFile = path.join(DEST_DIR, file);
 
-                fs.copyFileSync(srcFile, destFile);
+                copyFileWithRetry(srcFile, destFile);
                 copied++;
             }
         }
