@@ -5,12 +5,9 @@
 
 ifeq ($(OS),Windows_NT)
 	BIN_NAME = bin/synaptic-server.exe
-	# Use taskkill on Windows to unlock the binary before rebuilding
-	PRE_BUILD = cmd /c "taskkill /F /IM synaptic-server.exe /T 2>NUL || exit /b 0"
 	BUILD_TIME = $(shell powershell -NoProfile -Command "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')")
 else
 	BIN_NAME = bin/synaptic-server
-	PRE_BUILD = pkill -f $(BIN_NAME) 2>/dev/null || true
 	BUILD_TIME = $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 endif
 

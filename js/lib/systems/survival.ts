@@ -5,6 +5,8 @@ import { getThreats } from "../utils/threats.js";
 export interface SurvivalConfig {
     onInterrupt: (reason: string) => void;
     stopMovement: () => void;
+    onPanicStart?: (cause: string) => void;
+    onPanicEnd?: (cause: string) => void;
 }
 
 export class SurvivalSystem {
@@ -32,8 +34,8 @@ export class SurvivalSystem {
             }
 
             if (this.running) {
-                // Run twice a second. Fast enough to catch creepers, slow enough to spare the CPU.
-                this.tickTimeout = setTimeout(tick, 500);
+                // Run four times a second so close-range hostiles trigger faster.
+                this.tickTimeout = setTimeout(tick, 250);
             }
         };
 
@@ -58,11 +60,17 @@ export class SurvivalSystem {
     private checkSurvival() {
         const threats = getThreats(this.bot);
 
-        // Filter for things that are actually trying to kill us right now
+        const criticalMobNames = new Set(["creeper", "skeleton", "witch"]);
+
+        // React earlier when health is already compromised or a high-risk mob is close.
         const immediateThreats = threats.filter(
             (t: any) =>
-                t.distance < 16 &&
-                t.threatScore > 5 &&
+                t.distance < 20 &&
+                (
+                    t.threatScore > 5 ||
+                    this.bot.health <= 12 ||
+                    criticalMobNames.has(t.name)
+                ) &&
                 t.name !== "low_health_no_food" &&
                 t.name !== "starvation",
         );
@@ -86,15 +94,13 @@ export class SurvivalSystem {
                 },
             );
 
-            // Phase 0.1: Removed this.config.stopMovement() to allow movement during panic.
-
-            // This aborts the current TS FSM with cause: "INTERRUPTED"
-            // Go's FeedbackAnalyzer catches this, drops the micro-plan, and asks Strategy for a Retreat Directive.
+            this.config.onPanicStart?.(topThreat.name);
             this.config.onInterrupt(`panic_${topThreat.name}`);
         } else if (this.isPanicking && Date.now() > this.panicCooldownUntil) {
             // Coast is clear and cooldown finished. Drop the panic lock.
             this.isPanicking = false;
             log.info("SENSOR: Threat passed; releasing panic lock.");
+            this.config.onPanicEnd?.("safe");
         }
     }
 }

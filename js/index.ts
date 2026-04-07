@@ -472,12 +472,24 @@ async function connectWithRetry(maxAttempts = 10) {
     if (!survival) {
         survival = new SurvivalSystem(bot, {
             onInterrupt: (r: string) => {
-                if (r === "panic_flee") abortActiveTask("survival_panic");
+                if (r.startsWith("panic_")) {
+                    abortActiveTask("survival_panic");
+                    pushState();
+                }
             },
             stopMovement: () => stopMovement(),
+            onPanicStart: (cause: string) => {
+                client.sendEvent("panic_retreat_start", "evasion", "", cause, 0);
+                pushState();
+            },
+            onPanicEnd: (cause: string) => {
+                client.sendEvent("panic_retreat_end", "evasion_complete", "", cause, 0);
+                pushState();
+            },
         });
     } else {
         survival.bot = bot;
+        survival.reset();
     }
 
     bot.on("spawn", () => {
@@ -498,7 +510,14 @@ async function connectWithRetry(maxAttempts = 10) {
         bot.pathfinder.thinkTimeout = 5000;
 
         survival.start();
+        lastStateSig = "";
+        lastStatePushTime = 0;
         pushState();
+
+        if (hasDied) {
+            client.sendEvent("bot_respawn", { status: "respawned" });
+            hasDied = false;
+        }
 
         if (runtimeConfig.enable_viewer && !viewerStarted) {
             viewer(bot, { port: runtimeConfig.viewer_port, firstPerson: true });
@@ -508,6 +527,8 @@ async function connectWithRetry(maxAttempts = 10) {
 
     bot.on("death", () => {
         isBotSpawned = false;
+        hasDied = true;
+        survival.reset();
         abortActiveTask("bot_died");
         client.sendEvent("death", { error: "bot_died" });
         setTimeout(() => {

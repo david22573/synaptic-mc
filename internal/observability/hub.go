@@ -1,4 +1,3 @@
-// internal/observability/hub.go
 package observability
 
 import (

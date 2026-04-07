@@ -31,6 +31,7 @@ func (h *actionHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
 	item := old[n-1]
+	old[n-1] = queuedAction{} // FIX: Prevent context memory leak on pop
 	*h = old[0 : n-1]
 	return item
 }
@@ -91,11 +92,13 @@ func (e *TaskExecutionEngine) HasController() bool {
 	return e.controller.IsReady()
 }
 
+// FIX: Return a value copy to prevent data races after the lock is released
 func (e *TaskExecutionEngine) GetInFlight() *domain.Action {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.inFlight != nil {
-		return &e.inFlight.Action
+		copyAction := e.inFlight.Action
+		return &copyAction
 	}
 	return nil
 }

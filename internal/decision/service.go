@@ -71,6 +71,8 @@ func NewService(
 
 	bus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
 	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+	bus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
+	bus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
 
 	return s
 }
@@ -237,6 +239,19 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	s.planner.ClearCurrentPlan()
 
 	_ = s.planManager.Transition(domain.PlanStatusCompleted)
+	go s.evaluateNextPlan(context.Background())
+}
+
+func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.DomainEvent) {
+	s.commitment.Store(nil)
+	s.activeIntent.Store(nil)
+	s.beforeState.Store(nil)
+	s.planner.ClearCurrentPlan()
+	s.planManager.Clear()
+}
+
+func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
+	s.handlePlanInvalidated(ctx, event)
 	go s.evaluateNextPlan(context.Background())
 }
 
