@@ -30,10 +30,10 @@ func NewService(bus domain.EventBus, logger *slog.Logger) *Service {
 	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
 
 	// Catch UI-driven updates if they come through as STATE_UPDATE
-	bus.Subscribe(domain.EventType("STATE_UPDATE"), domain.FuncHandler(s.handleStateTick))
+	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
 
 	// Phase 5: Listen for task completion to alter the world model
-	bus.Subscribe(domain.EventType("TASK_END"), domain.FuncHandler(s.handleTaskEnd))
+	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
 
 	return s
 }
@@ -52,6 +52,8 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 		return
 	}
 
+	newState.Initialized = true
+
 	// Phase 5: Build world model - Track chunks visited from heartbeat
 	newState.RecordChunkVisit(int(newState.Position.X)>>4, int(newState.Position.Z)>>4)
 
@@ -67,7 +69,11 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 
 // Phase 5: Mutate state actively based on execution feedback
 func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
-	var result domain.ExecutionResult
+	var result struct {
+		Success  bool    `json:"success"`
+		Cause    string  `json:"cause"`
+		Progress float64 `json:"progress"`
+	}
 	if err := json.Unmarshal(event.Payload, &result); err != nil {
 		return
 	}

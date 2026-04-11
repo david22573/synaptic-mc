@@ -48,7 +48,7 @@ type DynamicFlags struct {
 	lastMod  time.Time
 	logger   *slog.Logger
 
-	reloadCh chan struct{}
+	subs []chan struct{}
 }
 
 func NewDynamicFlags(path string, logger *slog.Logger) *DynamicFlags {
@@ -56,7 +56,7 @@ func NewDynamicFlags(path string, logger *slog.Logger) *DynamicFlags {
 		flags:    DefaultFlags(),
 		filepath: path,
 		logger:   logger.With(slog.String("component", "config_watcher")),
-		reloadCh: make(chan struct{}),
+		subs:     make([]chan struct{}, 0),
 	}
 
 	if path != "" {
@@ -73,11 +73,25 @@ func (f *DynamicFlags) Get() FeatureFlags {
 	return f.flags
 }
 
-// ReloadChannel returns a channel that gets closed whenever the config is successfully reloaded.
-func (f *DynamicFlags) ReloadChannel() <-chan struct{} {
+// Subscribe returns a new channel that receives a signal whenever the config is reloaded.
+func (f *DynamicFlags) Subscribe() <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch := make(chan struct{}, 1)
+	f.subs = append(f.subs, ch)
+	return ch
+}
+
+func (f *DynamicFlags) notify() {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.reloadCh
+	for _, ch := range f.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+			// Buffer full, signal already pending
+		}
+	}
 }
 
 // LoadFromFile reads the JSON config and updates the flags safely.
@@ -92,21 +106,17 @@ func (f *DynamicFlags) LoadFromFile() error {
 		return err
 	}
 
-	var newFlags FeatureFlags
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Start with a copy of current flags to support partial updates
+	newFlags := f.flags
 	if err := json.Unmarshal(data, &newFlags); err != nil {
 		return err
 	}
 
-	f.mu.Lock()
-
-	// Ensure defaults for weights exist if the JSON file is missing them
-	if newFlags.Weights.SuccessWeight == 0 {
-		newFlags.Weights = DefaultFlags().Weights
-	}
-
 	f.flags = newFlags
 	f.lastMod = info.ModTime()
-	f.mu.Unlock()
 
 	f.logger.Info("Feature flags hot-reloaded from file", slog.String("file", f.filepath))
 	return nil
@@ -143,11 +153,7 @@ func (f *DynamicFlags) Watch(ctx context.Context) {
 		case <-ticker.C:
 			if f.hasConfigChanged() {
 				if err := f.LoadFromFile(); err == nil {
-					f.mu.Lock()
-					// Close the old channel to broadcast the change, then make a new one for the next cycle
-					close(f.reloadCh)
-					f.reloadCh = make(chan struct{})
-					f.mu.Unlock()
+					f.notify()
 				} else {
 					f.logger.Error("Failed to parse updated config file", slog.Any("error", err))
 				}

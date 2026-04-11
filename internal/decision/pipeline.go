@@ -2,6 +2,7 @@ package decision
 
 import (
 	"context"
+	"log/slog"
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/pipeline"
@@ -14,7 +15,7 @@ type Engine struct {
 }
 
 // NewEngine constructs the complete decision pipeline.
-func NewEngine(store domain.EventStore, sessionID string) *Engine {
+func NewEngine(store domain.EventStore, sessionID string, logger *slog.Logger) *Engine {
 	return &Engine{
 		stages: []pipeline.Stage{
 			pipeline.NewNormalizeStage(),
@@ -23,7 +24,7 @@ func NewEngine(store domain.EventStore, sessionID string) *Engine {
 			pipeline.NewSimulateStage(), // NEW: Triggers the risk simulation
 			pipeline.NewPolicyStage(
 				policy.NewCompositePolicy(
-					policy.NewIntelligencePolicy(store, sessionID),
+					policy.NewIntelligencePolicy(store, sessionID, logger),
 				),
 			),
 		},

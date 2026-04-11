@@ -85,3 +85,52 @@ func TestPlanTransitions(t *testing.T) {
 		t.Error("Expected no active plan after transition to COMPLETED")
 	}
 }
+
+func TestPlanManagerDeepCopy(t *testing.T) {
+	pm := NewPlanManager()
+
+	originalTasks := []domain.Action{
+		{ID: "task-1", Action: "mine", Target: domain.Target{Name: "stone"}},
+	}
+	plan := &domain.Plan{
+		Objective: "Deep Copy Test",
+		Tasks:     originalTasks,
+	}
+
+	pm.SetPlan(plan)
+
+	// Mutate the original plan's tasks
+	plan.Tasks[0].Action = "mutated"
+	plan.Objective = "mutated objective"
+
+	current := pm.GetCurrent()
+	if current.Objective == "mutated objective" {
+		t.Error("PlanManager.SetPlan did not perform a deep copy of the objective")
+	}
+	if current.Tasks[0].Action == "mutated" {
+		t.Error("PlanManager.SetPlan did not perform a deep copy of the tasks")
+	}
+
+	// Mutate the result from GetCurrent
+	current.Tasks[0].Action = "mutated from get"
+	
+	current2 := pm.GetCurrent()
+	if current2.Tasks[0].Action == "mutated from get" {
+		t.Error("PlanManager.GetCurrent did not return a deep copy")
+	}
+}
+
+func TestPlanManagerNilSafety(t *testing.T) {
+	pm := NewPlanManager()
+
+	// Should not panic
+	pm.SetPlan(nil)
+
+	if pm.GetCurrent() != nil {
+		t.Error("Expected GetCurrent to be nil after SetPlan(nil)")
+	}
+
+	if pm.HasActivePlan() {
+		t.Error("Expected HasActivePlan to be false after SetPlan(nil)")
+	}
+}

@@ -27,21 +27,31 @@ func (pm *PlanManager) GetCurrent() *domain.Plan {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
-	if pm.current == nil {
+	return clonePlan(pm.current)
+}
+
+func clonePlan(src *domain.Plan) *domain.Plan {
+	if src == nil {
 		return nil
 	}
 
-	// FIX: Return a deep copy to prevent slice mutation data races
-	cp := *pm.current
-	cp.Tasks = cloneActions(pm.current.Tasks)
+	// Shallow copy top-level fields
+	dst := *src
 
-	// Clone fallbacks too
-	cp.Fallbacks = make([][]domain.Action, len(pm.current.Fallbacks))
-	for i, fb := range pm.current.Fallbacks {
-		cp.Fallbacks[i] = cloneActions(fb)
+	// Deep copy slices
+	dst.Tasks = cloneActions(src.Tasks)
+	dst.Fallbacks = make([][]domain.Action, len(src.Fallbacks))
+	for i, fb := range src.Fallbacks {
+		dst.Fallbacks[i] = cloneActions(fb)
 	}
 
-	return &cp
+	// Deep copy pointer fields
+	if src.InvalidatedAt != nil {
+		t := *src.InvalidatedAt
+		dst.InvalidatedAt = &t
+	}
+
+	return &dst
 }
 
 func cloneActions(src []domain.Action) []domain.Action {
@@ -50,20 +60,43 @@ func cloneActions(src []domain.Action) []domain.Action {
 	}
 	dst := make([]domain.Action, len(src))
 	for i, a := range src {
-		// Bitwise copy of the struct.
-		// If domain.Action ever grows to include pointers or slices,
-		// we must explicitly deep copy them here.
-		dst[i] = a
+		// Explicit deep copy to prevent data races if pointers are added later
+		dst[i] = domain.Action{
+			ID:           a.ID,
+			ControllerID: a.ControllerID,
+			Source:       a.Source,
+			Trace: domain.TraceContext{
+				TraceID:     a.Trace.TraceID,
+				ActionID:    a.Trace.ActionID,
+				MilestoneID: a.Trace.MilestoneID,
+			},
+			Type:   a.Type,
+			Action: a.Action,
+			Target: domain.Target{
+				Type: a.Target.Type,
+				Name: a.Target.Name,
+			},
+			Count:     a.Count,
+			Rationale: a.Rationale,
+			Priority:  a.Priority,
+			Timeout:   a.Timeout,
+		}
 	}
 	return dst
 }
 
 func (pm *PlanManager) SetPlan(plan *domain.Plan) {
+	if plan == nil {
+		return
+	}
+
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	plan.Status = domain.PlanStatusPending
-	pm.current = plan
+	// Perform deep copy before storing to prevent outside mutation
+	newPlan := clonePlan(plan)
+	newPlan.Status = domain.PlanStatusPending
+	pm.current = newPlan
 }
 
 // FIX: Safe, locked mutation for task progression
@@ -75,10 +108,11 @@ func (pm *PlanManager) PopTask(taskID string) bool {
 		return false
 	}
 
-	if pm.current.Tasks[0].ID == taskID {
-		pm.current.Tasks = pm.current.Tasks[1:]
+	if pm.current.Tasks[0].ID != taskID {
+		return false // stale event, don't advance
 	}
 
+	pm.current.Tasks = pm.current.Tasks[1:]
 	return len(pm.current.Tasks) > 0
 }
 

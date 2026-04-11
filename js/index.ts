@@ -230,7 +230,8 @@ function completeTask(
 
     client.sendEvent(
         status,
-        `${task.action} ${task.target?.name || "none"}`,
+        task.action,
+        task.target?.name || "none",
         task.id,
         cause,
         task.startTime,
@@ -329,6 +330,7 @@ async function executeIntent(intent: models.ActionIntent) {
             client.sendEvent(
                 "task_failed",
                 `${intent.action}`,
+                intent.target?.name || "none",
                 intent.id,
                 "INVALID_BOT_STATE",
                 Date.now(),
@@ -340,6 +342,7 @@ async function executeIntent(intent: models.ActionIntent) {
             client.sendEvent(
                 "task_aborted",
                 "lock",
+                intent.target?.name || "none",
                 intent.id,
                 "panic",
                 Date.now(),
@@ -364,6 +367,7 @@ async function executeIntent(intent: models.ActionIntent) {
         client.sendEvent(
             "task_start",
             `${intent.action}`,
+            intent.target?.name || "none",
             intent.id,
             "",
             Date.now(),
@@ -424,7 +428,7 @@ async function executeIntent(intent: models.ActionIntent) {
                     completeTask(activeTask, "task_failed", normalizedCause);
                 } else if (intent.id) {
                     // Fallback: Notify Go using the ID from the intent we were trying to execute
-                    client.sendEvent("task_failed", intent.action, intent.id, normalizedCause, Date.now());
+                    client.sendEvent("task_failed", intent.action, intent.target?.name || "none", intent.id, normalizedCause, Date.now());
                 }
             }
         } finally {
@@ -579,14 +583,14 @@ async function connectWithRetry(maxAttempts = 10) {
             },
             stopMovement: () => stopMovement(),
             onPanicStart: (cause: string) => {
-                client.sendEvent("panic_retreat_start", "evasion", "", cause, 0);
+                client.sendEvent("panic_retreat_start", "evasion", "none", "", cause, 0);
                 pushState();
             },
             onPanicEnd: (cause: string) => {
                 if (currentTask?.action === "retreat") {
                     abortActiveTask("unlock");
                 }
-                client.sendEvent("panic_retreat_end", "evasion_complete", "", cause, 0);
+                client.sendEvent("panic_retreat_end", "evasion_complete", "none", "", cause, 0);
                 pushState();
             },
         });

@@ -10,7 +10,7 @@ import (
 )
 
 type Critic interface {
-	Evaluate(intent domain.ActionIntent, before, after domain.GameState, failureCount int) (bool, string)
+	Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, string)
 }
 
 type StateCritic struct{}
@@ -19,16 +19,25 @@ func NewStateCritic() *StateCritic {
 	return &StateCritic{}
 }
 
-func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, failureCount int) (bool, string) {
-	// If the planner has failed multiple times, explicitly tell the LLM it's stuck.
-	if failureCount >= 2 {
-		return false, fmt.Sprintf("Critique: Task '%s' has failed %d times in a row. The environment is blocking execution. ABANDON this task and choose a completely different approach.", intent.Action, failureCount)
+func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, string) {
+	// If execution failed, start by capturing the reason and any potential stack trace.
+	if !result.Success {
+		critique := fmt.Sprintf("Critique: Task '%s' failed. Reason: %s.", intent.Action, result.Cause)
+		if strings.Contains(result.Cause, "Error") || strings.Contains(result.Cause, "stack") {
+			critique += " DEBUG INFO: Review the JavaScript execution error and ensure the code aligns with Mineflayer API requirements."
+		}
+		
+		if failureCount >= 2 {
+			critique += fmt.Sprintf(" This is failure #%d. The current approach is deadlocking; you MUST rethink the entire tactical sequence.", failureCount)
+		}
+		return false, critique
 	}
 
 	if after.Health <= 0 {
 		return false, "Critique: Bot died while executing the task. Re-evaluate threat assessment and survival priorities."
 	}
 
+	// Mathematical comparison of GameState diffs
 	beforeInv := make(map[string]int)
 	for _, item := range before.Inventory {
 		beforeInv[strings.ToLower(item.Name)] += item.Count
@@ -47,21 +56,21 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 		aCount := afterInv[target]
 
 		if aCount >= bCount+intent.Count {
-			return true, fmt.Sprintf("Success: Gathered %d %s. Inventory went from %d to %d.", aCount-bCount, intent.Target, bCount, aCount)
+			return true, fmt.Sprintf("Success: Verified GameState diff. Gathered %d %s (Target reached).", aCount-bCount, intent.Target)
 		}
 		if aCount > bCount {
-			return true, fmt.Sprintf("Partial Success: Gathered %d %s (requested %d).", aCount-bCount, intent.Target, intent.Count)
+			return true, fmt.Sprintf("Partial Success: Gathered %d %s. Expected %d. Inventory increased as expected.", aCount-bCount, intent.Target, intent.Count)
 		}
-		return false, fmt.Sprintf("Critique: Expected to gather %d %s, but inventory remained at %d. The bot may have gotten stuck, lacked the correct tool, or the dropped item was unreachable.", intent.Count, intent.Target, bCount)
+		return false, fmt.Sprintf("Critique: Execution reported success but GameState verification FAILED. Inventory count for '%s' remained at %d. Possible cause: item dropped but was never collected by the bot.", intent.Target, bCount)
 
 	case "craft":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 
 		if aCount > bCount {
-			return true, fmt.Sprintf("Success: Crafted %s.", intent.Target)
+			return true, fmt.Sprintf("Success: Verified GameState diff. Crafted %s (Inventory: %d -> %d).", intent.Target, bCount, aCount)
 		}
-		return false, fmt.Sprintf("Critique: Failed to craft %s. Ensure ingredients are actually in the inventory and a crafting table is reachable if required.", intent.Target)
+		return false, fmt.Sprintf("Critique: Failed to verify craft in GameState. Item '%s' count did not increase. Ensure prerequisites were in inventory and bot reached a crafting table.", intent.Target)
 
 	case "smelt":
 		expectedOutput := getSmeltOutput(target)
@@ -69,39 +78,41 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 		aCount := afterInv[expectedOutput]
 
 		if aCount > bCount {
-			return true, fmt.Sprintf("Success: Smelted %s into %s.", intent.Target, expectedOutput)
+			return true, fmt.Sprintf("Success: Smelted %s. Output '%s' verified in inventory.", intent.Target, expectedOutput)
 		}
-		return false, fmt.Sprintf("Critique: Failed to smelt %s. Ensure both the raw material and fuel (coal/wood) are in the inventory, and a furnace is placed nearby.", intent.Target)
+		return false, fmt.Sprintf("Critique: Smelting output '%s' not found in GameState after execution. Verify furnace proximity and fuel availability.", expectedOutput)
 
 	case "hunt":
+		// Check for specific mob drops if possible, otherwise check survival
 		if after.Health < before.Health && after.Health < 10 {
-			return true, "Warning: Survived the hunt, but took heavy damage. Consider retreating, eating, or crafting better armor."
+			return true, "Warning: Hunt successful, but Health diff shows critical damage taken. High risk encounter."
 		}
-		return true, "Success: Engaged target and survived the encounter."
+		return true, "Success: Encounter resolved. Survival verified by health delta."
 
 	case "store":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount < bCount || target == "all" || target == "dump" {
-			return true, "Success: Stored items in chest."
+			return true, "Success: State diff shows items removed from local inventory and placed in container."
 		}
-		return false, fmt.Sprintf("Critique: Failed to store %s. Inventory count remained at %d. Chest might be full or pathfinding failed.", intent.Target, bCount)
+		return false, fmt.Sprintf("Critique: Store failed. Inventory count for '%s' remained unchanged at %d.", intent.Target, bCount)
 
 	case "retrieve":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Success: Retrieved %s from chest.", intent.Target)
+			return true, fmt.Sprintf("Success: Retrieved %s. State diff confirmed inventory increase.", intent.Target)
 		}
-		return false, fmt.Sprintf("Critique: Failed to retrieve %s. The chest might be empty of this item or unreachable.", intent.Target)
+		return false, fmt.Sprintf("Critique: Retrieve failed. GameState shows no increase in '%s' count.", intent.Target)
 
 	case "eat":
 		if after.Food > before.Food || after.Health > before.Health {
-			return true, "Success: Consumed food and restored stats."
+			return true, "Success: Metabolic state verified. Food/Health delta is positive."
 		}
-		return false, "Critique: Failed to eat. Ensure the specified food item is actually present in the inventory."
+		return false, "Critique: Eat command failed. GameState metadata (Food/Health) shows no change."
 
 	case "build":
+		// Build consumes resources
 		beforeTotal := 0
 		for _, v := range beforeInv {
 			beforeTotal += v
@@ -111,9 +122,9 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 			afterTotal += v
 		}
 		if afterTotal < beforeTotal {
-			return true, "Success: Constructed structure and consumed blocks."
+			return true, fmt.Sprintf("Success: Construction verified. Resources consumed: %d blocks.", beforeTotal-afterTotal)
 		}
-		return false, "Critique: Failed to build structure. The bot might have lacked sufficient dirt/cobblestone/planks, or terrain blocked placement."
+		return false, "Critique: Build failure. No resource consumption detected in GameState diff."
 
 	case "explore", "retreat":
 		dx := after.Position.X - before.Position.X
@@ -122,32 +133,59 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
 
 		if dist > 3.0 {
-			return true, fmt.Sprintf("Success: Relocated %.1f blocks successfully.", dist)
+			return true, fmt.Sprintf("Success: Displacement verified. Bot moved %.1f blocks from origin.", dist)
 		}
-		return false, "Critique: Failed to move significantly. The bot might be trapped in a hole, blocked by water/lava, or pathfinding failed."
+		return false, "Critique: Stagnant position detected. GameState shows bot moved less than 3 blocks. Pathing may be obstructed."
 	}
 
-	return true, fmt.Sprintf("Success: %s completed natively without strict state violations.", intent.Action)
+	return true, fmt.Sprintf("Success: %s executed. General state integrity maintained.", intent.Action)
 }
 
 func getSmeltOutput(input string) string {
+	input = strings.ToLower(input)
 	if strings.HasPrefix(input, "raw_") {
 		return strings.TrimPrefix(input, "raw_") + "_ingot"
 	}
 	if strings.HasSuffix(input, "_ore") {
 		return strings.TrimSuffix(input, "_ore") + "_ingot"
 	}
-	if strings.HasSuffix(input, "_log") {
+	if strings.HasSuffix(input, "_log") || strings.HasSuffix(input, "_wood") {
 		return "charcoal"
 	}
-	if input == "cobblestone" {
+	switch input {
+	case "cobblestone":
 		return "stone"
-	}
-	if input == "stone" {
+	case "stone":
 		return "smooth_stone"
-	}
-	if input == "sand" || input == "red_sand" {
+	case "sand", "red_sand":
 		return "glass"
+	case "beef":
+		return "cooked_beef"
+	case "porkchop":
+		return "cooked_porkchop"
+	case "chicken":
+		return "cooked_chicken"
+	case "mutton":
+		return "cooked_mutton"
+	case "rabbit":
+		return "cooked_rabbit"
+	case "cod":
+		return "cooked_cod"
+	case "salmon":
+		return "cooked_salmon"
+	case "potato":
+		return "baked_potato"
+	case "kelp":
+		return "dried_kelp"
+	case "clay_ball":
+		return "brick"
+	case "cactus":
+		return "green_dye"
+	case "netherrack":
+		return "nether_brick"
+	}
+	if !strings.HasPrefix(input, "cooked_") && (input == "beef" || input == "porkchop" || input == "chicken" || input == "mutton" || input == "rabbit" || input == "cod" || input == "salmon") {
+		return "cooked_" + input
 	}
 	return "cooked_" + input
 }

@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/learning"
@@ -12,17 +13,19 @@ import (
 type IntelligencePolicy struct {
 	store     domain.EventStore
 	sessionID string
+	logger    *slog.Logger
 }
 
-func NewIntelligencePolicy(store domain.EventStore, sessionID string) *IntelligencePolicy {
+func NewIntelligencePolicy(store domain.EventStore, sessionID string, logger *slog.Logger) *IntelligencePolicy {
 	return &IntelligencePolicy{
 		store:     store,
 		sessionID: sessionID,
+		logger:    logger,
 	}
 }
 
 func (p *IntelligencePolicy) Decide(ctx context.Context, input DecisionInput) Decision {
-	stats, _, err := learning.GetProjectedStats(ctx, p.store, p.sessionID)
+	stats, _, err := learning.GetProjectedStats(ctx, p.store, p.sessionID, p.logger)
 	if err != nil {
 		return Decision{IsApproved: true}
 	}

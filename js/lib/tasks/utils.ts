@@ -233,7 +233,12 @@ export function moveToGoal(
             resolve();
         };
 
-        const onAbort = () => finish(new Error("aborted"));
+        const onAbort = () =>
+            finish(
+                signal?.reason instanceof Error
+                    ? signal.reason
+                    : new Error("aborted"),
+            );
         const onGoalReached = () => {
             finish();
         };
@@ -254,16 +259,16 @@ export function moveToGoal(
             const dist = lastPos.distanceTo(currentPos);
 
             // If we are supposed to be moving but aren't
-            if (bot.pathfinder.isMoving() && dist < 0.1) {
+            if (bot.pathfinder.isMoving() && dist < 0.05) {
                 stuckStrikes++;
-                if (stuckStrikes >= 3) {
+                if (stuckStrikes >= 2) {
                     finish(new Error("stuck"));
                 }
             } else {
                 stuckStrikes = 0;
             }
             lastPos = currentPos.clone();
-        }, stuckTimeoutMs);
+        }, 800);
 
         listeners.set("goal_reached", onGoalReached);
         listeners.set("path_update", onPathUpdate);

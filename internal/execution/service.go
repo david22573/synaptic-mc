@@ -75,16 +75,6 @@ func (s *ControlService) SetReflexActive(active bool) {
 	s.stability.ReflexActive = active
 }
 
-func isControlledStop(cause string) bool {
-	switch cause {
-	case "preempted_by_priority", "plan_invalidated", "survival_panic", "panic",
-		"panic_triggered", "unlock", "bot_died", "planner_warmup":
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.DomainEvent) {
 	s.stabilityMu.RLock()
 	reflexActive := s.stability.ReflexActive
@@ -170,33 +160,36 @@ func (s *ControlService) handleTaskStart(ctx context.Context, event domain.Domai
 	var payload struct {
 		CommandID string `json:"command_id"`
 	}
-	if err := json.Unmarshal(event.Payload, &payload); err == nil {
-		s.engine.OnTaskStart(payload.CommandID)
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		s.logger.Error("Failed to unmarshal TaskStart payload", slog.Any("error", err), slog.String("event_id", string(event.Type)))
+		return
+	}
 
-		inFlight := s.engine.GetInFlight()
-		if inFlight != nil && inFlight.ID == payload.CommandID {
-			s.failuresMu.Lock()
-			if _, exists := s.failures[payload.CommandID]; !exists {
-				s.failures[payload.CommandID] = &FailureRecord{
-					IntentID: payload.CommandID,
-					Action:   *inFlight,
-				}
+	s.engine.OnTaskStart(payload.CommandID)
+
+	inFlight := s.engine.GetInFlight()
+	if inFlight != nil && inFlight.ID == payload.CommandID {
+		s.failuresMu.Lock()
+		if _, exists := s.failures[payload.CommandID]; !exists {
+			s.failures[payload.CommandID] = &FailureRecord{
+				IntentID: payload.CommandID,
+				Action:   *inFlight,
 			}
-			s.failuresMu.Unlock()
-
-			// Default timeout: 45s base + 15s grace for network/server lag
-			timeout := 60 * time.Second
-			sessionID := event.SessionID
-
-			timer := time.AfterFunc(timeout, func() {
-				s.logger.Warn("Execution deadline exceeded, triggering recovery", slog.String("task_id", payload.CommandID))
-				s.triggerRecovery(sessionID, payload.CommandID, "DEADLINE_EXCEEDED")
-			})
-
-			s.timersMu.Lock()
-			s.activeTimers[payload.CommandID] = timer
-			s.timersMu.Unlock()
 		}
+		s.failuresMu.Unlock()
+
+		// Default timeout: 45s base + 15s grace for network/server lag
+		timeout := 60 * time.Second
+		sessionID := event.SessionID
+
+		timer := time.AfterFunc(timeout, func() {
+			s.logger.Warn("Execution deadline exceeded, triggering recovery", slog.String("task_id", payload.CommandID))
+			s.triggerRecovery(sessionID, payload.CommandID, "DEADLINE_EXCEEDED")
+		})
+
+		s.timersMu.Lock()
+		s.activeTimers[payload.CommandID] = timer
+		s.timersMu.Unlock()
 	}
 }
 
@@ -219,104 +212,106 @@ func (s *ControlService) triggerRecovery(sessionID string, taskID string, cause 
 }
 
 func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
-	var payload struct {
-		Status    string  `json:"status"`
-		CommandID string  `json:"command_id"`
-		Cause     string  `json:"cause"`
-		Progress  float64 `json:"progress"`
+	var payload domain.TaskEndPayload
+
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		s.logger.Error("Failed to unmarshal TaskEnd payload", slog.Any("error", err), slog.String("event_id", string(event.Type)))
+		return
 	}
 
-	if err := json.Unmarshal(event.Payload, &payload); err == nil {
-		success := payload.Status == "COMPLETED"
+	success := payload.Status == "COMPLETED"
 
-		s.timersMu.Lock()
-		timer, isActive := s.activeTimers[payload.CommandID]
-		if isActive {
-			timer.Stop()
-			delete(s.activeTimers, payload.CommandID)
-		}
-		s.timersMu.Unlock()
+	s.timersMu.Lock()
+	timer, isActive := s.activeTimers[payload.CommandID]
+	if isActive {
+		timer.Stop()
+		delete(s.activeTimers, payload.CommandID)
+	}
+	s.timersMu.Unlock()
 
-		// ALWAYS signal task engine and manager that the current attempt is finished
-		// to prevent deadlocks in the dispatch queue.
-		s.engine.OnTaskEnd(payload.CommandID, success)
-		_ = s.taskManager.Complete(ctx, payload.CommandID, success)
+	// ALWAYS signal task engine and manager that the current attempt is finished
+	// to prevent deadlocks in the dispatch queue.
+	s.engine.OnTaskEnd(payload.CommandID, success)
+	_ = s.taskManager.Complete(ctx, payload.CommandID, success)
 
+	if !isActive {
+		s.logger.Debug("Cleaning up untracked or timed-out task", slog.String("task_id", payload.CommandID))
+		// We still continue to clean up failure records, but we don't trigger new adaptation
+		// if it was already handled by the watchdog or is a duplicate.
+	}
+
+	if !success && !domain.IsControlledStop(payload.Cause) {
 		if !isActive {
-			s.logger.Debug("Cleaning up untracked or timed-out task", slog.String("task_id", payload.CommandID))
-			// We still continue to clean up failure records, but we don't trigger new adaptation
-			// if it was already handled by the watchdog or is a duplicate.
+			return // already handled by watchdog or duplicate
 		}
 
-		if !success && !isControlledStop(payload.Cause) {
-			s.failuresMu.Lock()
-			record, exists := s.failures[payload.CommandID]
-			if !exists {
-				record = &FailureRecord{IntentID: payload.CommandID}
-				s.failures[payload.CommandID] = record
-			}
-			record.Count++
-			record.LastFailure = time.Now()
+		s.failuresMu.Lock()
+		record, exists := s.failures[payload.CommandID]
+		if !exists {
+			record = &FailureRecord{IntentID: payload.CommandID}
+			s.failures[payload.CommandID] = record
+		}
+		record.Count++
+		record.LastFailure = time.Now()
 
-			res := domain.ExecutionResult{
-				Success:  false,
-				Cause:    payload.Cause,
-				Progress: payload.Progress,
-				Action:   record.Action,
-			}
+		res := domain.ExecutionResult{
+			Success:  false,
+			Cause:    payload.Cause,
+			Progress: payload.Progress,
+			Action:   record.Action,
+		}
 
-			// Evaluate if we should retry, degrade, or abort based on failure cause/progress
-			directive := s.ctrlManager.EvaluateFailure(res, record.Count)
-			actionToRetry := record.Action
-			s.failuresMu.Unlock()
+		// Evaluate if we should retry, degrade, or abort based on failure cause/progress
+		directive := s.ctrlManager.EvaluateFailure(res, record.Count)
+		actionToRetry := record.Action
+		s.failuresMu.Unlock()
 
-			s.ctrlManager.RecordResult(res)
+		s.ctrlManager.RecordResult(res)
 
-			// Phase 6: Update humanizer with performance feedback
+		// Phase 6: Update humanizer with performance feedback
+		successRate := s.ctrlManager.GetSuccessRate()
+		s.humanizer.State().UpdateFeedback(record.Count, successRate)
+
+		s.logger.Warn("Task failed, applying adaptation strategy",
+			slog.String("task_id", payload.CommandID),
+			slog.String("cause", payload.Cause),
+			slog.Float64("progress", payload.Progress),
+			slog.String("strategy", string(directive.Strategy)),
+			slog.Duration("delay", directive.Delay),
+		)
+
+		if actionToRetry.ID == "" {
+			return
+		}
+
+		// Execute the adaptation directive
+		switch directive.Strategy {
+		case StrategyRetrySame, StrategyRetryDifferent:
+			executeAt := time.Now().Add(directive.Delay)
+			_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
+
+		case StrategyDegrade:
+			actionToRetry.Action = directive.Fallback
+			actionToRetry.ID = actionToRetry.ID + "-degraded"
+			executeAt := time.Now().Add(directive.Delay)
+			_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
+
+		case StrategyAbort:
+			// No further action, task is dropped from execution pipeline
+		}
+
+	} else {
+		// Clean up failure history for this specific ID on success or controlled stop
+		s.failuresMu.Lock()
+		delete(s.failures, payload.CommandID)
+		s.failuresMu.Unlock()
+
+		if success {
+			s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
+
+			// Phase 6: Update humanizer with success feedback
 			successRate := s.ctrlManager.GetSuccessRate()
-			s.humanizer.State().UpdateFeedback(record.Count, successRate)
-
-			s.logger.Warn("Task failed, applying adaptation strategy",
-				slog.String("task_id", payload.CommandID),
-				slog.String("cause", payload.Cause),
-				slog.Float64("progress", payload.Progress),
-				slog.String("strategy", string(directive.Strategy)),
-				slog.Duration("delay", directive.Delay),
-			)
-
-			if actionToRetry.ID == "" {
-				return
-			}
-
-			// Execute the adaptation directive
-			switch directive.Strategy {
-			case StrategyRetrySame, StrategyRetryDifferent:
-				executeAt := time.Now().Add(directive.Delay)
-				_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
-
-			case StrategyDegrade:
-				actionToRetry.Action = directive.Fallback
-				actionToRetry.ID = actionToRetry.ID + "-degraded"
-				executeAt := time.Now().Add(directive.Delay)
-				_ = s.taskManager.EnqueueScheduled(ctx, actionToRetry, executeAt)
-
-			case StrategyAbort:
-				// No further action, task is dropped from execution pipeline
-			}
-
-		} else {
-			// Clean up failure history for this specific ID on success or controlled stop
-			s.failuresMu.Lock()
-			delete(s.failures, payload.CommandID)
-			s.failuresMu.Unlock()
-
-			if success {
-				s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
-
-				// Phase 6: Update humanizer with success feedback
-				successRate := s.ctrlManager.GetSuccessRate()
-				s.humanizer.State().UpdateFeedback(0, successRate)
-			}
+			s.humanizer.State().UpdateFeedback(0, successRate)
 		}
 	}
 }

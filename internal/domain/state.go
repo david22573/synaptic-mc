@@ -19,18 +19,6 @@ const (
 	PlanStatusBlocked     PlanStatus = "BLOCKED" // Week 3: Plan State Machine
 )
 
-// Phase 1 & 5: Execution Result Protocol
-const (
-	CauseTimeout                 = "TIMEOUT"
-	CauseBlocked                 = "BLOCKED"
-	CauseStuck                   = "STUCK"
-	CausePartial                 = "PARTIAL"
-	CauseFailed                  = "FAILED"
-	CauseDistracted              = "DISTRACTED"
-	CauseAbortedDuringHesitation = "ABORTED_DURING_HESITATION"
-	CauseUnknown                 = "UNKNOWN"
-)
-
 // Survival & Decision Thresholds
 const (
 	SurvivalCriticalHealth = 4.0
@@ -40,6 +28,16 @@ const (
 	DecisionHealthHunt     = 12.0
 	DecisionFoodMax        = 20.0
 )
+
+type TaskEndPayload struct {
+	Success   bool    `json:"success"`
+	Status    string  `json:"status"`
+	Action    string  `json:"action"`
+	Target    string  `json:"target"`
+	CommandID string  `json:"command_id"`
+	Cause     string  `json:"cause"`
+	Progress  float64 `json:"progress"`
+}
 
 type ExecutionResult struct {
 	Action   Action  `json:"action"`
@@ -82,6 +80,7 @@ type Feedback struct {
 }
 
 type GameState struct {
+	Initialized  bool              `json:"initialized"`
 	Health       float64           `json:"health"`
 	Food         float64           `json:"food"`
 	TimeOfDay          int               `json:"time_of_day"`
@@ -325,4 +324,101 @@ func CleanJSON(raw string) string {
 	cleaned = strings.TrimPrefix(cleaned, "```")
 	cleaned = strings.TrimSuffix(cleaned, "```")
 	return strings.TrimSpace(cleaned)
+}
+
+func IsFood(name string) bool {
+	foods := []string{"beef", "porkchop", "chicken", "mutton", "rabbit",
+		"cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton", "cooked_rabbit",
+		"apple", "bread", "carrot", "potato", "baked_potato", "sweet_berries"}
+	for _, f := range foods {
+		if strings.Contains(name, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// AutomaticCurriculum proposes the next tech-tree milestone based on current state.
+type AutomaticCurriculum struct {
+	TechTree []Milestone
+}
+
+type Milestone struct {
+	Name         string
+	Prerequisite func(state GameState) bool
+	Goal         string
+}
+
+func NewAutomaticCurriculum() *AutomaticCurriculum {
+	hasItem := func(state GameState, name string, count int) bool {
+		for _, item := range state.Inventory {
+			if strings.Contains(strings.ToLower(item.Name), strings.ToLower(name)) && item.Count >= count {
+				return true
+			}
+		}
+		return false
+	}
+
+	return &AutomaticCurriculum{
+		TechTree: []Milestone{
+			{
+				Name: "Wood Age",
+				Prerequisite: func(state GameState) bool {
+					return !hasItem(state, "log", 1) && !hasItem(state, "plank", 1)
+				},
+				Goal: "Gather logs from a tree.",
+			},
+			{
+				Name: "Crafting Age",
+				Prerequisite: func(state GameState) bool {
+					return (hasItem(state, "log", 1) || hasItem(state, "plank", 4)) && !hasItem(state, "crafting_table", 1)
+				},
+				Goal: "Craft a crafting table.",
+			},
+			{
+				Name: "Tool Age",
+				Prerequisite: func(state GameState) bool {
+					return hasItem(state, "crafting_table", 1) && !hasItem(state, "wooden_pickaxe", 1) && !hasItem(state, "stone_pickaxe", 1)
+				},
+				Goal: "Craft a wooden pickaxe.",
+			},
+			{
+				Name: "Stone Age",
+				Prerequisite: func(state GameState) bool {
+					return hasItem(state, "wooden_pickaxe", 1) && !hasItem(state, "cobblestone", 8)
+				},
+				Goal: "Mine cobblestone.",
+			},
+			{
+				Name: "Smelting Age",
+				Prerequisite: func(state GameState) bool {
+					return hasItem(state, "cobblestone", 8) && !hasItem(state, "furnace", 1)
+				},
+				Goal: "Craft a furnace.",
+			},
+			{
+				Name: "Iron Age",
+				Prerequisite: func(state GameState) bool {
+					return hasItem(state, "stone_pickaxe", 1) && !hasItem(state, "raw_iron", 1) && !hasItem(state, "iron_ingot", 1)
+				},
+				Goal: "Mine iron ore.",
+			},
+			{
+				Name: "Survivalist",
+				Prerequisite: func(state GameState) bool {
+					return state.Food < 10
+				},
+				Goal: "Gather food by hunting or farming.",
+			},
+		},
+	}
+}
+
+func (ac *AutomaticCurriculum) Propose(state GameState) string {
+	for _, milestone := range ac.TechTree {
+		if milestone.Prerequisite(state) {
+			return milestone.Goal
+		}
+	}
+	return "Explore the world and gather advanced resources like diamonds or obsidian."
 }

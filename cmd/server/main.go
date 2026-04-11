@@ -11,10 +11,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -29,6 +31,7 @@ import (
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/state"
 	"david22573/synaptic-mc/internal/strategy"
 	"david22573/synaptic-mc/internal/supervisor"
@@ -128,17 +131,20 @@ func main() {
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore)
 
 	dynFlags := config.NewDynamicFlags(cfg.ConfigPath, logger)
+plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, humanizer, logger, dynFlags.Get())
 
-	planner := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, logger, dynFlags.Get())
+
 	planManager := decision.NewPlanManager()
 	worldModel := domain.NewWorldModel()
+	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel)
 
-	decisionSvc := decision.NewService(cfg.SessionID, eventBus, planner, planManager, curriculum, critic, stateSvc, worldModel, logger)
+	decisionSvc := decision.NewService(cfg.SessionID, eventBus, plannerObj, planManager, 
+	curriculum, critic, stateSvc, taskManager, worldModel, feedbackAnalyzer, logger)
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
 	}
-	planner.SetOnPlanReady(decisionSvc.RequestEvaluation)
+	plannerObj.SetOnPlanReady(decisionSvc.RequestEvaluation)
 	taskManager.OnDrain = decisionSvc.RequestEvaluation
 
 	// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
@@ -147,17 +153,18 @@ func main() {
 	eventBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		var stateUpdate struct {
 			POIs []struct {
-				Name string      `json:"name"`
-				Type string      `json:"type"`
+				Name string          `json:"name"`
+				Type string          `json:"type"`
 				Pos  domain.Vec3 `json:"position"`
 			} `json:"pois"`
 		}
-		if err := json.Unmarshal(ev.Payload, &stateUpdate); err == nil {
-			for _, poi := range stateUpdate.POIs {
-				_ = memoryStore.MarkWorldNode(ctx, poi.Name, poi.Type, poi.Pos)
-			}
+		if err := json.Unmarshal(ev.Payload, &stateUpdate); err != nil {
+			logger.Warn("Failed to unmarshal state update POIs", slog.Any("error", err))
+			return
 		}
-	}))
+		for _, poi := range stateUpdate.POIs { 
+			_ = memoryStore.MarkWorldNode(ctx, poi.Name, poi.Type, poi.Pos)
+		}	}))
 
 	eventBus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		eventBus.Publish(ctx, domain.DomainEvent{
@@ -167,44 +174,22 @@ func main() {
 		})
 	}))
 
+	// Phase 6: Bounded worker pool for persistence and UI broadcasting
+	eventWorkerCh := make(chan domain.DomainEvent, 1024)
+
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		if ev.Type == "" {
 			return
 		}
 
-		// Phase 6: Non-blocking fan-out to prevent event bus bottleneck
-
-		// 1. Persist to SQLite (Async)
-		go func(e domain.DomainEvent) {
-			_ = eventStore.Append(context.Background(), e.SessionID, e.Trace, e.Type, e.Payload)
-		}(ev)
-
-		// 2. UI Broadcasting (Async)
-		go func(e domain.DomainEvent) {
-			var payloadObj interface{}
-			if err := json.Unmarshal(e.Payload, &payloadObj); err != nil {
-				return
-			}
-
-			// BroadcastEv structure
-			broadcastEv := map[string]interface{}{
-				"type":      string(e.Type),
-				"payload":   payloadObj,
-				"timestamp": e.CreatedAt.Format(time.Kitchen),
-			}
-
-			// Identify if this is a high-frequency state update or a discrete event
-			isState := e.Type == domain.EventTypeStateUpdated || e.Type == domain.EventTypeStateTick
-
-			if isState {
-				// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
-				latestStateUpdate.Store(&broadcastEv)
-			} else {
-				// Send to the log/sidebar stream
-				uiHub.Broadcast("EVENT_STREAM", broadcastEv)
-			}
-		}(ev)
+		// Phase 6: Push to worker pool instead of spawning new goroutines
+		select {
+		case eventWorkerCh <- ev:
+		default:
+			// DROP: Prevents fan-out goroutine explosion when workers are overloaded
+		}
 	})
+
 	eventTypes := []domain.EventType{
 		domain.EventTypeStateTick, domain.EventTypeStateUpdated,
 		domain.EventTypeTaskStart, domain.EventTypeTaskEnd,
@@ -223,6 +208,56 @@ func main() {
 	defer cancelRoot()
 
 	g, ctx := errgroup.WithContext(rootCtx)
+
+	// Phase 6: Bounded Event Workers (Persistence & UI)
+	const numWorkers = 4
+	for i := 0; i < numWorkers; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case ev, ok := <-eventWorkerCh:
+					if !ok {
+						return nil
+					}
+
+					// 1. Persist to SQLite
+					_ = eventStore.Append(context.Background(), ev.SessionID, ev.Trace, ev.Type, ev.Payload)
+
+					// 2. UI Broadcasting
+					var payloadObj interface{}
+					if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
+						logger.Error("Failed to unmarshal event payload for UI broadcast", 
+							slog.Any("error", err), 
+							slog.String("event_type", string(ev.Type)),
+							slog.String("session_id", ev.SessionID))
+						continue
+					}
+
+					// BroadcastEv structure
+					broadcastEv := map[string]interface{}{
+						"type":      string(ev.Type),
+						"payload":   payloadObj,
+						"timestamp": ev.CreatedAt.Format(time.Kitchen),
+					}
+
+					// Identify if this is a high-frequency state update or a discrete event
+					isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
+
+					if isState {
+						// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
+						// Always allocate a fresh variable to avoid pointer reuse risks
+						evCopy := broadcastEv
+						latestStateUpdate.Store(&evCopy)
+					} else {
+						// Send to the log/sidebar stream
+						uiHub.Broadcast("EVENT_STREAM", broadcastEv)
+					}
+				}
+			}
+		})
+	}
 
 	// Phase 6: Throttled UI state broadcast (10 FPS)
 	g.Go(func() error {
@@ -303,7 +338,7 @@ func main() {
 
 	g.Go(func() error {
 		logger.Info("Starting Planner slow loop")
-		planner.SlowReplanLoop(ctx, cfg.SessionID)
+		plannerObj.SlowReplanLoop(ctx, cfg.SessionID)
 		return nil
 	})
 
@@ -347,18 +382,35 @@ func main() {
 
 // serveSPA wraps the standard file server to redirect 404s to index.html for Svelte routing
 func serveSPA(dir string) http.HandlerFunc {
-	fs := http.FileServer(http.Dir(dir))
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		absDir = dir
+	}
+	fs := http.FileServer(http.Dir(absDir))
+
 	return func(w http.ResponseWriter, r *http.Request) {
-		path := filepath.Join(dir, filepath.Clean(r.URL.Path))
-		_, err := os.Stat(path)
-		if os.IsNotExist(err) {
-			http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+		// Clean the path and remove leading slashes to prevent absolute path escapes on Windows
+		cleanPath := filepath.Clean(r.URL.Path)
+		cleanPath = strings.TrimLeft(cleanPath, `/\`)
+
+		path := filepath.Join(absDir, cleanPath)
+
+		// Verify that the resulting path is still within the intended directory
+		rel, err := filepath.Rel(absDir, path)
+		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			http.ServeFile(w, r, filepath.Join(absDir, "index.html"))
 			return
 		}
+
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) || info.IsDir() {
+			http.ServeFile(w, r, filepath.Join(absDir, "index.html"))
+			return
+		}
+
 		fs.ServeHTTP(w, r)
 	}
 }
-
 func parseConfig() Config {
 	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
 	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
@@ -425,7 +477,24 @@ func getEnvFloat(key string, fallback float64) float64 {
 func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+
+			// Allow localhost and same-host connections
+			host := r.Host
+			if origin == "http://"+host || origin == "https://"+host {
+				return true
+			}
+
+			// Always allow localhost for development
+			return origin == "http://localhost" || 
+				   origin == "http://127.0.0.1" || 
+				   origin == "http://[::1]" ||
+				   strings.HasPrefix(origin, "http://localhost:") ||
+				   strings.HasPrefix(origin, "http://127.0.0.1:") ||
+				   strings.HasPrefix(origin, "http://[::1]:")
 		},
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -434,32 +503,30 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			logger.Error("Bot WS upgrade failed", slog.Any("error", err))
+			logger.Error("Bot WS up grade failed", slog.Any("error", err))
 			return
 		}
 
-		controllerID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
+		controllerID := uuid.New().String()
 		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
 
 		runner.Ping()
 
 		onMessage := func(msgType string, payload []byte) {
-			// Phase 6: Non-blocking ingestion to prevent WebSocket thread from stalling
-			go func(mt string, p []byte) {
-				runner.Ping()
-				normalizedType := domain.NormalizeEventType(mt)
-				cleanPayload := p
-				if len(cleanPayload) == 0 {
-					cleanPayload = []byte(`{}`)
-				}
+			// Phase 6: Non-blocking ingestion (EventBus handles buffering internally)
+			runner.Ping()
+			normalizedType := domain.NormalizeEventType(msgType)
+			cleanPayload := payload
+			if len(cleanPayload) == 0 {
+				cleanPayload = []byte(`{}`)
+			}
 
-				bus.Publish(appCtx, domain.DomainEvent{
-					SessionID: sessionID,
-					Type:      normalizedType,
-					Payload:   cleanPayload,
-					CreatedAt: time.Now(),
-				})
-			}(msgType, payload)
+			bus.Publish(appCtx, domain.DomainEvent{
+				SessionID: sessionID,
+				Type:      normalizedType,
+				Payload:   cleanPayload,
+				CreatedAt: time.Now(),
+			})
 		}
 		onClose := func() {
 			logger.Warn("Bot connection closed", slog.String("controller_id", controllerID))

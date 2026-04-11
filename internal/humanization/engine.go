@@ -33,6 +33,10 @@ func (e *Engine) State() *State {
 	return e.state
 }
 
+func (e *Engine) Config() Config {
+	return e.cfg
+}
+
 func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 	var scheduled []ScheduledAction
 	now := time.Now()
@@ -72,28 +76,16 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 		}
 	}
 
-	for i, task := range approvedTasks {
+	for _, task := range approvedTasks {
 		if task.Priority == 0 {
 			task.Priority = 5
 		}
 
 		noisyTask := ApplyNoise(task, ctx, e.state, e.cfg)
-		hesitation := time.Duration(0)
 
-		if i == 0 || !isCritical {
-			hesitation = CalculateHesitation(noisyTask, ctx, e.state, e.cfg)
-		}
-
-		if i > 0 && !isCritical {
-			hesitation = hesitation / 2
-		}
-
-		// In Panic Mode, reaction time is instantaneous
-		if isCritical {
-			hesitation = 0
-		}
-
-		currentDelay += hesitation
+		// Phase 7: Hesitation moved to cognitive decision layer (planner.go)
+		// to avoid stalling physical execution with stale world states.
+		// We still use currentDelay for sequential task spacing (100ms).
 
 		scheduled = append(scheduled, ScheduledAction{
 			Action:    noisyTask,

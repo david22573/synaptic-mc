@@ -170,6 +170,7 @@ export class SynapticClient extends EventEmitter {
     public sendEvent(
         event: string,
         actionStr: string,
+        targetStr: string,
         commandId?: string,
         cause?: string,
         startTime?: number,
@@ -179,6 +180,7 @@ export class SynapticClient extends EventEmitter {
     public sendEvent(
         event: string,
         arg2: string | Record<string, any>,
+        arg3: string = "",
         commandId = "",
         cause = "",
         startTime = 0,
@@ -198,6 +200,7 @@ export class SynapticClient extends EventEmitter {
             else if (event === "panic_retreat_end") msgType = "PANIC_RESOLVED";
         } else {
             const actionStr = arg2 as string;
+            const targetStr = arg3 as string;
             const duration_ms = startTime > 0 ? Date.now() - startTime : 0;
 
             if (event === "task_start") msgType = "TASK_START";
@@ -220,6 +223,7 @@ export class SynapticClient extends EventEmitter {
                 success: success,
                 status: status,
                 action: actionStr,
+                target: targetStr,
                 command_id: commandId,
                 cause: cause,
                 duration_ms: duration_ms,

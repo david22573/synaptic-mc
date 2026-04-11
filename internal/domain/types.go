@@ -55,6 +55,7 @@ type EventStore interface {
 	GetStream(ctx context.Context, sessionID string) ([]DomainEvent, error)
 	GetRecentStream(ctx context.Context, sessionID string, limit int) ([]DomainEvent, error)
 	GetStreamSince(ctx context.Context, sessionID string, sinceID int64) ([]DomainEvent, error)
+	GetLastEventID(ctx context.Context, sessionID string) (int64, error)
 	SaveSnapshot(ctx context.Context, snap SessionSnapshot) error
 	GetLatestSnapshot(ctx context.Context, sessionID string) (*SessionSnapshot, error)
 	Close() error

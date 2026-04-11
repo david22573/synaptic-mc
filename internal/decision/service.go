@@ -11,11 +11,16 @@ import (
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/voyager"
 )
 
 type StateProvider interface {
 	GetCurrentState() domain.VersionedState
+}
+
+type ExecutionStatus interface {
+	IsIdle() bool
 }
 
 type Commitment struct {
@@ -32,7 +37,9 @@ type Service struct {
 	curriculum    voyager.Curriculum
 	critic        voyager.Critic
 	stateProvider StateProvider
+	execStatus    ExecutionStatus
 	worldModel    *domain.WorldModel
+	feedback      *planner.FeedbackAnalyzer
 	logger        *slog.Logger
 
 	mu            sync.Mutex
@@ -44,19 +51,9 @@ type Service struct {
 	commitment atomic.Pointer[Commitment]
 }
 
-func isControlledStop(cause string) bool {
-	switch cause {
-	case "preempted_by_priority", "plan_invalidated", "survival_panic", "panic",
-		"panic_triggered", "unlock", "bot_died", "planner_warmup":
-		return true
-	default:
-		return false
-	}
-}
-
 func shouldWaitForFreshState(cause string) bool {
 	switch cause {
-	case "survival_panic", "panic", "panic_triggered", "unlock":
+	case domain.CauseSurvivalPanic, domain.CausePanic, domain.CausePanicTriggered, domain.CauseUnlock:
 		return true
 	default:
 		return false
@@ -86,7 +83,7 @@ func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent
 		}
 	case "eat":
 		for _, item := range state.Inventory {
-			if strings.EqualFold(item.Name, target) && item.Count > 0 {
+			if strings.EqualFold(item.Name, target) && item.Count > 0 && domain.IsFood(item.Name) {
 				return true
 			}
 		}
@@ -99,23 +96,27 @@ func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent
 func NewService(
 	sessionID string,
 	bus domain.EventBus,
-	planner *AdvancedPlanner,
+	advPlanner *AdvancedPlanner,
 	pm *PlanManager,
 	curriculum voyager.Curriculum,
 	critic voyager.Critic,
 	stateProvider StateProvider,
+	execStatus ExecutionStatus,
 	worldModel *domain.WorldModel,
+	feedback *planner.FeedbackAnalyzer,
 	logger *slog.Logger,
 ) *Service {
 	s := &Service{
 		sessionID:     sessionID,
 		bus:           bus,
-		planner:       planner,
+		planner:       advPlanner,
 		planManager:   pm,
 		curriculum:    curriculum,
 		critic:        critic,
 		stateProvider: stateProvider,
+		execStatus:    execStatus,
 		worldModel:    worldModel,
+		feedback:      feedback,
 		logger:        logger.With(slog.String("component", "decision_service")),
 		evalSemaphore: make(chan struct{}, 1),
 		taskHistory:   make([]domain.TaskHistory, 0),
@@ -164,8 +165,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 		// Check if we actually have food
 		hasFood := false
 		for _, item := range state.Inventory {
-			// Basic food check
-			if item.Name == "apple" || item.Name == "cooked_beef" || item.Name == "bread" || item.Name == "carrot" {
+			if domain.IsFood(item.Name) {
 				hasFood = true
 				break
 			}
@@ -199,18 +199,14 @@ func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEve
 }
 
 func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
-	var payload struct {
-		Status    string `json:"status"`
-		CommandID string `json:"command_id"`
-		Cause     string `json:"cause"`
-	}
+	var payload domain.TaskEndPayload
 
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return
 	}
 
 	success := payload.Status == "COMPLETED"
-	controlledStop := isControlledStop(payload.Cause)
+	controlledStop := domain.IsControlledStop(payload.Cause)
 
 	intent := s.activeIntent.Load()
 	beforePtr := s.beforeState.Load()
@@ -224,7 +220,19 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			failureCount = s.planner.GetFailureCount(currentPlan.Objective)
 		}
 
-		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after, failureCount)
+		// Phase 5.5: Analyze feedback for tactical adaptation
+		res := domain.ExecutionResult{
+			Success:  success,
+			Cause:    payload.Cause,
+			Progress: payload.Progress,
+			Action: domain.Action{
+				Action: payload.Action,
+				Target: domain.Target{Name: payload.Target},
+			},
+		}
+		adaptedIntent := s.feedback.Analyze(*intent, res)
+
+		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after, res, failureCount)
 
 		if !success {
 			successCritic = false
@@ -235,6 +243,14 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 				s.worldModel.PenalizeAction(intent.Action, 1.0)
 				loc := domain.Location{X: beforePtr.Position.X, Y: beforePtr.Position.Y, Z: beforePtr.Position.Z}
 				s.worldModel.PenalizeZone(loc, 0.5)
+			}
+
+			// If analyzer provided a tactical fallback, inject it immediately
+			if adaptedIntent != nil && adaptedIntent.ID != intent.ID {
+				s.logger.Info("FeedbackAnalyzer injected tactical fallback", slog.String("action", adaptedIntent.Action))
+				s.activeIntent.Store(adaptedIntent)
+				s.dispatchActiveIntent(ctx, adaptedIntent)
+				return
 			}
 		} else {
 			// Learn from success: reward the action
@@ -311,6 +327,46 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	go s.evaluateNextPlan(context.Background())
 }
 
+func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.ActionIntent) {
+	if intent == nil {
+		return
+	}
+
+	s.commitment.Store(&Commitment{
+		TaskID:      intent.ID,
+		StartTime:   time.Now(),
+		MinDuration: 2 * time.Second,
+	})
+
+	// Wrap the single intent into a plan for the wire
+	plan := domain.Plan{
+		ID:        fmt.Sprintf("adapted-%d", time.Now().UnixNano()),
+		Objective: "Tactical Adaptation",
+		Tasks: []domain.Action{
+			{
+				ID:        intent.ID,
+				Action:    intent.Action,
+				Target:    domain.Target{Name: intent.Target, Type: "adapted"},
+				Count:     intent.Count,
+				Rationale: intent.Rationale,
+				Priority:  100,
+			},
+		},
+	}
+
+	payload, _ := json.Marshal(plan)
+	s.bus.Publish(ctx, domain.DomainEvent{
+		SessionID: s.sessionID,
+		Trace: domain.TraceContext{
+			TraceID:  fmt.Sprintf("tr-ad-%d", time.Now().UnixNano()),
+			ActionID: intent.ID,
+		},
+		Type:      domain.EventTypePlanCreated,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+	})
+}
+
 func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.DomainEvent) {
 	s.commitment.Store(nil)
 	s.activeIntent.Store(nil)
@@ -347,7 +403,7 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 
 	// Keep the current plan/task flowing unless survival needs to interrupt it.
 	if !survivalOverride {
-		if s.activeIntent.Load() != nil || s.planManager.HasActivePlan() {
+		if s.activeIntent.Load() != nil || s.planManager.HasActivePlan() || !s.execStatus.IsIdle() {
 			return
 		}
 	}

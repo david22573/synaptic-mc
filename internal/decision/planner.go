@@ -13,8 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/policy"
@@ -23,6 +26,7 @@ import (
 
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	CompressState(state domain.GameState, events []domain.DomainEvent) string
 }
 
 type RuleExtractor interface {
@@ -35,14 +39,17 @@ type AdvancedPlanner struct {
 	extractor RuleExtractor
 	memStore  memory.Store
 	store     domain.EventStore
+	humanizer *humanization.Engine
 	logger    *slog.Logger
 	flags     config.FeatureFlags
 
 	currentPlan atomic.Pointer[domain.Plan]
 	latestState atomic.Pointer[domain.GameState]
+	isStuck     atomic.Bool
 
-	planCache map[uint64]cachedPlan
+	planCache map[string]cachedPlan
 	cacheMu   sync.RWMutex
+	sf        singleflight.Group
 
 	failures map[string]int
 	failMu   sync.Mutex
@@ -53,6 +60,8 @@ type AdvancedPlanner struct {
 type cachedPlan struct {
 	plan      *domain.Plan
 	createdAt time.Time
+	lastUsed  time.Time
+	cacheKey  string
 }
 
 const maxPlanCacheSize = 500
@@ -63,6 +72,7 @@ func NewAdvancedPlanner(
 	extractor RuleExtractor,
 	memStore memory.Store,
 	store domain.EventStore,
+	humanizer *humanization.Engine,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
 ) *AdvancedPlanner {
@@ -72,9 +82,10 @@ func NewAdvancedPlanner(
 		extractor: extractor,
 		memStore:  memStore,
 		store:     store,
+		humanizer: humanizer,
 		logger:    logger.With(slog.String("component", "advanced_planner")),
 		flags:     flags,
-		planCache: make(map[uint64]cachedPlan),
+		planCache: make(map[string]cachedPlan),
 		failures:  make(map[string]int),
 	}
 }
@@ -207,9 +218,7 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 				continue
 			}
 
-			if activeState.Health == 0 && activeState.Food == 0 &&
-				activeState.Position.X == 0 && activeState.Position.Y == 0 && activeState.Position.Z == 0 &&
-				len(activeState.Inventory) == 0 {
+			if !activeState.Initialized {
 				continue
 			}
 
@@ -217,6 +226,34 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 			if !needsReplan {
 				continue
+			}
+
+			// Phase 7: Hesitation moved to cognitive decision layer.
+			// We calculate hesitation based on the *previous* plan's outcome
+			// or current state criticalness.
+			if p.humanizer != nil {
+				currPlan := p.currentPlan.Load()
+				var lastAction domain.Action
+				if currPlan != nil && len(currPlan.Tasks) > 0 {
+					lastAction = currPlan.Tasks[0]
+				}
+
+				hCtx := humanization.BuildContext(*activeState, p.isStuck.Load())
+				hesitation := humanization.CalculateHesitation(lastAction, hCtx, p.humanizer.State(), p.humanizer.Config())
+
+				if hesitation > 0 {
+					p.logger.Debug("Cognitive hesitation active", slog.Duration("duration", hesitation))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(hesitation):
+						// After hesitation, pull the ABSOLUTE LATEST state again
+						// to ensure the plan isn't based on what happened *before* the pause.
+						if s := p.latestState.Swap(nil); s != nil {
+							activeState = s
+						}
+					}
+				}
 			}
 
 			plan, err := p.generateLLMPlan(ctx, sessionID, *activeState)
@@ -267,10 +304,10 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 		p.failMu.Unlock()
 
 		if fails > 3 {
-			p.logger.Warn("Plan stuck in failure loop, degrading behavior", slog.String("objective", current.Objective))
+			p.logger.Warn("Plan stuck in failure loop, degrading behavior", slog.String("objective", current.Objective), slog.Int("failures", fails))
 			p.currentPlan.Store(nil)
-			p.RecordSuccess(current.Objective)
-			return p.degradedPlan(state)
+			// BUG FIX: Do NOT call RecordSuccess here. That clears the signal we need to break the loop.
+			return p.degradedPlan(state, fails)
 		}
 	}
 
@@ -280,7 +317,7 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 	return p.reactivePlan(state)
 }
 
-func (p *AdvancedPlanner) degradedPlan(state domain.GameState) domain.Plan {
+func (p *AdvancedPlanner) degradedPlan(state domain.GameState, failureCount int) domain.Plan {
 	return domain.Plan{
 		Objective: "Degraded Recovery state",
 		Tasks: []domain.Action{
@@ -289,7 +326,7 @@ func (p *AdvancedPlanner) degradedPlan(state domain.GameState) domain.Plan {
 				Action:    "random_walk",
 				Target:    domain.Target{Name: "none", Type: "none"},
 				Priority:  50,
-				Rationale: "System stuck in loop: falling back to random walk to break deadlock",
+				Rationale: fmt.Sprintf("System stuck in loop (%d consecutive failures): falling back to random walk to break deadlock", failureCount),
 			},
 		},
 	}
@@ -352,6 +389,16 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 		})
 	}
 
+	if len(tasks) == 0 {
+		tasks = append(tasks, domain.Action{
+			ID:        fmt.Sprintf("react-idle-%d", time.Now().UnixNano()),
+			Action:    "idle",
+			Target:    domain.Target{Name: "none", Type: "none"},
+			Priority:  10,
+			Rationale: "Reactive fast-path: No immediate survival threats, idling until next tick",
+		})
+	}
+
 	return domain.Plan{
 		Objective: "Reactive Fallback Plan",
 		Tasks:     tasks,
@@ -366,134 +413,199 @@ func (p *AdvancedPlanner) evictCache() {
 		return
 	}
 
-	// Evict 20% of entries randomly to keep memory usage bounded.
-	// Go map iteration is naturally randomized.
-	count := 0
+	// Use a predictable LRU strategy:
+	// 1. Gather all keys and their lastUsed times
+	type entry struct {
+		key  string
+		used time.Time
+	}
+	entries := make([]entry, 0, len(p.planCache))
+	for k, v := range p.planCache {
+		entries = append(entries, entry{k, v.lastUsed})
+	}
+
+	// 2. Sort by lastUsed ASC (oldest first)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].used.Before(entries[j].used)
+	})
+
+	// 3. Evict oldest 20%
 	target := maxPlanCacheSize / 5
-	for k := range p.planCache {
-		delete(p.planCache, k)
-		count++
-		if count >= target {
-			break
-		}
+	for i := 0; i < target && i < len(entries); i++ {
+		delete(p.planCache, entries[i].key)
 	}
 }
 
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
-	stateHash := hashState(state)
+	lastEventID, err := p.store.GetLastEventID(ctx, sessionID)
+	if err != nil {
+		p.logger.Warn("Failed to get last event ID, using 0", slog.Any("error", err))
+		lastEventID = 0
+	}
 
+	stateHash := hashState(state)
+	// Key includes session and event ID to prevent stale reuse when memory/rules change
+	cacheKey := fmt.Sprintf("%s:%d:%d", sessionID, lastEventID, stateHash)
+	sfKey := cacheKey
+
+	// Phase 1: Fast cache check
 	p.cacheMu.RLock()
-	if entry, ok := p.planCache[stateHash]; ok {
+	if entry, ok := p.planCache[cacheKey]; ok {
+		// TTL check (10 seconds)
+		if time.Since(entry.createdAt) > 10*time.Second {
+			p.cacheMu.RUnlock()
+			p.cacheMu.Lock()
+			delete(p.planCache, cacheKey)
+			p.cacheMu.Unlock()
+			goto cacheMiss
+		}
+
 		cachedPlan := entry.plan
 		p.failMu.Lock()
 		fails := p.failures[cachedPlan.Objective]
 		p.failMu.Unlock()
 
-		// ONLY use the cache if this plan hasn't proven to be a failure
 		if fails == 0 {
+			// Update lastUsed for LRU eviction strategy
 			p.cacheMu.RUnlock()
+			p.cacheMu.Lock()
+			if entry, ok := p.planCache[cacheKey]; ok {
+				entry.lastUsed = time.Now()
+				p.planCache[cacheKey] = entry
+			}
+			p.cacheMu.Unlock()
+
 			p.logger.Info("Using cached plan for stable state", slog.String("objective", cachedPlan.Objective))
 			return p.clonePlanWithNewIDs(cachedPlan), nil
 		}
 	}
 	p.cacheMu.RUnlock()
 
-	directive := p.evaluator.Evaluate(state)
-	learnedRules := ""
+cacheMiss:
 
-	if p.extractor != nil {
-		learnedRules = p.extractor.GenerateRules(ctx, sessionID)
-	}
-
-	knownWorld := "KNOWN WORLD: empty"
-	longTermMem := "No active summary."
-	if p.memStore != nil {
-		var err error
-		knownWorld, err = p.memStore.GetKnownWorld(ctx, state.Position)
-		if err != nil {
-			p.logger.Warn("Failed to get known world", slog.Any("error", err))
+	// Phase 2: Deduplicated LLM call
+	val, err, _ := p.sf.Do(sfKey, func() (interface{}, error) {
+		// Re-check cache inside singleflight to catch the winner of the race
+		p.cacheMu.RLock()
+		if entry, ok := p.planCache[cacheKey]; ok {
+			p.cacheMu.RUnlock()
+			return entry.plan, nil
 		}
-		longTermMem, err = p.memStore.GetSummary(ctx, sessionID)
-		if err != nil {
-			p.logger.Warn("Failed to get long-term memory", slog.Any("error", err))
+		p.cacheMu.RUnlock()
+
+		directive := p.evaluator.Evaluate(state)
+		learnedRules := ""
+
+		if p.extractor != nil {
+			learnedRules = p.extractor.GenerateRules(ctx, sessionID)
 		}
-	}
 
-	systemPrompt := fmt.Sprintf("%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
-		BaseSystemRules,
-		learnedRules,
-		longTermMem,
-		knownWorld,
-		directive.PrimaryGoal,
-		directive.SecondaryGoal,
-	)
-
-	userContent := domain.FormatStateForLLM(state)
-
-	rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)
-	if err != nil {
-		return nil, fmt.Errorf("llm api failure: %w", err)
-	}
-
-	var parsed multiCandidateResponse
-	if err := json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &parsed); err != nil {
-		return nil, fmt.Errorf("llm schema violation: %w", err)
-	}
-
-	if len(parsed.Candidates) == 0 {
-		return nil, fmt.Errorf("planner returned zero candidates")
-	}
-
-	now := time.Now().UnixNano()
-	for i := range parsed.Candidates {
-		for j := range parsed.Candidates[i] {
-			if parsed.Candidates[i][j].ID == "" {
-				parsed.Candidates[i][j].ID = fmt.Sprintf("plan-%d-c%d-t%d", now, i, j)
+		knownWorld := "KNOWN WORLD: empty"
+		longTermMem := "No active summary."
+		if p.memStore != nil {
+			var err error
+			knownWorld, err = p.memStore.GetKnownWorld(ctx, state.Position)
+			if err != nil {
+				p.logger.Warn("Failed to get known world", slog.Any("error", err))
+			}
+			longTermMem, err = p.memStore.GetSummary(ctx, sessionID)
+			if err != nil {
+				p.logger.Warn("Failed to get long-term memory", slog.Any("error", err))
 			}
 		}
-	}
 
-	events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
-	stats := learning.CalculateActionStats(nil, events)
+		systemPrompt := fmt.Sprintf("%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
+			BaseSystemRules,
+			learnedRules,
+			longTermMem,
+			knownWorld,
+			directive.PrimaryGoal,
+			directive.SecondaryGoal,
+		)
 
-	p.failMu.Lock()
-	failureCount := p.failures[parsed.Objective]
-	p.failMu.Unlock()
+		userContent := domain.FormatStateForLLM(state)
 
-	type scoredCandidate struct {
-		tasks []domain.Action
-		score float64
-	}
+		// Phase 7: Lossy State Compression
+		// We use the LLM client to compress the massive event stream into a token-capped summary
+		// that only contains the variables needed for the immediate next decision.
+		events, _ := p.store.GetRecentStream(ctx, sessionID, 100)
+		historySummary := p.client.CompressState(state, events)
+		userContent = fmt.Sprintf("%s\n\nEXECUTION_HISTORY_SUMMARY:\n%s", userContent, historySummary)
 
-	var scored []scoredCandidate
-	for _, candidate := range parsed.Candidates {
-		score := p.scoreCandidate(candidate, state, stats, failureCount)
-		scored = append(scored, scoredCandidate{candidate, score})
-	}
+		rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)
+		if err != nil {
+			return nil, fmt.Errorf("llm api failure: %w", err)
+		}
 
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
+		var parsed multiCandidateResponse
+		if err := json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &parsed); err != nil {
+			return nil, fmt.Errorf("llm schema violation: %w", err)
+		}
+
+		if len(parsed.Candidates) == 0 {
+			return nil, fmt.Errorf("planner returned zero candidates")
+		}
+
+		now := time.Now().UnixNano()
+		for i := range parsed.Candidates {
+			for j := range parsed.Candidates[i] {
+				if parsed.Candidates[i][j].ID == "" {
+					parsed.Candidates[i][j].ID = fmt.Sprintf("plan-%d-c%d-t%d", now, i, j)
+				}
+			}
+		}
+
+		events, _ = p.store.GetRecentStream(ctx, sessionID, 500)
+		stats := learning.CalculateActionStats(nil, events, p.logger)
+
+		p.failMu.Lock()
+		failureCount := p.failures[parsed.Objective]
+		p.failMu.Unlock()
+
+		var scored []struct {
+			tasks []domain.Action
+			score float64
+		}
+		for _, candidate := range parsed.Candidates {
+			score := p.scoreCandidate(candidate, state, stats, failureCount)
+			scored = append(scored, struct {
+				tasks []domain.Action
+				score float64
+			}{candidate, score})
+		}
+
+		sort.Slice(scored, func(i, j int) bool {
+			return scored[i].score > scored[j].score
+		})
+
+		finalPlan := &domain.Plan{
+			ID:        fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			Objective: parsed.Objective,
+			Tasks:     scored[0].tasks,
+		}
+
+		for i := 1; i < len(scored); i++ {
+			finalPlan.Fallbacks = append(finalPlan.Fallbacks, scored[i].tasks)
+		}
+
+		p.evictCache()
+		p.cacheMu.Lock()
+		p.planCache[cacheKey] = cachedPlan{
+			plan:      finalPlan,
+			createdAt: time.Now(),
+			lastUsed:  time.Now(),
+			cacheKey:  cacheKey,
+		}
+		p.cacheMu.Unlock()
+
+		return finalPlan, nil
 	})
 
-	finalPlan := &domain.Plan{
-		ID:        fmt.Sprintf("plan-%d", time.Now().UnixNano()),
-		Objective: parsed.Objective,
-		Tasks:     scored[0].tasks,
+	if err != nil {
+		return nil, err
 	}
 
-	for i := 1; i < len(scored); i++ {
-		finalPlan.Fallbacks = append(finalPlan.Fallbacks, scored[i].tasks)
-	}
-
-	p.evictCache()
-	p.cacheMu.Lock()
-	p.planCache[stateHash] = cachedPlan{
-		plan:      finalPlan,
-		createdAt: time.Now(),
-	}
-	p.cacheMu.Unlock()
-
-	return finalPlan, nil
+	return p.clonePlanWithNewIDs(val.(*domain.Plan)), nil
 }
 
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {

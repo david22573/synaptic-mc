@@ -90,7 +90,8 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 				desc := fmt.Sprintf("Successfully executed '%s %d %s' when health was %.0f and time was %d", task.Intent.Action, task.Intent.Count, task.Intent.Target, finalState.Health, finalState.TimeOfDay)
 				descEmb, err := c.client.CreateEmbedding(saveCtx, desc)
 				if err == nil && len(descEmb) > 0 {
-					_ = c.vector.SaveSkill(saveCtx, desc, task.Intent, descEmb)
+					intentJSON, _ := json.Marshal(task.Intent)
+					_ = c.vector.SaveSkill(saveCtx, desc, string(intentJSON), descEmb)
 				}
 			}(lastTask, state)
 		}
@@ -106,7 +107,12 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		if len(skills) > 0 {
 			var skillStrs []string
 			for _, s := range skills {
-				skillStrs = append(skillStrs, fmt.Sprintf("- Situation: %s -> Intent: %s %d %s", s.Description, s.Intent.Action, s.Intent.Count, s.Intent.Target))
+				var intent domain.ActionIntent
+				if err := json.Unmarshal([]byte(s.Code), &intent); err == nil {
+					skillStrs = append(skillStrs, fmt.Sprintf("- Situation: %s -> Intent: %s %d %s", s.Description, intent.Action, intent.Count, intent.Target))
+				} else {
+					skillStrs = append(skillStrs, fmt.Sprintf("- Situation: %s -> Code: %s", s.Description, s.Code))
+				}
 			}
 			skillContext = "RELEVANT PAST SUCCESSES:\n" + strings.Join(skillStrs, "\n")
 		}

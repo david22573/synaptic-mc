@@ -169,8 +169,10 @@ func (c *WSController) readPump() {
 		}
 
 		if msg.Type == "TASK_END" {
-			var res domain.ExecutionResult
-			if err := json.Unmarshal(msg.Payload, &res); err == nil {
+			var res domain.TaskEndPayload
+			if err := json.Unmarshal(msg.Payload, &res); err != nil {
+				c.logger.Error("Failed to unmarshal TASK_END payload", slog.Any("error", err))
+			} else {
 				c.logger.Info("Execution result parsed",
 					slog.Bool("success", res.Success),
 					slog.String("cause", res.Cause),

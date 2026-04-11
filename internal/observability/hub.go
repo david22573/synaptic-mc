@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +28,24 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+
+		// Allow localhost and same-host connections
+		host := r.Host
+		if origin == "http://"+host || origin == "https://"+host {
+			return true
+		}
+
+		// Always allow localhost for development
+		return origin == "http://localhost" || 
+			   origin == "http://127.0.0.1" || 
+			   origin == "http://[::1]" ||
+			   strings.HasPrefix(origin, "http://localhost:") ||
+			   strings.HasPrefix(origin, "http://127.0.0.1:") ||
+			   strings.HasPrefix(origin, "http://[::1]:")
 	},
 }
 
@@ -237,7 +255,9 @@ func (c *UIClient) readPump() {
 			Payload json.RawMessage `json:"payload"`
 		}
 
-		if err := json.Unmarshal(msg, &envelope); err == nil {
+		if err := json.Unmarshal(msg, &envelope); err != nil {
+			c.hub.logger.Error("Failed to unmarshal UI client message", slog.Any("error", err))
+		} else {
 			if envelope.Type == MsgTypeControlInput {
 				c.hub.handleControlInput(c, envelope.Payload)
 			}

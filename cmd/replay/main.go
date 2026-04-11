@@ -77,7 +77,9 @@ func main() {
 		// Reconstruct base GameState
 		if ev.Type == domain.EventTypeStateTick || ev.Type == domain.EventTypeStateUpdated {
 			var st domain.GameState
-			if err := json.Unmarshal(ev.Payload, &st); err == nil {
+			if err := json.Unmarshal(ev.Payload, &st); err != nil {
+				fmt.Printf("[%s] Error unmarshaling state: %v\n", ev.CreatedAt.Format(time.RFC3339), err)
+			} else {
 				currentState = st
 			}
 		}
@@ -86,18 +88,24 @@ func main() {
 		switch ev.Type {
 		case domain.EventTypePlanCreated:
 			var plan domain.Plan
-			json.Unmarshal(ev.Payload, &plan)
-			fmt.Printf("[%s] 🧠 PLAN CREATED: %s (Tasks: %d)\n", ev.CreatedAt.Format(time.RFC3339), plan.Objective, len(plan.Tasks))
+			if err := json.Unmarshal(ev.Payload, &plan); err != nil {
+				fmt.Printf("[%s] Error unmarshaling plan: %v\n", ev.CreatedAt.Format(time.RFC3339), err)
+			} else {
+				fmt.Printf("[%s] 🧠 PLAN CREATED: %s (Tasks: %d)\n", ev.CreatedAt.Format(time.RFC3339), plan.Objective, len(plan.Tasks))
+			}
 		case domain.EventTypeTaskStart:
 			fmt.Printf("[%s] 🚀 TASK START: %s\n", ev.CreatedAt.Format(time.RFC3339), ev.Trace.ActionID)
 		case domain.EventTypeTaskEnd:
 			var payload map[string]string
-			json.Unmarshal(ev.Payload, &payload)
-			status := payload["status"]
-			if status == "FAILED" {
-				fmt.Printf("[%s] ❌ TASK FAILED: %s (Cause: %s)\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"], payload["cause"])
+			if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+				fmt.Printf("[%s] Error unmarshaling TaskEnd payload: %v\n", ev.CreatedAt.Format(time.RFC3339), err)
 			} else {
-				fmt.Printf("[%s] ✅ TASK COMPLETED: %s\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"])
+				status := payload["status"]
+				if status == "FAILED" {
+					fmt.Printf("[%s] ❌ TASK FAILED: %s (Cause: %s)\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"], payload["cause"])
+				} else {
+					fmt.Printf("[%s] ✅ TASK COMPLETED: %s\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"])
+				}
 			}
 		case domain.EventTypePlanInvalidated:
 			fmt.Printf("[%s] ⚠️ PLAN INVALIDATED\n", ev.CreatedAt.Format(time.RFC3339))

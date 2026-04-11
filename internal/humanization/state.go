@@ -64,3 +64,9 @@ func (s *State) GetFeedback() Feedback {
 	defer s.mu.Unlock()
 	return s.Feedback
 }
+
+func (s *State) GetCommitment() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Intent.Commitment
+}

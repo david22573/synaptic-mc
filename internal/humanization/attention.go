@@ -9,41 +9,19 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type AttentionModel struct {
-	FocusLevel float64
-	LastUpdate time.Time
-}
-
-func NewAttentionModel() *AttentionModel {
-	return &AttentionModel{
-		FocusLevel: 1.0,
-		LastUpdate: time.Now(),
-	}
-}
-
-func (a *AttentionModel) Decay() {
-	elapsed := time.Since(a.LastUpdate).Seconds()
-	a.FocusLevel -= (elapsed / 60.0) * 0.05
-	if a.FocusLevel < 0.2 {
-		a.FocusLevel = 0.2
-	}
-	a.LastUpdate = time.Now()
-}
-
-func (a *AttentionModel) CheckDistraction() bool {
-	a.Decay()
-	return rand.Float64() < (1.0-a.FocusLevel)*0.25
-}
-
-func (a *AttentionModel) Refocus() {
-	a.FocusLevel = 1.0
-	a.LastUpdate = time.Now()
-}
-
 // ProcessAttentionDrift generates idle drift actions when the bot's attention
 // has degraded enough to cause a lapse in focus.
 func ProcessAttentionDrift(ctx Context, state *State, now time.Time) []ScheduledAction {
 	attention := state.GetAttention()
+
+	// Requirement 2: Drop humanization yaw drift commands during active navigation
+	// to resolve orientation contention with movement tasks.
+	if ctx.State.CurrentTask != nil {
+		action := ctx.State.CurrentTask.Action
+		if action == "gather" || action == "mine" || action == "explore" || action == "hunt" || action == "retreat" {
+			return nil
+		}
+	}
 
 	// Scale distraction probability inversely with attention
 	distractionChance := (1.0 - attention) * 0.3

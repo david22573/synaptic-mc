@@ -104,6 +104,14 @@ func (tm *TaskManager) SetReadyChecker(checker func() bool) {
 }
 
 func (tm *TaskManager) Run(ctx context.Context) {
+	defer func() {
+		// Ensure active tasks are aborted when the manager stops.
+		// Use a background context with timeout to allow final cleanup even if the parent context is done.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = tm.Halt(shutdownCtx, "task manager shutdown")
+	}()
+
 	idleCheck := time.NewTicker(1 * time.Second)
 	defer idleCheck.Stop()
 
@@ -113,6 +121,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			tm.logger.InfoContext(ctx, "Task manager stopping due to context cancellation")
 			return
 		case <-idleCheck.C:
 			tm.mu.Lock()
@@ -133,7 +142,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 				if tm.idleSince.IsZero() {
 					tm.idleSince = time.Now()
 				} else if time.Since(tm.idleSince) > 6*time.Second {
-					tm.logger.Info("Curiosity loop triggered: autonomous exploration", slog.Int("failure_count", tm.failureCount))
+					tm.logger.InfoContext(ctx, "Curiosity loop triggered: autonomous exploration", slog.Int("failure_count", tm.failureCount))
 
 					exploreTask := domain.Action{
 						ID:        "explore-curiosity-stable",
@@ -156,10 +165,10 @@ func (tm *TaskManager) Run(ctx context.Context) {
 			tm.mu.Unlock()
 
 		case <-scheduleTicker.C:
-			tm.processScheduled()
+			tm.processScheduled(ctx)
 
 		case <-tm.scheduleSig:
-			tm.processScheduled()
+			tm.processScheduled(ctx)
 
 		case <-tm.signalCh:
 			tm.mu.Lock()
@@ -185,16 +194,20 @@ func (tm *TaskManager) Run(ctx context.Context) {
 }
 
 func (tm *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
-	tm.logger.Debug("Warm starting next task in background", slog.String("action", nextTask.Action))
+	tm.logger.DebugContext(ctx, "Warm starting next task in background", slog.String("action", nextTask.Action))
 }
 
 func (tm *TaskManager) IsIdle() bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	return tm.activeTask == nil && tm.queue.Len() == 0
+	return tm.activeTask == nil && tm.queue.Len() == 0 && tm.engine.IsIdle()
 }
 
 func (tm *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -212,6 +225,10 @@ func (tm *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) erro
 }
 
 func (tm *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Action, executeAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	tm.scheduleMu.Lock()
 	tm.scheduled = append(tm.scheduled, scheduledItem{action, executeAt})
 	sort.Slice(tm.scheduled, func(i, j int) bool {
@@ -226,7 +243,7 @@ func (tm *TaskManager) EnqueueScheduled(ctx context.Context, action domain.Actio
 	return nil
 }
 
-func (tm *TaskManager) processScheduled() {
+func (tm *TaskManager) processScheduled(_ context.Context) {
 	tm.scheduleMu.Lock()
 	defer tm.scheduleMu.Unlock()
 
@@ -338,7 +355,7 @@ func (tm *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action
 	tm.mu.Lock()
 
 	if tm.activeTask != nil && !tm.engine.HasController() {
-		tm.logger.Warn("Controller missing, preserving active task")
+		tm.logger.WarnContext(ctx, "Controller missing, preserving active task")
 		tm.mu.Unlock()
 		return
 	}
@@ -353,6 +370,11 @@ func (tm *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action
 			return
 		}
 	} else if tm.activeTask != nil {
+		tm.mu.Unlock()
+		return
+	}
+
+	if err := ctx.Err(); err != nil {
 		tm.mu.Unlock()
 		return
 	}

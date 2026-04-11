@@ -1,6 +1,8 @@
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import { getErrorMessage } from "../utils/errors.js";
+import { Vec3 } from "vec3";
+import * as vm from "node:vm";
 
 export type TaskStatus = "RUNNING" | "SUCCESS" | "FAILED";
 
@@ -21,12 +23,104 @@ export interface StateContext {
     result?: TaskResult;
 }
 
+/**
+ * DynamicSkillSandbox acts as a dynamic, secure sandbox that evaluates and executes 
+ * arbitrary JavaScript functions injected at runtime from the Go backend.
+ * 
+ * This implements Requirement 2 for the Voyager-class architecture transition.
+ */
+export class DynamicSkillSandbox {
+    public static async execute(
+        code: string,
+        context: StateContext
+    ): Promise<TaskResult> {
+        context.startTime = Date.now();
+
+        // Define secure sandbox globals
+        // We provide the bot, utilities, and task-specific context
+        const sandbox = {
+            bot: context.bot,
+            Vec3: Vec3,
+            console: console,
+            setTimeout: setTimeout,
+            clearTimeout: clearTimeout,
+            setInterval: setInterval,
+            clearInterval: clearInterval,
+            Promise: Promise,
+            Math: Math,
+            Date: Date,
+            // Context variables
+            targetName: context.targetName,
+            targetEntity: context.targetEntity,
+            searchRadius: context.searchRadius,
+            signal: context.signal,
+            // Result object for the dynamic skill to populate
+            result: { status: "SUCCESS", reason: "" } as TaskResult,
+        };
+
+        const vmContext = vm.createContext(sandbox);
+
+        // We expect 'code' to be a string representation of an async function,
+        // e.g., "async (bot, Vec3, ctx) => { ... }"
+        // We wrap it to ensure it is evaluated and then executed within the sandbox.
+        const wrappedCode = `
+            (async () => {
+                try {
+                    const skillFunc = ${code};
+                    await skillFunc(bot, Vec3, { 
+                        targetName, 
+                        targetEntity, 
+                        searchRadius, 
+                        signal, 
+                        result 
+                    });
+                } catch (err) {
+                    result.status = "FAILED";
+                    result.reason = err.message;
+                }
+            })()
+        `;
+
+        try {
+            const script = new vm.Script(wrappedCode, {
+                filename: "voyager_skill.js",
+            });
+
+            // Execute with a hard CPU timeout and display errors
+            await script.runInContext(vmContext, {
+                timeout: context.timeoutMs,
+                displayErrors: true,
+                breakOnSigint: true,
+            });
+
+            if (context.signal.aborted) {
+                return { status: "FAILED", reason: "aborted" };
+            }
+
+            return sandbox.result;
+        } catch (err: unknown) {
+            const msg = getErrorMessage(err);
+            if (context.signal.aborted) {
+                return { status: "FAILED", reason: "aborted" };
+            }
+            return {
+                status: "FAILED",
+                reason: `SANDBOX_CRASH: ${msg}`,
+            };
+        }
+    }
+}
+
 export interface FSMState {
     name: string;
     enter(ctx: StateContext): Promise<void> | void;
     execute(ctx: StateContext): Promise<FSMState | null>;
 }
 
+/**
+ * StateMachineRunner maintained for legacy FSM support while transitioning 
+ * to dynamic skill generation.
+ */
 export class StateMachineRunner {
     private currentState: FSMState | null = null;
     private context: StateContext;
@@ -40,7 +134,11 @@ export class StateMachineRunner {
         this.context.startTime = Date.now();
 
         if (this.currentState) {
-            await this.currentState.enter(this.context);
+            try {
+                await this.currentState.enter(this.context);
+            } catch (err) {
+                return { status: "FAILED", reason: `FSM_ENTER_CRASH: ${getErrorMessage(err)}` };
+            }
         }
 
         while (this.currentState !== null) {
@@ -77,8 +175,7 @@ export class StateMachineRunner {
                     }
                     this.currentState = nextState;
                 } else {
-                    // Safety: Yield to the event loop if we are staying in the same state
-                    // to prevent synchronous CPU pinning.
+                    // Yield to event loop to prevent CPU pinning
                     await new Promise(resolve => setImmediate(resolve));
                 }
             } catch (err: unknown) {

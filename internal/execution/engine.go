@@ -25,7 +25,7 @@ func (h actionHeap) Less(i, j int) bool {
 	}
 	return h[i].action.Priority > h[j].action.Priority
 }
-func (h actionHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h actionHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
 func (h *actionHeap) Push(x interface{}) { *h = append(*h, x.(queuedAction)) }
 func (h *actionHeap) Pop() interface{} {
 	old := *h
@@ -71,8 +71,25 @@ func (e *TaskExecutionEngine) Start(ctx context.Context) {
 			return
 		case <-cleanupTicker.C:
 			e.cleanupRecentActions()
+			e.checkStuckTasks()
 		case <-pumpTicker.C:
 			e.pump()
+		}
+	}
+}
+
+func (e *TaskExecutionEngine) checkStuckTasks() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// If a task is dispatched but we never receive a TASK_START ack from the TS client,
+	// the ControlService watchdog won't fire. Abort to prevent permanent queue deadlock.
+	if e.inFlight != nil && e.inFlight.Status == StatusDispatched {
+		if time.Since(e.inFlight.EnqueueTime) > 15*time.Second && e.inFlight.StartTime == nil {
+			e.logger.Warn("Task stuck in dispatched state (no TASK_START received). Aborting to clear queue deadlock.", slog.String("action", e.inFlight.Action.ID))
+			e.inFlight.Status = StatusFailed
+			e.inFlight.Error = "DISPATCH_TIMEOUT_NO_ACK"
+			e.inFlight = nil
 		}
 	}
 }
@@ -90,6 +107,12 @@ func (e *TaskExecutionEngine) cleanupRecentActions() {
 
 func (e *TaskExecutionEngine) HasController() bool {
 	return e.controller.IsReady()
+}
+
+func (e *TaskExecutionEngine) IsIdle() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.inFlight == nil && len(e.queue) == 0
 }
 
 func (e *TaskExecutionEngine) GetInFlight() *domain.Action {

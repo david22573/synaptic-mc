@@ -36,34 +36,40 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 
 	for _, ev := range events {
 		if ev.Type == domain.EventTypeTaskEnd {
-			var payload struct {
-				Status string `json:"status"`
-				Action string `json:"action"`
-				Cause  string `json:"cause"`
+			var payload domain.TaskEndPayload
+			if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+				p.logger.Warn("Failed to unmarshal TaskEnd event payload", slog.Any("error", err), slog.String("event_id", fmt.Sprintf("%d", ev.ID)))
+				continue
 			}
-			if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-				switch payload.Status {
-				case "FAILED", "ABORTED":
-					failures[payload.Action]++
-					if causes[payload.Action] == nil {
-						causes[payload.Action] = make(map[string]int)
-					}
-					causes[payload.Action][payload.Cause]++
-				case "COMPLETED":
-					delete(failures, payload.Action)
-					delete(causes, payload.Action)
+			key := fmt.Sprintf("%s:%s", payload.Action, payload.Target)
+			switch payload.Status {
+			case "FAILED", "ABORTED":
+				failures[key]++
+				if causes[key] == nil {
+					causes[key] = make(map[string]int)
 				}
+				causes[key][payload.Cause]++
+			case "COMPLETED":
+				delete(failures, key)
+				delete(causes, key)
 			}
 		}
 	}
 
 	var rules []string
-	for action, count := range failures {
+	for key, count := range failures {
 		if count >= 2 {
+			parts := strings.SplitN(key, ":", 2)
+			action := parts[0]
+			target := "unknown"
+			if len(parts) > 1 && parts[1] != "" {
+				target = parts[1]
+			}
+
 			// Find the most frequent cause
 			maxFreq := 0
 			primaryCause := ""
-			for c, freq := range causes[action] {
+			for c, freq := range causes[key] {
 				if freq > maxFreq {
 					maxFreq = freq
 					primaryCause = c
@@ -90,7 +96,12 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 			default:
 				attribution = fmt.Sprintf("Reported cause: %s", primaryCause)
 			}
-			rules = append(rules, fmt.Sprintf("- AVOID: Executing '%s'. %s", action, attribution))
+			rule := fmt.Sprintf("- AVOID: Executing '%s'", action)
+			if target != "unknown" {
+				rule += fmt.Sprintf(" on '%s'", target)
+			}
+			rule += fmt.Sprintf(". %s", attribution)
+			rules = append(rules, rule)
 		}
 	}
 

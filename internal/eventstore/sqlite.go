@@ -157,6 +157,13 @@ func (s *SQLiteStore) GetStreamSince(ctx context.Context, sessionID string, sinc
 	return s.queryEvents(ctx, query, sessionID, sinceID)
 }
 
+func (s *SQLiteStore) GetLastEventID(ctx context.Context, sessionID string) (int64, error) {
+	query := `SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?`
+	var id int64
+	err := s.db.QueryRowContext(ctx, query, sessionID).Scan(&id)
+	return id, err
+}
+
 func (s *SQLiteStore) queryEvents(ctx context.Context, query string, args ...any) ([]domain.DomainEvent, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

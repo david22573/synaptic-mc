@@ -32,6 +32,9 @@ var DegradationMap = map[string]string{
 	"mine":    "reposition",
 	"build":   "gather",
 	"gather":  "explore",
+	"hunt":    "retreat",
+	"smelt":   "gather",
+	"craft":   "gather",
 }
 
 type VersionedController struct {

@@ -114,12 +114,34 @@ func validateSpatialReality(task domain.Action, input PipelineState) error {
 }
 
 func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map[string]int) error {
+	target := strings.ToLower(task.Target.Name)
+	hasCraftingTable := simInv["crafting_table"] > 0
+	for _, poi := range gameState.POIs {
+		if strings.Contains(strings.ToLower(poi.Name), "crafting_table") && poi.Distance < 5.0 {
+			hasCraftingTable = true
+			break
+		}
+	}
+
 	switch task.Action {
-	case "explore", "retreat":
+	case "explore", "retreat", "idle":
 		return nil
 	case "eat":
-		if simInv[task.Target.Name] <= 0 {
+		if simInv[task.Target.Name] <= 0 && !domain.IsFood(task.Target.Name) {
 			return fmt.Errorf("cannot eat %s: not in inventory", task.Target.Name)
+		}
+		// If target is "best_food", we should check if ANY food exists
+		if task.Target.Name == "best_food" {
+			foundFood := false
+			for k, v := range simInv {
+				if v > 0 && domain.IsFood(k) {
+					foundFood = true
+					break
+				}
+			}
+			if !foundFood {
+				return fmt.Errorf("cannot eat: no food found in inventory")
+			}
 		}
 	case "smelt":
 		hasValidInput := false
@@ -127,19 +149,18 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 		validSmeltInputs := []string{
 			"raw_iron", "iron_ore", "raw_gold", "gold_ore", "raw_copper", "copper_ore",
 			"beef", "porkchop", "mutton", "chicken", "rabbit", "cod", "salmon",
-			"sand", "red_sand", "cobblestone", "stone",
-			"oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log",
+			"sand", "red_sand", "cobblestone", "stone", "potato", "kelp", "clay_ball", "cactus", "netherrack",
 		}
 
 		for k, v := range simInv {
 			if v > 0 {
 				for _, input := range validSmeltInputs {
-					if k == input {
+					if k == input || strings.HasSuffix(k, "_log") {
 						hasValidInput = true
 						break
 					}
 				}
-				if k == "coal" || k == "charcoal" || strings.HasSuffix(k, "_log") || strings.HasSuffix(k, "_planks") {
+				if k == "coal" || k == "charcoal" || strings.HasSuffix(k, "_log") || strings.HasSuffix(k, "_planks") || k == "blaze_rod" {
 					hasFuel = true
 				}
 			}
@@ -153,18 +174,15 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 		}
 
 	case "mine", "gather":
-		target := strings.ToLower(task.Target.Name)
-		isHardBlock := strings.Contains(target, "stone") || strings.Contains(target, "coal") || strings.Contains(target, "iron")
+		isHardBlock := strings.Contains(target, "stone") || strings.Contains(target, "coal") || strings.Contains(target, "iron") || strings.Contains(target, "gold") || strings.Contains(target, "diamond") || strings.Contains(target, "emerald") || strings.Contains(target, "redstone") || strings.Contains(target, "lapis")
 
 		if task.Action == "mine" && isHardBlock {
-			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0 || simInv["diamond_pickaxe"] > 0
+			hasPick := simInv["wooden_pickaxe"] > 0 || simInv["stone_pickaxe"] > 0 || simInv["iron_pickaxe"] > 0 || simInv["diamond_pickaxe"] > 0 || simInv["netherite_pickaxe"] > 0
 			if !hasPick {
 				return fmt.Errorf("mining %s requires a pickaxe", task.Target.Name)
 			}
 		}
 	case "craft":
-		target := strings.ToLower(task.Target.Name)
-
 		if strings.HasSuffix(target, "_planks") {
 			hasLogs := false
 			for k, v := range simInv {
@@ -186,6 +204,21 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			}
 			if !hasPlanks {
 				return fmt.Errorf("cannot craft sticks without at least 2 planks")
+			}
+		} else if strings.Contains(target, "pickaxe") || strings.Contains(target, "sword") || strings.Contains(target, "axe") || strings.Contains(target, "shovel") || strings.Contains(target, "hoe") {
+			if !hasCraftingTable {
+				return fmt.Errorf("crafting %s requires a crafting table nearby or in inventory", target)
+			}
+		} else if target == "crafting_table" {
+			hasPlanks := false
+			for k, v := range simInv {
+				if strings.HasSuffix(k, "_planks") && v >= 4 {
+					hasPlanks = true
+					break
+				}
+			}
+			if !hasPlanks {
+				return fmt.Errorf("cannot craft crafting_table without at least 4 planks")
 			}
 		}
 	}

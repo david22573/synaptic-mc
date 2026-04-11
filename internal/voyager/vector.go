@@ -8,20 +8,18 @@ import (
 	"math"
 	"sort"
 
-	"david22573/synaptic-mc/internal/domain"
-
 	_ "modernc.org/sqlite"
 )
 
 type VectorStore interface {
-	SaveSkill(ctx context.Context, description string, intent domain.ActionIntent, embedding []float32) error
+	SaveSkill(ctx context.Context, description string, code string, embedding []float32) error
 	RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error)
 	Close() error
 }
 
 type SkillRecord struct {
 	Description string
-	Intent      domain.ActionIntent
+	Code        string
 	Similarity  float32
 }
 
@@ -41,7 +39,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		description TEXT NOT NULL UNIQUE,
-		intent_json TEXT NOT NULL,
+		code TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
@@ -53,20 +51,19 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	return &SQLiteVectorStore{db: db}, nil
 }
 
-func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, intent domain.ActionIntent, embedding []float32) error {
-	intentBytes, _ := json.Marshal(intent)
+func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, code string, embedding []float32) error {
 	embeddingBytes, _ := json.Marshal(embedding)
 
-	query := `INSERT INTO skills (description, intent_json, embedding_json) VALUES (?, ?, ?) 
-	          ON CONFLICT(description) DO UPDATE SET intent_json=excluded.intent_json, embedding_json=excluded.embedding_json`
-	_, err := s.db.ExecContext(ctx, query, description, string(intentBytes), string(embeddingBytes))
+	query := `INSERT INTO skills (description, code, embedding_json) VALUES (?, ?, ?) 
+	          ON CONFLICT(description) DO UPDATE SET code=excluded.code, embedding_json=excluded.embedding_json`
+	_, err := s.db.ExecContext(ctx, query, description, code, string(embeddingBytes))
 
 	return err
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
 	// Full table scan for accurate cosine similarity
-	query := `SELECT description, intent_json, embedding_json FROM skills`
+	query := `SELECT description, code, embedding_json FROM skills`
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
@@ -83,13 +80,8 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 		default:
 		}
 
-		var desc, intentJSON, embJSON string
-		if err := rows.Scan(&desc, &intentJSON, &embJSON); err != nil {
-			continue
-		}
-
-		var intent domain.ActionIntent
-		if err := json.Unmarshal([]byte(intentJSON), &intent); err != nil {
+		var desc, code, embJSON string
+		if err := rows.Scan(&desc, &code, &embJSON); err != nil {
 			continue
 		}
 
@@ -101,7 +93,7 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 		sim := cosineSimilarity(queryEmbedding, embedding)
 		records = append(records, SkillRecord{
 			Description: desc,
-			Intent:      intent,
+			Code:        code,
 			Similarity:  sim,
 		})
 	}

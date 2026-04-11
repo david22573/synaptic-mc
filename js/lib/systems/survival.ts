@@ -44,14 +44,17 @@ export class SurvivalSystem {
     }
 
     public stop() {
-        this.running = false;
-        if (this.tickTimeout) clearTimeout(this.tickTimeout);
         this.reset();
     }
 
     public reset() {
+        this.running = false;
         this.isPanicking = false;
         this.panicCooldownUntil = 0;
+        if (this.tickTimeout) {
+            clearTimeout(this.tickTimeout);
+            this.tickTimeout = null;
+        }
     }
 
     public isPanickingNow(): boolean {

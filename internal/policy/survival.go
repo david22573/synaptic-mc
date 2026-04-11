@@ -88,7 +88,7 @@ func (p *SurvivalPolicy) buildEmergencyPlan(state domain.GameState) *domain.Plan
 	// prefer eat if food exists, else retreat
 	foodName := ""
 	for _, item := range state.Inventory {
-		if isFood(item.Name) && item.Count > 0 {
+		if domain.IsFood(item.Name) && item.Count > 0 {
 			foodName = item.Name
 			break
 		}
@@ -108,16 +108,4 @@ func (p *SurvivalPolicy) buildEmergencyPlan(state domain.GameState) *domain.Plan
 			Rationale: "SurvivalPolicy emergency override",
 		}},
 	}
-}
-
-func isFood(name string) bool {
-	foods := []string{"beef", "porkchop", "chicken", "mutton", "rabbit",
-		"cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton", "cooked_rabbit",
-		"apple", "bread", "carrot", "potato", "baked_potato", "sweet_berries"}
-	for _, f := range foods {
-		if strings.Contains(name, f) {
-			return true
-		}
-	}
-	return false
 }

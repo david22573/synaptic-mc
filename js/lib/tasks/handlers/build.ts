@@ -1,3 +1,4 @@
+// js/lib/tasks/handlers/build.ts
 import {
     type FSMState,
     type StateContext,
@@ -37,90 +38,53 @@ interface BuildContext extends StateContext {
 
 const SCHEMATICS: Record<string, BlueprintNode[]> = {
     shelter: [
-        { dx: -1, dy: 0, dz: -1 },
-        { dx: 0, dy: 0, dz: -1 },
-        { dx: 1, dy: 0, dz: -1 },
-        { dx: -1, dy: 0, dz: 0 },
-        { dx: 1, dy: 0, dz: 0 },
-        { dx: -1, dy: 0, dz: 1 },
-        { dx: 0, dy: 0, dz: 1 },
-        { dx: 1, dy: 0, dz: 1 },
-        { dx: -1, dy: 1, dz: -1 },
-        { dx: 0, dy: 1, dz: -1 },
-        { dx: 1, dy: 1, dz: -1 },
-        { dx: -1, dy: 1, dz: 0 },
-        { dx: 1, dy: 1, dz: 0 },
-        { dx: -1, dy: 1, dz: 1 },
-        { dx: 0, dy: 1, dz: 1 },
-        { dx: 1, dy: 1, dz: 1 },
-        { dx: -1, dy: 2, dz: -1 },
-        { dx: 0, dy: 2, dz: -1 },
-        { dx: 1, dy: 2, dz: -1 },
-        { dx: -1, dy: 2, dz: 0 },
-        { dx: 0, dy: 2, dz: 0 },
-        { dx: 1, dy: 2, dz: 0 },
-        { dx: -1, dy: 2, dz: 1 },
-        { dx: 0, dy: 2, dz: 1 },
-        { dx: 1, dy: 2, dz: 1 },
+        { dx: -1, dy: 0, dz: -1 }, { dx: 0, dy: 0, dz: -1 }, { dx: 1, dy: 0, dz: -1 },
+        { dx: -1, dy: 0, dz: 0 }, { dx: 1, dy: 0, dz: 0 },
+        { dx: -1, dy: 0, dz: 1 }, { dx: 1, dy: 0, dz: 1 },
+        { dx: -1, dy: 1, dz: -1 }, { dx: 0, dy: 1, dz: -1 }, { dx: 1, dy: 1, dz: -1 },
+        { dx: -1, dy: 1, dz: 0 }, { dx: 1, dy: 1, dz: 0 },
+        { dx: -1, dy: 1, dz: 1 }, { dx: 1, dy: 1, dz: 1 },
+        { dx: -1, dy: 2, dz: -1 }, { dx: 0, dy: 2, dz: -1 }, { dx: 1, dy: 2, dz: -1 },
+        { dx: -1, dy: 2, dz: 0 }, { dx: 0, dy: 2, dz: 0 }, { dx: 1, dy: 2, dz: 0 },
+        { dx: -1, dy: 2, dz: 1 }, { dx: 0, dy: 2, dz: 1 }, { dx: 1, dy: 2, dz: 1 },
     ],
     pillar: [
-        { dx: 0, dy: -1, dz: 0 },
-        { dx: 0, dy: 0, dz: 0 },
-        { dx: 0, dy: 1, dz: 0 },
-        { dx: 0, dy: 2, dz: 0 },
+        { dx: 0, dy: -1, dz: 0 }, { dx: 0, dy: 0, dz: 0 }, { dx: 0, dy: 1, dz: 0 }, { dx: 0, dy: 2, dz: 0 },
     ],
 };
 
 class ConstructState implements FSMState {
     name = "CONSTRUCTING";
-
     async enter() {}
-
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as BuildContext;
         const bot = sCtx.bot;
         const origin = sCtx.buildOrigin!;
 
         if (!sCtx.materialType) {
-            sCtx.result = {
-                status: "FAILED",
-                reason: "MISSING_INGREDIENTS: Ran out of building materials.",
-            };
+            sCtx.result = { status: "FAILED", reason: "MISSING_INGREDIENTS" };
             return null;
         }
 
         let consecutiveFailures = 0;
-
         while (sCtx.currentIndex < sCtx.blueprint.length) {
             if (sCtx.signal.aborted) throw new Error("aborted");
-
-            if (consecutiveFailures > 5) {
-                throw new Error(
-                    "PANIC: Bot is hopelessly stuck trying to place blocks. Physics or state desync.",
-                );
-            }
+            if (consecutiveFailures > 5) throw new Error("PANIC: Bot is hopelessly stuck.");
 
             const node = sCtx.blueprint[sCtx.currentIndex];
             if (!node) break;
 
             const targetPos = origin.offset(node.dx, node.dy, node.dz);
             const targetBlock = bot.blockAt(targetPos);
-
             if (targetBlock && targetBlock.boundingBox === "block") {
                 sCtx.currentIndex++;
                 consecutiveFailures = 0;
                 continue;
             }
 
-            // Check if we actually still have the block
-            const hasMaterial = bot.inventory
-                .items()
-                .some((i) => i.type === sCtx.materialType);
+            const hasMaterial = bot.inventory.items().some((i: any) => i.type === sCtx.materialType);
             if (!hasMaterial) {
-                sCtx.result = {
-                    status: "FAILED",
-                    reason: "MISSING_INGREDIENTS: Ran out of building materials mid-construction.",
-                };
+                sCtx.result = { status: "FAILED", reason: "MISSING_INGREDIENTS" };
                 return null;
             }
 
@@ -129,26 +93,18 @@ class ConstructState implements FSMState {
 
             if (!refBlock) {
                 try {
-                    await moveToGoal(
-                        bot,
-                        new goals.GoalNear(
-                            targetPos.x,
-                            targetPos.y,
-                            targetPos.z,
-                            2,
-                        ),
-                        {
-                            signal: sCtx.signal,
-                            timeoutMs: 10000,
-                            stopMovement: sCtx.stopMovement,
-                            dynamic: false,
-                        },
-                    );
+                    // Requirement 3: Normalize diagonal movement by ensuring clean navigation state
+                    bot.clearControlStates();
+                    await moveToGoal(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2), {
+                        signal: sCtx.signal,
+                        timeoutMs: 10000,
+                        stopMovement: sCtx.stopMovement,
+                        dynamic: false,
+                    });
                 } catch (e: any) {
                     if (e.message === "aborted") throw e;
                     consecutiveFailures++;
                 }
-
                 const retryRef = this.findReferenceBlock(bot, targetPos);
                 if (!retryRef) {
                     sCtx.currentIndex++;
@@ -158,51 +114,31 @@ class ConstructState implements FSMState {
             }
 
             const distToBot = bot.entity.position.distanceTo(targetPos);
-
             if (distToBot < 1.5) {
                 if (node.dx === 0 && node.dz === 0 && node.dy >= 0) {
                     const localRef = this.findReferenceBlock(bot, targetPos);
                     if (localRef) {
                         bot.setControlState("jump", true);
                         await bot.waitForTicks(2);
-
                         try {
-                            const faceVector = targetPos.minus(
-                                localRef.position,
-                            );
+                            const faceVector = targetPos.minus(localRef.position);
                             await bot.placeBlock(localRef, faceVector);
                             consecutiveFailures = 0;
-                        } catch (err) {
-                            consecutiveFailures++;
-                        } finally {
-                            bot.setControlState("jump", false);
-                        }
-                    } else {
-                        consecutiveFailures++;
-                    }
-
+                        } catch (err) { consecutiveFailures++; }
+                        finally { bot.setControlState("jump", false); }
+                    } else { consecutiveFailures++; }
                     sCtx.currentIndex++;
                     continue;
                 } else {
                     try {
-                        await moveToGoal(
-                            bot,
-                            new goals.GoalNear(
-                                targetPos.x,
-                                targetPos.y,
-                                targetPos.z,
-                                2,
-                            ),
-                            {
-                                signal: sCtx.signal,
-                                timeoutMs: 5000,
-                                stopMovement: sCtx.stopMovement,
-                                dynamic: false,
-                            },
-                        );
-                    } catch (e: any) {
-                        if (e.message === "aborted") throw e;
-                    }
+                        bot.clearControlStates();
+                        await moveToGoal(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2), {
+                            signal: sCtx.signal,
+                            timeoutMs: 5000,
+                            stopMovement: sCtx.stopMovement,
+                            dynamic: false,
+                        });
+                    } catch (e: any) { if (e.message === "aborted") throw e; }
                 }
             }
 
@@ -212,36 +148,20 @@ class ConstructState implements FSMState {
                     const faceVector = targetPos.minus(finalRef.position);
                     await bot.placeBlock(finalRef, faceVector);
                     consecutiveFailures = 0;
-                } else {
-                    consecutiveFailures++;
-                }
-            } catch (err: any) {
-                consecutiveFailures++;
-            }
-
+                } else { consecutiveFailures++; }
+            } catch (err: any) { consecutiveFailures++; }
             sCtx.currentIndex++;
         }
-
         sCtx.result = { status: "SUCCESS", reason: "BUILD_COMPLETE" };
         return null;
     }
 
     private findReferenceBlock(bot: any, pos: Vec3): any | null {
-        const offsets = [
-            new Vec3(0, -1, 0),
-            new Vec3(1, 0, 0),
-            new Vec3(-1, 0, 0),
-            new Vec3(0, 0, 1),
-            new Vec3(0, 0, -1),
-            new Vec3(0, 1, 0),
-        ];
-
+        const offsets = [new Vec3(0, -1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1), new Vec3(0, 1, 0)];
         for (const offset of offsets) {
             const adjPos = pos.plus(offset);
             const block = bot.blockAt(adjPos);
-            if (block && block.boundingBox === "block") {
-                return block;
-            }
+            if (block && block.boundingBox === "block") return block;
         }
         return null;
     }
@@ -249,57 +169,37 @@ class ConstructState implements FSMState {
 
 class PrepareBuildState implements FSMState {
     name = "PREPARING";
-
     async enter() {}
-
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as BuildContext;
-        const bot = sCtx.bot;
-
         const blueprint = SCHEMATICS[sCtx.targetStructure];
         if (!blueprint) {
-            sCtx.result = {
-                status: "FAILED",
-                reason: `UNKNOWN_RECIPE: No schematic found for ${sCtx.targetStructure}`,
-            };
+            sCtx.result = { status: "FAILED", reason: `UNKNOWN_RECIPE: ${sCtx.targetStructure}` };
             return null;
         }
         sCtx.blueprint = blueprint;
-
         let selectedMaterial: any = null;
         let totalBlocks = 0;
-
-        for (const item of bot.inventory.items()) {
+        for (const item of sCtx.bot.inventory.items()) {
             if (BUILDING_BLOCKS.has(item.name)) {
                 totalBlocks += item.count;
-                if (!selectedMaterial) {
-                    selectedMaterial = item;
-                }
+                if (!selectedMaterial) selectedMaterial = item;
             }
         }
-
         if (!selectedMaterial || totalBlocks < blueprint.length * 0.5) {
-            sCtx.result = {
-                status: "FAILED",
-                reason: "MISSING_INGREDIENTS: Not enough building blocks.",
-            };
+            sCtx.result = { status: "FAILED", reason: "MISSING_INGREDIENTS" };
             return null;
         }
-
         sCtx.materialType = selectedMaterial.type;
-        sCtx.buildOrigin = bot.entity.position.floored();
-
+        sCtx.buildOrigin = sCtx.bot.entity.position.floored();
         return new ConstructState();
     }
 }
 
 export async function handleBuild(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, timeouts, stopMovement } = ctx;
-
     await escapeTree(bot, signal);
-
     const targetName = intent.target?.name?.toLowerCase() || "shelter";
-
     const fsmCtx: BuildContext = {
         bot,
         targetStructure: targetName,
@@ -315,11 +215,7 @@ export async function handleBuild(ctx: TaskContext): Promise<void> {
         stopMovement,
         targetName: "",
     };
-
     const fsm = new StateMachineRunner(new PrepareBuildState(), fsmCtx);
     const result = await fsm.run();
-
-    if (result.status === "FAILED") {
-        throw new Error(result.reason || "unknown_fsm_failure");
-    }
+    if (result.status === "FAILED") throw new Error(result.reason || "unknown_fsm_failure");
 }
