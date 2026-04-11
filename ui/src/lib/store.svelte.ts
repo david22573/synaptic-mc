@@ -109,7 +109,8 @@ export function connectToBot() {
 
             if (type === "STATE_UPDATE" || type === "STATE_SYNC") {
                 const state = unwrapState(unwrapBroadcastPayload(message.payload));
-                botStore.gameState = state;
+                // Force a new object reference so Svelte 5 runes catch the deep changes
+                botStore.gameState = { ...botStore.gameState, ...state };
                 controller.onStateUpdate(state);
                 return;
             }
@@ -153,7 +154,8 @@ export function connectToBot() {
                     eventType === "STATE_TICK"
                 ) {
                     const state = unwrapState(innerPayload);
-                    botStore.gameState = state;
+                    // Force a new object reference so Svelte 5 runes catch the deep changes
+                    botStore.gameState = { ...botStore.gameState, ...state };
                     controller.onStateUpdate(state);
                     innerPayload = state;
                 }

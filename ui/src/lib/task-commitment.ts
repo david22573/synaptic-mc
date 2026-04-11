@@ -25,6 +25,11 @@ export class TaskCommitment {
             }
         }
 
+        // Reset if commitment is met so that the next task (new or same type) can start a new lock
+        if (this.commitmentTicks >= this.minCommitment) {
+            this.reset();
+        }
+
         if (
             task.type === "move" ||
             task.type === "craft" ||
