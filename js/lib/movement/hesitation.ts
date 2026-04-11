@@ -3,14 +3,15 @@ import type { Bot } from "mineflayer";
 
 /**
  * Applies situational hesitation before movement starts.
- * Ported from the Go cognitive layer to prevent blocking the planner.
+ * Synced to server physics ticks to prevent event loop drift.
  */
 export async function applyHesitation(bot: Bot): Promise<void> {
-    let base = 150; // base reaction time
+    let baseTicks = 3; // base reaction time (~150ms)
 
     // Risk-Based Hesitation (Caution factor)
     if (bot.health < 20) {
-        base += (20 - bot.health) * 20;
+        // ~20ms per lost HP = ~0.4 ticks
+        baseTicks += Math.floor((20 - bot.health) * 0.4);
     }
 
     // Proximity threat check
@@ -22,16 +23,16 @@ export async function applyHesitation(bot: Bot): Promise<void> {
     });
 
     if (threats) {
-        base += 300;
+        baseTicks += 6; // ~300ms extra hesitation
     }
 
     // Natural Jitter
-    const jitterLimit = base * 0.5;
-    const jitter = Math.random() * jitterLimit;
+    const jitterLimit = baseTicks * 0.5;
+    const jitterTicks = Math.floor(Math.random() * jitterLimit);
 
-    const finalMs = base + jitter;
+    const finalTicks = baseTicks + jitterTicks;
 
-    if (finalMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, finalMs));
+    if (finalTicks > 0) {
+        await bot.waitForTicks(finalTicks);
     }
 }
