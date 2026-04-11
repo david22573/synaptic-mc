@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/farm.ts
 import {
     type FSMState,
     type StateContext,
@@ -6,6 +5,7 @@ import {
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
 import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
+import { Runtime } from "../../control/runtime.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 
@@ -35,7 +35,9 @@ class ReplantState implements FSMState {
         const farmlandPos = fCtx.targetBlock.position.offset(0, -1, 0);
         const farmlandBlock = fCtx.bot.blockAt(farmlandPos);
         if (farmlandBlock && farmlandBlock.name === "farmland") {
-            const seed = fCtx.bot.inventory.items().find((i: any) => i.name === cropInfo!.seedName);
+            const seed = fCtx.bot.inventory
+                .items()
+                .find((i: any) => i.name === cropInfo!.seedName);
             if (seed) {
                 try {
                     await fCtx.bot.equip(seed, "hand");
@@ -55,12 +57,15 @@ class HarvestState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const fCtx = ctx as FarmContext;
         const cropBlock = fCtx.bot.blockAt(fCtx.targetBlock.position);
-        if (!cropBlock || cropBlock.name !== fCtx.targetName) return advanceToNextCrop(fCtx, "CROP_MISSING");
+        if (!cropBlock || cropBlock.name !== fCtx.targetName)
+            return advanceToNextCrop(fCtx, "CROP_MISSING");
         try {
             await fCtx.bot.dig(cropBlock, true);
             await waitForMs(1000, fCtx.signal);
             return new ReplantState();
-        } catch (err: any) { return advanceToNextCrop(fCtx, `DIG_FAIL: ${err.message}`); }
+        } catch (err: any) {
+            return advanceToNextCrop(fCtx, `DIG_FAIL: ${err.message}`);
+        }
     }
 }
 
@@ -72,15 +77,20 @@ class NavigateCropState implements FSMState {
         const pos = fCtx.candidatePositions[fCtx.currentIndex];
         fCtx.targetBlock = fCtx.bot.blockAt(pos);
         try {
-            // Requirement 3: Normalize diagonal movement by ensuring clean navigation state
             fCtx.bot.clearControlStates();
-            await moveToGoal(fCtx.bot, new goals.GoalGetToBlock(pos.x, pos.y, pos.z), {
-                signal: fCtx.signal,
-                timeoutMs: 12000,
-                stopMovement: fCtx.stopMovement,
-            });
+            await moveToGoal(
+                fCtx.bot,
+                new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
+                {
+                    signal: fCtx.signal,
+                    timeoutMs: 12000,
+                    stopMovement: fCtx.stopMovement,
+                },
+            );
             return new HarvestState();
-        } catch (err: any) { return advanceToNextCrop(fCtx, `PATH_FAIL: ${err.message}`); }
+        } catch (err: any) {
+            return advanceToNextCrop(fCtx, `PATH_FAIL: ${err.message}`);
+        }
     }
 }
 
@@ -91,21 +101,33 @@ class SearchCropState implements FSMState {
         const fCtx = ctx as FarmContext;
         const cropInfo = CROP_DATA[fCtx.targetName];
         if (!cropInfo) {
-            fCtx.result = { status: "FAILED", reason: `UNSUPPORTED_CROP: ${fCtx.targetName}` };
+            fCtx.result = {
+                status: "FAILED",
+                reason: `UNSUPPORTED_CROP: ${fCtx.targetName}`,
+            };
             return null;
         }
         const blockId = fCtx.bot.registry.blocksByName[fCtx.targetName]?.id;
-        let blocks = fCtx.bot.findBlocks({ matching: blockId!, maxDistance: 32, count: 128 });
+        let blocks = fCtx.bot.findBlocks({
+            matching: blockId!,
+            maxDistance: 32,
+            count: 128,
+        });
         const botPos = fCtx.bot.entity.position;
         blocks = blocks.filter((pos: any) => {
             const block = fCtx.bot.blockAt(pos);
             return block && block.metadata === cropInfo.matureAge;
         });
         if (blocks.length === 0) {
-            fCtx.result = { status: "FAILED", reason: `NO_MATURE_${fCtx.targetName.toUpperCase()}_FOUND` };
+            fCtx.result = {
+                status: "FAILED",
+                reason: `NO_MATURE_${fCtx.targetName.toUpperCase()}_FOUND`,
+            };
             return null;
         }
-        blocks.sort((a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos));
+        blocks.sort(
+            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
+        );
         fCtx.candidatePositions = blocks.slice(0, fCtx.targetCount);
         fCtx.currentIndex = 0;
         return new NavigateCropState();
@@ -138,6 +160,9 @@ export async function handleFarm(ctx: TaskContext): Promise<void> {
         targetBlock: null,
         stopMovement,
     };
-    const result = await new StateMachineRunner(new SearchCropState(), fsmCtx).run();
+
+    const fsm = new StateMachineRunner(new SearchCropState(), fsmCtx);
+    const result = await new Runtime(bot).execute(fsm.run(), signal);
+
     if (result.status === "FAILED") throw new Error(result.reason);
 }

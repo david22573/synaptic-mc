@@ -18,19 +18,21 @@ type ScoreWeights struct {
 }
 
 type FeatureFlags struct {
-	AsyncLoop       bool         `json:"async_loop" env:"FF_ASYNC_LOOP"`
-	NonBlockPlanner bool         `json:"non_block_planner" env:"FF_NON_BLOCK_PLANNER"`
-	ActionQueue     bool         `json:"action_queue" env:"FF_ACTION_QUEUE"`
-	ClientSmooth    bool         `json:"client_smooth" env:"FF_CLIENT_SMOOTH"`
-	Weights         ScoreWeights `json:"score_weights"`
+	AsyncLoop         bool         `json:"async_loop" env:"FF_ASYNC_LOOP"`
+	NonBlockPlanner   bool         `json:"non_block_planner" env:"FF_NON_BLOCK_PLANNER"`
+	ActionQueue       bool         `json:"action_queue" env:"FF_ACTION_QUEUE"`
+	ClientSmooth      bool         `json:"client_smooth" env:"FF_CLIENT_SMOOTH"`
+	CurriculumHorizon int          `json:"curriculum_horizon" env:"FF_CURRICULUM_HORIZON"`
+	Weights           ScoreWeights `json:"score_weights"`
 }
 
 func DefaultFlags() FeatureFlags {
 	return FeatureFlags{
-		AsyncLoop:       true, // Production: non-blocking loops
-		NonBlockPlanner: true, // Production: background LLM planning
-		ActionQueue:     true, // Production: priority queue + backpressure
-		ClientSmooth:    true, // Production: 60 FPS interpolation
+		AsyncLoop:         true, // Production: non-blocking loops
+		NonBlockPlanner:   true, // Production: background LLM planning
+		ActionQueue:       true, // Production: priority queue + backpressure
+		ClientSmooth:      true, // Production: 60 FPS interpolation
+		CurriculumHorizon: 6,    // Phase 8: Composable multi-step programs
 		Weights: ScoreWeights{
 			RiskPenalty:      20.0,
 			SuccessWeight:    30.0,

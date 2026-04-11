@@ -1,5 +1,6 @@
 <script lang="ts">
     import { botStore, uiStore } from "../lib/store.svelte";
+    import ItemIcon from "./ItemIcon.svelte";
 
     const health = $derived(botStore.gameState?.health ?? 20);
     const food = $derived(botStore.gameState?.food ?? 20);
@@ -10,17 +11,17 @@
     );
     const offhand = $derived(botStore.gameState?.offhand || null);
     const activeSlot = $derived(botStore.gameState?.active_slot ?? 0);
-    
+
     // Derived state for the warning banner
     const failureWarning = $derived(botStore.activeFailure);
 
     const fullHearts = $derived(Math.max(0, Math.floor(health / 2)));
-    const halfHearts = $derived(health % 2 !== 0 && health > 0 ? 1 : 0);
-    const emptyHearts = $derived(Math.max(0, 10 - fullHearts - halfHearts));
+    const hasHalfHeart = $derived(health % 2 >= 1);
+    const emptyHearts = $derived(Math.max(0, 10 - fullHearts - (hasHalfHeart ? 1 : 0)));
 
     const fullFood = $derived(Math.max(0, Math.floor(food / 2)));
-    const halfFood = $derived(food % 2 !== 0 && food > 0 ? 1 : 0);
-    const emptyFood = $derived(Math.max(0, 10 - fullFood - halfFood));
+    const hasHalfFood = $derived(food % 2 >= 1);
+    const emptyFood = $derived(Math.max(0, 10 - fullFood - (hasHalfFood ? 1 : 0)));
 
     function formatName(name: string) {
         if (!name) return "";
@@ -52,34 +53,34 @@
         </div>
     {/if}
 
-    <div class="mc-hud">
+    <div class="mc-hud-container">
         <div class="mc-bars">
-            <div class="mc-bar-half left-align">
-                {#each Array(fullHearts) as _}
-                    <span class="mc-icon-stat">❤️</span>
-                {/each}
-                {#each Array(halfHearts) as _}
-                    <span class="mc-icon-stat">💔</span>
-                {/each}
+            <div class="mc-bar health-bar">
                 {#each Array(emptyHearts) as _}
-                    <span class="mc-icon-stat empty">🖤</span>
+                    <div class="icon-container empty"><div class="heart empty"></div></div>
+                {/each}
+                {#if hasHalfHeart}
+                    <div class="icon-container"><div class="heart half"></div></div>
+                {/if}
+                {#each Array(fullHearts) as _}
+                    <div class="icon-container"><div class="heart full"></div></div>
                 {/each}
             </div>
 
-            <div class="mc-bar-half right-align">
-                {#each Array(emptyFood) as _}
-                    <span class="mc-icon-stat empty">🍗</span>
-                {/each}
-                {#each Array(halfFood) as _}
-                    <span class="mc-icon-stat">🍖</span>
-                {/each}
+            <div class="mc-bar food-bar">
                 {#each Array(fullFood) as _}
-                    <span class="mc-icon-stat">🍗</span>
+                    <div class="icon-container"><div class="food full"></div></div>
+                {/each}
+                {#if hasHalfFood}
+                    <div class="icon-container"><div class="food half"></div></div>
+                {/if}
+                {#each Array(emptyFood) as _}
+                    <div class="icon-container empty"><div class="food empty"></div></div>
                 {/each}
             </div>
         </div>
 
-        <div class="mc-xp-bar-container">
+        <div class="mc-xp-container">
             {#if xpLevel > 0}
                 <span class="mc-xp-level">{xpLevel}</span>
             {/if}
@@ -91,7 +92,7 @@
             </div>
         </div>
 
-        <div class="mc-hotbar-container">
+        <div class="mc-hotbar-outer">
             <div
                 class="mc-offhand slot"
                 role="presentation"
@@ -100,11 +101,7 @@
                 onmouseleave={clearTooltip}
             >
                 {#if offhand}
-                    <img
-                        src="/assets/{offhand.name}.png"
-                        alt={offhand.name}
-                        class="item-icon"
-                    />
+                    <ItemIcon name={offhand.name} size={24} />
                     {#if offhand.count > 1}
                         <span class="slot-count">{offhand.count}</span>
                     {/if}
@@ -121,11 +118,7 @@
                         onmouseleave={clearTooltip}
                     >
                         {#if slot}
-                            <img
-                                src="/assets/{slot.name}.png"
-                                alt={slot.name}
-                                class="item-icon"
-                            />
+                            <ItemIcon name={slot.name} size={24} />
                             {#if slot.count > 1}
                                 <span class="slot-count">{slot.count}</span>
                             {/if}
@@ -144,9 +137,9 @@
         pointer-events: none;
         display: flex;
         flex-direction: column;
-        justify-content: flex-start;
+        justify-content: flex-end;
         align-items: center;
-        padding-top: 24px;
+        padding-bottom: 8px;
         z-index: 10;
     }
 
@@ -183,11 +176,12 @@
     }
 
     .mc-alert-banner {
+        position: absolute;
+        top: 80px;
         background: rgba(40, 0, 0, 0.85);
         border: 2px solid #ff4444;
         color: white;
         padding: 8px 16px;
-        margin-bottom: 24px;
         display: flex;
         align-items: center;
         gap: 12px;
@@ -203,106 +197,143 @@
         animation: pulse 1s infinite alternate;
     }
 
-    .mc-alert-icon {
-        font-size: 20px;
-    }
-
     @keyframes pulse {
         from { box-shadow: 0 0 4px #ff0000; }
         to { box-shadow: 0 0 16px #ff0000; }
     }
 
-    .mc-hud {
+    .mc-hud-container {
         display: flex;
         flex-direction: column;
         align-items: center;
+        gap: 2px;
     }
 
     .mc-bars {
         display: flex;
         justify-content: space-between;
         width: 364px;
-        gap: 1rem;
-        margin-bottom: 6px;
-        padding: 0 4px;
+        padding: 0 2px;
+        margin-bottom: 1px;
     }
 
-    .mc-bar-half {
+    .mc-bar {
         display: flex;
-        gap: 1px;
+        gap: 0px;
     }
 
-    .mc-icon-stat {
-        font-size: 14px;
-        line-height: 1;
-        filter: drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
+    .health-bar {
+        flex-direction: row-reverse;
     }
 
-    .mc-icon-stat.empty {
-        filter: grayscale(1) brightness(0.2)
-            drop-shadow(1px 1px 0 rgba(0, 0, 0, 0.8));
-    }
-
-    .mc-xp-bar-container {
-        position: relative;
-        width: 364px;
+    .icon-container {
+        width: 18px;
+        height: 18px;
         display: flex;
         justify-content: center;
-        margin-bottom: 6px;
+        align-items: center;
+    }
+
+    /* CSS Heart */
+    .heart {
+        width: 9px;
+        height: 9px;
+        background: #ff0000;
+        position: relative;
+        transform: rotate(-45deg);
+        box-shadow: -1px -1px 0 #000, 1px 1px 0 #000;
+    }
+    .heart::before, .heart::after {
+        content: "";
+        width: 9px;
+        height: 9px;
+        background: #ff0000;
+        border-radius: 50%;
+        position: absolute;
+    }
+    .heart::before { top: -5px; left: 0; }
+    .heart::after { left: 5px; top: 0; }
+
+    .heart.half { background: linear-gradient(to right, #ff0000 50%, #333 50%); }
+    .heart.half::after { background: #333; }
+    .heart.empty { background: #333; }
+    .heart.empty::before, .heart.empty::after { background: #333; }
+
+    /* CSS Food Icon (Drumstick-ish) */
+    .food {
+        width: 10px;
+        height: 12px;
+        background: #964b00;
+        border-radius: 4px 4px 2px 2px;
+        position: relative;
+        box-shadow: 1px 1px 0 #000;
+    }
+    .food::after {
+        content: "";
+        position: absolute;
+        bottom: -4px;
+        left: 2px;
+        width: 6px;
+        height: 6px;
+        background: #c68642;
+        border-radius: 50%;
+    }
+    .food.half { background: linear-gradient(to bottom, #964b00 50%, #333 50%); }
+    .food.empty { background: #333; }
+    .food.empty::after { background: #222; }
+
+    .mc-xp-container {
+        position: relative;
+        width: 364px;
+        height: 12px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        margin-top: -2px;
     }
 
     .mc-xp-bar {
         width: 100%;
-        height: 10px;
-        background: #222;
-        border: 2px solid #111;
-        box-shadow: inset 1px 1px 0px rgba(0, 0, 0, 0.5);
+        height: 5px;
+        background: #111;
+        border: 1px solid #000;
     }
 
     .mc-xp-fill {
         height: 100%;
         background: #84e84b;
-        box-shadow: inset 0px 2px 0px rgba(255, 255, 255, 0.3);
     }
 
     .mc-xp-level {
         position: absolute;
-        top: -16px;
+        top: -14px;
         color: #84e84b;
         font-family: monospace;
-        font-size: 16px;
+        font-size: 14px;
         font-weight: bold;
-        text-shadow:
-            2px 2px 0 #000,
-            -1px -1px 0 #000,
-            1px -1px 0 #000,
-            -1px 1px 0 #000;
+        text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
         z-index: 15;
     }
 
-    .mc-hotbar-container {
+    .mc-hotbar-outer {
         display: flex;
         align-items: flex-end;
-        gap: 8px;
+        gap: 4px;
+        margin-top: 2px;
     }
 
     .mc-hotbar {
         display: flex;
-        background: #8b8b8b;
+        background: rgba(0, 0, 0, 0.4);
         border: 2px solid #111;
-        padding: 2px;
-        box-shadow:
-            inset 2px 2px 0px rgba(255, 255, 255, 0.4),
-            inset -2px -2px 0px rgba(0, 0, 0, 0.4);
+        padding: 1px;
     }
 
     .slot {
         width: 36px;
         height: 36px;
-        background: #8b8b8b;
-        border-style: solid;
-        border-width: 2px;
-        border-color: #373737 #fff #fff #373737;
+        background: rgba(139, 139, 139, 0.5);
+        border: 2px solid #373737;
         position: relative;
         display: flex;
         justify-content: center;
@@ -311,36 +342,22 @@
         pointer-events: auto;
     }
 
-    .mc-offhand {
-        border-color: #373737 #fff #fff #373737;
-    }
-
     .slot.active {
-        border-color: #fff;
-        box-shadow:
-            inset 0 0 0 2px #fff,
-            0 0 6px rgba(255, 255, 255, 0.6);
+        border: 2px solid #fff;
+        background: rgba(255, 255, 255, 0.2);
+        outline: 2px solid #000;
         z-index: 10;
-    }
-
-    .item-icon {
-        width: 24px;
-        height: 24px;
-        image-rendering: pixelated;
-        pointer-events: none;
     }
 
     .slot-count {
         position: absolute;
-        bottom: -2px;
-        right: 1px;
+        bottom: 1px;
+        right: 2px;
+        font-family: monospace;
         font-size: 14px;
-        font-weight: 900;
+        font-weight: bold;
         color: white;
-        text-shadow:
-            2px 2px 0 #3f3f3f,
-            -1px -1px 0 #3f3f3f,
-            1px -1px 0 #3f3f3f,
-            -1px 1px 0 #3f3f3f;
+        text-shadow: 1px 1px 0 #3f3f3f;
     }
 </style>
+

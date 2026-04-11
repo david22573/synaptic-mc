@@ -150,6 +150,7 @@ func validateTaskPure(task domain.Action, gameState domain.GameState, simInv map
 			"raw_iron", "iron_ore", "raw_gold", "gold_ore", "raw_copper", "copper_ore",
 			"beef", "porkchop", "mutton", "chicken", "rabbit", "cod", "salmon",
 			"sand", "red_sand", "cobblestone", "stone", "potato", "kelp", "clay_ball", "cactus", "netherrack",
+			"oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log",
 		}
 
 		for k, v := range simInv {

@@ -31,11 +31,6 @@ function isValidPosition(pos: any): boolean {
     );
 }
 
-/**
- * FIXED: Refined ignorable errors.
- * While we suppress crashes, we now log warnings for PartialReadErrors
- * as they indicate the bot's world state is likely corrupted/out of sync.
- */
 const isIgnorableError = (err: Error | any): boolean => {
     if (!err) return false;
     const msg = String(err?.message || err?.stack || err);
@@ -206,7 +201,6 @@ function handleBotProtocolError(err: Error | any) {
 
     recordProtocolError(msg);
 
-    // Keep the logs high signal while malformed packets are flooding in.
     if (Date.now() - lastProtocolLogAt < 250) return;
     lastProtocolLogAt = Date.now();
 
@@ -224,6 +218,7 @@ function completeTask(
         | "task_failed"
         | "task_aborted" = "task_completed",
     cause: string = "",
+    progress: number = 0,
 ) {
     if (!task || !client) return;
     if (currentTask?.id === task.id) currentTask = null;
@@ -235,6 +230,7 @@ function completeTask(
         task.id,
         cause,
         task.startTime,
+        progress,
     );
 }
 
@@ -242,7 +238,7 @@ function abortActiveTask(reason: string) {
     if (currentTask && taskAbortController) {
         taskAbortController.abort(reason);
         stopMovement();
-        completeTask(currentTask, "task_aborted", reason);
+        completeTask(currentTask, "task_aborted", reason, 0);
         currentTask = null;
         taskAbortController = null;
     }
@@ -273,16 +269,11 @@ function normalizeFailureCause(err: any): string {
     return "UNKNOWN";
 }
 
-/**
- * FIXED: Enhanced Anti-Stuck Reflex.
- * Adds more aggressive movement and block clearing to escape environmental traps.
- */
 async function executeAntiStuckReflex() {
     if (!bot || !bot.entity || bot.health <= 0) return;
     log.warn("STUCK DETECTED in navigator: Triggering quick jump recovery");
 
     try {
-        // Strategy 1: Jump and random strafe
         bot.setControlState("jump", true);
         const directions: mineflayer.ControlState[] = ["left", "right", "back"];
         const dir = directions[Math.floor(Math.random() * directions.length)];
@@ -291,7 +282,6 @@ async function executeAntiStuckReflex() {
         await new Promise((r) => setTimeout(r, 500));
         bot.clearControlStates();
 
-        // Strategy 2: Break local obstructions
         const pos = bot.entity.position.floored();
         const yaw = bot.entity.yaw;
         const dx = -Math.sin(yaw);
@@ -381,7 +371,7 @@ async function executeIntent(intent: models.ActionIntent) {
                 runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
             const timeoutMs = timeouts[intent.action] || 30000;
 
-            await Promise.race([
+            const result = await Promise.race([
                 runTask(
                     bot,
                     intent,
@@ -391,7 +381,7 @@ async function executeIntent(intent: models.ActionIntent) {
                     (t) => computeSafeRetreat(bot, t, 20),
                     stopMovement,
                 ),
-                new Promise((_, r) => {
+                new Promise<any>((_, r) => {
                     timeoutId = setTimeout(() => {
                         localController.abort("timeout");
                         stopMovement();
@@ -404,15 +394,38 @@ async function executeIntent(intent: models.ActionIntent) {
                 if (!signal.aborted) {
                     await new Promise((r) => setTimeout(r, 200));
                     pushState();
-                    completeTask(activeTask, "task_completed");
+
+                    if (result && result.success === false) {
+                        completeTask(
+                            activeTask,
+                            "task_failed",
+                            result.cause,
+                            result.progress,
+                        );
+                    } else {
+                        completeTask(
+                            activeTask,
+                            "task_completed",
+                            "",
+                            result?.progress ?? 1.0,
+                        );
+                    }
                 } else {
-                    // Signal was aborted during execution but task finished or was caught by race
-                    completeTask(activeTask, "task_aborted", signal.reason || "preempted");
+                    completeTask(
+                        activeTask,
+                        "task_aborted",
+                        signal.reason || "preempted",
+                        result?.progress ?? 0,
+                    );
                 }
             }
         } catch (err: any) {
             if (!signal.aborted || err.message === "timeout") {
                 const normalizedCause = normalizeFailureCause(err);
+                log.warn(`Task failed: ${intent.action}`, {
+                    cause: normalizedCause,
+                    error: err.message,
+                });
 
                 if (
                     normalizedCause === "STUCK" ||
@@ -422,13 +435,18 @@ async function executeIntent(intent: models.ActionIntent) {
                 }
 
                 pushState();
-                
-                // CRITICAL FIX: Ensure Go is notified even if local state is slightly drifted
+
                 if (activeTask) {
-                    completeTask(activeTask, "task_failed", normalizedCause);
+                    completeTask(activeTask, "task_failed", normalizedCause, 0);
                 } else if (intent.id) {
-                    // Fallback: Notify Go using the ID from the intent we were trying to execute
-                    client.sendEvent("task_failed", intent.action, intent.target?.name || "none", intent.id, normalizedCause, Date.now());
+                    client.sendEvent(
+                        "task_failed",
+                        intent.action,
+                        intent.target?.name || "none",
+                        intent.id,
+                        normalizedCause,
+                        Date.now(),
+                    );
                 }
             }
         } finally {
@@ -515,7 +533,6 @@ function pushState() {
     client.sendState(state);
 }
 
-
 async function connectWithRetry(maxAttempts = 10) {
     if (reconnectAttempt > maxAttempts) {
         process.exit(1);
@@ -534,7 +551,6 @@ async function connectWithRetry(maxAttempts = 10) {
         host: "127.0.0.1",
         port: 25565,
         username: "SynapticBot",
-        // Prefer protocol autodetection unless explicitly pinned by the user.
         version: mcVersion,
         hideErrors: true,
         logErrors: false,
@@ -559,8 +575,6 @@ async function connectWithRetry(maxAttempts = 10) {
         client.on("abort", (payload?: { reason?: string }) => {
             const reason = payload?.reason || "unlock";
 
-            // During survival handling, stale aborts from invalidated plans should not
-            // cancel the currently running retreat task.
             if (
                 currentTask?.action === "retreat" &&
                 (survival?.isPanickingNow() || reason === "plan_invalidated")
@@ -583,14 +597,28 @@ async function connectWithRetry(maxAttempts = 10) {
             },
             stopMovement: () => stopMovement(),
             onPanicStart: (cause: string) => {
-                client.sendEvent("panic_retreat_start", "evasion", "none", "", cause, 0);
+                client.sendEvent(
+                    "panic_retreat_start",
+                    "evasion",
+                    "none",
+                    "",
+                    cause,
+                    0,
+                );
                 pushState();
             },
             onPanicEnd: (cause: string) => {
                 if (currentTask?.action === "retreat") {
                     abortActiveTask("unlock");
                 }
-                client.sendEvent("panic_retreat_end", "evasion_complete", "none", "", cause, 0);
+                client.sendEvent(
+                    "panic_retreat_end",
+                    "evasion_complete",
+                    "none",
+                    "",
+                    cause,
+                    0,
+                );
                 pushState();
             },
         });
@@ -613,7 +641,6 @@ async function connectWithRetry(maxAttempts = 10) {
         });
         clearPOICache();
 
-        // FIXED: Enhanced Movements config for 1.19.1 stability
         const movements = new Movements(bot);
         movements.canDig = true;
         movements.allowSprinting = true;
@@ -622,7 +649,6 @@ async function connectWithRetry(maxAttempts = 10) {
         movements.allowFreeMotion = true;
 
         bot.pathfinder.setMovements(movements);
-        // Shortened thinkTimeout to prevent "infinite thinking" during path blocks
         bot.pathfinder.thinkTimeout = 5000;
 
         survival.start();

@@ -5,6 +5,7 @@ import {
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
 import { escapeTree, moveToGoal } from "../utils.js";
+import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
@@ -49,8 +50,6 @@ class WithdrawState implements FSMState {
                     await chestWindow.withdraw(item.type, null, amountToTake);
                     sCtx.collectedCount += amountToTake;
 
-                    // Jitter delay to prevent Mineflayer's chest UI from desyncing with the server
-                    // when withdrawing multiple stacks sequentially.
                     await new Promise((r) =>
                         setTimeout(r, 100 + Math.random() * 50),
                     );
@@ -189,7 +188,7 @@ export async function handleRetrieve(ctx: TaskContext): Promise<void> {
     };
 
     const fsm = new StateMachineRunner(new LocateChestState(), fsmCtx);
-    const result = await fsm.run();
+    const result = await new Runtime(bot).execute(fsm.run(), signal);
 
     if (result.status === "FAILED") {
         throw new Error(result.reason || "unknown_fsm_failure");

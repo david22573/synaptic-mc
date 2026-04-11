@@ -2,6 +2,7 @@
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { ExecutionError } from "./primitives.js";
 
 const { goals } = pkg;
 
@@ -65,17 +66,14 @@ export function isInFoliage(bot: any): boolean {
 
 export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
     if (!isInFoliage(bot)) return;
-
     try {
         bot.pathfinder.setGoal(null);
         bot.clearControlStates();
     } catch (_err) {}
 
     const MAX_ATTEMPTS = 30;
-
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
         if (signal.aborted) throw new Error("aborted");
-
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
@@ -90,7 +88,6 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
         ];
 
         let clearedSomething = false;
-
         for (const targetBlock of blocksToClear) {
             if (
                 targetBlock &&
@@ -101,6 +98,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
                     const tool = bot.pathfinder.bestHarvestTool(targetBlock);
                     if (tool) await bot.equip(tool, "hand");
                     else await bot.unequip("hand");
+
                     await bot.dig(targetBlock, true, "ignore");
                     clearedSomething = true;
                 } catch (err) {
@@ -111,31 +109,12 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
 
         if (!clearedSomething && !isOnSolidGround(bot)) {
             const dir = Math.random() > 0.5 ? "forward" : "back";
-            const strafe = Math.random() > 0.5 ? "left" : "right";
             bot.setControlState(dir, true);
-            bot.setControlState(strafe, true);
-            await new Promise((res) => setTimeout(res, 250));
+            await new Promise((r) => setTimeout(r, 250));
             bot.setControlState(dir, false);
-            bot.setControlState(strafe, false);
         }
 
-        await new Promise<void>((resolve, reject) => {
-            let ticks = 0;
-            const timeout = setTimeout(() => {
-                bot.removeListener("physicsTick", check);
-                resolve();
-            }, 1000);
-
-            const check = () => {
-                ticks++;
-                if (isOnSolidGround(bot) || ticks > 10) {
-                    clearTimeout(timeout);
-                    bot.removeListener("physicsTick", check);
-                    resolve();
-                }
-            };
-            bot.on("physicsTick", check);
-        });
+        await new Promise((r) => setTimeout(r, 100));
     }
 
     if (!isOnSolidGround(bot)) {
@@ -151,22 +130,18 @@ export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
             reject(new Error("aborted"));
             return;
         }
-
         const timer = setTimeout(() => {
             cleanup();
             resolve();
         }, ms);
-
         const onAbort = () => {
             clearTimeout(timer);
             cleanup();
             reject(new Error("aborted"));
         };
-
         const cleanup = () => {
             signal.removeEventListener("abort", onAbort);
         };
-
         signal.addEventListener("abort", onAbort, { once: true });
     });
 }
@@ -189,7 +164,7 @@ export function moveToGoal(
         timeoutMs,
         stopMovement,
         dynamic = false,
-        stuckTimeoutMs = 2000, // Reduced for faster detection
+        stuckTimeoutMs = 2000,
     } = opts;
 
     return new Promise((resolve, reject) => {
@@ -205,6 +180,7 @@ export function moveToGoal(
         let lastPos = bot.entity.position.clone();
         let stuckTimer: NodeJS.Timeout | null = null;
         let mainTimer: NodeJS.Timeout | null = null;
+
         const listeners = new Map<string, any>();
 
         const cleanup = () => {
@@ -220,7 +196,6 @@ export function moveToGoal(
             if (settled) return;
             settled = true;
             cleanup();
-
             if (err) {
                 if (stopMovement) {
                     try {
@@ -239,13 +214,13 @@ export function moveToGoal(
                     ? signal.reason
                     : new Error("aborted"),
             );
+
         const onGoalReached = () => {
             finish();
         };
 
         const onPathUpdate = (results: any) => {
             if (results.status === "noPath") {
-                // If no path found, don't wait 3.5s, it's usually definitive in current env
                 finish(new Error("no_path"));
             } else if (results.status === "timeout") {
                 finish(new Error("pathfinder_timeout"));
@@ -255,6 +230,7 @@ export function moveToGoal(
         let stuckStrikes = 0;
         stuckTimer = setInterval(() => {
             if (settled) return;
+
             const currentPos = bot.entity.position;
             const dist = lastPos.distanceTo(currentPos);
 
@@ -262,11 +238,20 @@ export function moveToGoal(
             if (bot.pathfinder.isMoving() && dist < 0.05) {
                 stuckStrikes++;
                 if (stuckStrikes >= 2) {
-                    finish(new Error("stuck"));
+                    // FIX: Throw structured ExecutionError so runTask properly categorizes this
+                    // as domain.CauseStuck instead of generic "error", triggering StrategyRetryDifferent.
+                    finish(
+                        new ExecutionError(
+                            "bot physically stuck during pathing",
+                            "STUCK",
+                            0.0,
+                        ),
+                    );
                 }
             } else {
                 stuckStrikes = 0;
             }
+
             lastPos = currentPos.clone();
         }, 800);
 
@@ -310,13 +295,11 @@ export async function makeRoomInInventory(
     let slotsFreed = 0;
     for (const item of trashItems) {
         if (slotsFreed >= slotsNeeded) break;
-
         try {
             // Adjust pitch to toss the item slightly forward/up instead of straight down
             const yaw = bot.entity.yaw;
             await bot.look(yaw, -0.3, true);
             await bot.tossStack(item);
-
             // Wait for item to clear the pickup hitbox
             await new Promise((r) => setTimeout(r, 300));
             slotsFreed++;
@@ -333,23 +316,36 @@ export async function placePortableUtility(
     const item = bot.inventory.items().find((i: any) => i.name === blockName);
     if (!item) return null;
 
-    await bot.equip(item, "hand");
     const pos = bot.entity.position.floored();
 
-    const candidates = [
-        bot.blockAt(pos.offset(1, -1, 0)),
-        bot.blockAt(pos.offset(-1, -1, 0)),
-        bot.blockAt(pos.offset(0, -1, 1)),
-        bot.blockAt(pos.offset(0, -1, -1)),
+    const offsets = [
+        new Vec3(1, 0, 0),
+        new Vec3(-1, 0, 0),
+        new Vec3(0, 0, 1),
+        new Vec3(0, 0, -1),
+        new Vec3(1, 0, 1),
+        new Vec3(-1, 0, -1),
     ];
 
-    for (const refBlock of candidates) {
-        if (refBlock && refBlock.name !== "air" && refBlock.name !== "water") {
+    for (const offset of offsets) {
+        const placePos = pos.plus(offset);
+        const blockAt = bot.blockAt(placePos);
+        const belowBlock = bot.blockAt(placePos.offset(0, -1, 0));
+
+        if (
+            blockAt &&
+            blockAt.name === "air" &&
+            belowBlock &&
+            belowBlock.boundingBox === "block"
+        ) {
             try {
-                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                return findNearestBlockByName(bot, blockName);
+                await bot.equip(item.type, "hand");
+                const faceVector = new Vec3(0, 1, 0);
+                await bot.placeBlock(belowBlock, faceVector);
+                await new Promise((r) => setTimeout(r, 250));
+                return bot.blockAt(placePos);
             } catch (err) {
-                // Ignore placement failure
+                // Try next position
             }
         }
     }

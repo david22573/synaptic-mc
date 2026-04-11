@@ -10,7 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/voyager"
 )
@@ -39,14 +41,17 @@ type Service struct {
 	stateProvider StateProvider
 	execStatus    ExecutionStatus
 	worldModel    *domain.WorldModel
+	memStore      memory.Store
 	feedback      *planner.FeedbackAnalyzer
 	logger        *slog.Logger
+	flags         config.FeatureFlags
 
 	mu            sync.Mutex
 	evalSemaphore chan struct{}
 	activeIntent  atomic.Pointer[domain.ActionIntent]
 	beforeState   atomic.Pointer[domain.GameState]
 	taskHistory   []domain.TaskHistory
+	milestones    []domain.ProgressionMilestone
 
 	commitment atomic.Pointer[Commitment]
 }
@@ -76,6 +81,8 @@ func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent
 
 	target := strings.ToLower(strings.TrimSpace(intent.Target))
 	switch intent.Action {
+	case "use_skill":
+		return target != ""
 	case "gather":
 		switch target {
 		case "", "none", "air", "water", "lava":
@@ -103,8 +110,10 @@ func NewService(
 	stateProvider StateProvider,
 	execStatus ExecutionStatus,
 	worldModel *domain.WorldModel,
+	memStore memory.Store,
 	feedback *planner.FeedbackAnalyzer,
 	logger *slog.Logger,
+	flags config.FeatureFlags,
 ) *Service {
 	s := &Service{
 		sessionID:     sessionID,
@@ -116,10 +125,28 @@ func NewService(
 		stateProvider: stateProvider,
 		execStatus:    execStatus,
 		worldModel:    worldModel,
+		memStore:      memStore,
 		feedback:      feedback,
 		logger:        logger.With(slog.String("component", "decision_service")),
+		flags:         flags,
 		evalSemaphore: make(chan struct{}, 1),
 		taskHistory:   make([]domain.TaskHistory, 0),
+		milestones:    make([]domain.ProgressionMilestone, 0),
+	}
+
+	// Load persistent state
+	if memStore != nil {
+		history, err := memStore.GetTaskHistory(context.Background(), sessionID, 50)
+		if err == nil {
+			s.taskHistory = history
+			s.logger.Info("Loaded task history from persistent store", slog.Int("count", len(history)))
+		}
+
+		milestones, err := memStore.GetMilestones(context.Background(), sessionID)
+		if err == nil {
+			s.milestones = milestones
+			s.logger.Info("Loaded milestones from persistent store", slog.Int("count", len(milestones)))
+		}
 	}
 
 	bus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
@@ -192,6 +219,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 }
 
 func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
+	s.planner.SetMilestoneContext(s.getMilestoneContext())
 	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
 	if !s.planManager.HasActivePlan() {
 		go s.evaluateNextPlan(context.Background())
@@ -257,13 +285,33 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			if s.worldModel != nil {
 				s.worldModel.RecordSuccess(intent.Action, intent.Target)
 			}
+
+			// Milestone detection
+			s.detectMilestones(beforePtr, &after)
 		}
 
 		s.mu.Lock()
-		s.taskHistory = append(s.taskHistory, domain.TaskHistory{
+		newHistory := domain.TaskHistory{
 			Intent: *intent, Success: successCritic, Critique: critique,
-		})
+		}
+		s.taskHistory = append(s.taskHistory, newHistory)
+
+		// Trim in-memory history to 200 entries max
+		if len(s.taskHistory) > 200 {
+			s.taskHistory = s.taskHistory[len(s.taskHistory)-200:]
+		}
 		s.mu.Unlock()
+
+		// Persist to SQLite
+		if s.memStore != nil {
+			go func(h domain.TaskHistory) {
+				dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := s.memStore.SaveTaskHistory(dbCtx, s.sessionID, []domain.TaskHistory{h}); err != nil {
+					s.logger.Error("Failed to persist task history", slog.Any("error", err))
+				}
+			}(newHistory)
+		}
 
 		s.activeIntent.Store(nil)
 		s.beforeState.Store(nil)
@@ -294,6 +342,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		s.bus.Publish(ctx, domain.DomainEvent{
 			SessionID: s.sessionID,
 			Type:      domain.EventTypePlanInvalidated,
+			Payload:   []byte(`{}`), // FIX: Prevent EOF unmarshal error on UI broadcast
 			CreatedAt: time.Now(),
 		})
 		go s.evaluateNextPlan(context.Background())
@@ -384,6 +433,116 @@ func (s *Service) RequestEvaluation() {
 	go s.evaluateNextPlan(context.Background())
 }
 
+func (s *Service) getTaskHistory() []domain.TaskHistory {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	historyCopy := make([]domain.TaskHistory, len(s.taskHistory))
+	copy(historyCopy, s.taskHistory)
+	return historyCopy
+}
+
+var techTree = []string{
+	"crafting_table",
+	"wooden_pickaxe",
+	"stone_pickaxe",
+	"furnace",
+	"iron_pickaxe",
+	"iron_ingot",
+	"iron_sword",
+	"iron_chestplate",
+	"diamond_pickaxe",
+	"diamond",
+}
+
+func (s *Service) detectMilestones(before, after *domain.GameState) {
+	beforeItems := make(map[string]bool)
+	for _, item := range before.Inventory {
+		beforeItems[item.Name] = true
+	}
+
+	for _, item := range techTree {
+		alreadyUnlocked := false
+		s.mu.Lock()
+		for _, m := range s.milestones {
+			if m.Name == item {
+				alreadyUnlocked = true
+				break
+			}
+		}
+		s.mu.Unlock()
+
+		if alreadyUnlocked {
+			continue
+		}
+
+		// Check if it's new in inventory
+		hasItNow := false
+		for _, inv := range after.Inventory {
+			if inv.Name == item {
+				hasItNow = true
+				break
+			}
+		}
+
+		if hasItNow && !beforeItems[item] {
+			s.logger.Info("Milestone unlocked!", slog.String("name", item))
+			m := domain.ProgressionMilestone{Name: item, UnlockedAt: time.Now()}
+			s.mu.Lock()
+			s.milestones = append(s.milestones, m)
+			s.mu.Unlock()
+
+			if s.memStore != nil {
+				go func(name string) {
+					dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_ = s.memStore.SaveMilestone(dbCtx, s.sessionID, name)
+				}(item)
+			}
+		}
+	}
+}
+
+func (s *Service) getMilestoneContext() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.milestones) == 0 {
+		return "PROGRESSION STATUS: Just started. Goal: crafting_table, wooden_pickaxe."
+	}
+
+	var unlocked []string
+	for _, m := range s.milestones {
+		unlocked = append(unlocked, m.Name)
+	}
+
+	// Simple next goal derivation
+	nextGoal := ""
+	for _, item := range techTree {
+		found := false
+		for _, u := range unlocked {
+			if u == item {
+				found = true
+				break
+			}
+		}
+		if !found {
+			nextGoal = item
+			break
+		}
+	}
+
+	return fmt.Sprintf("PROGRESSION STATUS:\n  UNLOCKED: %s\n  ACTIVE GOAL: acquire_%s",
+		strings.Join(unlocked, ", "), nextGoal)
+}
+
+func isProgressionMode(state domain.GameState) bool {
+	// Progression mode active when survival is stable:
+	// health > 14 (enough to survive a surprise),
+	// food > 10 (not starving),
+	// no immediate threats.
+	return state.Health > 14 && state.Food > 10 && len(state.Threats) == 0
+}
+
 func (s *Service) evaluateNextPlan(ctx context.Context) {
 	select {
 	case s.evalSemaphore <- struct{}{}:
@@ -422,8 +581,54 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 	if survivalOverride {
 		s.logger.Warn("Survival priority override active")
 		plan = s.planner.reactivePlan(state)
+	} else if isProgressionMode(state) && s.curriculum != nil {
+		s.logger.Info("Stable state detected, curriculum driving progression")
+
+		intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+		if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
+			if intent.Action == "use_skill" && len(intent.SkillSteps) > 0 {
+				s.logger.Info("Expanding composable skill", slog.String("skill", intent.Target), slog.Int("steps", len(intent.SkillSteps)))
+				plan = domain.Plan{
+					Objective:  intent.Rationale,
+					IsFallback: false,
+					Tasks:      make([]domain.Action, len(intent.SkillSteps)),
+				}
+				for i, step := range intent.SkillSteps {
+					plan.Tasks[i] = domain.Action{
+						ID:        fmt.Sprintf("%s-step-%d", intent.ID, i),
+						Action:    step.Action,
+						Target:    domain.Target{Name: step.Target, Type: "skill_step"},
+						Count:     step.Count,
+						Rationale: step.Rationale,
+						Priority:  75 - i, // Slightly declining priority for later steps
+					}
+				}
+			} else {
+				plan = domain.Plan{
+					Objective:  intent.Rationale,
+					IsFallback: false,
+					Tasks: []domain.Action{
+						{
+							ID:        fmt.Sprintf("curr-%d", time.Now().UnixNano()), // FIX: Force unique ID to avoid idempotency drops from LLM hallucinated loops
+							Action:    intent.Action,
+							Target:    domain.Target{Name: intent.Target, Type: "curriculum"},
+							Count:     intent.Count,
+							Rationale: intent.Rationale,
+							Priority:  70,
+						},
+					},
+				}
+			}
+		} else {
+			if err != nil {
+				s.logger.Error("Curriculum failed to propose task, falling back to tactical planner", slog.Any("error", err))
+			} else {
+				s.logger.Info("Curriculum provided no intent, using tactical planner")
+			}
+			plan = s.planner.FastPlan(state)
+		}
 	} else {
-		s.logger.Info("Evaluating next objective")
+		s.logger.Info("Evaluating next tactical objective")
 		plan = s.planner.FastPlan(state)
 	}
 
@@ -434,34 +639,27 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 	}
 
 	if (plan.IsFallback || len(plan.Tasks) == 0) && s.curriculum != nil {
-		s.logger.Info("Planner cache empty, falling back to curriculum")
+		// Only trigger fallback if we didn't just try curriculum (or if it's a critical fallback)
+		if plan.Objective != "Curriculum Fallback" && plan.Objective != "Curriculum" {
+			s.logger.Info("Planner failed or empty, using curriculum as fallback")
 
-		s.mu.Lock()
-		historyCopy := make([]domain.TaskHistory, len(s.taskHistory))
-		copy(historyCopy, s.taskHistory)
-		s.mu.Unlock()
-
-		intent, err := s.curriculum.ProposeTask(ctx, state, historyCopy, s.sessionID)
-		if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
-			plan = domain.Plan{
-				Objective:  "Curriculum Fallback",
-				IsFallback: true,
-				Tasks: []domain.Action{
-					{
-						ID:        intent.ID,
-						Action:    intent.Action,
-						Target:    domain.Target{Name: intent.Target, Type: "inferred"},
-						Count:     intent.Count,
-						Rationale: intent.Rationale,
-						Priority:  50,
+			intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+			if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
+				plan = domain.Plan{
+					Objective:  "Curriculum Fallback",
+					IsFallback: true,
+					Tasks: []domain.Action{
+						{
+							ID:        fmt.Sprintf("curr-fb-%d", time.Now().UnixNano()), // FIX: Force unique ID
+							Action:    intent.Action,
+							Target:    domain.Target{Name: intent.Target, Type: "inferred"},
+							Count:     intent.Count,
+							Rationale: intent.Rationale,
+							Priority:  50,
+						},
 					},
-				},
+				}
 			}
-		} else if err == nil && intent != nil {
-			s.logger.Warn("Rejected invalid curriculum intent",
-				slog.String("action", intent.Action),
-				slog.String("target", intent.Target),
-			)
 		}
 	}
 

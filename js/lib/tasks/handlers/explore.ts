@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/explore.ts
 import {
     type FSMState,
     type StateContext,
@@ -6,6 +5,7 @@ import {
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
 import { escapeTree } from "../utils.js";
+import { Runtime } from "../../control/runtime.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { log } from "../../logger.js";
 import pkg from "mineflayer-pathfinder";
@@ -95,7 +95,6 @@ class PickDirectionState implements FSMState {
         const pos = eCtx.bot.entity.position.floored();
 
         for (let i = 0; i < 24; i++) {
-            // Yield to the event loop to prevent blocking physics and network ticks
             if (i > 0 && i % 4 === 0) {
                 await new Promise((r) => setTimeout(r, 0));
             }
@@ -158,7 +157,6 @@ class PickDirectionState implements FSMState {
             if (eCtx.visitedPoints.length === 0)
                 minDistanceToHistory = validLength;
 
-            // Combine distance and repulsion
             const score = validLength * 0.3 + minDistanceToHistory * 0.7;
 
             if (score > maxRepulsionScore) {
@@ -215,7 +213,8 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
             visitedPoints: botRef.explorationHistory,
         };
 
-        await new StateMachineRunner(new PickDirectionState(), fsmCtx).run();
+        const fsm = new StateMachineRunner(new PickDirectionState(), fsmCtx);
+        await new Runtime(bot).execute(fsm.run(), signal);
     } catch (err: any) {
         log.warn("Explore task aborted or crashed", { reason: err.message });
     }

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -19,6 +20,10 @@ type Store interface {
 	GetKnownWorld(ctx context.Context, pos domain.Vec3) (string, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
+	SaveTaskHistory(ctx context.Context, sessionID string, history []domain.TaskHistory) error
+	GetTaskHistory(ctx context.Context, sessionID string, limit int) ([]domain.TaskHistory, error)
+	SaveMilestone(ctx context.Context, sessionID string, name string) error
+	GetMilestones(ctx context.Context, sessionID string) ([]domain.ProgressionMilestone, error)
 	Close() error
 }
 
@@ -55,6 +60,22 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		y REAL,
 		z REAL,
 		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS task_history (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL,
+		intent_json TEXT NOT NULL,
+		success BOOLEAN NOT NULL,
+		critique TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	CREATE TABLE IF NOT EXISTS milestones (
+		session_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		unlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (session_id, name)
 	);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -62,6 +83,81 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	}
 
 	return &SQLiteStore{db: db}, nil
+}
+
+func (s *SQLiteStore) SaveMilestone(ctx context.Context, sessionID string, name string) error {
+	query := `INSERT INTO milestones (session_id, name) VALUES (?, ?) ON CONFLICT(session_id, name) DO NOTHING`
+	_, err := s.db.ExecContext(ctx, query, sessionID, name)
+	return err
+}
+
+func (s *SQLiteStore) GetMilestones(ctx context.Context, sessionID string) ([]domain.ProgressionMilestone, error) {
+	query := `SELECT name, unlocked_at FROM milestones WHERE session_id = ? ORDER BY unlocked_at ASC`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var milestones []domain.ProgressionMilestone
+	for rows.Next() {
+		var m domain.ProgressionMilestone
+		if err := rows.Scan(&m.Name, &m.UnlockedAt); err != nil {
+			return nil, err
+		}
+		milestones = append(milestones, m)
+	}
+	return milestones, nil
+}
+
+func (s *SQLiteStore) SaveTaskHistory(ctx context.Context, sessionID string, history []domain.TaskHistory) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	query := `INSERT INTO task_history (session_id, intent_json, success, critique) VALUES (?, ?, ?, ?)`
+	for _, h := range history {
+		intentJSON, err := json.Marshal(h.Intent)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, query, sessionID, string(intentJSON), h.Success, h.Critique); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limit int) ([]domain.TaskHistory, error) {
+	query := `SELECT intent_json, success, critique FROM task_history WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []domain.TaskHistory
+	for rows.Next() {
+		var h domain.TaskHistory
+		var intentJSON string
+		if err := rows.Scan(&intentJSON, &h.Success, &h.Critique); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(intentJSON), &h.Intent); err != nil {
+			return nil, err
+		}
+		history = append(history, h)
+	}
+
+	// Reverse to get chronological order (they were DESC for LIMIT)
+	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
+		history[i], history[j] = history[j], history[i]
+	}
+
+	return history, nil
 }
 
 func (s *SQLiteStore) MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error {

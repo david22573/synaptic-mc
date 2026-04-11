@@ -1,3 +1,4 @@
+// internal/decision/planner.go
 package decision
 
 import (
@@ -27,6 +28,7 @@ import (
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
 	CompressState(state domain.GameState, events []domain.DomainEvent) string
+	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
 }
 
 type RuleExtractor interface {
@@ -34,14 +36,16 @@ type RuleExtractor interface {
 }
 
 type AdvancedPlanner struct {
-	client    LLMClient
-	evaluator *strategy.Evaluator
-	extractor RuleExtractor
-	memStore  memory.Store
-	store     domain.EventStore
-	humanizer *humanization.Engine
-	logger    *slog.Logger
-	flags     config.FeatureFlags
+	client     LLMClient
+	evaluator  *strategy.Evaluator
+	extractor  RuleExtractor
+	memStore   memory.Store
+	store      domain.EventStore
+	worldModel *domain.WorldModel
+	humanizer  *humanization.Engine
+	logger     *slog.Logger
+	flags      config.FeatureFlags
+	skills     domain.SkillRetriever
 
 	currentPlan atomic.Pointer[domain.Plan]
 	latestState atomic.Pointer[domain.GameState]
@@ -54,7 +58,13 @@ type AdvancedPlanner struct {
 	failures map[string]int
 	failMu   sync.Mutex
 
-	onPlanReady func()
+	replanChan       chan struct{}
+	onPlanReady      func()
+	milestoneContext string
+}
+
+func (p *AdvancedPlanner) SetMilestoneContext(ctx string) {
+	p.milestoneContext = ctx
 }
 
 type cachedPlan struct {
@@ -72,21 +82,26 @@ func NewAdvancedPlanner(
 	extractor RuleExtractor,
 	memStore memory.Store,
 	store domain.EventStore,
+	worldModel *domain.WorldModel,
 	humanizer *humanization.Engine,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
+	skills domain.SkillRetriever,
 ) *AdvancedPlanner {
 	return &AdvancedPlanner{
-		client:    client,
-		evaluator: evaluator,
-		extractor: extractor,
-		memStore:  memStore,
-		store:     store,
-		humanizer: humanizer,
-		logger:    logger.With(slog.String("component", "advanced_planner")),
-		flags:     flags,
-		planCache: make(map[string]cachedPlan),
-		failures:  make(map[string]int),
+		client:     client,
+		evaluator:  evaluator,
+		extractor:  extractor,
+		memStore:   memStore,
+		store:      store,
+		worldModel: worldModel,
+		humanizer:  humanizer,
+		logger:     logger.With(slog.String("component", "advanced_planner")),
+		flags:      flags,
+		skills:     skills,
+		planCache:  make(map[string]cachedPlan),
+		failures:   make(map[string]int),
+		replanChan: make(chan struct{}, 1),
 	}
 }
 
@@ -104,8 +119,11 @@ CRITICAL GAME MECHANIC RULES:
       - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
       - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
 6.  If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
-VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none".
-VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat.
+7.  SKILL UTILIZATION: If a relevant skill exists in AVAILABLE SKILLS, you MUST use it instead of raw actions. 
+    Set the action field to "use_skill" and the target.name field to the exact Skill ID.
+
+VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none", "skill".
+VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat, use_skill.
 OUTPUT REQUIREMENT (ADVANCED PLANNING):
     You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective.
     Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
@@ -114,11 +132,11 @@ Response format (JSON only):
     "objective": "Sub-goal description",
     "candidates": [
     [
-    { "id": "task-1", "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Directly gather wood" }
+    { "id": "task-1", "action": "use_skill", "target": { "type": "skill", "name": "safe_woodcut_v1" }, "rationale": "Leverage known skill for gathering" }
     ],
     [
     { "id": "task-2", "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
-    { "id": "task-3", "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood safely" }
+    { "id": "task-3", "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood manually if skill fails" }
     ]
     ]
     }`
@@ -168,7 +186,7 @@ func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState)
 }
 
 func (p *AdvancedPlanner) Close() {
-	// No channels to close currently.
+	// Let the GC handle replanChan to avoid panics from late concurrent writers.
 }
 
 func (p *AdvancedPlanner) SetOnPlanReady(cb func()) {
@@ -198,9 +216,6 @@ func (p *AdvancedPlanner) ClearCurrentPlan() {
 }
 
 func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
 	var activeState *domain.GameState
 	var lastPlannedState domain.GameState
 
@@ -208,8 +223,7 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// Pull latest state if one was triggered
+		case <-p.replanChan:
 			if s := p.latestState.Swap(nil); s != nil {
 				activeState = s
 			}
@@ -226,34 +240,6 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 			if !needsReplan {
 				continue
-			}
-
-			// Phase 7: Hesitation moved to cognitive decision layer.
-			// We calculate hesitation based on the *previous* plan's outcome
-			// or current state criticalness.
-			if p.humanizer != nil {
-				currPlan := p.currentPlan.Load()
-				var lastAction domain.Action
-				if currPlan != nil && len(currPlan.Tasks) > 0 {
-					lastAction = currPlan.Tasks[0]
-				}
-
-				hCtx := humanization.BuildContext(*activeState, p.isStuck.Load())
-				hesitation := humanization.CalculateHesitation(lastAction, hCtx, p.humanizer.State(), p.humanizer.Config())
-
-				if hesitation > 0 {
-					p.logger.Debug("Cognitive hesitation active", slog.Duration("duration", hesitation))
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(hesitation):
-						// After hesitation, pull the ABSOLUTE LATEST state again
-						// to ensure the plan isn't based on what happened *before* the pause.
-						if s := p.latestState.Swap(nil); s != nil {
-							activeState = s
-						}
-					}
-				}
 			}
 
 			plan, err := p.generateLLMPlan(ctx, sessionID, *activeState)
@@ -274,6 +260,11 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 	p.latestState.Store(&state)
+
+	select {
+	case p.replanChan <- struct{}{}:
+	default:
+	}
 }
 
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
@@ -306,7 +297,6 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 		if fails > 3 {
 			p.logger.Warn("Plan stuck in failure loop, degrading behavior", slog.String("objective", current.Objective), slog.Int("failures", fails))
 			p.currentPlan.Store(nil)
-			// BUG FIX: Do NOT call RecordSuccess here. That clears the signal we need to break the loop.
 			return p.degradedPlan(state, fails)
 		}
 	}
@@ -413,8 +403,6 @@ func (p *AdvancedPlanner) evictCache() {
 		return
 	}
 
-	// Use a predictable LRU strategy:
-	// 1. Gather all keys and their lastUsed times
 	type entry struct {
 		key  string
 		used time.Time
@@ -424,12 +412,10 @@ func (p *AdvancedPlanner) evictCache() {
 		entries = append(entries, entry{k, v.lastUsed})
 	}
 
-	// 2. Sort by lastUsed ASC (oldest first)
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].used.Before(entries[j].used)
 	})
 
-	// 3. Evict oldest 20%
 	target := maxPlanCacheSize / 5
 	for i := 0; i < target && i < len(entries); i++ {
 		delete(p.planCache, entries[i].key)
@@ -444,14 +430,11 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	}
 
 	stateHash := hashState(state)
-	// Key includes session and event ID to prevent stale reuse when memory/rules change
 	cacheKey := fmt.Sprintf("%s:%d:%d", sessionID, lastEventID, stateHash)
 	sfKey := cacheKey
 
-	// Phase 1: Fast cache check
 	p.cacheMu.RLock()
 	if entry, ok := p.planCache[cacheKey]; ok {
-		// TTL check (10 seconds)
 		if time.Since(entry.createdAt) > 10*time.Second {
 			p.cacheMu.RUnlock()
 			p.cacheMu.Lock()
@@ -466,7 +449,6 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		p.failMu.Unlock()
 
 		if fails == 0 {
-			// Update lastUsed for LRU eviction strategy
 			p.cacheMu.RUnlock()
 			p.cacheMu.Lock()
 			if entry, ok := p.planCache[cacheKey]; ok {
@@ -483,9 +465,7 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 
 cacheMiss:
 
-	// Phase 2: Deduplicated LLM call
 	val, err, _ := p.sf.Do(sfKey, func() (interface{}, error) {
-		// Re-check cache inside singleflight to catch the winner of the race
 		p.cacheMu.RLock()
 		if entry, ok := p.planCache[cacheKey]; ok {
 			p.cacheMu.RUnlock()
@@ -502,6 +482,7 @@ cacheMiss:
 
 		knownWorld := "KNOWN WORLD: empty"
 		longTermMem := "No active summary."
+		tacticalFeedback := ""
 		if p.memStore != nil {
 			var err error
 			knownWorld, err = p.memStore.GetKnownWorld(ctx, state.Position)
@@ -514,20 +495,38 @@ cacheMiss:
 			}
 		}
 
-		systemPrompt := fmt.Sprintf("%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
+		if p.worldModel != nil {
+			tacticalFeedback = p.worldModel.GetTacticalFeedback()
+		}
+
+		availableSkillsDocs := "AVAILABLE SKILLS: none"
+		if p.skills != nil {
+			query := fmt.Sprintf("Goal: %s, Secondary: %s, Health: %.0f, Food: %.0f", directive.PrimaryGoal, directive.SecondaryGoal, state.Health, state.Food)
+			retrieved, err := p.skills.RetrieveSkills(ctx, query, 5)
+			if err == nil && len(retrieved) > 0 {
+				var sb strings.Builder
+				sb.WriteString("AVAILABLE SKILLS:\n")
+				for _, sk := range retrieved {
+					sb.WriteString(fmt.Sprintf("- ID: %s | Desc: %s\n", sk.Name, sk.Description))
+				}
+				availableSkillsDocs = sb.String()
+			}
+		}
+
+		systemPrompt := fmt.Sprintf("%s\n\n%s\n\n%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
 			BaseSystemRules,
+			p.milestoneContext,
+			tacticalFeedback,
 			learnedRules,
 			longTermMem,
 			knownWorld,
+			availableSkillsDocs,
 			directive.PrimaryGoal,
 			directive.SecondaryGoal,
 		)
 
 		userContent := domain.FormatStateForLLM(state)
 
-		// Phase 7: Lossy State Compression
-		// We use the LLM client to compress the massive event stream into a token-capped summary
-		// that only contains the variables needed for the immediate next decision.
 		events, _ := p.store.GetRecentStream(ctx, sessionID, 100)
 		historySummary := p.client.CompressState(state, events)
 		userContent = fmt.Sprintf("%s\n\nEXECUTION_HISTORY_SUMMARY:\n%s", userContent, historySummary)

@@ -1,3 +1,4 @@
+// internal/voyager/curriculum.go
 package voyager
 
 import (
@@ -17,54 +18,58 @@ type LLMClient interface {
 }
 
 type Curriculum interface {
-	ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory, sessionID string) (*domain.ActionIntent, error)
+	ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory, milestoneContext, sessionID string, horizon int) (*domain.ActionIntent, error)
 }
 
 type AutonomousCurriculum struct {
-	client   LLMClient
-	vector   VectorStore
-	memStore memory.Store
+	client     LLMClient
+	vector     VectorStore
+	memStore   memory.Store
+	worldModel *domain.WorldModel
 }
 
-func NewAutonomousCurriculum(client LLMClient, vector VectorStore, memStore memory.Store) *AutonomousCurriculum {
+func NewAutonomousCurriculum(client LLMClient, vector VectorStore, memStore memory.Store, worldModel *domain.WorldModel) *AutonomousCurriculum {
 	return &AutonomousCurriculum{
-		client:   client,
-		vector:   vector,
-		memStore: memStore,
+		client:     client,
+		vector:     vector,
+		memStore:   memStore,
+		worldModel: worldModel,
 	}
 }
 
 const SystemPrompt = `You are the Curriculum Agent for an autonomous Minecraft bot.
-Your job is to evaluate the current Game State, review recent task history, and propose EXACTLY ONE optimal next intent to advance the bot's progression or ensure its survival.
+Your job is to evaluate the current Game State, review recent task history and progression status, and propose an optimal plan to advance the bot's progression or ensure its survival.
 
 CRITICAL RULES:
-1.  SURVIVAL FIRST: If health < 10, your intent MUST be 'eat' or 'retreat'.
+1.  SURVIVAL FIRST: If health < 10, your plan MUST be 'eat' or 'retreat'.
 2.  PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
 3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable (1-10).
 4.  STORAGE: If inventory is full, use the 'store' action to put items in a chest.
 5.  RETRIEVAL: If you need an item and it is in a known chest, use the 'retrieve' action.
-6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter' to construct a 3x3 bunker. You need at least 20 blocks (dirt, planks, or cobblestone).
+6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter'.
+7.  SKILLS: If an 'AVAILABLE SKILL' is perfect, use action: "use_skill" and specify the skill name in "target".
 
-AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build", "farm"
+AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build", "farm", "use_skill"
 
 OUTPUT FORMAT (Strict JSON):
 {
 	"id": "intent-123",
-	"rationale": "Brief explanation of why this is the best next step based on state and history.",
-	"action": "gather",
-	"target": "oak_log",
-	"count": 4
+	"rationale": "Brief explanation of why this is the best next step.",
+	"action": "acquire_wooden_pickaxe",
+	"target": "wooden_pickaxe"
 }`
 
-func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory, sessionID string) (*domain.ActionIntent, error) {
+func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, memory []domain.TaskHistory, milestoneContext, sessionID string, horizon int) (*domain.ActionIntent, error) {
 	if state.Health <= 0 {
 		return nil, fmt.Errorf("bot is dead, waiting for respawn")
 	}
 
+	systemPrompt := fmt.Sprintf(SystemPrompt, horizon)
+
 	var historyStrs []string
 	recentHistory := memory
-	if len(memory) > 5 {
-		recentHistory = memory[len(memory)-5:]
+	if len(memory) > 20 {
+		recentHistory = memory[len(memory)-20:]
 	}
 
 	for _, m := range recentHistory {
@@ -80,41 +85,25 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		historyContext = strings.Join(historyStrs, "\n")
 	}
 
-	if len(recentHistory) > 0 {
-		lastTask := recentHistory[len(recentHistory)-1]
-		if lastTask.Success && c.vector != nil {
-			go func(task domain.TaskHistory, finalState domain.GameState) {
-				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-
-				desc := fmt.Sprintf("Successfully executed '%s %d %s' when health was %.0f and time was %d", task.Intent.Action, task.Intent.Count, task.Intent.Target, finalState.Health, finalState.TimeOfDay)
-				descEmb, err := c.client.CreateEmbedding(saveCtx, desc)
-				if err == nil && len(descEmb) > 0 {
-					intentJSON, _ := json.Marshal(task.Intent)
-					_ = c.vector.SaveSkill(saveCtx, desc, string(intentJSON), descEmb)
-				}
-			}(lastTask, state)
-		}
-	}
-
 	stateContext := domain.FormatStateForLLM(state)
 	queryText := buildRetrievalQuery(state)
 	queryEmb, err := c.client.CreateEmbedding(ctx, queryText)
 
 	skillContext := ""
 	if err == nil && c.vector != nil && len(queryEmb) > 0 {
-		skills, _ := c.vector.RetrieveSkills(ctx, queryEmb, 3)
+		skills, _ := c.vector.RetrieveSkills(ctx, queryEmb, 5)
 		if len(skills) > 0 {
 			var skillStrs []string
 			for _, s := range skills {
-				var intent domain.ActionIntent
-				if err := json.Unmarshal([]byte(s.Code), &intent); err == nil {
-					skillStrs = append(skillStrs, fmt.Sprintf("- Situation: %s -> Intent: %s %d %s", s.Description, intent.Action, intent.Count, intent.Target))
-				} else {
-					skillStrs = append(skillStrs, fmt.Sprintf("- Situation: %s -> Code: %s", s.Description, s.Code))
+				var skill domain.ExecutableSkill
+				// Unmarshal into the new ExecutableSkill structure
+				if err := json.Unmarshal([]byte(s.Code), &skill); err == nil && skill.Name != "" {
+					skillStrs = append(skillStrs, fmt.Sprintf("- Skill: %s (%s)", skill.Name, skill.Description))
 				}
 			}
-			skillContext = "RELEVANT PAST SUCCESSES:\n" + strings.Join(skillStrs, "\n")
+			if len(skillStrs) > 0 {
+				skillContext = "AVAILABLE SKILLS:\n" + strings.Join(skillStrs, "\n")
+			}
 		}
 	}
 
@@ -134,9 +123,19 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
+	tacticalFeedback := ""
+	if c.worldModel != nil {
+		tacticalFeedback = c.worldModel.GetTacticalFeedback()
+		if tacticalFeedback != "" {
+			tacticalFeedback += "\n\n"
+		}
+	}
+
+	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%s%s%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
 		stateContext,
 		memoryContext.String(),
+		milestoneContext,
+		tacticalFeedback,
 		historyContext,
 		skillContext)
 
@@ -144,13 +143,23 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 	var parseErr error
 
 	for attempt := 0; attempt < 3; attempt++ {
-		rawResponse, genErr := c.client.Generate(ctx, SystemPrompt, userContent)
+		rawResponse, genErr := c.client.Generate(ctx, systemPrompt, userContent)
 		if genErr != nil {
 			return nil, fmt.Errorf("llm api failure: %w", genErr)
 		}
 
 		parseErr = json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &intent)
 		if parseErr == nil && intent.Action != "" {
+			if intent.Action == "use_skill" && intent.Target != "" && c.vector != nil {
+				skill, err := c.vector.RetrieveNamedSkill(ctx, intent.Target)
+				if err == nil && skill != nil {
+					intent.SkillName = skill.Name
+				} else {
+					parseErr = fmt.Errorf("skill '%s' not found", intent.Target)
+					userContent += fmt.Sprintf("\n\nSYSTEM: Skill '%s' not found. Choose from the AVAILABLE SKILLS list.", intent.Target)
+					continue
+				}
+			}
 			break
 		}
 
@@ -175,7 +184,6 @@ func buildRetrievalQuery(state domain.GameState) string {
 		priorities = append(priorities, "survival, healing, retreating")
 	}
 
-	// FIX: Align with survival.ts threshold (bot starts panicking about food around 8)
 	if state.Food <= 8 {
 		priorities = append(priorities, "finding food, eating, hunting")
 	}

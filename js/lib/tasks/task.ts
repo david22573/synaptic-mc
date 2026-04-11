@@ -1,14 +1,12 @@
 // js/lib/tasks/task.ts
-
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
-import { type TaskContext } from "./registry.js";
+import { type TaskContext, INTENT_EVALUATORS } from "./registry.js";
 import { log } from "../logger.js";
 
 import { handleGather } from "./handlers/gather.js";
 import { handleCraft } from "./handlers/craft.js";
-import { handleHunt } from "./handlers/hunt.js";
 import { handleBuild } from "./handlers/build.js";
 import { handleExplore } from "./handlers/explore.js";
 import { handleSmelt } from "./handlers/smelt.js";
@@ -20,12 +18,11 @@ import { handleInteract } from "./handlers/interact.js";
 import { handleStore } from "./handlers/store.js";
 import { handleRetrieve } from "./handlers/retrieve.js";
 
-import { ExecutionError } from "./primitives.js"; // Phase 1 update
+import { ExecutionError } from "./primitives.js";
 import { Vec3 } from "vec3";
 
 const { goals } = pkg;
 
-// Phase 1: Define TS representation of ExecutionResult
 export interface ExecutionResult {
     success: boolean;
     cause: string;
@@ -80,10 +77,104 @@ export async function runTask(
     }
 
     try {
+        // --- COMPOSITE TASK RUNNER ---
+        const steps = (intent as any).skill_steps || (intent as any).skillSteps;
+        if (steps && Array.isArray(steps) && steps.length > 0) {
+            log.info(
+                `Executing composite task '${intent.action}' with ${steps.length} steps`,
+            );
+            let progressAccum = 0;
+
+            for (let i = 0; i < steps.length; i++) {
+                if (signal.aborted) {
+                    return {
+                        success: false,
+                        cause: "aborted",
+                        progress: progressAccum,
+                    };
+                }
+
+                const step = steps[i];
+                log.info(
+                    `[Step ${i + 1}/${steps.length}] Starting sub-task: ${step.action}`,
+                );
+
+                const stepResult = await runTask(
+                    bot,
+                    step,
+                    signal,
+                    timeouts,
+                    getThreats,
+                    computeSafeRetreat,
+                    stopMovement,
+                );
+
+                if (!stepResult.success) {
+                    log.warn(
+                        `[Step ${i + 1}/${steps.length}] Sub-task failed`,
+                        { cause: stepResult.cause },
+                    );
+                    return {
+                        success: false,
+                        cause: `step_failed:${step.action}:${stepResult.cause}`,
+                        progress: (i + stepResult.progress) / steps.length,
+                    };
+                }
+                progressAccum = (i + 1) / steps.length;
+            }
+            return { success: true, cause: "", progress: 1.0 };
+        }
+
+        // --- CONTINUOUS LOOP BRIDGE ---
+        if (INTENT_EVALUATORS[intent.action]) {
+            const controller = (bot as any).controller;
+            if (!controller) {
+                throw new ExecutionError(
+                    "BotController not initialized on bot instance",
+                    "error",
+                    0,
+                );
+            }
+
+            controller.setIntent(intent);
+
+            return await new Promise<ExecutionResult>((resolve) => {
+                const check = setInterval(() => {
+                    if (signal.aborted) {
+                        clearInterval(check);
+                        controller.setIntent({
+                            action: "idle",
+                            target: { name: "none" },
+                        });
+                        resolve({
+                            success: false,
+                            cause: "aborted",
+                            progress: 0.0,
+                        });
+                        return;
+                    }
+                    const state = controller.intentState;
+                    if (state.completed) {
+                        clearInterval(check);
+                        resolve({
+                            success: true,
+                            cause: "completed",
+                            progress: 1.0,
+                        });
+                    } else if (state.failed) {
+                        clearInterval(check);
+                        resolve({
+                            success: false,
+                            cause: state.reason || "failed",
+                            progress: 0.0,
+                        });
+                    }
+                }, 100);
+            });
+        }
+
+        // --- LEGACY FSM ROUTER ---
         switch (intent.action) {
-            case "hunt":
-                await handleHunt(taskCtx);
-                break;
             case "gather":
                 await handleGather(taskCtx);
                 break;
@@ -112,7 +203,6 @@ export async function runTask(
                 await handleRetrieve(taskCtx);
                 break;
             case "camera_move": {
-                // Parse coordinates from target name JSON
                 const data = JSON.parse(intent.target.name);
                 await bot.look(data.yaw, data.pitch, true);
                 break;
@@ -121,9 +211,7 @@ export async function runTask(
                 const food = bot.inventory
                     .items()
                     .find((i) => i.name === intent.target.name);
-
                 if (!food) throw new ExecutionError(`NO_FOOD`, "error", 0);
-
                 try {
                     await bot.equip(food.type, "hand");
                     await bot.consume();
@@ -154,7 +242,10 @@ export async function runTask(
                             east: Math.PI / 2,
                             west: -Math.PI / 2,
                         };
-                        if (yawMap[intent.target.name.toLowerCase()] !== undefined) {
+                        if (
+                            yawMap[intent.target.name.toLowerCase()] !==
+                            undefined
+                        ) {
                             await bot.look(
                                 yawMap[intent.target.name.toLowerCase()],
                                 0,
@@ -163,9 +254,14 @@ export async function runTask(
                         }
                     }
                 } else if (intent.target.type === "entity") {
-                    const e = bot.nearestEntity((e) => e.name === intent.target.name);
+                    const e = bot.nearestEntity(
+                        (e) => e.name === intent.target.name,
+                    );
                     if (e) {
-                        await bot.lookAt(e.position.offset(0, e.height || 1.5, 0), true);
+                        await bot.lookAt(
+                            e.position.offset(0, e.height || 1.5, 0),
+                            true,
+                        );
                     }
                 } else {
                     const startYaw = bot.entity.yaw;
@@ -179,7 +275,6 @@ export async function runTask(
             }
             case "sleep": {
                 await escapeTree(bot, signal);
-
                 const bed = bot.findBlock({
                     maxDistance: 32,
                     matching: (b: any) => b?.name.includes("bed"),
@@ -209,14 +304,12 @@ export async function runTask(
                             reject(
                                 new ExecutionError("aborted", "aborted", 1.0),
                             );
-
                         bot.on("wake", onWake);
                         signal.addEventListener("abort", onAbort, {
                             once: true,
                         });
                     });
 
-                    // Phase 2 Fix #6: Replace raw setTimeout abort with AbortController + clearTimeout
                     const sleepAbortCtrl = new AbortController();
                     const timeoutPromise = new Promise<void>((_, reject) => {
                         timeoutId = setTimeout(() => {
@@ -232,22 +325,24 @@ export async function runTask(
                     });
 
                     const sleepPromise = bot.sleep(bed).then(() => wakePromise);
-
                     await Promise.race([sleepPromise, timeoutPromise]);
                 } finally {
                     if (timeoutId) clearTimeout(timeoutId);
                     if (onWake) bot.removeListener("wake", onWake);
                     if (onAbort) signal.removeEventListener("abort", onAbort);
                 }
-
                 break;
             }
             case "retreat": {
                 await escapeTree(bot, signal);
-
                 const threats = taskCtx.getThreats ? taskCtx.getThreats() : [];
-                const pos = taskCtx.computeSafeRetreat ? taskCtx.computeSafeRetreat(threats) : { x: bot.entity.position.x + 5, z: bot.entity.position.z + 5 };
-                
+                const pos = taskCtx.computeSafeRetreat
+                    ? taskCtx.computeSafeRetreat(threats)
+                    : {
+                          x: bot.entity.position.x + 5,
+                          z: bot.entity.position.z + 5,
+                      };
+
                 log.info("Retreating to safe position", {
                     threatCount: threats.length,
                     target: pos,
@@ -258,7 +353,6 @@ export async function runTask(
                     timeoutMs: 15000,
                     stopMovement,
                 });
-
                 await waitForMs(1000, signal);
                 break;
             }
@@ -277,7 +371,6 @@ export async function runTask(
                 );
         }
 
-        // Return a clean 100% success state if we clear the switch block cleanly
         return { success: true, cause: "", progress: 1.0 };
     } catch (err: any) {
         stopMovement();
@@ -286,10 +379,9 @@ export async function runTask(
             return { success: false, cause: "aborted", progress: 1.0 };
         }
 
-        // Phase 1: Return the structured result back so we can pipe it over websockets
         if (err instanceof ExecutionError || err.name === "ExecutionError") {
             return {
-                success: err.cause === "partial", // True if we accept partial paths
+                success: err.cause === "partial",
                 cause: err.cause,
                 progress: err.progress,
             };
@@ -299,8 +391,6 @@ export async function runTask(
             error: err.message,
             stack: err.stack,
         });
-
-        // Fallback for unhandled/raw node errors
         return { success: false, cause: "error", progress: 0.0 };
     }
 }

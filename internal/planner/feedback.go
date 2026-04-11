@@ -115,18 +115,32 @@ func (f *FeedbackAnalyzer) triggerReevaluation() *domain.ActionIntent {
 }
 
 func (f *FeedbackAnalyzer) generatePrerequisitePlan(failedIntent domain.ActionIntent) *domain.ActionIntent {
-	deps := map[string]struct{ action, target string }{
-		"planks":         {action: "gather", target: "log"},
-		"stick":          {action: "gather", target: "log"},
-		"crafting_table": {action: "gather", target: "log"},
-		"wooden_pickaxe": {action: "gather", target: "log"},
-		"stone_pickaxe":  {action: "mine", target: "cobblestone"},
-		"iron_pickaxe":   {action: "mine", target: "iron_ore"},
-		"furnace":        {action: "mine", target: "cobblestone"},
+	target := strings.ToLower(failedIntent.Target)
+
+	// Dependency mapping with substring matching
+	deps := []struct {
+		key    string
+		action string
+		target string
+	}{
+		{key: "planks", action: "gather", target: "log"},
+		{key: "stick", action: "gather", target: "log"},
+		{key: "crafting_table", action: "gather", target: "log"},
+		{key: "wooden_pickaxe", action: "gather", target: "log"},
+		{key: "stone_pickaxe", action: "mine", target: "cobblestone"},
+		{key: "iron_pickaxe", action: "mine", target: "iron_ore"},
+		{key: "furnace", action: "mine", target: "cobblestone"},
 	}
 
-	dep, exists := deps[failedIntent.Target]
-	if !exists {
+	var dep *struct{ action, target string }
+	for _, d := range deps {
+		if strings.Contains(target, d.key) {
+			dep = &struct{ action, target string }{action: d.action, target: d.target}
+			break
+		}
+	}
+
+	if dep == nil {
 		log.Printf("[FeedbackAnalyzer] Unknown dependency map for %s, dropping to macro strategy", failedIntent.Target)
 		return nil
 	}

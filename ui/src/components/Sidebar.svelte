@@ -1,5 +1,6 @@
 <script lang="ts">
     import { botStore, uiStore, clearEventLog } from "../lib/store.svelte";
+    import ItemIcon from "./ItemIcon.svelte";
 
     let { isOpen = true } = $props();
 
@@ -80,6 +81,7 @@
                             setTooltip(e, formatName(item.name))}
                         onmouseleave={clearTooltip}
                     >
+                        <ItemIcon name={item.name} size={24} />
                         <span class="item-name">{formatName(item.name)}</span>
                         <span class="item-count">{item.count}</span>
                     </div>
@@ -323,7 +325,8 @@
 
     .item {
         display: flex;
-        justify-content: space-between;
+        align-items: center;
+        gap: 0.5rem;
         padding: 0.5rem;
         background: rgba(51, 65, 85, 0.8);
         border-radius: 4px;
@@ -336,12 +339,15 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 80px;
     }
 
     .item-count {
-        font-weight: 600;
-        color: #94a3b8;
+        font-family: monospace;
+        font-size: 0.9rem;
+        font-weight: bold;
+        color: white;
+        text-shadow: 1px 1px 0 #3f3f3f;
+        margin-left: auto;
     }
 
     .list {

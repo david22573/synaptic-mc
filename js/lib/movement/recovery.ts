@@ -8,22 +8,28 @@ export async function straightLineMove(
     durationMs: number = 2000,
     signal?: AbortSignal,
 ): Promise<void> {
-    // Unconditional sanitization before starting movement
     bot.clearControlStates();
     if (!bot.entity) return;
     if (signal?.aborted) return;
 
-    bot.lookAt(new Vec3(target.x, (bot.entity as any).position.y, target.z), true);
     bot.setControlState("forward", true);
     bot.setControlState("sprint", true);
 
-    const jumpInterval = setInterval(() => {
+    const targetVec = new Vec3(target.x, bot.entity.position.y, target.z);
+
+    // Bind to the engine's physics loop for reactive per-tick updates
+    const onTick = () => {
+        if (!bot.entity) return;
+        bot.lookAt(new Vec3(target.x, bot.entity.position.y, target.z), true);
+
         if ((bot.entity as any).isCollidedHorizontally) {
             bot.setControlState("jump", true);
         } else {
             bot.setControlState("jump", false);
         }
-    }, 100);
+    };
+
+    bot.on("physicsTick", onTick);
 
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -37,9 +43,8 @@ export async function straightLineMove(
         };
 
         const cleanup = () => {
-            clearInterval(jumpInterval);
+            bot.removeListener("physicsTick", onTick);
             clearTimeout(timeout);
-            // Phase 7: Enforce global state sanitization unconditionally on task abort or completion
             bot.clearControlStates();
             signal?.removeEventListener("abort", onAbort);
         };
@@ -55,24 +60,31 @@ export async function randomWalk(
     durationMs: number = 2000,
     signal?: AbortSignal,
 ): Promise<void> {
-    // Unconditional sanitization before starting movement
     bot.clearControlStates();
     if (!bot.entity) return;
     if (signal?.aborted) return;
 
-    const rx = (bot.entity as any).position.x + (Math.random() * 16 - 8);
-    const rz = (bot.entity as any).position.z + (Math.random() * 16 - 8);
+    const rx = bot.entity.position.x + (Math.random() * 16 - 8);
+    const rz = bot.entity.position.z + (Math.random() * 16 - 8);
+    const targetVec = new Vec3(rx, bot.entity.position.y, rz);
 
-    bot.lookAt(new Vec3(rx, (bot.entity as any).position.y, rz), true);
     bot.setControlState("forward", true);
 
-    const jumpInterval = setInterval(() => {
-        if (Math.random() > 0.8 || (bot.entity as any).isCollidedHorizontally) {
+    const onTick = () => {
+        if (!bot.entity) return;
+        bot.lookAt(targetVec, true);
+
+        if (
+            Math.random() > 0.95 ||
+            (bot.entity as any).isCollidedHorizontally
+        ) {
             bot.setControlState("jump", true);
         } else {
             bot.setControlState("jump", false);
         }
-    }, 200);
+    };
+
+    bot.on("physicsTick", onTick);
 
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -86,9 +98,8 @@ export async function randomWalk(
         };
 
         const cleanup = () => {
-            clearInterval(jumpInterval);
+            bot.removeListener("physicsTick", onTick);
             clearTimeout(timeout);
-            // Phase 7: Enforce global state sanitization unconditionally on task abort or completion
             bot.clearControlStates();
             signal?.removeEventListener("abort", onAbort);
         };
@@ -103,9 +114,9 @@ export async function jumpRecovery(
     bot: Bot,
     durationMs: number = 1000,
 ): Promise<void> {
-    // Unconditional sanitization before starting movement
     bot.clearControlStates();
     if (!bot.entity) return;
+
     bot.setControlState("jump", true);
     bot.setControlState("left", Math.random() > 0.5);
     bot.setControlState("right", Math.random() > 0.5);
@@ -114,7 +125,6 @@ export async function jumpRecovery(
 
     return new Promise((resolve) => {
         setTimeout(() => {
-            // Phase 7: Enforce global state sanitization unconditionally on completion
             bot.clearControlStates();
             resolve();
         }, durationMs);

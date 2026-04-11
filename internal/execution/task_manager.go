@@ -50,15 +50,16 @@ type TaskManager struct {
 	timeouts    map[string]time.Duration
 	OnDrain     func()
 
-	queue        ActionPriorityQueue
-	mu           sync.Mutex
-	activeTask   *domain.Action
-	activeCtx    context.Context
-	cancelTask   context.CancelFunc
-	signalCh     chan struct{}
-	idleSince    time.Time
-	lastFailure  time.Time
-	failureCount int
+	queue         ActionPriorityQueue
+	recentActions map[string]time.Time
+	mu            sync.Mutex
+	activeTask    *domain.Action
+	activeCtx     context.Context
+	cancelTask    context.CancelFunc
+	signalCh      chan struct{}
+	idleSince     time.Time
+	lastFailure   time.Time
+	failureCount  int
 
 	scheduleMu  sync.Mutex
 	scheduled   []scheduledItem
@@ -78,13 +79,14 @@ func NewTaskManager(
 		timeouts = make(map[string]time.Duration)
 	}
 	tm := &TaskManager{
-		engine:      engine,
-		ctrlManager: ctrlManager,
-		logger:      logger.With(slog.String("component", "task_manager")),
-		timeouts:    timeouts,
-		queue:       make(ActionPriorityQueue, 0, 10),
-		signalCh:    make(chan struct{}, 1),
-		scheduleSig: make(chan struct{}, 1),
+		engine:        engine,
+		ctrlManager:   ctrlManager,
+		logger:        logger.With(slog.String("component", "task_manager")),
+		timeouts:      timeouts,
+		queue:         make(ActionPriorityQueue, 0, 10),
+		recentActions: make(map[string]time.Time),
+		signalCh:      make(chan struct{}, 1),
+		scheduleSig:   make(chan struct{}, 1),
 	}
 
 	heap.Init(&tm.queue)
@@ -105,8 +107,6 @@ func (tm *TaskManager) SetReadyChecker(checker func() bool) {
 
 func (tm *TaskManager) Run(ctx context.Context) {
 	defer func() {
-		// Ensure active tasks are aborted when the manager stops.
-		// Use a background context with timeout to allow final cleanup even if the parent context is done.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = tm.Halt(shutdownCtx, "task manager shutdown")
@@ -125,6 +125,14 @@ func (tm *TaskManager) Run(ctx context.Context) {
 			return
 		case <-idleCheck.C:
 			tm.mu.Lock()
+
+			// Clean up recent actions dedup mapping
+			now := time.Now()
+			for k, t := range tm.recentActions {
+				if now.Sub(t) > 5*time.Second {
+					delete(tm.recentActions, k)
+				}
+			}
 
 			backoffSec := math.Min(300, 5*math.Pow(2, float64(tm.failureCount)))
 			if time.Since(tm.lastFailure) < time.Duration(backoffSec)*time.Second {
@@ -211,7 +219,21 @@ func (tm *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) erro
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
+	now := time.Now()
 	for _, task := range tasks {
+		isCuriosity := task.ID == "explore-curiosity-stable"
+		dedupKey := task.Action + ":" + task.Target.Name
+
+		if !isCuriosity {
+			if lastSeen, exists := tm.recentActions[dedupKey]; exists {
+				if now.Sub(lastSeen) < 2*time.Second {
+					tm.logger.Debug("Dropped duplicate action within dedup window", slog.String("action", task.Action))
+					continue
+				}
+			}
+		}
+		tm.recentActions[dedupKey] = now
+
 		t := task
 		heap.Push(&tm.queue, &t)
 	}
@@ -299,8 +321,6 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 			}
 		}
 
-		// We clear the queue to prevent "failure waterfalls", but now backoff
-		// handles the curiosity loop "vibration".
 		tm.queue = make(ActionPriorityQueue, 0, 10)
 		heap.Init(&tm.queue)
 
@@ -310,7 +330,6 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 		return nil
 	}
 
-	// Reset failure count on success
 	tm.failureCount = 0
 
 	if tm.queue.Len() == 0 {
@@ -385,5 +404,5 @@ func (tm *TaskManager) dispatchCurrent(ctx context.Context, action domain.Action
 	tm.cancelTask = cancel
 	tm.mu.Unlock()
 
-	tm.engine.Enqueue(derivedCtx, action)
+	tm.engine.ExecuteAsync(derivedCtx, action)
 }

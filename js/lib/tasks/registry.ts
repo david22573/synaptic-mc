@@ -1,5 +1,8 @@
+// js/lib/tasks/registry.ts
 import type { Bot } from "mineflayer";
 import type * as models from "../models.js";
+import { ActionPlan, Perception } from "../control/controller.js";
+import { evaluateHunt } from "./handlers/hunt.js";
 
 export interface TaskContext {
     bot: Bot;
@@ -16,4 +19,15 @@ export interface TaskContext {
 
 export type TaskHandler = (ctx: TaskContext) => Promise<void>;
 
+// Legacy FSM Handlers
 export const TASK_REGISTRY: Record<string, TaskHandler> = {};
+
+// Continuous Control Evaluators
+export type IntentEvaluator = (
+    bot: Bot,
+    perception: Perception,
+    plan: ActionPlan,
+) => ActionPlan;
+export const INTENT_EVALUATORS: Record<string, IntentEvaluator> = {
+    hunt: evaluateHunt,
+};

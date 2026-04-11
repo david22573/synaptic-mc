@@ -1,3 +1,4 @@
+// cmd/server/main.go
 package main
 
 import (
@@ -107,6 +108,7 @@ func main() {
 	})
 
 	eventBus := domain.NewEventBus()
+	rtBus := domain.NewRealtimeBus()
 	uiHub := observability.NewHub(logger)
 
 	humanCfg := humanization.Config{
@@ -122,24 +124,28 @@ func main() {
 	ctrlManager := execution.NewControllerManager()
 	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger)
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
-	execService := execution.NewControlService(eventBus, execEngine, taskManager, ctrlManager, humanizer, stateSvc, logger)
 
+	execService := execution.NewControlService(rtBus, eventBus, execEngine, taskManager, ctrlManager, humanizer, stateSvc, logger)
 	uiHub.SetOrchestrator(execService)
 
 	evaluator := strategy.NewEvaluator()
 	critic := voyager.NewStateCritic()
-	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore)
+	worldModel := domain.NewWorldModel()
+	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore, worldModel)
 
 	dynFlags := config.NewDynamicFlags(cfg.ConfigPath, logger)
-plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, humanizer, logger, dynFlags.Get())
 
+	// Initialize the new SkillManager
+	skillManager := voyager.NewSkillManager(vectorStore, llmClient)
+
+	// Inject skillManager into AdvancedPlanner
+	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
 
 	planManager := decision.NewPlanManager()
-	worldModel := domain.NewWorldModel()
 	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel)
 
-	decisionSvc := decision.NewService(cfg.SessionID, eventBus, plannerObj, planManager, 
-	curriculum, critic, stateSvc, taskManager, worldModel, feedbackAnalyzer, logger)
+	decisionSvc := decision.NewService(cfg.SessionID, eventBus, plannerObj, planManager,
+		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, logger, dynFlags.Get())
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
@@ -147,14 +153,13 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 	plannerObj.SetOnPlanReady(decisionSvc.RequestEvaluation)
 	taskManager.OnDrain = decisionSvc.RequestEvaluation
 
-	// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
 	var latestStateUpdate atomic.Pointer[map[string]interface{}]
 
 	eventBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		var stateUpdate struct {
 			POIs []struct {
-				Name string          `json:"name"`
-				Type string          `json:"type"`
+				Name string      `json:"name"`
+				Type string      `json:"type"`
 				Pos  domain.Vec3 `json:"position"`
 			} `json:"pois"`
 		}
@@ -162,19 +167,20 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 			logger.Warn("Failed to unmarshal state update POIs", slog.Any("error", err))
 			return
 		}
-		for _, poi := range stateUpdate.POIs { 
+		for _, poi := range stateUpdate.POIs {
 			_ = memoryStore.MarkWorldNode(ctx, poi.Name, poi.Type, poi.Pos)
-		}	}))
+		}
+	}))
 
 	eventBus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		eventBus.Publish(ctx, domain.DomainEvent{
 			SessionID: ev.SessionID,
 			Type:      domain.EventTypePlanInvalidated,
+			Payload:   []byte(`{}`),
 			CreatedAt: time.Now(),
 		})
 	}))
 
-	// Phase 6: Bounded worker pool for persistence and UI broadcasting
 	eventWorkerCh := make(chan domain.DomainEvent, 1024)
 
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
@@ -182,11 +188,9 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 			return
 		}
 
-		// Phase 6: Push to worker pool instead of spawning new goroutines
 		select {
 		case eventWorkerCh <- ev:
 		default:
-			// DROP: Prevents fan-out goroutine explosion when workers are overloaded
 		}
 	})
 
@@ -209,7 +213,6 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 
 	g, ctx := errgroup.WithContext(rootCtx)
 
-	// Phase 6: Bounded Event Workers (Persistence & UI)
 	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
 		g.Go(func() error {
@@ -222,36 +225,29 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 						return nil
 					}
 
-					// 1. Persist to SQLite
 					_ = eventStore.Append(context.Background(), ev.SessionID, ev.Trace, ev.Type, ev.Payload)
 
-					// 2. UI Broadcasting
 					var payloadObj interface{}
 					if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
-						logger.Error("Failed to unmarshal event payload for UI broadcast", 
-							slog.Any("error", err), 
+						logger.Error("Failed to unmarshal event payload for UI broadcast",
+							slog.Any("error", err),
 							slog.String("event_type", string(ev.Type)),
 							slog.String("session_id", ev.SessionID))
 						continue
 					}
 
-					// BroadcastEv structure
 					broadcastEv := map[string]interface{}{
 						"type":      string(ev.Type),
 						"payload":   payloadObj,
 						"timestamp": ev.CreatedAt.Format(time.Kitchen),
 					}
 
-					// Identify if this is a high-frequency state update or a discrete event
 					isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
 
 					if isState {
-						// Phase 6: Throttled UI state updates to reduce OBS Browser Source CPU usage
-						// Always allocate a fresh variable to avoid pointer reuse risks
 						evCopy := broadcastEv
 						latestStateUpdate.Store(&evCopy)
 					} else {
-						// Send to the log/sidebar stream
 						uiHub.Broadcast("EVENT_STREAM", broadcastEv)
 					}
 				}
@@ -259,7 +255,6 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 		})
 	}
 
-	// Phase 6: Throttled UI state broadcast (10 FPS)
 	g.Go(func() error {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
@@ -277,7 +272,6 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 
 	mux := http.NewServeMux()
 
-	// FIX: Dynamically construct the WebSocket host based on the client's HTTP request
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		scheme := "ws://"
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
@@ -299,7 +293,7 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 	})
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, eventBus, ctrlManager, runner, logger, cfg.SessionID))
+	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, rtBus, eventBus, ctrlManager, runner, logger, cfg.SessionID))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	uiPath := cfg.UIPath
@@ -307,7 +301,6 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 		uiPath = filepath.Join(".", uiPath)
 	}
 
-	// FIX: Serve the SPA correctly, falling back to index.html for unknown routes
 	mux.Handle("/", serveSPA(uiPath))
 
 	server := &http.Server{
@@ -380,7 +373,6 @@ plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memorySt
 	logger.Info("Synaptic MC shutdown complete")
 }
 
-// serveSPA wraps the standard file server to redirect 404s to index.html for Svelte routing
 func serveSPA(dir string) http.HandlerFunc {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -389,13 +381,11 @@ func serveSPA(dir string) http.HandlerFunc {
 	fs := http.FileServer(http.Dir(absDir))
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Clean the path and remove leading slashes to prevent absolute path escapes on Windows
 		cleanPath := filepath.Clean(r.URL.Path)
 		cleanPath = strings.TrimLeft(cleanPath, `/\`)
 
 		path := filepath.Join(absDir, cleanPath)
 
-		// Verify that the resulting path is still within the intended directory
 		rel, err := filepath.Rel(absDir, path)
 		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 			http.ServeFile(w, r, filepath.Join(absDir, "index.html"))
@@ -411,6 +401,7 @@ func serveSPA(dir string) http.HandlerFunc {
 		fs.ServeHTTP(w, r)
 	}
 }
+
 func parseConfig() Config {
 	httpAddr := flag.String("http", getEnvOrDefault("HTTP_ADDR", ":8080"), "HTTP server address")
 	eventsDB := flag.String("events", getEnvOrDefault("EVENT_STORE_DB", "events.db"), "Event store database filename")
@@ -474,7 +465,7 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
+func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
@@ -482,19 +473,17 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 				return true
 			}
 
-			// Allow localhost and same-host connections
 			host := r.Host
 			if origin == "http://"+host || origin == "https://"+host {
 				return true
 			}
 
-			// Always allow localhost for development
-			return origin == "http://localhost" || 
-				   origin == "http://127.0.0.1" || 
-				   origin == "http://[::1]" ||
-				   strings.HasPrefix(origin, "http://localhost:") ||
-				   strings.HasPrefix(origin, "http://127.0.0.1:") ||
-				   strings.HasPrefix(origin, "http://[::1]:")
+			return origin == "http://localhost" ||
+				origin == "http://127.0.0.1" ||
+				origin == "http://[::1]" ||
+				strings.HasPrefix(origin, "http://localhost:") ||
+				strings.HasPrefix(origin, "http://127.0.0.1:") ||
+				strings.HasPrefix(origin, "http://[::1]:")
 		},
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -513,7 +502,6 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 		runner.Ping()
 
 		onMessage := func(msgType string, payload []byte) {
-			// Phase 6: Non-blocking ingestion (EventBus handles buffering internally)
 			runner.Ping()
 			normalizedType := domain.NormalizeEventType(msgType)
 			cleanPayload := payload
@@ -521,17 +509,22 @@ func handleBotConnection(appCtx context.Context, bus domain.EventBus, cm *execut
 				cleanPayload = []byte(`{}`)
 			}
 
-			bus.Publish(appCtx, domain.DomainEvent{
+			ev := domain.DomainEvent{
 				SessionID: sessionID,
 				Type:      normalizedType,
 				Payload:   cleanPayload,
 				CreatedAt: time.Now(),
-			})
+			}
+
+			rtBus.Publish(appCtx, ev)
+			evBus.Publish(appCtx, ev)
 		}
+
 		onClose := func() {
 			logger.Warn("Bot connection closed", slog.String("controller_id", controllerID))
 			cm.RemoveController(controllerID)
 		}
+
 		botController := execution.NewWSController(appCtx, conn, logger, onMessage, onClose)
 		idempotentController := execution.NewIdempotentController(botController, 1000)
 

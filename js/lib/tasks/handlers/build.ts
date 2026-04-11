@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/build.ts
 import {
     type FSMState,
     type StateContext,
@@ -6,6 +5,7 @@ import {
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
 import { escapeTree, moveToGoal } from "../utils.js";
+import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 
@@ -38,18 +38,35 @@ interface BuildContext extends StateContext {
 
 const SCHEMATICS: Record<string, BlueprintNode[]> = {
     shelter: [
-        { dx: -1, dy: 0, dz: -1 }, { dx: 0, dy: 0, dz: -1 }, { dx: 1, dy: 0, dz: -1 },
-        { dx: -1, dy: 0, dz: 0 }, { dx: 1, dy: 0, dz: 0 },
-        { dx: -1, dy: 0, dz: 1 }, { dx: 1, dy: 0, dz: 1 },
-        { dx: -1, dy: 1, dz: -1 }, { dx: 0, dy: 1, dz: -1 }, { dx: 1, dy: 1, dz: -1 },
-        { dx: -1, dy: 1, dz: 0 }, { dx: 1, dy: 1, dz: 0 },
-        { dx: -1, dy: 1, dz: 1 }, { dx: 1, dy: 1, dz: 1 },
-        { dx: -1, dy: 2, dz: -1 }, { dx: 0, dy: 2, dz: -1 }, { dx: 1, dy: 2, dz: -1 },
-        { dx: -1, dy: 2, dz: 0 }, { dx: 0, dy: 2, dz: 0 }, { dx: 1, dy: 2, dz: 0 },
-        { dx: -1, dy: 2, dz: 1 }, { dx: 0, dy: 2, dz: 1 }, { dx: 1, dy: 2, dz: 1 },
+        { dx: -1, dy: 0, dz: -1 },
+        { dx: 0, dy: 0, dz: -1 },
+        { dx: 1, dy: 0, dz: -1 },
+        { dx: -1, dy: 0, dz: 0 },
+        { dx: 1, dy: 0, dz: 0 },
+        { dx: -1, dy: 0, dz: 1 },
+        { dx: 1, dy: 0, dz: 1 },
+        { dx: -1, dy: 1, dz: -1 },
+        { dx: 0, dy: 1, dz: -1 },
+        { dx: 1, dy: 1, dz: -1 },
+        { dx: -1, dy: 1, dz: 0 },
+        { dx: 1, dy: 1, dz: 0 },
+        { dx: -1, dy: 1, dz: 1 },
+        { dx: 1, dy: 1, dz: 1 },
+        { dx: -1, dy: 2, dz: -1 },
+        { dx: 0, dy: 2, dz: -1 },
+        { dx: 1, dy: 2, dz: -1 },
+        { dx: -1, dy: 2, dz: 0 },
+        { dx: 0, dy: 2, dz: 0 },
+        { dx: 1, dy: 2, dz: 0 },
+        { dx: -1, dy: 2, dz: 1 },
+        { dx: 0, dy: 2, dz: 1 },
+        { dx: 1, dy: 2, dz: 1 },
     ],
     pillar: [
-        { dx: 0, dy: -1, dz: 0 }, { dx: 0, dy: 0, dz: 0 }, { dx: 0, dy: 1, dz: 0 }, { dx: 0, dy: 2, dz: 0 },
+        { dx: 0, dy: -1, dz: 0 },
+        { dx: 0, dy: 0, dz: 0 },
+        { dx: 0, dy: 1, dz: 0 },
+        { dx: 0, dy: 2, dz: 0 },
     ],
 };
 
@@ -69,7 +86,8 @@ class ConstructState implements FSMState {
         let consecutiveFailures = 0;
         while (sCtx.currentIndex < sCtx.blueprint.length) {
             if (sCtx.signal.aborted) throw new Error("aborted");
-            if (consecutiveFailures > 5) throw new Error("PANIC: Bot is hopelessly stuck.");
+            if (consecutiveFailures > 5)
+                throw new Error("PANIC: Bot is hopelessly stuck.");
 
             const node = sCtx.blueprint[sCtx.currentIndex];
             if (!node) break;
@@ -82,9 +100,14 @@ class ConstructState implements FSMState {
                 continue;
             }
 
-            const hasMaterial = bot.inventory.items().some((i: any) => i.type === sCtx.materialType);
+            const hasMaterial = bot.inventory
+                .items()
+                .some((i: any) => i.type === sCtx.materialType);
             if (!hasMaterial) {
-                sCtx.result = { status: "FAILED", reason: "MISSING_INGREDIENTS" };
+                sCtx.result = {
+                    status: "FAILED",
+                    reason: "MISSING_INGREDIENTS",
+                };
                 return null;
             }
 
@@ -93,14 +116,22 @@ class ConstructState implements FSMState {
 
             if (!refBlock) {
                 try {
-                    // Requirement 3: Normalize diagonal movement by ensuring clean navigation state
                     bot.clearControlStates();
-                    await moveToGoal(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2), {
-                        signal: sCtx.signal,
-                        timeoutMs: 10000,
-                        stopMovement: sCtx.stopMovement,
-                        dynamic: false,
-                    });
+                    await moveToGoal(
+                        bot,
+                        new goals.GoalNear(
+                            targetPos.x,
+                            targetPos.y,
+                            targetPos.z,
+                            2,
+                        ),
+                        {
+                            signal: sCtx.signal,
+                            timeoutMs: 10000,
+                            stopMovement: sCtx.stopMovement,
+                            dynamic: false,
+                        },
+                    );
                 } catch (e: any) {
                     if (e.message === "aborted") throw e;
                     consecutiveFailures++;
@@ -121,24 +152,42 @@ class ConstructState implements FSMState {
                         bot.setControlState("jump", true);
                         await bot.waitForTicks(2);
                         try {
-                            const faceVector = targetPos.minus(localRef.position);
+                            const faceVector = targetPos.minus(
+                                localRef.position,
+                            );
                             await bot.placeBlock(localRef, faceVector);
                             consecutiveFailures = 0;
-                        } catch (err) { consecutiveFailures++; }
-                        finally { bot.setControlState("jump", false); }
-                    } else { consecutiveFailures++; }
+                        } catch (err) {
+                            consecutiveFailures++;
+                        } finally {
+                            bot.setControlState("jump", false);
+                        }
+                    } else {
+                        consecutiveFailures++;
+                    }
                     sCtx.currentIndex++;
                     continue;
                 } else {
                     try {
                         bot.clearControlStates();
-                        await moveToGoal(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2), {
-                            signal: sCtx.signal,
-                            timeoutMs: 5000,
-                            stopMovement: sCtx.stopMovement,
-                            dynamic: false,
-                        });
-                    } catch (e: any) { if (e.message === "aborted") throw e; }
+                        await moveToGoal(
+                            bot,
+                            new goals.GoalNear(
+                                targetPos.x,
+                                targetPos.y,
+                                targetPos.z,
+                                2,
+                            ),
+                            {
+                                signal: sCtx.signal,
+                                timeoutMs: 5000,
+                                stopMovement: sCtx.stopMovement,
+                                dynamic: false,
+                            },
+                        );
+                    } catch (e: any) {
+                        if (e.message === "aborted") throw e;
+                    }
                 }
             }
 
@@ -148,8 +197,12 @@ class ConstructState implements FSMState {
                     const faceVector = targetPos.minus(finalRef.position);
                     await bot.placeBlock(finalRef, faceVector);
                     consecutiveFailures = 0;
-                } else { consecutiveFailures++; }
-            } catch (err: any) { consecutiveFailures++; }
+                } else {
+                    consecutiveFailures++;
+                }
+            } catch (err: any) {
+                consecutiveFailures++;
+            }
             sCtx.currentIndex++;
         }
         sCtx.result = { status: "SUCCESS", reason: "BUILD_COMPLETE" };
@@ -157,7 +210,14 @@ class ConstructState implements FSMState {
     }
 
     private findReferenceBlock(bot: any, pos: Vec3): any | null {
-        const offsets = [new Vec3(0, -1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1), new Vec3(0, 1, 0)];
+        const offsets = [
+            new Vec3(0, -1, 0),
+            new Vec3(1, 0, 0),
+            new Vec3(-1, 0, 0),
+            new Vec3(0, 0, 1),
+            new Vec3(0, 0, -1),
+            new Vec3(0, 1, 0),
+        ];
         for (const offset of offsets) {
             const adjPos = pos.plus(offset);
             const block = bot.blockAt(adjPos);
@@ -174,7 +234,10 @@ class PrepareBuildState implements FSMState {
         const sCtx = ctx as BuildContext;
         const blueprint = SCHEMATICS[sCtx.targetStructure];
         if (!blueprint) {
-            sCtx.result = { status: "FAILED", reason: `UNKNOWN_RECIPE: ${sCtx.targetStructure}` };
+            sCtx.result = {
+                status: "FAILED",
+                reason: `UNKNOWN_RECIPE: ${sCtx.targetStructure}`,
+            };
             return null;
         }
         sCtx.blueprint = blueprint;
@@ -215,7 +278,12 @@ export async function handleBuild(ctx: TaskContext): Promise<void> {
         stopMovement,
         targetName: "",
     };
+
     const fsm = new StateMachineRunner(new PrepareBuildState(), fsmCtx);
-    const result = await fsm.run();
-    if (result.status === "FAILED") throw new Error(result.reason || "unknown_fsm_failure");
+    const runtime = new Runtime(bot);
+
+    const result = await runtime.execute(fsm.run(), signal);
+
+    if (result.status === "FAILED")
+        throw new Error(result.reason || "unknown_fsm_failure");
 }

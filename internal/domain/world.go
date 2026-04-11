@@ -3,6 +3,7 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -79,6 +80,34 @@ func (w *WorldModel) GetZoneCost(loc Location) float64 {
 
 	zone := getZoneKey(loc)
 	return w.ZonePenalties[zone]
+}
+
+// GetTacticalFeedback returns a summary of penalized actions and zones for the LLM.
+func (w *WorldModel) GetTacticalFeedback() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	var feedback []string
+
+	// Report significantly failing actions
+	for action, weight := range w.ActionWeights {
+		if weight < -0.2 {
+			feedback = append(feedback, fmt.Sprintf("Action '%s' is failing recently (confidence: %.2f)", action, weight))
+		}
+	}
+
+	// Report dangerous zones
+	for zone, penalty := range w.ZonePenalties {
+		if penalty > 1.0 {
+			feedback = append(feedback, fmt.Sprintf("Zone %s is dangerous or blocked (penalty: %.1f)", zone, penalty))
+		}
+	}
+
+	if len(feedback) == 0 {
+		return ""
+	}
+
+	return "TACTICAL FEEDBACK (Avoid these failures):\n- " + strings.Join(feedback, "\n- ")
 }
 
 // getZoneKey buckets exact coordinates into ~16x16 chunk zones (Minecraft standard)

@@ -1,3 +1,5 @@
+// js/lib/tasks/normalize.ts
+
 import type { Bot } from "mineflayer";
 import * as models from "../models.js";
 import { log } from "../logger.js";
@@ -42,9 +44,17 @@ export function normalizeIntent(
     bot: Bot,
     intent: models.ActionIntent,
 ): models.ActionIntent {
+    // 0. SAFE TARGET EXTRACTION: Ensure string targets from Go backend are converted to objects
+    let safeTarget: any = intent.target;
+    if (typeof intent.target === "string") {
+        safeTarget = { name: intent.target, type: "default" };
+    } else if (!intent.target) {
+        safeTarget = { name: "none", type: "none" };
+    }
+
     const normalized: models.ActionIntent = {
         ...intent,
-        target: { ...intent.target },
+        target: { ...safeTarget },
     };
 
     const action = normalized.action;

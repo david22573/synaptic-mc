@@ -27,18 +27,22 @@ export class ProgressTracker {
     }
 
     /**
-     * Checks if the bot is stuck by comparing current position with last position.
+     * Checks if the bot is stuck by comparing current position and actual velocity.
      * Uses a strike-based system to avoid false positives during legitimate slow movement
      * (e.g., soul sand, cobwebs, or jumping up blocks).
      */
     public checkStuck(bot: Bot): boolean {
         if (!bot.entity) return false;
-        const dist = bot.entity.position.distanceTo(this.lastPos);
-        this.lastPos = bot.entity.position.clone();
 
-        // If movement is less than 0.2 blocks (walking is ~4 blocks/sec)
-        // We consider this stuck if it persists for several checks.
-        if (dist < 0.2) {
+        const currentPos = bot.entity.position;
+        const dist = currentPos.distanceTo(this.lastPos);
+        this.lastPos = currentPos.clone();
+
+        const vel = bot.entity.velocity;
+        const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+
+        // If positional diff is tiny AND actual per-tick velocity is dead
+        if (dist < 0.2 && speed < 0.02) {
             this.stuckStrikes++;
         } else {
             // Decaying strikes allows for intermittent slow movement without immediately

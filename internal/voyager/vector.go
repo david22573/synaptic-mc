@@ -1,3 +1,4 @@
+// internal/voyager/vector.go
 package voyager
 
 import (
@@ -8,12 +9,15 @@ import (
 	"math"
 	"sort"
 
+	"david22573/synaptic-mc/internal/domain"
+
 	_ "modernc.org/sqlite"
 )
 
 type VectorStore interface {
 	SaveSkill(ctx context.Context, description string, code string, embedding []float32) error
 	RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error)
+	RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error)
 	Close() error
 }
 
@@ -38,9 +42,11 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	schema := `
 	CREATE TABLE IF NOT EXISTS skills (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT UNIQUE,
 		description TEXT NOT NULL UNIQUE,
 		code TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
+		success_count INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 
@@ -54,15 +60,39 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, code string, embedding []float32) error {
 	embeddingBytes, _ := json.Marshal(embedding)
 
-	query := `INSERT INTO skills (description, code, embedding_json) VALUES (?, ?, ?) 
-	          ON CONFLICT(description) DO UPDATE SET code=excluded.code, embedding_json=excluded.embedding_json`
-	_, err := s.db.ExecContext(ctx, query, description, code, string(embeddingBytes))
+	var name sql.NullString
+	var skill domain.ExecutableSkill
+	if err := json.Unmarshal([]byte(code), &skill); err == nil && skill.Name != "" {
+		name.String = skill.Name
+		name.Valid = true
+	}
+
+	query := `INSERT INTO skills (name, description, code, embedding_json, success_count) VALUES (?, ?, ?, ?, 1) 
+	          ON CONFLICT(description) DO UPDATE SET 
+	          code=excluded.code, 
+	          embedding_json=excluded.embedding_json,
+	          success_count=success_count+1`
+	_, err := s.db.ExecContext(ctx, query, name, description, code, string(embeddingBytes))
 
 	return err
 }
 
+func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error) {
+	query := `SELECT code FROM skills WHERE name = ?`
+	var code string
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&code)
+	if err != nil {
+		return nil, err
+	}
+
+	var skill domain.ExecutableSkill
+	if err := json.Unmarshal([]byte(code), &skill); err != nil {
+		return nil, err
+	}
+	return &skill, nil
+}
+
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	// Full table scan for accurate cosine similarity
 	query := `SELECT description, code, embedding_json FROM skills`
 
 	rows, err := s.db.QueryContext(ctx, query)

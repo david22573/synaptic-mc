@@ -1,7 +1,6 @@
 package execution
 
 import (
-	"container/heap"
 	"context"
 	"log/slog"
 	"sync"
@@ -10,70 +9,30 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type queuedAction struct {
-	ctx        context.Context
-	action     domain.Action
-	enqueuedAt time.Time
-}
-
-type actionHeap []queuedAction
-
-func (h actionHeap) Len() int { return len(h) }
-func (h actionHeap) Less(i, j int) bool {
-	if h[i].action.Priority == h[j].action.Priority {
-		return h[i].enqueuedAt.Before(h[j].enqueuedAt)
-	}
-	return h[i].action.Priority > h[j].action.Priority
-}
-func (h actionHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *actionHeap) Push(x interface{}) { *h = append(*h, x.(queuedAction)) }
-func (h *actionHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = queuedAction{} // FIX: Prevent context memory leak on pop
-	*h = old[0 : n-1]
-	return item
-}
-
 type TaskExecutionEngine struct {
-	controller    Controller
-	logger        *slog.Logger
-	mu            sync.Mutex
-	queue         actionHeap
-	recentActions map[string]time.Time
-	inFlight      *ExecutionTask
-	maxInFlight   int
+	controller Controller
+	logger     *slog.Logger
+	mu         sync.Mutex
+	inFlight   *ExecutionTask
 }
 
 func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
-	e := &TaskExecutionEngine{
-		controller:    ctrl,
-		logger:        logger.With(slog.String("component", "task_execution_engine")),
-		queue:         make(actionHeap, 0),
-		recentActions: make(map[string]time.Time),
-		maxInFlight:   1,
+	return &TaskExecutionEngine{
+		controller: ctrl,
+		logger:     logger.With(slog.String("component", "task_execution_engine")),
 	}
-	heap.Init(&e.queue)
-	return e
 }
 
 func (e *TaskExecutionEngine) Start(ctx context.Context) {
 	cleanupTicker := time.NewTicker(30 * time.Second)
 	defer cleanupTicker.Stop()
 
-	pumpTicker := time.NewTicker(10 * time.Millisecond)
-	defer pumpTicker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-cleanupTicker.C:
-			e.cleanupRecentActions()
 			e.checkStuckTasks()
-		case <-pumpTicker.C:
-			e.pump()
 		}
 	}
 }
@@ -82,25 +41,12 @@ func (e *TaskExecutionEngine) checkStuckTasks() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// If a task is dispatched but we never receive a TASK_START ack from the TS client,
-	// the ControlService watchdog won't fire. Abort to prevent permanent queue deadlock.
 	if e.inFlight != nil && e.inFlight.Status == StatusDispatched {
 		if time.Since(e.inFlight.EnqueueTime) > 15*time.Second && e.inFlight.StartTime == nil {
-			e.logger.Warn("Task stuck in dispatched state (no TASK_START received). Aborting to clear queue deadlock.", slog.String("action", e.inFlight.Action.ID))
+			e.logger.Warn("Task stuck in dispatched state (no TASK_START received). Aborting to clear state.", slog.String("action", e.inFlight.Action.ID))
 			e.inFlight.Status = StatusFailed
 			e.inFlight.Error = "DISPATCH_TIMEOUT_NO_ACK"
 			e.inFlight = nil
-		}
-	}
-}
-
-func (e *TaskExecutionEngine) cleanupRecentActions() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	now := time.Now()
-	for k, t := range e.recentActions {
-		if now.Sub(t) > 5*time.Second {
-			delete(e.recentActions, k)
 		}
 	}
 }
@@ -112,7 +58,7 @@ func (e *TaskExecutionEngine) HasController() bool {
 func (e *TaskExecutionEngine) IsIdle() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.inFlight == nil && len(e.queue) == 0
+	return e.inFlight == nil
 }
 
 func (e *TaskExecutionEngine) GetInFlight() *domain.Action {
@@ -125,74 +71,78 @@ func (e *TaskExecutionEngine) GetInFlight() *domain.Action {
 	return nil
 }
 
-func (e *TaskExecutionEngine) Enqueue(ctx context.Context, action domain.Action) {
+func (e *TaskExecutionEngine) ExecuteAsync(ctx context.Context, action domain.Action) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	isCuriosity := action.ID == "explore-curiosity-stable"
-
-	dedupKey := action.Action + ":" + action.Target.Name
-	if !isCuriosity {
-		if lastSeen, exists := e.recentActions[dedupKey]; exists {
-			if time.Since(lastSeen) < 2*time.Second {
-				e.logger.Debug("Dropped duplicate action within dedup window", slog.String("action", action.Action))
-				return
-			}
-		}
-	}
-	e.recentActions[dedupKey] = time.Now()
-
-	heap.Push(&e.queue, queuedAction{
-		ctx:        ctx,
-		action:     action,
-		enqueuedAt: time.Now(),
-	})
-}
-
-func (e *TaskExecutionEngine) pump() {
-	e.mu.Lock()
-
-	if e.inFlight != nil || len(e.queue) == 0 {
-		e.mu.Unlock()
-		return
-	}
-
-	qa := heap.Pop(&e.queue).(queuedAction)
-
 	e.inFlight = &ExecutionTask{
-		Action:      qa.action,
+		Action:      action,
 		Status:      StatusDispatched,
 		EnqueueTime: time.Now(),
 	}
 	e.mu.Unlock()
 
-	go func(qa queuedAction) {
-		err := e.controller.Dispatch(qa.ctx, qa.action)
+	go func() {
+		err := e.controller.Dispatch(ctx, action)
 		if err != nil {
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				e.logger.Debug("Task aborted cleanly", slog.String("action", qa.action.Action), slog.Any("reason", err))
-				e.mu.Lock()
-				if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
-					e.inFlight = nil
-				}
-				e.mu.Unlock()
-				return
-			}
-
-			e.mu.Lock()
-			if e.inFlight != nil && e.inFlight.Action.ID == qa.action.ID {
-				e.inFlight.Status = StatusFailed
-				e.inFlight.Error = err.Error()
-				e.inFlight = nil
-			}
-			e.mu.Unlock()
-
-			if err.Error() != "no active controller" {
-				e.logger.Error("Task execution failed, notifying planner", slog.Any("error", err), slog.String("action", qa.action.Action))
-			}
+			e.handleFailure(action, err)
 			return
 		}
-	}(qa)
+
+		// Mid-task active loop
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				e.logger.Debug("Task context cancelled mid-execution", slog.String("action", action.Action))
+				e.AbortCurrent(context.Background(), "context_cancelled")
+				return
+			case <-ticker.C:
+				e.mu.Lock()
+				inFlight := e.inFlight
+				e.mu.Unlock()
+
+				// Break loop if task resolved or replaced
+				if inFlight == nil || inFlight.Action.ID != action.ID {
+					return
+				}
+
+				// Here you can poll e.controller.ReadState(ctx) to send mid-task
+				// corrections or updates if the Go planner needs to intervene.
+			}
+		}
+	}()
+}
+
+func (e *TaskExecutionEngine) handleFailure(action domain.Action, err error) {
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		e.logger.Debug("Task aborted cleanly", slog.String("action", action.Action), slog.Any("reason", err))
+		e.mu.Lock()
+		if e.inFlight != nil && e.inFlight.Action.ID == action.ID {
+			e.inFlight.Status = StatusAborted
+			now := time.Now()
+			e.inFlight.EndTime = &now
+			e.inFlight = nil
+		}
+		e.mu.Unlock()
+		return
+	}
+
+	e.mu.Lock()
+	if e.inFlight != nil && e.inFlight.Action.ID == action.ID {
+		e.inFlight.Status = StatusFailed
+		e.inFlight.Error = err.Error()
+		e.inFlight = nil
+	}
+	e.mu.Unlock()
+
+	if err.Error() != "no active controller" {
+		e.logger.Error("Task execution failed, notifying planner", slog.Any("error", err), slog.String("action", action.Action))
+	}
+}
+
+func (e *TaskExecutionEngine) ExecuteDirect(ctx context.Context, action domain.Action) error {
+	return e.controller.Dispatch(ctx, action)
 }
 
 func (e *TaskExecutionEngine) OnTaskStart(actionID string) {
@@ -230,9 +180,6 @@ func (e *TaskExecutionEngine) AbortCurrent(ctx context.Context, reason string) e
 		e.inFlight.EndTime = &now
 		e.inFlight = nil
 	}
-
-	e.queue = make(actionHeap, 0)
-	heap.Init(&e.queue)
 	e.mu.Unlock()
 
 	return e.controller.AbortCurrent(ctx, reason)

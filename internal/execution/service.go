@@ -1,8 +1,10 @@
+// internal/execution/service.go
 package execution
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -16,7 +18,8 @@ type StateProvider interface {
 }
 
 type ControlService struct {
-	bus         domain.EventBus
+	rtBus       *domain.RealtimeBus
+	evBus       domain.EventBus
 	engine      *TaskExecutionEngine
 	taskManager *TaskManager
 	ctrlManager *ControllerManager
@@ -38,7 +41,8 @@ type ControlService struct {
 }
 
 func NewControlService(
-	bus domain.EventBus,
+	rtBus *domain.RealtimeBus,
+	evBus domain.EventBus,
 	engine *TaskExecutionEngine,
 	tm *TaskManager,
 	cm *ControllerManager,
@@ -47,7 +51,8 @@ func NewControlService(
 	logger *slog.Logger,
 ) *ControlService {
 	s := &ControlService{
-		bus:          bus,
+		rtBus:        rtBus,
+		evBus:        evBus,
 		engine:       engine,
 		taskManager:  tm,
 		ctrlManager:  cm,
@@ -58,13 +63,16 @@ func NewControlService(
 		activeTimers: make(map[string]*time.Timer),
 	}
 
-	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(s.handlePlanCreated))
-	bus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
-	bus.Subscribe(domain.EventTypeTaskStart, domain.FuncHandler(s.handleTaskStart))
-	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
-	bus.Subscribe(domain.EventTypePanic, domain.FuncHandler(s.handlePanic))
-	bus.Subscribe(domain.EventTypePanicResolved, domain.FuncHandler(s.handlePanicResolved))
-	bus.Subscribe(domain.EventBotDeath, domain.FuncHandler(s.handleBotDeath))
+	// Plans arrive from the slower, async pipeline
+	evBus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(s.handlePlanCreated))
+	evBus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
+
+	// Execution events bypass queues via the realtime pipeline
+	rtBus.Subscribe(domain.EventTypeTaskStart, domain.FuncHandler(s.handleTaskStart))
+	rtBus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+	rtBus.Subscribe(domain.EventTypePanic, domain.FuncHandler(s.handlePanic))
+	rtBus.Subscribe(domain.EventTypePanicResolved, domain.FuncHandler(s.handlePanicResolved))
+	rtBus.Subscribe(domain.EventBotDeath, domain.FuncHandler(s.handleBotDeath))
 
 	return s
 }
@@ -203,12 +211,15 @@ func (s *ControlService) triggerRecovery(sessionID string, taskID string, cause 
 		"progress":   0.0,
 	})
 
-	s.bus.Publish(context.Background(), domain.DomainEvent{
+	ev := domain.DomainEvent{
 		SessionID: sessionID,
 		Type:      domain.EventTypeTaskEnd,
 		Payload:   failedPayload,
 		CreatedAt: time.Now(),
-	})
+	}
+
+	s.rtBus.Publish(context.Background(), ev)
+	s.evBus.Publish(context.Background(), ev)
 }
 
 func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
@@ -322,5 +333,45 @@ func (s *ControlService) clearAllWatchdogs() {
 	for id, timer := range s.activeTimers {
 		timer.Stop()
 		delete(s.activeTimers, id)
+	}
+}
+
+// IngestControlInput satisfies the observability.ControlOrchestrator interface.
+func (s *ControlService) IngestControlInput(ctx context.Context, input domain.ControlInput) {
+	// Nuke manual camera movement entirely to prevent queue flooding
+	if input.Action == "camera_move" {
+		return
+	}
+
+	s.logger.Debug("Received control input from UI", slog.String("action", input.Action))
+
+	if s.ctrlManager == nil || !s.ctrlManager.HasActiveController() {
+		return
+	}
+
+	targetData := map[string]float64{
+		"yaw":   input.Yaw,
+		"pitch": input.Pitch,
+	}
+
+	payloadBytes, err := json.Marshal(targetData)
+	if err != nil {
+		s.logger.Error("Failed to marshal control input target data", slog.Any("error", err))
+		return
+	}
+
+	action := domain.Action{
+		ID:        fmt.Sprintf("ctrl-%d", time.Now().UnixNano()),
+		Source:    "ui_direct_control",
+		Action:    input.Action,
+		Target:    domain.Target{Type: "direct_input", Name: string(payloadBytes)},
+		Priority:  1000, // Absolute highest priority
+		Rationale: "Direct user control input",
+	}
+
+	err = s.ctrlManager.Dispatch(ctx, action)
+
+	if err != nil {
+		s.logger.Error("Failed to dispatch control input", slog.Any("error", err))
 	}
 }

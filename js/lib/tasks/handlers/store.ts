@@ -1,4 +1,3 @@
-// js/lib/tasks/handlers/store.ts
 import {
     type FSMState,
     type StateContext,
@@ -10,6 +9,7 @@ import {
     findNearestBlockByName,
     placePortableUtility,
 } from "../utils.js";
+import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
@@ -42,8 +42,6 @@ class DepositState implements FSMState {
                 try {
                     await chestWindow.deposit(item.type, null, item.count);
 
-                    // Jitter delay to prevent Mineflayer's chest UI from desyncing with the server
-                    // when dumping multiple stacks at once.
                     await new Promise((r) =>
                         setTimeout(r, 100 + Math.random() * 50),
                     );
@@ -255,7 +253,7 @@ export async function handleStore(ctx: TaskContext): Promise<void> {
     };
 
     const fsm = new StateMachineRunner(new CheckItemsState(), fsmCtx);
-    const result = await fsm.run();
+    const result = await new Runtime(bot).execute(fsm.run(), signal);
 
     if (result.status === "FAILED") {
         throw new Error(result.reason || "unknown_fsm_failure");

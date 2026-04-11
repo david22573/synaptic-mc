@@ -1,5 +1,5 @@
-// js/lib/tasks/handlers/smelt.ts
 import { type TaskContext } from "../registry.js";
+import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 import { log } from "../../logger.js";
 import { makeRoomInInventory } from "../utils.js";
@@ -50,212 +50,224 @@ const FUEL_TYPES = [
 export async function handleSmelt(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal, stopMovement } = ctx;
 
-    const targetName = intent.target.name.toLowerCase();
-    const targetCount = intent.count || 1;
+    const taskLogic = async () => {
+        const targetName = intent.target.name.toLowerCase();
+        const targetCount = intent.count || 1;
 
-    const acceptedInputs = SMELT_RECIPES[targetName];
+        const acceptedInputs = SMELT_RECIPES[targetName];
 
-    if (!acceptedInputs) {
-        throw new Error(
-            `UNKNOWN_RECIPE: Don't know how to smelt into ${targetName}`,
-        );
-    }
+        if (!acceptedInputs) {
+            throw new Error(
+                `UNKNOWN_RECIPE: Don't know how to smelt into ${targetName}`,
+            );
+        }
 
-    const inputItem = bot.inventory
-        .items()
-        .find((item) => acceptedInputs.includes(item.name));
-
-    if (!inputItem || inputItem.count < targetCount) {
-        throw new Error(
-            `MISSING_INGREDIENTS: Need at least ${targetCount} of ${acceptedInputs.join(" or ")}`,
-        );
-    }
-
-    const fuelItem = bot.inventory
-        .items()
-        .find((item) => FUEL_TYPES.includes(item.name));
-
-    if (!fuelItem) {
-        throw new Error(
-            "MISSING_INGREDIENTS: No valid fuel source in inventory",
-        );
-    }
-
-    let furnaceBlock = bot.findBlock({
-        matching: bot.registry.blocksByName.furnace?.id ?? -1,
-        maxDistance: 16,
-    });
-
-    let placedFurnace = false;
-
-    if (!furnaceBlock) {
-        const furnaceInInv = bot.inventory
+        const inputItem = bot.inventory
             .items()
-            .find((item) => item.name === "furnace");
+            .find((item) => acceptedInputs.includes(item.name));
 
-        if (!furnaceInInv) {
+        if (!inputItem || inputItem.count < targetCount) {
             throw new Error(
-                "NO_FURNACE: No furnace nearby and none in inventory",
+                `MISSING_INGREDIENTS: Need at least ${targetCount} of ${acceptedInputs.join(" or ")}`,
             );
         }
 
-        const refBlock = bot.findBlock({
-            matching: (b: any): boolean => {
-                if (
-                    !b ||
-                    b.name === "air" ||
-                    b.name === "water" ||
-                    b.name === "lava"
-                )
-                    return false;
-                const above = bot.blockAt(b.position.offset(0, 1, 0));
-                if (!above) return false;
-                return above.name === "air" || above.name === "cave_air";
-            },
-            maxDistance: 4,
-        });
+        const fuelItem = bot.inventory
+            .items()
+            .find((item) => FUEL_TYPES.includes(item.name));
 
-        if (!refBlock) {
+        if (!fuelItem) {
             throw new Error(
-                "PATH_FAILED: Nowhere to place the furnace. Need an exposed solid block.",
+                "MISSING_INGREDIENTS: No valid fuel source in inventory",
             );
         }
 
-        await bot.equip(furnaceInInv.type, "hand");
-
-        try {
-            await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-            placedFurnace = true;
-        } catch (err: any) {
-            throw new Error(
-                `PATH_FAILED: Could not place furnace - ${err.message}`,
-            );
-        }
-
-        furnaceBlock = bot.findBlock({
+        let furnaceBlock = bot.findBlock({
             matching: bot.registry.blocksByName.furnace?.id ?? -1,
-            maxDistance: 6,
+            maxDistance: 16,
         });
-    }
 
-    if (!furnaceBlock) {
-        throw new Error("NO_FURNACE: Lost track of furnace after placing it");
-    }
+        let placedFurnace = false;
 
-    if (bot.entity.position.distanceTo(furnaceBlock.position) > 3) {
-        bot.pathfinder.setGoal(
-            new goals.GoalBlock(
-                furnaceBlock.position.x,
-                furnaceBlock.position.y,
-                furnaceBlock.position.z,
-            ),
-            true,
-        );
+        if (!furnaceBlock) {
+            const furnaceInInv = bot.inventory
+                .items()
+                .find((item) => item.name === "furnace");
 
-        await new Promise<void>((resolve, reject) => {
-            const onGoal = () => {
-                cleanup();
-                resolve();
-            };
-            const onStop = (r: any) => {
-                if (r.status === "noPath") {
-                    cleanup();
-                    reject(new Error("PATH_FAILED: Navigation interrupted"));
-                }
-            };
-            const onAbort = () => {
-                cleanup();
-                reject(new Error("TIMEOUT"));
-            };
-
-            const cleanup = () => {
-                bot.removeListener("goal_reached", onGoal);
-                bot.removeListener("path_update", onStop);
-                signal.removeEventListener("abort", onAbort);
-                stopMovement();
-            };
-
-            bot.on("goal_reached", onGoal);
-            bot.on("path_update", onStop);
-            signal.addEventListener("abort", onAbort);
-        });
-    }
-
-    const furnace = await bot.openFurnace(furnaceBlock);
-    let collectedCount = 0;
-
-    try {
-        while (collectedCount < targetCount) {
-            if (signal.aborted) throw new Error("TIMEOUT");
-
-            if (
-                !furnace.fuelItem() &&
-                (!furnace.fuel || Math.round(furnace.fuel) === 0)
-            ) {
-                const currentFuel = bot.inventory
-                    .items()
-                    .find((item) => FUEL_TYPES.includes(item.name));
-
-                if (!currentFuel)
-                    throw new Error(
-                        "MISSING_INGREDIENTS: Ran out of fuel during smelting",
-                    );
-
-                await furnace.putFuel(currentFuel.type, null, 1);
-            }
-
-            if (!furnace.inputItem()) {
-                const currentInput = bot.inventory
-                    .items()
-                    .find((item) => acceptedInputs.includes(item.name));
-
-                if (!currentInput)
-                    throw new Error(
-                        "MISSING_INGREDIENTS: Ran out of raw materials during smelting",
-                    );
-
-                const amountToPut = Math.min(
-                    currentInput.count,
-                    targetCount - collectedCount,
+            if (!furnaceInInv) {
+                throw new Error(
+                    "NO_FURNACE: No furnace nearby and none in inventory",
                 );
-
-                await furnace.putInput(currentInput.type, null, amountToPut);
             }
 
-            const output = furnace.outputItem();
+            const refBlock = bot.findBlock({
+                matching: (b: any): boolean => {
+                    if (
+                        !b ||
+                        b.name === "air" ||
+                        b.name === "water" ||
+                        b.name === "lava"
+                    )
+                        return false;
+                    const above = bot.blockAt(b.position.offset(0, 1, 0));
+                    if (!above) return false;
+                    return above.name === "air" || above.name === "cave_air";
+                },
+                maxDistance: 4,
+            });
 
-            if (output && output.name === targetName) {
-                const taken = await furnace.takeOutput();
-                if (taken) {
-                    collectedCount += taken.count;
-                    log.info(
-                        `Smelted ${taken.count} ${targetName}. Total: ${collectedCount}/${targetCount}`,
-                    );
-                }
+            if (!refBlock) {
+                throw new Error(
+                    "PATH_FAILED: Nowhere to place the furnace. Need an exposed solid block.",
+                );
             }
 
-            await new Promise((r) => setTimeout(r, 1000));
-        }
-    } finally {
-        furnace.close();
-
-        if (placedFurnace && !signal.aborted) {
-            const pickType =
-                bot.registry.itemsByName.wooden_pickaxe?.id ||
-                bot.registry.itemsByName.stone_pickaxe?.id;
-
-            if (pickType) {
-                await bot.equip(pickType, "hand");
-            } else {
-                await bot.unequip("hand");
-            }
+            await bot.equip(furnaceInInv.type, "hand");
 
             try {
-                await makeRoomInInventory(bot, 1);
-                await bot.dig(furnaceBlock);
-            } catch (e) {
-                log.warn("Failed to retrieve placed furnace", { err: e });
+                await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                placedFurnace = true;
+            } catch (err: any) {
+                throw new Error(
+                    `PATH_FAILED: Could not place furnace - ${err.message}`,
+                );
+            }
+
+            furnaceBlock = bot.findBlock({
+                matching: bot.registry.blocksByName.furnace?.id ?? -1,
+                maxDistance: 6,
+            });
+        }
+
+        if (!furnaceBlock) {
+            throw new Error(
+                "NO_FURNACE: Lost track of furnace after placing it",
+            );
+        }
+
+        if (bot.entity.position.distanceTo(furnaceBlock.position) > 3) {
+            bot.pathfinder.setGoal(
+                new goals.GoalBlock(
+                    furnaceBlock.position.x,
+                    furnaceBlock.position.y,
+                    furnaceBlock.position.z,
+                ),
+                true,
+            );
+
+            await new Promise<void>((resolve, reject) => {
+                const onGoal = () => {
+                    cleanup();
+                    resolve();
+                };
+                const onStop = (r: any) => {
+                    if (r.status === "noPath") {
+                        cleanup();
+                        reject(
+                            new Error("PATH_FAILED: Navigation interrupted"),
+                        );
+                    }
+                };
+                const onAbort = () => {
+                    cleanup();
+                    reject(new Error("TIMEOUT"));
+                };
+
+                const cleanup = () => {
+                    bot.removeListener("goal_reached", onGoal);
+                    bot.removeListener("path_update", onStop);
+                    signal.removeEventListener("abort", onAbort);
+                    stopMovement();
+                };
+
+                bot.on("goal_reached", onGoal);
+                bot.on("path_update", onStop);
+                signal.addEventListener("abort", onAbort);
+            });
+        }
+
+        const furnace = await bot.openFurnace(furnaceBlock);
+        let collectedCount = 0;
+
+        try {
+            while (collectedCount < targetCount) {
+                if (signal.aborted) throw new Error("TIMEOUT");
+
+                if (
+                    !furnace.fuelItem() &&
+                    (!furnace.fuel || Math.round(furnace.fuel) === 0)
+                ) {
+                    const currentFuel = bot.inventory
+                        .items()
+                        .find((item) => FUEL_TYPES.includes(item.name));
+
+                    if (!currentFuel)
+                        throw new Error(
+                            "MISSING_INGREDIENTS: Ran out of fuel during smelting",
+                        );
+
+                    await furnace.putFuel(currentFuel.type, null, 1);
+                }
+
+                if (!furnace.inputItem()) {
+                    const currentInput = bot.inventory
+                        .items()
+                        .find((item) => acceptedInputs.includes(item.name));
+
+                    if (!currentInput)
+                        throw new Error(
+                            "MISSING_INGREDIENTS: Ran out of raw materials during smelting",
+                        );
+
+                    const amountToPut = Math.min(
+                        currentInput.count,
+                        targetCount - collectedCount,
+                    );
+
+                    await furnace.putInput(
+                        currentInput.type,
+                        null,
+                        amountToPut,
+                    );
+                }
+
+                const output = furnace.outputItem();
+
+                if (output && output.name === targetName) {
+                    const taken = await furnace.takeOutput();
+                    if (taken) {
+                        collectedCount += taken.count;
+                        log.info(
+                            `Smelted ${taken.count} ${targetName}. Total: ${collectedCount}/${targetCount}`,
+                        );
+                    }
+                }
+
+                await new Promise((r) => setTimeout(r, 1000));
+            }
+        } finally {
+            furnace.close();
+
+            if (placedFurnace && !signal.aborted) {
+                const pickType =
+                    bot.registry.itemsByName.wooden_pickaxe?.id ||
+                    bot.registry.itemsByName.stone_pickaxe?.id;
+
+                if (pickType) {
+                    await bot.equip(pickType, "hand");
+                } else {
+                    await bot.unequip("hand");
+                }
+
+                try {
+                    await makeRoomInInventory(bot, 1);
+                    await bot.dig(furnaceBlock);
+                } catch (e) {
+                    log.warn("Failed to retrieve placed furnace", { err: e });
+                }
             }
         }
-    }
+    };
+
+    await new Runtime(bot).execute(taskLogic(), signal);
 }
