@@ -4,7 +4,8 @@ import {
     StateMachineRunner,
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal } from "../utils.js";
+import { escapeTree } from "../utils.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 
@@ -100,14 +101,13 @@ class ApproachChestState implements FSMState {
         const cPos = sCtx.currentChest.position;
 
         try {
-            await moveToGoal(
+            await navigateWithFallbacks(
                 sCtx.bot,
                 new goals.GoalNear(cPos.x, cPos.y, cPos.z, 2),
                 {
                     signal: sCtx.signal,
                     timeoutMs: 15000,
                     stopMovement: sCtx.stopMovement,
-                    dynamic: false,
                 },
             );
         } catch (err: any) {

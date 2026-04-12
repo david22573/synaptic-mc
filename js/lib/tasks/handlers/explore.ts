@@ -31,15 +31,50 @@ class NavigateState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const eCtx = ctx as ExploreContext;
 
+        const checkForTargets = () => {
+            if (eCtx.targetName === "food_source") {
+                const food = eCtx.bot.nearestEntity((e: any) => 
+                    ["pig", "cow", "sheep", "chicken", "rabbit"].includes(e.name) && 
+                    eCtx.bot.entity.position.distanceTo(e.position) < 16
+                );
+                if (food) {
+                    log.info("Exploration: Found food source nearby, stopping exploration early.");
+                    return true;
+                }
+                const bush = eCtx.bot.findBlock({
+                    matching: (b: any) => b && b.name === "sweet_berry_bush" && b.metadata >= 2,
+                    maxDistance: 16
+                });
+                if (bush) {
+                    log.info("Exploration: Found berry bush nearby, stopping exploration early.");
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        const targetAbort = new AbortController();
+        const onParentAbort = () => targetAbort.abort(eCtx.signal.reason);
+        eCtx.signal.addEventListener("abort", onParentAbort, { once: true });
+
+        const combinedSignal = targetAbort.signal;
+
+        // Interval check for targets while moving
+        const targetCheckInterval = setInterval(() => {
+            if (checkForTargets()) {
+                targetAbort.abort("target_found");
+            }
+        }, 500);
+
         try {
             await navigateWithFallbacks(
                 eCtx.bot,
                 new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
                 {
-                    signal: eCtx.signal,
-                    timeoutMs: 12000,
+                    signal: combinedSignal,
+                    timeoutMs: 25000, // Increased timeout
                     stopMovement: eCtx.stopMovement,
-                    maxRetries: 2,
+                    maxRetries: 4, // Increased retries
                 },
             );
 
@@ -55,10 +90,16 @@ class NavigateState implements FSMState {
             eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
             return null;
         } catch (err: any) {
+            clearInterval(targetCheckInterval);
             const msg = String(err?.message ?? err);
 
-            if (eCtx.signal.aborted || msg.includes("aborted")) {
+            if (combinedSignal.aborted || msg.includes("aborted")) {
                 eCtx.result = { status: "FAILED", reason: "aborted" };
+                return null;
+            }
+
+            if (msg.includes("target_found")) {
+                eCtx.result = { status: "SUCCESS", reason: "TARGET_FOUND" };
                 return null;
             }
 
@@ -67,6 +108,8 @@ class NavigateState implements FSMState {
             });
 
             return new PickDirectionState();
+        } finally {
+            clearInterval(targetCheckInterval);
         }
     }
 }

@@ -2,7 +2,12 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import { ProgressTracker } from "./progress.js";
-import { straightLineMove, randomWalk } from "./recovery.js";
+import {
+    straightLineMove,
+    randomWalk,
+    sideStepRecovery,
+    backOffRecovery,
+} from "./recovery.js";
 import { moveToGoal } from "../tasks/utils.js";
 import { log } from "../logger.js";
 import { ExecutionError } from "../tasks/primitives.js";
@@ -39,13 +44,23 @@ export async function navigateWithFallbacks(
     if (!bot.entity || !bot.entity.position) {
         throw new ExecutionError("Bot not spawned", "BLOCKED", 0);
     }
-    const maxRetries = opts.maxRetries ?? 3;
+    const maxRetries = opts.maxRetries ?? 5; // Increased default retries
     let attempts = 0;
-    const targetVec = new Vec3(
-        goal.x ?? bot.entity.position.x,
-        goal.y ?? bot.entity.position.y,
-        goal.z ?? bot.entity.position.z,
-    );
+    const getGoalPos = (): Vec3 | null => {
+        if (goal.x !== undefined && goal.z !== undefined) {
+            return new Vec3(goal.x, goal.y ?? bot.entity.position.y, goal.z);
+        }
+        if ((goal as any).dest) {
+            const dest = (goal as any).dest;
+            return new Vec3(dest.x, dest.y, dest.z);
+        }
+        if ((goal as any).entity?.position) {
+            return (goal as any).entity.position;
+        }
+        return null;
+    };
+
+    const targetVec = getGoalPos() || bot.entity.position.clone();
     const tracker = new ProgressTracker(bot, targetVec);
     let strategyController: AbortController | null = null;
 
@@ -72,6 +87,8 @@ export async function navigateWithFallbacks(
                 if (attempts === 0) {
                     await applyHesitation(bot);
                 }
+                
+                // Strategy Selection
                 if (attempts === 0) {
                     await moveToGoal(bot, goal, {
                         timeoutMs: opts.timeoutMs ?? 15000,
@@ -82,25 +99,44 @@ export async function navigateWithFallbacks(
                     await ensureKinematicStop(bot);
                     return;
                 }
+                
                 if (attempts === 1) {
-                    log.info("Strategy 2: Straight-line movement fallback");
+                    log.info("Strategy: Side-step recovery");
+                    await sideStepRecovery(bot, 1200, strategySignal);
+                } else if (attempts === 2) {
+                    log.info("Strategy: Back-off recovery");
+                    await backOffRecovery(bot, 1000, strategySignal);
+                } else if (attempts === 3) {
+                    log.info("Strategy: Straight-line fallback");
                     await straightLineMove(
                         bot,
                         { x: targetVec.x, z: targetVec.z },
-                        3000,
+                        3500,
                         strategySignal,
                     );
+                } else if (attempts === 4) {
+                    log.info("Strategy: Random walk fallback");
+                    await randomWalk(bot, 4000, strategySignal);
                 }
-                if (attempts === 2) {
-                    log.info("Strategy 3: Random walk fallback");
-                    await randomWalk(bot, 3000, strategySignal);
-                }
+
+                // After a recovery strategy, try pathfinding again if not yet at goal
                 const dist = tracker.getDistance(bot);
                 if (dist < 2) {
                     await ensureKinematicStop(bot);
                     return;
                 }
-                throw new Error("strategy_exhausted");
+                
+                // If we haven't returned, the loop continues and tries moveToGoal (attempt 0 equivalent logic)
+                // We'll reset attempt 0 behavior by letting the loop continue and next attempt will try pathfinding again
+                // Actually, let's explicitly try pathfinding after recovery.
+                log.info("Recovery complete, retrying pathfinder...");
+                await moveToGoal(bot, goal, {
+                    timeoutMs: 8000,
+                    dynamic: false,
+                    signal: strategySignal,
+                    stopMovement: opts.stopMovement,
+                });
+                return;
             } catch (err: any) {
                 if (opts.signal?.aborted) {
                     bot.clearControlStates();
@@ -139,6 +175,7 @@ export function steerTowards(
     bot: Bot,
     target: Vec3,
     stopDistance: number = 1.0,
+    applyControls: boolean = false,
 ): Record<string, boolean> {
     const controls = {
         forward: false,
@@ -154,6 +191,7 @@ export function steerTowards(
     const dist = pos.distanceTo(target);
 
     if (dist <= stopDistance) {
+        if (applyControls) bot.clearControlStates();
         return controls; // Goal reached, kill throttle
     }
 
@@ -199,6 +237,12 @@ export function steerTowards(
         blockAbove.name === "air"
     ) {
         controls.jump = true;
+    }
+
+    if (applyControls) {
+        Object.entries(controls).forEach(([state, active]) => {
+            bot.setControlState(state as any, active);
+        });
     }
 
     return controls;

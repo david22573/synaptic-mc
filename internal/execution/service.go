@@ -73,6 +73,7 @@ func NewControlService(
 	rtBus.Subscribe(domain.EventTypePanic, domain.FuncHandler(s.handlePanic))
 	rtBus.Subscribe(domain.EventTypePanicResolved, domain.FuncHandler(s.handlePanicResolved))
 	rtBus.Subscribe(domain.EventBotDeath, domain.FuncHandler(s.handleBotDeath))
+	rtBus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
 
 	return s
 }
@@ -87,10 +88,18 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 	s.stabilityMu.RLock()
 	reflexActive := s.stability.ReflexActive
 	isStuck := s.stability.IsStuck
+	deathCount := s.stability.DeathCount
+	lastDeath := s.stability.LastDeath
 	s.stabilityMu.RUnlock()
 
 	if reflexActive {
 		s.logger.Warn("Reflex active: dropping new plan from decision layer")
+		return
+	}
+
+	// Death loop protection: If we died recently and many times, ignore plans for a bit
+	if deathCount >= 3 && time.Since(lastDeath) < 30*time.Second {
+		s.logger.Warn("Death loop protection active: dropping new plan", slog.Int("death_count", deathCount))
 		return
 	}
 
@@ -155,9 +164,37 @@ func (s *ControlService) handlePanic(ctx context.Context, event domain.DomainEve
 }
 
 func (s *ControlService) handleBotDeath(ctx context.Context, event domain.DomainEvent) {
-	s.SetReflexActive(false)
+	s.stabilityMu.Lock()
+	s.stability.ReflexActive = false
+	s.stability.DeathCount++
+	s.stability.LastDeath = time.Now()
+	deathCount := s.stability.DeathCount
+	s.stabilityMu.Unlock()
+
+	s.logger.Warn("Bot death detected", slog.Int("death_count", deathCount))
+
 	_ = s.taskManager.Halt(ctx, "bot_died")
 	s.clearAllWatchdogs()
+
+	if deathCount >= 3 {
+		s.logger.Error("CRITICAL: Bot in death loop, invalidating current plan")
+		s.evBus.Publish(ctx, domain.DomainEvent{
+			SessionID: event.SessionID,
+			Type:      domain.EventTypePlanInvalidated,
+			Payload:   []byte(`{"reason": "death_loop"}`),
+			CreatedAt: time.Now(),
+		})
+	}
+}
+
+func (s *ControlService) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
+	s.stabilityMu.Lock()
+	// If it's been a while since the last death, reset the count
+	if time.Since(s.stability.LastDeath) > 5*time.Minute {
+		s.stability.DeathCount = 0
+	}
+	s.stabilityMu.Unlock()
+	s.logger.Info("Bot respawned")
 }
 
 func (s *ControlService) handlePanicResolved(ctx context.Context, event domain.DomainEvent) {
@@ -243,7 +280,7 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 	// ALWAYS signal task engine and manager that the current attempt is finished
 	// to prevent deadlocks in the dispatch queue.
 	s.engine.OnTaskEnd(payload.CommandID, success)
-	_ = s.taskManager.Complete(ctx, payload.CommandID, success)
+	_ = s.taskManager.Complete(ctx, payload.CommandID, success, payload.Cause)
 
 	if !isActive {
 		s.logger.Debug("Cleaning up untracked or timed-out task", slog.String("task_id", payload.CommandID))

@@ -17,7 +17,9 @@ import { normalizeIntent } from "./normalize.js";
 import { handleInteract } from "./handlers/interact.js";
 import { handleStore } from "./handlers/store.js";
 import { handleRetrieve } from "./handlers/retrieve.js";
+import { handleUseSkill } from "./handlers/use_skill.js";
 
+import { navigateWithFallbacks } from "../movement/navigator.js";
 import { ExecutionError } from "./primitives.js";
 import { Vec3 } from "vec3";
 
@@ -282,7 +284,7 @@ export async function runTask(
 
                 if (!bed) throw new ExecutionError("no bed found", "error", 0);
 
-                await moveToGoal(
+                await navigateWithFallbacks(
                     bot,
                     new goals.GoalNear(
                         bed.position.x,
@@ -348,11 +350,15 @@ export async function runTask(
                     target: pos,
                 });
 
-                await moveToGoal(bot, new goals.GoalNearXZ(pos.x, pos.z, 2), {
-                    signal,
-                    timeoutMs: 15000,
-                    stopMovement,
-                });
+                await navigateWithFallbacks(
+                    bot,
+                    new goals.GoalNearXZ(pos.x, pos.z, 2),
+                    {
+                        signal,
+                        timeoutMs: 15000,
+                        stopMovement,
+                    },
+                );
                 await waitForMs(1000, signal);
                 break;
             }
@@ -362,6 +368,9 @@ export async function runTask(
             case "mark_location":
             case "recall_location":
                 await waitForMs(500, signal);
+                break;
+            case "use_skill":
+                await handleUseSkill(taskCtx);
                 break;
             default:
                 throw new ExecutionError(

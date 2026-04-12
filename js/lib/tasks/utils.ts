@@ -230,6 +230,20 @@ export function moveToGoal(
             }
         };
 
+        const getGoalPos = (): Vec3 | null => {
+            if (goal.x !== undefined && goal.z !== undefined) {
+                return new Vec3(goal.x, goal.y ?? bot.entity.position.y, goal.z);
+            }
+            if ((goal as any).dest) {
+                const dest = (goal as any).dest;
+                return new Vec3(dest.x, dest.y, dest.z);
+            }
+            if ((goal as any).entity?.position) {
+                return (goal as any).entity.position;
+            }
+            return null;
+        };
+
         const onTick = () => {
             if (settled) return;
             ticksElapsed++;
@@ -239,46 +253,52 @@ export function moveToGoal(
                 return;
             }
 
+            const targetVec = getGoalPos();
+
             // Engine-synced stuck checking (~800ms intervals)
             if (ticksElapsed % 16 === 0) {
                 const currentPos = bot.entity.position;
-                const dist = lastPos.distanceTo(currentPos);
+                const distSinceLast = lastPos.distanceTo(currentPos);
                 const vel = bot.entity.velocity;
                 const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-                if (bot.pathfinder.isMoving() && dist < 0.05 && speed < 0.02) {
+                // More lenient stuck detection: requires 3 strikes (~2.4s) 
+                // Checks if we are trying to move (either via pathfinder or steering hijack)
+                const isTryingToMove = bot.pathfinder.isMoving() || (targetVec && currentPos.distanceTo(targetVec) < 2.5);
+                
+                if (isTryingToMove && distSinceLast < 0.1 && speed < 0.02) {
                     stuckStrikes++;
-                    if (stuckStrikes >= 2) {
+                    if (stuckStrikes >= 3) {
                         finish(
                             new ExecutionError(
-                                "bot physically stuck during pathing",
+                                "bot physically stuck during movement",
                                 "STUCK",
                                 0.0,
                             ),
                         );
                     }
                 } else {
-                    stuckStrikes = 0;
+                    // Decaying strikes to handle intermittent slow-downs
+                    stuckStrikes = Math.max(0, stuckStrikes - 1);
                 }
                 lastPos = currentPos.clone();
             }
 
             // Hijack the final approach with per-tick continuous steering
-            if (
-                bot.pathfinder.isMoving() &&
-                goal.x !== undefined &&
-                goal.z !== undefined
-            ) {
+            if (targetVec) {
                 const currentPos = bot.entity.position;
-                const targetVec = new Vec3(
-                    goal.x,
-                    goal.y ?? currentPos.y,
-                    goal.z,
-                );
                 const distToGoal = currentPos.distanceTo(targetVec);
 
-                if (distToGoal < 2.0) {
-                    steerTowards(bot, targetVec);
+                // If very close, override pathfinder completely with steering
+                if (distToGoal < 2.5) {
+                    if (bot.pathfinder.isMoving()) {
+                        bot.pathfinder.setGoal(null);
+                    }
+                    steerTowards(bot, targetVec, 0.8, true);
+                    
+                    if (distToGoal < 1.0) {
+                        finish();
+                    }
                 }
             }
         };

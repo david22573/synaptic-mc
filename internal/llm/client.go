@@ -40,7 +40,7 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		config: cfg,
 		http: &http.Client{
-			Timeout: 45 * time.Second,
+			Timeout: 60 * time.Second,
 		},
 	}
 }
@@ -118,7 +118,7 @@ func (c *Client) CompressState(state domain.GameState, events []domain.DomainEve
 }
 
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	genCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	genCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	payload := map[string]any{

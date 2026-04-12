@@ -1,6 +1,7 @@
 import { type TaskContext } from "../registry.js";
 import { findNearestEntity } from "../primitives.js";
-import { findNearestBlockByName, moveToGoal } from "../utils.js";
+import { findNearestBlockByName } from "../utils.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 
@@ -18,7 +19,7 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
 
         const entity = findNearestEntity(bot, targetName, 16);
         if (entity) {
-            await moveToGoal(
+            await navigateWithFallbacks(
                 bot,
                 new goals.GoalNear(
                     entity.position.x,
@@ -30,6 +31,7 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
                     signal,
                     timeoutMs: timeouts.interact ?? 15000,
                     stopMovement,
+                    maxRetries: 2,
                 },
             );
             if (
@@ -46,7 +48,7 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
 
         const block = findNearestBlockByName(bot, targetName);
         if (block) {
-            await moveToGoal(
+            await navigateWithFallbacks(
                 bot,
                 new goals.GoalNear(
                     block.position.x,
@@ -58,6 +60,7 @@ export async function handleInteract(ctx: TaskContext): Promise<void> {
                     signal,
                     timeoutMs: timeouts.interact ?? 15000,
                     stopMovement,
+                    maxRetries: 2,
                 },
             );
             await bot.activateBlock(block);

@@ -9,6 +9,7 @@ import {
     findNearestBlockByName,
     placePortableUtility,
 } from "../utils.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 
@@ -89,45 +90,15 @@ class ApproachChestState implements FSMState {
         const cPos = sCtx.chestBlock.position;
 
         try {
-            sCtx.bot.pathfinder.setGoal(
+            await navigateWithFallbacks(
+                sCtx.bot,
                 new goals.GoalNear(cPos.x, cPos.y, cPos.z, 2),
-                true,
+                {
+                    signal: sCtx.signal,
+                    timeoutMs: 15000,
+                    stopMovement: sCtx.stopMovement,
+                },
             );
-
-            await new Promise<void>((resolve, reject) => {
-                let timeoutId: NodeJS.Timeout | null = null;
-                const onGoal = () => {
-                    cleanup();
-                    resolve();
-                };
-                const onStop = (r: any) => {
-                    if (r.status === "noPath") {
-                        cleanup();
-                        reject(new Error("FAILED_TO_REACH_CHEST"));
-                    }
-                };
-                const onAbort = () => {
-                    cleanup();
-                    reject(new Error("aborted"));
-                };
-
-                const cleanup = () => {
-                    if (timeoutId) clearTimeout(timeoutId);
-                    sCtx.bot.removeListener("goal_reached", onGoal);
-                    sCtx.bot.removeListener("path_update", onStop);
-                    sCtx.signal.removeEventListener("abort", onAbort);
-                    sCtx.stopMovement();
-                };
-
-                timeoutId = setTimeout(() => {
-                    cleanup();
-                    reject(new Error("FAILED_TO_REACH_CHEST"));
-                }, 15000);
-
-                sCtx.bot.on("goal_reached", onGoal);
-                sCtx.bot.on("path_update", onStop);
-                sCtx.signal.addEventListener("abort", onAbort);
-            });
         } catch (err: any) {
             sCtx.result = {
                 status: "FAILED",

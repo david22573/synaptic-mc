@@ -25,4 +25,6 @@ const (
 type StabilityState struct {
 	ReflexActive bool
 	IsStuck      bool
+	DeathCount   int
+	LastDeath    time.Time
 }

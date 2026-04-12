@@ -128,8 +128,8 @@ func main() {
 	execService := execution.NewControlService(rtBus, eventBus, execEngine, taskManager, ctrlManager, humanizer, stateSvc, logger)
 	uiHub.SetOrchestrator(execService)
 
-	evaluator := strategy.NewEvaluator()
-	critic := voyager.NewStateCritic()
+	evaluator := strategy.NewEvaluatorWithLLM(llmClient)
+	critic := voyager.NewStateCriticWithLLM(llmClient)
 	worldModel := domain.NewWorldModel()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore, worldModel)
 
@@ -145,7 +145,7 @@ func main() {
 	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel)
 
 	decisionSvc := decision.NewService(cfg.SessionID, eventBus, plannerObj, planManager,
-		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, logger, dynFlags.Get())
+		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
@@ -290,6 +290,32 @@ func main() {
 			"viewer_port":   3000,
 			"enable_viewer": true,
 		})
+	})
+
+	// GET /api/skills/{name} — returns the stored executable skill by name.
+	// Used by the TypeScript use_skill handler to fetch compiled JS.
+	mux.HandleFunc("/api/skills/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract skill name from path: /api/skills/{name}
+		name := strings.TrimPrefix(r.URL.Path, "/api/skills/")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			http.Error(w, "skill name required", http.StatusBadRequest)
+			return
+		}
+
+		skill, err := vectorStore.RetrieveNamedSkill(r.Context(), name)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("skill not found: %v", err), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(skill)
 	})
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)

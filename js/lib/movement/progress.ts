@@ -41,15 +41,15 @@ export class ProgressTracker {
         const vel = bot.entity.velocity;
         const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-        // If positional diff is tiny AND actual per-tick velocity is dead
-        if (dist < 0.2 && speed < 0.02) {
+        // More lenient: dist < 0.1 instead of 0.2
+        if (dist < 0.1 && speed < 0.02) {
             this.stuckStrikes++;
         } else {
-            // Decaying strikes allows for intermittent slow movement without immediately
-            // resetting the stuck state if the bot is still struggling.
+            // Decaying strikes instead of immediate reset
             this.stuckStrikes = Math.max(0, this.stuckStrikes - 1);
         }
 
-        return this.stuckStrikes >= 3;
+        // Higher strike threshold
+        return this.stuckStrikes >= 5;
     }
 }

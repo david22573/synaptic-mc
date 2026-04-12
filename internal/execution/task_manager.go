@@ -3,9 +3,11 @@ package execution
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,7 +155,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 					tm.logger.InfoContext(ctx, "Curiosity loop triggered: autonomous exploration", slog.Int("failure_count", tm.failureCount))
 
 					exploreTask := domain.Action{
-						ID:        "explore-curiosity-stable",
+						ID:        fmt.Sprintf("explore-curiosity-%d", time.Now().UnixNano()),
 						Action:    "explore",
 						Target:    domain.Target{Type: "category", Name: "surroundings"},
 						Priority:  -1,
@@ -221,7 +223,7 @@ func (tm *TaskManager) Enqueue(ctx context.Context, tasks ...domain.Action) erro
 
 	now := time.Now()
 	for _, task := range tasks {
-		isCuriosity := task.ID == "explore-curiosity-stable"
+		isCuriosity := strings.HasPrefix(task.ID, "explore-curiosity-")
 		dedupKey := task.Action + ":" + task.Target.Name
 
 		if !isCuriosity {
@@ -296,7 +298,7 @@ func (tm *TaskManager) processScheduled(_ context.Context) {
 	}
 }
 
-func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool) error {
+func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool, cause string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -312,8 +314,11 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 	tm.activeTask = nil
 
 	if !success {
-		tm.lastFailure = time.Now()
-		tm.failureCount++
+		// Controlled stops like panic or preemption shouldn't trigger idleness backoff
+		if !domain.IsControlledStop(cause) {
+			tm.lastFailure = time.Now()
+			tm.failureCount++
+		}
 
 		if tm.ctrlManager != nil {
 			if idm := tm.ctrlManager.GetIdempotent(); idm != nil {

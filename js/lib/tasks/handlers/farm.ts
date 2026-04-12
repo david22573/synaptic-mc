@@ -4,8 +4,9 @@ import {
     StateMachineRunner,
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal, waitForMs } from "../utils.js";
+import { escapeTree, waitForMs } from "../utils.js";
 import { Runtime } from "../../control/runtime.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 
@@ -78,13 +79,14 @@ class NavigateCropState implements FSMState {
         fCtx.targetBlock = fCtx.bot.blockAt(pos);
         try {
             fCtx.bot.clearControlStates();
-            await moveToGoal(
+            await navigateWithFallbacks(
                 fCtx.bot,
                 new goals.GoalGetToBlock(pos.x, pos.y, pos.z),
                 {
                     signal: fCtx.signal,
                     timeoutMs: 12000,
                     stopMovement: fCtx.stopMovement,
+                    maxRetries: 2,
                 },
             );
             return new HarvestState();

@@ -21,7 +21,6 @@ import (
 	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
-	"david22573/synaptic-mc/internal/policy"
 	"david22573/synaptic-mc/internal/strategy"
 )
 
@@ -270,25 +269,6 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 	current := p.currentPlan.Load()
 
-	survPolicy := policy.NewSurvivalPolicy()
-	input := policy.DecisionInput{
-		State: state,
-		Plan:  current,
-	}
-
-	decision := survPolicy.Decide(context.Background(), input)
-
-	if !decision.IsApproved {
-		if decision.OverridePlan != nil {
-			p.logger.Warn("Survival reflex triggered, overriding planner", slog.String("reason", decision.Reason))
-			p.currentPlan.Store(nil)
-			return *decision.OverridePlan
-		}
-		p.logger.Warn("Plan rejected by survival policy", slog.String("reason", decision.Reason))
-		p.currentPlan.Store(nil)
-		return p.reactivePlan(state)
-	}
-
 	if current != nil {
 		p.failMu.Lock()
 		fails := p.failures[current.Objective]
@@ -327,19 +307,19 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 	hasFood := false
 	hasImmediateThreat := false
 
+	nearbyFoodEntity := ""
+	nearbyFoodBlock := ""
+
+	for _, poi := range state.POIs {
+		if isFoodEntity(poi.Name) {
+			nearbyFoodEntity = poi.Name
+		} else if isFoodBlock(poi.Name) {
+			nearbyFoodBlock = poi.Name
+		}
+	}
+
 	for _, item := range state.Inventory {
-		name := strings.ToLower(item.Name)
-		if item.Count > 0 && (strings.Contains(name, "bread") ||
-			strings.Contains(name, "apple") ||
-			strings.Contains(name, "berries") ||
-			strings.Contains(name, "carrot") ||
-			strings.Contains(name, "potato") ||
-			strings.Contains(name, "cooked_") ||
-			strings.Contains(name, "beef") ||
-			strings.Contains(name, "porkchop") ||
-			strings.Contains(name, "mutton") ||
-			strings.Contains(name, "chicken") ||
-			strings.Contains(name, "rabbit")) {
+		if item.Count > 0 && domain.IsFood(item.Name) {
 			hasFood = true
 			break
 		}
@@ -369,23 +349,41 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 			Priority:  95,
 			Rationale: "Reactive fast-path fallback: Recover health with available food",
 		})
-	case state.Health < domain.SurvivalCriticalHealth || state.Food < domain.SurvivalMinFoodForHunt:
-		tasks = append(tasks, domain.Action{
-			ID:        fmt.Sprintf("react-food-%d", time.Now().UnixNano()),
-			Action:    "explore",
-			Target:    domain.Target{Name: "food_source", Type: "category"},
-			Priority:  85,
-			Rationale: "Reactive fast-path fallback: Seek immediate food instead of looping retreat",
-		})
+	case state.Health < domain.SurvivalCriticalHealth || state.Food < 12.0:
+		if nearbyFoodEntity != "" && state.Health > 8.0 {
+			tasks = append(tasks, domain.Action{
+				ID:        fmt.Sprintf("react-hunt-%d", time.Now().UnixNano()),
+				Action:    "hunt",
+				Target:    domain.Target{Name: nearbyFoodEntity, Type: "entity"},
+				Priority:  90,
+				Rationale: "Reactive fast-path: Hunt nearby food source",
+			})
+		} else if nearbyFoodBlock != "" {
+			tasks = append(tasks, domain.Action{
+				ID:        fmt.Sprintf("react-gather-%d", time.Now().UnixNano()),
+				Action:    "gather",
+				Target:    domain.Target{Name: nearbyFoodBlock, Type: "block"},
+				Priority:  90,
+				Rationale: "Reactive fast-path: Gather nearby berry bush",
+			})
+		} else {
+			tasks = append(tasks, domain.Action{
+				ID:        fmt.Sprintf("react-food-%d", time.Now().UnixNano()),
+				Action:    "explore",
+				Target:    domain.Target{Name: "food_source", Type: "category"},
+				Priority:  85,
+				Rationale: "Reactive fast-path fallback: Seek food or resources",
+			})
+		}
 	}
 
 	if len(tasks) == 0 {
 		tasks = append(tasks, domain.Action{
-			ID:        fmt.Sprintf("react-idle-%d", time.Now().UnixNano()),
-			Action:    "idle",
-			Target:    domain.Target{Name: "none", Type: "none"},
-			Priority:  10,
-			Rationale: "Reactive fast-path: No immediate survival threats, idling until next tick",
+			ID:        fmt.Sprintf("react-explore-%d", time.Now().UnixNano()),
+			Action:    "explore",
+			Target:    domain.Target{Name: "surroundings", Type: "category"},
+			Priority:  5,
+			Rationale: "Reactive fast-path: Stable state, exploring surroundings while waiting for next plan",
 		})
 	}
 
@@ -393,6 +391,26 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 		Objective: "Reactive Fallback Plan",
 		Tasks:     tasks,
 	}
+}
+
+func isFoodEntity(name string) bool {
+	foods := []string{"pig", "cow", "sheep", "chicken", "rabbit"}
+	for _, f := range foods {
+		if strings.Contains(strings.ToLower(name), f) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFoodBlock(name string) bool {
+	foods := []string{"sweet_berry_bush"}
+	for _, f := range foods {
+		if strings.Contains(strings.ToLower(name), f) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *AdvancedPlanner) evictCache() {

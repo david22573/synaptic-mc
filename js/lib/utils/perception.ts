@@ -69,6 +69,7 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
         let type = "entity";
         if (e.type === "hostile") type = "threat";
         else if (e.type === "object" || e.type === "orb") type = "resource";
+        else if (["pig", "cow", "sheep", "chicken", "rabbit"].includes(e.name || "")) type = "resource";
 
         const baseScore = 100 / Math.max(dist, 1);
         const scoreMultiplier =
@@ -100,6 +101,7 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
                     b.name === "stone" ||
                     b.name === "crafting_table" ||
                     b.name.includes("bed") ||
+                    b.name === "sweet_berry_bush" ||
                     b.name === "water" ||
                     b.name === "lava"
                 );

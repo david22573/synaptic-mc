@@ -110,6 +110,70 @@ export async function randomWalk(
     });
 }
 
+export async function sideStepRecovery(
+    bot: Bot,
+    durationMs: number = 1000,
+    signal?: AbortSignal,
+): Promise<void> {
+    bot.clearControlStates();
+    if (!bot.entity) return;
+    if (signal?.aborted) return;
+
+    const left = Math.random() > 0.5;
+    bot.setControlState(left ? "left" : "right", true);
+    bot.setControlState("forward", true);
+    bot.setControlState("jump", true);
+
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            bot.clearControlStates();
+            resolve();
+        }, durationMs);
+
+        const onAbort = () => {
+            bot.clearControlStates();
+            clearTimeout(timeout);
+            reject(new Error("aborted"));
+        };
+
+        if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+        }
+    });
+}
+
+export async function backOffRecovery(
+    bot: Bot,
+    durationMs: number = 800,
+    signal?: AbortSignal,
+): Promise<void> {
+    bot.clearControlStates();
+    if (!bot.entity) return;
+    if (signal?.aborted) return;
+
+    bot.setControlState("back", true);
+    if (Math.random() > 0.5) {
+        bot.setControlState(Math.random() > 0.5 ? "left" : "right", true);
+    }
+
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            bot.clearControlStates();
+            resolve();
+        }, durationMs);
+
+        const onAbort = () => {
+            bot.clearControlStates();
+            clearTimeout(timeout);
+            reject(new Error("aborted"));
+        };
+
+        if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+        }
+    });
+}
+
 export async function jumpRecovery(
     bot: Bot,
     durationMs: number = 1000,

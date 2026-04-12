@@ -5,8 +5,8 @@ import {
     placePortableUtility,
     makeRoomInInventory,
     escapeTree,
-    moveToGoal,
 } from "../utils.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
@@ -65,14 +65,14 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
         if (recipe.requiresTable && craftingTable) {
             const pos = craftingTable.position;
             try {
-                await moveToGoal(
+                await navigateWithFallbacks(
                     bot,
                     new goals.GoalNear(pos.x, pos.y, pos.z, 2),
                     {
                         signal,
                         timeoutMs: 15000,
                         stopMovement,
-                        dynamic: false,
+                        maxRetries: 2,
                     },
                 );
             } catch (err: any) {

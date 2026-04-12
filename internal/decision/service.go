@@ -45,6 +45,7 @@ type Service struct {
 	feedback      *planner.FeedbackAnalyzer
 	logger        *slog.Logger
 	flags         config.FeatureFlags
+	skillManager  *voyager.SkillManager
 
 	mu            sync.Mutex
 	evalSemaphore chan struct{}
@@ -112,6 +113,7 @@ func NewService(
 	worldModel *domain.WorldModel,
 	memStore memory.Store,
 	feedback *planner.FeedbackAnalyzer,
+	skillManager *voyager.SkillManager,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
 ) *Service {
@@ -132,6 +134,7 @@ func NewService(
 		evalSemaphore: make(chan struct{}, 1),
 		taskHistory:   make([]domain.TaskHistory, 0),
 		milestones:    make([]domain.ProgressionMilestone, 0),
+		skillManager:  skillManager,
 	}
 
 	// Load persistent state
@@ -153,6 +156,29 @@ func NewService(
 	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
 	bus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
 	bus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
+
+	// Link planner background completions to service evaluations
+	advPlanner.SetOnPlanReady(func() {
+		s.logger.Info("Background plan ready, requesting evaluation")
+		s.RequestEvaluation()
+	})
+
+	// Jumpstart background loop: ensures the bot doesn't stay idle if events are missed
+	// or if the state is stable but no plan is active.
+	go func() {
+		ticker := time.NewTicker(12 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !s.planManager.HasActivePlan() && s.activeIntent.Load() == nil && s.execStatus.IsIdle() {
+					s.logger.Info("Jumpstart: bot is idle, forcing evaluation")
+					s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
+					go s.evaluateNextPlan(context.Background())
+				}
+			}
+		}
+	}()
 
 	return s
 }
@@ -288,6 +314,49 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 			// Milestone detection
 			s.detectMilestones(beforePtr, &after)
+
+			if payload.Success && s.skillManager != nil {
+				// Type-assert the curriculum to check if it can synthesize code.
+				// This avoids changing the Curriculum interface.
+				synth, ok := s.curriculum.(voyager.CodeSynthesizer)
+				if ok {
+					beforeState := s.beforeState.Load()
+					afterState := s.stateProvider.GetCurrentState().State
+
+					if beforeState != nil {
+						intentVal := s.activeIntent.Load()
+						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
+							// Run synthesis in background so it doesn't block the planning loop.
+							go func(intent domain.ActionIntent, before, after domain.GameState) {
+								ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+								defer cancel()
+
+								jsCode, err := synth.SynthesizeCode(ctx, intent, before, after)
+								if err != nil {
+									s.logger.Warn("Skill synthesis failed", slog.String("action", intent.Action), slog.Any("error", err))
+									return
+								}
+								if jsCode == "" {
+									return
+								}
+
+								skillName := fmt.Sprintf("%s_%s", intent.Action, sanitizeSkillName(intent.Target))
+								skill := voyager.ExecutableSkill{
+									Name:        skillName,
+									Description: fmt.Sprintf("%s %s (count: %d)", intent.Action, intent.Target, intent.Count),
+									JSCode:      jsCode,
+								}
+
+								if err := s.skillManager.SaveSkill(ctx, skill); err != nil {
+									s.logger.Warn("Failed to persist skill", slog.String("name", skillName), slog.Any("error", err))
+									return
+								}
+								s.logger.Info("Skill synthesized and saved", slog.String("name", skillName))
+							}(*intentVal, *beforeState, afterState)
+						}
+					}
+				}
+			}
 		}
 
 		s.mu.Lock()
@@ -711,4 +780,22 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 		Payload:   payload,
 		CreatedAt: time.Now(),
 	})
+}
+
+// sanitizeSkillName converts an arbitrary target string into a valid skill name.
+func sanitizeSkillName(target string) string {
+	target = strings.ToLower(strings.TrimSpace(target))
+	target = strings.ReplaceAll(target, " ", "_")
+	// Remove any characters that aren't alphanumeric or underscore.
+	var b strings.Builder
+	for _, r := range target {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	result := b.String()
+	if result == "" {
+		return "unnamed"
+	}
+	return result
 }

@@ -4,8 +4,9 @@ import {
     StateMachineRunner,
 } from "../fsm.js";
 import { type TaskContext } from "../registry.js";
-import { escapeTree, moveToGoal } from "../utils.js";
+import { escapeTree } from "../utils.js";
 import { Runtime } from "../../control/runtime.js";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 
@@ -117,7 +118,7 @@ class ConstructState implements FSMState {
             if (!refBlock) {
                 try {
                     bot.clearControlStates();
-                    await moveToGoal(
+                    await navigateWithFallbacks(
                         bot,
                         new goals.GoalNear(
                             targetPos.x,
@@ -129,7 +130,7 @@ class ConstructState implements FSMState {
                             signal: sCtx.signal,
                             timeoutMs: 10000,
                             stopMovement: sCtx.stopMovement,
-                            dynamic: false,
+                            maxRetries: 2,
                         },
                     );
                 } catch (e: any) {
@@ -170,7 +171,7 @@ class ConstructState implements FSMState {
                 } else {
                     try {
                         bot.clearControlStates();
-                        await moveToGoal(
+                        await navigateWithFallbacks(
                             bot,
                             new goals.GoalNear(
                                 targetPos.x,
@@ -182,7 +183,7 @@ class ConstructState implements FSMState {
                                 signal: sCtx.signal,
                                 timeoutMs: 5000,
                                 stopMovement: sCtx.stopMovement,
-                                dynamic: false,
+                                maxRetries: 2,
                             },
                         );
                     } catch (e: any) {
