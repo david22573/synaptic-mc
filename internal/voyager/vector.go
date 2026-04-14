@@ -93,7 +93,10 @@ func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string)
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	query := `SELECT description, code, embedding_json FROM skills`
+	// Candidate selection: load at most 500 skills to avoid unbounded linear scans.
+	// We prioritize skills with higher success counts.
+	query := `SELECT description, code, embedding_json FROM skills 
+	          ORDER BY success_count DESC LIMIT 500`
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {

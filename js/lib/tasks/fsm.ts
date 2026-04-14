@@ -86,22 +86,48 @@ export class DynamicSkillSandbox {
                 filename: "voyager_skill.js",
             });
 
-            // Execute with a hard CPU timeout and display errors
-            await script.runInContext(vmContext, {
+            // 1. CPU Timeout (Synchronous)
+            // Node's vm timeout option only limits synchronous execution time.
+            script.runInContext(vmContext, {
                 timeout: context.timeoutMs,
                 displayErrors: true,
                 breakOnSigint: true,
             });
 
-            if (context.signal.aborted) {
-                return { status: "FAILED", reason: "aborted" };
-            }
+            // 2. Wall Clock Timeout (Asynchronous)
+            // We race the script's internal async execution (which populates context.result)
+            // against a timer and the AbortSignal.
+            const timeoutPromise = new Promise<TaskResult>((_, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error("SKILL_ASYNC_TIMEOUT"));
+                }, context.timeoutMs);
+                
+                context.signal.addEventListener("abort", () => {
+                    clearTimeout(timer);
+                    reject(new Error("aborted"));
+                }, { once: true });
+            });
+
+            // The wrappedCode is an IIFE that returns a promise (via async ())
+            // However, script.runInContext returns the result of the last statement,
+            // which in our case is the Promise from the IIFE.
+            const scriptResult = script.runInContext(vmContext, {
+                timeout: context.timeoutMs,
+            }) as Promise<void>;
+
+            await Promise.race([
+                scriptResult,
+                timeoutPromise
+            ]);
 
             return sandbox.result;
         } catch (err: unknown) {
             const msg = getErrorMessage(err);
-            if (context.signal.aborted) {
+            if (context.signal.aborted || msg === "aborted") {
                 return { status: "FAILED", reason: "aborted" };
+            }
+            if (msg === "SKILL_ASYNC_TIMEOUT") {
+                return { status: "FAILED", reason: "SKILL_ASYNC_TIMEOUT" };
             }
             return {
                 status: "FAILED",

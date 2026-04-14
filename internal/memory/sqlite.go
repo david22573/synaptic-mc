@@ -32,7 +32,8 @@ type SQLiteStore struct {
 }
 
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite memory: %w", err)
 	}

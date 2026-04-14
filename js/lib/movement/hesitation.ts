@@ -1,17 +1,24 @@
 // js/lib/movement/hesitation.ts
 import type { Bot } from "mineflayer";
 
+let lastHesitationAt = 0;
+const HESITATION_COOLDOWN_MS = 2000;
+
 /**
  * Applies situational hesitation before movement starts.
  * Synced to server physics ticks to prevent event loop drift.
  */
 export async function applyHesitation(bot: Bot): Promise<void> {
-    let baseTicks = 3; // base reaction time (~150ms)
+    const now = Date.now();
+    if (now - lastHesitationAt < HESITATION_COOLDOWN_MS) return;
+    lastHesitationAt = now;
+
+    let baseTicks = 1; // base reaction time (~50ms)
 
     // Risk-Based Hesitation (Caution factor)
     if (bot.health < 20) {
-        // ~20ms per lost HP = ~0.4 ticks
-        baseTicks += Math.floor((20 - bot.health) * 0.4);
+        // Reduced scaling: ~10ms per lost HP
+        baseTicks += Math.floor((20 - bot.health) * 0.2);
     }
 
     // Proximity threat check

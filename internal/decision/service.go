@@ -49,6 +49,7 @@ type Service struct {
 
 	mu            sync.Mutex
 	evalSemaphore chan struct{}
+	evalPending   atomic.Int32
 	activeIntent  atomic.Pointer[domain.ActionIntent]
 	beforeState   atomic.Pointer[domain.GameState]
 	taskHistory   []domain.TaskHistory
@@ -102,6 +103,7 @@ func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent
 }
 
 func NewService(
+	ctx context.Context,
 	sessionID string,
 	bus domain.EventBus,
 	advPlanner *AdvancedPlanner,
@@ -139,13 +141,13 @@ func NewService(
 
 	// Load persistent state
 	if memStore != nil {
-		history, err := memStore.GetTaskHistory(context.Background(), sessionID, 50)
+		history, err := memStore.GetTaskHistory(ctx, sessionID, 50)
 		if err == nil {
 			s.taskHistory = history
 			s.logger.Info("Loaded task history from persistent store", slog.Int("count", len(history)))
 		}
 
-		milestones, err := memStore.GetMilestones(context.Background(), sessionID)
+		milestones, err := memStore.GetMilestones(ctx, sessionID)
 		if err == nil {
 			s.milestones = milestones
 			s.logger.Info("Loaded milestones from persistent store", slog.Int("count", len(milestones)))
@@ -170,6 +172,8 @@ func NewService(
 		defer ticker.Stop()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-ticker.C:
 				if !s.planManager.HasActivePlan() && s.activeIntent.Load() == nil && s.execStatus.IsIdle() {
 					s.logger.Info("Jumpstart: bot is idle, forcing evaluation")
@@ -328,7 +332,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
 							// Run synthesis in background so it doesn't block the planning loop.
 							go func(intent domain.ActionIntent, before, after domain.GameState) {
-								ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+								ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 								defer cancel()
 
 								jsCode, err := synth.SynthesizeCode(ctx, intent, before, after)
@@ -495,7 +499,10 @@ func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.Domain
 
 func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
 	s.handlePlanInvalidated(ctx, event)
-	go s.evaluateNextPlan(context.Background())
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		s.evaluateNextPlan(context.Background())
+	}()
 }
 
 func (s *Service) RequestEvaluation() {
@@ -529,16 +536,17 @@ func (s *Service) detectMilestones(before, after *domain.GameState) {
 		beforeItems[item.Name] = true
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, item := range techTree {
 		alreadyUnlocked := false
-		s.mu.Lock()
 		for _, m := range s.milestones {
 			if m.Name == item {
 				alreadyUnlocked = true
 				break
 			}
 		}
-		s.mu.Unlock()
 
 		if alreadyUnlocked {
 			continue
@@ -556,9 +564,7 @@ func (s *Service) detectMilestones(before, after *domain.GameState) {
 		if hasItNow && !beforeItems[item] {
 			s.logger.Info("Milestone unlocked!", slog.String("name", item))
 			m := domain.ProgressionMilestone{Name: item, UnlockedAt: time.Now()}
-			s.mu.Lock()
 			s.milestones = append(s.milestones, m)
-			s.mu.Unlock()
 
 			if s.memStore != nil {
 				go func(name string) {
@@ -613,13 +619,25 @@ func isProgressionMode(state domain.GameState) bool {
 }
 
 func (s *Service) evaluateNextPlan(ctx context.Context) {
-	select {
-	case s.evalSemaphore <- struct{}{}:
-	default:
-		return
+	if !s.evalPending.CompareAndSwap(0, 1) {
+		return // already queued
 	}
-	defer func() { <-s.evalSemaphore }()
 
+	go func() {
+		defer s.evalPending.Store(0)
+
+		select {
+		case s.evalSemaphore <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer func() { <-s.evalSemaphore }()
+
+		s.doEvaluateNextPlan(ctx)
+	}()
+}
+
+func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 	state := s.stateProvider.GetCurrentState().State
 	if state.Health <= 0 {
 		return
@@ -751,6 +769,12 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 	}
 
 	firstTask := plan.Tasks[0]
+
+	// Pre-fetch trigger for the NEXT plan if we're starting the last task of the current plan.
+	if len(plan.Tasks) == 1 {
+		s.logger.Debug("Last task in plan starting; warming next plan")
+		s.planner.WarmNextPlan(ctx, s.sessionID, s.stateProvider.GetCurrentState().State)
+	}
 
 	s.commitment.Store(&Commitment{
 		TaskID:      firstTask.ID,

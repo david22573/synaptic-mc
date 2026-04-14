@@ -1,6 +1,8 @@
 import { Bot } from "mineflayer";
 import { ActionPlan, Perception } from "../../control/controller.js";
 import { findNearestEntity } from "../primitives.js";
+import { TaskContext } from "../registry.js";
+import { Runtime } from "../../control/runtime.js";
 
 const WEAPON_SCORES: Record<string, number> = {
     netherite_sword: 10,
@@ -17,11 +19,11 @@ const WEAPON_SCORES: Record<string, number> = {
     golden_axe: 4.5,
 };
 
-function ensureBestEquipment(bot: Bot, state: Record<string, any>) {
-    if (Date.now() - (state.lastEquipCheck || 0) < 1000) return;
+function ensureBestEquipment(bot: Bot, state: Record<string, unknown>) {
+    if (Date.now() - (Number(state.lastEquipCheck) || 0) < 1000) return;
     state.lastEquipCheck = Date.now();
 
-    let bestWeapon: any = null;
+    let bestWeapon = null;
     let bestScore = -1;
     for (const item of bot.inventory.items()) {
         const score = WEAPON_SCORES[item.name] || 0;
@@ -33,19 +35,26 @@ function ensureBestEquipment(bot: Bot, state: Record<string, any>) {
     const currentWeapon = bot.heldItem;
     if (
         bestWeapon &&
-        (!currentWeapon || currentWeapon.type !== bestWeapon.type)
+        (!currentWeapon || (currentWeapon as any).type !== (bestWeapon as any).type)
     ) {
-        bot.equip(bestWeapon.type, "hand").catch(() => {});
+        bot.equip((bestWeapon as any).type, "hand").catch(() => {});
     }
     const offhand = bot.inventory.slots[45];
     if (!offhand || offhand.name !== "shield") {
         const shield = bot.inventory
             .items()
-            .find((i: any) => i.name === "shield");
+            .find((i) => i.name === "shield");
         if (shield) {
             bot.equip(shield.type, "off-hand").catch(() => {});
         }
     }
+}
+
+export async function handleHunt(ctx: TaskContext): Promise<void> {
+    const { bot, intent, signal } = ctx;
+    // Controller-based continuous hunt will handle the actual execution.
+    // This wrapper is just to keep the legacy FSM compatibility for now if needed.
+    await new Runtime(bot).execute(new Promise(() => {}), signal);
 }
 
 export function evaluateHunt(

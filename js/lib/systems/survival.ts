@@ -2,6 +2,7 @@
 import type { Bot } from "mineflayer";
 import { log } from "../logger.js";
 import { getThreats } from "../utils/threats.js";
+import { senseWorld } from "../utils/world.js";
 
 export interface SurvivalConfig {
     onInterrupt: (reason: string) => void;
@@ -63,15 +64,16 @@ export class SurvivalSystem {
 
     private checkSurvival() {
         const threats = getThreats(this.bot);
+        const world = senseWorld(this.bot, threats);
 
         const criticalMobNames = new Set(["creeper", "skeleton", "witch"]);
 
         // React earlier when health is already compromised or a high-risk mob is close.
         const immediateThreats = threats.filter(
-            (t: any) =>
+            (t) =>
                 t.distance < 20 &&
                 (
-                    t.threatScore > 5 ||
+                    (t.threatScore ?? 0) > 5 ||
                     this.bot.health <= 12 ||
                     criticalMobNames.has(t.name)
                 ) &&
@@ -79,7 +81,11 @@ export class SurvivalSystem {
                 t.name !== "starvation",
         );
 
-        if (immediateThreats.length > 0) {
+        const panicCause =
+            world.panicCause ||
+            (immediateThreats.length > 0 ? immediateThreats[0]!.name : null);
+
+        if (panicCause) {
             const topThreat = immediateThreats[0]!;
 
             // If we're panicking or in cooldown, let the current escape plan play out
@@ -87,20 +93,31 @@ export class SurvivalSystem {
                 return;
 
             this.isPanicking = true;
-            this.panicCooldownUntil = Date.now() + 15000; // 15-second cooldown to avoid retreat thrashing
+            this.panicCooldownUntil =
+                Date.now() +
+                (world.panicCause === "lava" || world.panicCause === "drowning"
+                    ? 8000
+                    : 15000);
 
             log.warn(
                 "SENSOR: Critical Threat Detected. Interrupting TS execution loop.",
                 {
-                    cause: topThreat.name,
+                    cause: panicCause,
                     health: Math.round(this.bot.health),
-                    distance: Math.round(topThreat.distance),
+                    distance:
+                        topThreat?.distance !== undefined
+                            ? Math.round(topThreat.distance)
+                            : 0,
                 },
             );
 
-            this.config.onPanicStart?.(topThreat.name);
-            this.config.onInterrupt(`panic_${topThreat.name}`);
-        } else if (this.isPanicking && Date.now() > this.panicCooldownUntil) {
+            this.config.onPanicStart?.(panicCause);
+            this.config.onInterrupt(`panic_${panicCause}`);
+        } else if (
+            this.isPanicking &&
+            Date.now() > this.panicCooldownUntil &&
+            !world.panicCause
+        ) {
             // Coast is clear and cooldown finished. Drop the panic lock.
             this.isPanicking = false;
             log.info("SENSOR: Threat passed; releasing panic lock.");

@@ -78,6 +78,27 @@ func (c *IdempotentController) Dispatch(ctx context.Context, action domain.Actio
 	return c.base.Dispatch(ctx, action)
 }
 
+func (c *IdempotentController) Preload(ctx context.Context, action domain.Action) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	c.mu.Lock()
+	c.cleanupExpired()
+
+	if ts, exists := c.seen[action.ID]; exists {
+		if time.Since(ts) < c.ttl {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	c.mu.Unlock()
+
+	return c.base.Preload(ctx, action)
+}
+
 func (c *IdempotentController) cleanupExpired() {
 	now := time.Now()
 	// Since keys is sorted by time (FIFO), we can just check from the front

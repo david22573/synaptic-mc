@@ -29,11 +29,7 @@ func NewService(bus domain.EventBus, logger *slog.Logger) *Service {
 	// Wire up the bus listeners
 	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
 
-	// Catch UI-driven updates if they come through as STATE_UPDATE
-	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
-
-	// Phase 5: Listen for task completion to alter the world model
-	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+	// Phase 5: Listen for task completion to alter the world model	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
 
 	return s
 }

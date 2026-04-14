@@ -37,6 +37,13 @@ func (e *Engine) Config() Config {
 	return e.cfg
 }
 
+func (e *Engine) UpdateConfig(cfg Config) {
+	e.cfg = cfg
+	e.state.mu.Lock()
+	e.state.cfg = cfg
+	e.state.mu.Unlock()
+}
+
 func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 	var scheduled []ScheduledAction
 	now := time.Now()
@@ -55,7 +62,7 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 			isCritical = true
 		}
 	}
-	if ctx.State.Health < 12 || len(ctx.State.Threats) > 0 {
+	if ctx.State.Health < e.cfg.CriticalHealthThreshold || len(ctx.State.Threats) > 0 {
 		isCritical = true
 	}
 
@@ -85,14 +92,14 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 
 		// Phase 7: Hesitation moved to cognitive decision layer (planner.go)
 		// to avoid stalling physical execution with stale world states.
-		// We still use currentDelay for sequential task spacing (100ms).
+		// We still use currentDelay for sequential task spacing.
 
 		scheduled = append(scheduled, ScheduledAction{
 			Action:    noisyTask,
 			ExecuteAt: now.Add(currentDelay),
 		})
 
-		currentDelay += 100 * time.Millisecond
+		currentDelay += e.cfg.TaskSpacing
 	}
 
 	return scheduled
@@ -107,7 +114,7 @@ func (e *Engine) generateDrift(ctx Context) *domain.Action {
 	}
 
 	// Dynamic curiosity: Look at interesting things if they exist
-	if roll < 0.4 && len(ctx.State.POIs) > 0 {
+	if roll < e.cfg.DriftCuriosityThreshold && len(ctx.State.POIs) > 0 {
 		poi := ctx.State.POIs[rand.Intn(len(ctx.State.POIs))]
 		
 		// Marshal POI coordinates for the TS look handler
@@ -123,11 +130,11 @@ func (e *Engine) generateDrift(ctx Context) *domain.Action {
 		return &action
 	}
 
-	if roll < 0.7 {
+	if roll < e.cfg.DriftIdleLookThreshold {
 		action.Action = "look"
 		action.Target = domain.Target{Type: "relative", Name: "random_yaw"}
 		action.Rationale = "Humanization: idle looking around"
-	} else if roll < 0.85 {
+	} else if roll < e.cfg.DriftInventoryThreshold {
 		action.Action = "inventory"
 		action.Target = domain.Target{Type: "ui", Name: "open_close"}
 		action.Rationale = "Humanization: nervously checking inventory"

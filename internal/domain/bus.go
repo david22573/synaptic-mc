@@ -2,7 +2,6 @@ package domain
 
 import (
 	"context"
-	"log"
 	"sync"
 )
 
@@ -27,11 +26,34 @@ type EventBus interface {
 // subscriber wraps a handler with its own dedicated queue to ensure ordering and isolation.
 type subscriber struct {
 	handler EventHandler
-	queue   chan DomainEvent
+	buffer  []DomainEvent
+	mu      sync.Mutex
+	cond    *sync.Cond
+}
+
+func (s *subscriber) push(ev DomainEvent, critical bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// For non-critical events, we drop if the buffer is already large to prevent OOM.
+	if !critical && len(s.buffer) > 1024 {
+		return
+	}
+
+	s.buffer = append(s.buffer, ev)
+	s.cond.Signal()
 }
 
 func (s *subscriber) run() {
-	for ev := range s.queue {
+	for {
+		s.mu.Lock()
+		for len(s.buffer) == 0 {
+			s.cond.Wait()
+		}
+		ev := s.buffer[0]
+		s.buffer = s.buffer[1:]
+		s.mu.Unlock()
+
 		// Use Background context for now as event handlers are decoupled from the publish context.
 		// However, we ensure they process events sequentially.
 		s.handler.HandleEvent(context.Background(), ev)
@@ -78,24 +100,7 @@ func (b *LocalEventBus) Publish(ctx context.Context, event DomainEvent) {
 	critical := IsCritical(event.Type)
 
 	for _, s := range subs {
-		if critical {
-			// For critical events, we wait for space in the subscriber's queue.
-			// This provides backpressure and guarantees delivery.
-			select {
-			case s.queue <- event:
-				// Success
-			case <-ctx.Done():
-				log.Printf("[EventBus] ERROR: Context cancelled while publishing critical event %s", event.Type)
-			}
-		} else {
-			// For non-critical events (like STATE_TICK), we drop if the queue is full.
-			select {
-			case s.queue <- event:
-				// Success
-			default:
-				// DROP: Prevents slow subscribers from blocking telemetry/heartbeats.
-			}
-		}
+		s.push(event, critical)
 	}
 }
 
@@ -105,8 +110,9 @@ func (b *LocalEventBus) Subscribe(eventType EventType, handler EventHandler) {
 
 	s := &subscriber{
 		handler: handler,
-		queue:   make(chan DomainEvent, 1024),
+		buffer:  make([]DomainEvent, 0, 10),
 	}
+	s.cond = sync.NewCond(&s.mu)
 	
 	b.subscribers[eventType] = append(b.subscribers[eventType], s)
 	go s.run()

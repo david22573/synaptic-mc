@@ -74,6 +74,7 @@ func (m *MockDrainingController) Close() error {
 	return nil
 }
 func (m *MockDrainingController) IsReady() bool { return m.isReady }
+func (m *MockDrainingController) Preload(ctx context.Context, action domain.Action) error { return nil }
 
 func TestControllerManager_SetController(t *testing.T) {
 	m := NewControllerManager()

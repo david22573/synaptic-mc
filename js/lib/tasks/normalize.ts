@@ -73,17 +73,38 @@ export function normalizeIntent(
     if (action === "craft") {
         if (targetName === "sticks" || targetName === "stick") {
             targetName = "stick";
-        } else if (targetName === "planks") {
+        } else if (targetName === "planks" || targetName === "plank") {
             const invItems = bot.inventory.items();
-            let foundLog = false;
+            let foundLog = null;
             for (const item of invItems) {
                 if (LOG_TO_PLANK_MAP[item.name]) {
-                    targetName = LOG_TO_PLANK_MAP[item.name]!;
-                    foundLog = true;
+                    foundLog = item.name;
                     break;
                 }
             }
-            if (!foundLog) throw new Error("MISSING_LOGS_FOR_PLANKS");
+            if (foundLog) {
+                targetName = LOG_TO_PLANK_MAP[foundLog]!;
+            } else {
+                // If no log, check if we already have any planks
+                const hasAnyPlanks = invItems.find((i) =>
+                    i.name.endsWith("_planks"),
+                );
+                if (hasAnyPlanks) {
+                    targetName = hasAnyPlanks.name;
+                } else {
+                    // Default to oak if nothing else, but usually handleCraft should fail
+                    targetName = "oak_planks";
+                }
+            }
+        } else if (targetName === "log" || targetName === "wood") {
+            const invLog = bot.inventory
+                .items()
+                .find((i) => LOG_TO_PLANK_MAP[i.name]);
+            if (invLog) {
+                targetName = invLog.name;
+            } else {
+                targetName = "oak_log";
+            }
         } else if (
             targetName === "table" ||
             targetName === "workbench" ||

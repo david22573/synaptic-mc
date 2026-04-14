@@ -83,7 +83,7 @@ export interface ThreatInfo extends Threat {
     id?: number;
     threatScore?: number;
     position?: Vec3;
-    entity?: any;
+    entity?: unknown;
 }
 
 export interface POI {

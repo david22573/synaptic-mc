@@ -41,7 +41,6 @@ bin/
 synaptic-mc
 
 # Runtime State
-data/*.db-shm
-data/*.db-wal
-data/*.db-journal
+data/
 server
+data/

@@ -113,10 +113,10 @@ export function getPOIs(bot: Bot, radius: number = 32): models.POI[] {
     }
 
     for (const bPos of staticBlockCache) {
-        const block = bot.blockAt(bPos as any);
+        const block = bot.blockAt(bPos);
         if (!block) continue;
 
-        const dist = pos.distanceTo(bPos as any);
+        const dist = pos.distanceTo(bPos);
         if (dist > radius) continue;
 
         const dx = bPos.x - pos.x;

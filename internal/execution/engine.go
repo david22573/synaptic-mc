@@ -2,34 +2,56 @@ package execution
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 )
 
 type TaskExecutionEngine struct {
 	controller Controller
 	logger     *slog.Logger
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	inFlight   *ExecutionTask
+	cfg        config.ExecutionConfig
+	
+	// Managed cancellation for engine-wide background tasks
+	cancel context.CancelFunc
 }
 
-func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger) *TaskExecutionEngine {
+func NewTaskExecutionEngine(ctrl Controller, logger *slog.Logger, cfg config.ExecutionConfig) *TaskExecutionEngine {
 	return &TaskExecutionEngine{
 		controller: ctrl,
 		logger:     logger.With(slog.String("component", "task_execution_engine")),
+		cfg:        cfg,
 	}
 }
 
+func (e *TaskExecutionEngine) UpdateConfig(cfg config.ExecutionConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg = cfg
+}
+
+// Start initiates the background maintenance loops.
 func (e *TaskExecutionEngine) Start(ctx context.Context) {
-	cleanupTicker := time.NewTicker(30 * time.Second)
+	innerCtx, cancel := context.WithCancel(ctx)
+	e.cancel = cancel
+
+	e.mu.RLock()
+	cleanupInterval := time.Duration(e.cfg.CleanupTickerMs) * time.Millisecond
+	e.mu.RUnlock()
+
+	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-innerCtx.Done():
+			e.logger.Info("Task engine shutting down")
 			return
 		case <-cleanupTicker.C:
 			e.checkStuckTasks()
@@ -37,13 +59,18 @@ func (e *TaskExecutionEngine) Start(ctx context.Context) {
 	}
 }
 
+// checkStuckTasks performs periodic audits of dispatched but unacknowledged tasks.
 func (e *TaskExecutionEngine) checkStuckTasks() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.inFlight != nil && e.inFlight.Status == StatusDispatched {
-		if time.Since(e.inFlight.EnqueueTime) > 15*time.Second && e.inFlight.StartTime == nil {
-			e.logger.Warn("Task stuck in dispatched state (no TASK_START received). Aborting to clear state.", slog.String("action", e.inFlight.Action.ID))
+		// threshold for the Node.js bot to acknowledge TASK_START
+		ackThreshold := time.Duration(e.cfg.DispatchTimeoutMs) * time.Millisecond
+		if time.Since(e.inFlight.EnqueueTime) > ackThreshold && e.inFlight.StartTime == nil {
+			e.logger.Warn("Task stuck in dispatched state (no TASK_START received). Force clearing.", 
+				slog.String("task_id", e.inFlight.Action.ID))
+			
 			e.inFlight.Status = StatusFailed
 			e.inFlight.Error = "DISPATCH_TIMEOUT_NO_ACK"
 			e.inFlight = nil
@@ -56,14 +83,14 @@ func (e *TaskExecutionEngine) HasController() bool {
 }
 
 func (e *TaskExecutionEngine) IsIdle() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.inFlight == nil
 }
 
 func (e *TaskExecutionEngine) GetInFlight() *domain.Action {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	if e.inFlight != nil {
 		copyAction := e.inFlight.Action
 		return &copyAction
@@ -71,6 +98,7 @@ func (e *TaskExecutionEngine) GetInFlight() *domain.Action {
 	return nil
 }
 
+// ExecuteAsync dispatches a task to the bot and monitors its lifecycle.
 func (e *TaskExecutionEngine) ExecuteAsync(ctx context.Context, action domain.Action) {
 	e.mu.Lock()
 	e.inFlight = &ExecutionTask{
@@ -78,71 +106,87 @@ func (e *TaskExecutionEngine) ExecuteAsync(ctx context.Context, action domain.Ac
 		Status:      StatusDispatched,
 		EnqueueTime: time.Now(),
 	}
+	maintenanceInterval := time.Duration(e.cfg.MaintenanceTickerMs) * time.Millisecond
 	e.mu.Unlock()
 
 	go func() {
+		// Propagate context to the controller dispatch
 		err := e.controller.Dispatch(ctx, action)
 		if err != nil {
-			e.handleFailure(action, err)
+			e.handleFailure(ctx, action, err)
 			return
 		}
 
-		// Mid-task active loop
-		ticker := time.NewTicker(200 * time.Millisecond)
+		// Maintenance loop for active tasks
+		ticker := time.NewTicker(maintenanceInterval)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
-				e.logger.Debug("Task context cancelled mid-execution", slog.String("action", action.Action))
-				e.AbortCurrent(context.Background(), "context_cancelled")
+				e.logger.Debug("Task context cancelled mid-execution", 
+					slog.String("action", action.Action),
+					slog.String("task_id", action.ID))
+				// Use original context for abort if possible, otherwise Background
+				_ = e.AbortCurrent(context.Background(), "context_cancelled")
 				return
 			case <-ticker.C:
-				e.mu.Lock()
+				e.mu.RLock()
 				inFlight := e.inFlight
-				e.mu.Unlock()
+				e.mu.RUnlock()
 
-				// Break loop if task resolved or replaced
+				// Exit loop if task resolved via events or replaced by new dispatch
 				if inFlight == nil || inFlight.Action.ID != action.ID {
 					return
 				}
-
-				// Here you can poll e.controller.ReadState(ctx) to send mid-task
-				// corrections or updates if the Go planner needs to intervene.
 			}
 		}
 	}()
 }
 
-func (e *TaskExecutionEngine) handleFailure(action domain.Action, err error) {
+func (e *TaskExecutionEngine) Preload(ctx context.Context, action domain.Action) {
+	e.mu.RLock()
+	inFlight := e.inFlight
+	e.mu.RUnlock()
+
+	// Only preload if we're already running something else
+	if inFlight == nil || inFlight.Action.ID == action.ID {
+		return
+	}
+
+	go func() {
+		_ = e.controller.Preload(ctx, action)
+	}()
+}
+
+func (e *TaskExecutionEngine) handleFailure(ctx context.Context, action domain.Action, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Handle clean cancellations
 	if err == context.Canceled || err == context.DeadlineExceeded {
-		e.logger.Debug("Task aborted cleanly", slog.String("action", action.Action), slog.Any("reason", err))
-		e.mu.Lock()
 		if e.inFlight != nil && e.inFlight.Action.ID == action.ID {
 			e.inFlight.Status = StatusAborted
 			now := time.Now()
 			e.inFlight.EndTime = &now
 			e.inFlight = nil
 		}
-		e.mu.Unlock()
 		return
 	}
 
-	e.mu.Lock()
+	// Update state for hard failures
 	if e.inFlight != nil && e.inFlight.Action.ID == action.ID {
 		e.inFlight.Status = StatusFailed
 		e.inFlight.Error = err.Error()
 		e.inFlight = nil
 	}
-	e.mu.Unlock()
 
 	if err.Error() != "no active controller" {
-		e.logger.Error("Task execution failed, notifying planner", slog.Any("error", err), slog.String("action", action.Action))
+		e.logger.Error("Task execution failed", 
+			slog.Any("error", err), 
+			slog.String("action", action.Action),
+			slog.String("task_id", action.ID))
 	}
-}
-
-func (e *TaskExecutionEngine) ExecuteDirect(ctx context.Context, action domain.Action) error {
-	return e.controller.Dispatch(ctx, action)
 }
 
 func (e *TaskExecutionEngine) OnTaskStart(actionID string) {
@@ -182,5 +226,8 @@ func (e *TaskExecutionEngine) AbortCurrent(ctx context.Context, reason string) e
 	}
 	e.mu.Unlock()
 
-	return e.controller.AbortCurrent(ctx, reason)
+	if err := e.controller.AbortCurrent(ctx, reason); err != nil {
+		return fmt.Errorf("failed to abort current task: %w", err)
+	}
+	return nil
 }

@@ -5,18 +5,9 @@ import pkg from "mineflayer-pathfinder";
 import { type MoveOptions } from "./utils.js";
 import { navigateWithFallbacks } from "../movement/navigator.js";
 
-const { goals } = pkg;
+import { ExecutionError, TaskAbortError, isAbortError } from "../errors.js";
 
-export class ExecutionError extends Error {
-    constructor(
-        message: string,
-        public cause: string,
-        public progress: number,
-    ) {
-        super(message);
-        this.name = "ExecutionError";
-    }
-}
+const { goals } = pkg;
 
 export async function gotoEntity(
     bot: Bot,
@@ -43,6 +34,10 @@ export async function gotoEntity(
         const currentDist = bot.entity.position.distanceTo(entity.position);
         const progress =
             startDist > 0 ? Math.max(0, 1 - currentDist / startDist) : 0;
+
+        if (isAbortError(err)) {
+            throw new TaskAbortError("aborted", progress);
+        }
 
         throw new ExecutionError(
             err.message || "Failed to reach entity",

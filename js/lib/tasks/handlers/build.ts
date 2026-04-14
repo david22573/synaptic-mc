@@ -1,3 +1,6 @@
+import { type Bot } from "mineflayer";
+import { type Block } from "prismarine-block";
+import { type Item } from "prismarine-item";
 import {
     type FSMState,
     type StateContext,
@@ -7,6 +10,7 @@ import { type TaskContext } from "../registry.js";
 import { escapeTree } from "../utils.js";
 import { Runtime } from "../../control/runtime.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
+import { TaskAbortError, isAbortError } from "../../errors.js";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 
@@ -86,7 +90,7 @@ class ConstructState implements FSMState {
 
         let consecutiveFailures = 0;
         while (sCtx.currentIndex < sCtx.blueprint.length) {
-            if (sCtx.signal.aborted) throw new Error("aborted");
+            if (sCtx.signal.aborted) throw new TaskAbortError();
             if (consecutiveFailures > 5)
                 throw new Error("PANIC: Bot is hopelessly stuck.");
 
@@ -103,7 +107,7 @@ class ConstructState implements FSMState {
 
             const hasMaterial = bot.inventory
                 .items()
-                .some((i: any) => i.type === sCtx.materialType);
+                .some((i: Item) => i.type === sCtx.materialType);
             if (!hasMaterial) {
                 sCtx.result = {
                     status: "FAILED",
@@ -134,7 +138,7 @@ class ConstructState implements FSMState {
                         },
                     );
                 } catch (e: any) {
-                    if (e.message === "aborted") throw e;
+                    if (isAbortError(e)) throw new TaskAbortError();
                     consecutiveFailures++;
                 }
                 const retryRef = this.findReferenceBlock(bot, targetPos);
@@ -187,7 +191,7 @@ class ConstructState implements FSMState {
                             },
                         );
                     } catch (e: any) {
-                        if (e.message === "aborted") throw e;
+                        if (isAbortError(e)) throw new TaskAbortError();
                     }
                 }
             }
@@ -210,7 +214,7 @@ class ConstructState implements FSMState {
         return null;
     }
 
-    private findReferenceBlock(bot: any, pos: Vec3): any | null {
+    private findReferenceBlock(bot: Bot, pos: Vec3): Block | null {
         const offsets = [
             new Vec3(0, -1, 0),
             new Vec3(1, 0, 0),
@@ -242,7 +246,7 @@ class PrepareBuildState implements FSMState {
             return null;
         }
         sCtx.blueprint = blueprint;
-        let selectedMaterial: any = null;
+        let selectedMaterial: Item | null = null;
         let totalBlocks = 0;
         for (const item of sCtx.bot.inventory.items()) {
             if (BUILDING_BLOCKS.has(item.name)) {

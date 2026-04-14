@@ -1,3 +1,6 @@
+import { type Bot, type Chest, type Dispenser } from "mineflayer";
+import { type Block } from "prismarine-block";
+import { type Item } from "prismarine-item";
 import {
     type FSMState,
     type StateContext,
@@ -11,12 +14,13 @@ import {
 } from "../utils.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { Runtime } from "../../control/runtime.js";
+import { TaskAbortError, isAbortError } from "../../errors.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
 
 interface StoreContext extends StateContext {
-    chestBlock: any | null;
+    chestBlock: Block | null;
     targetItems: { type: number; count: number }[];
     targetCount: number;
     stopMovement: () => void;
@@ -29,16 +33,17 @@ class DepositState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as StoreContext;
-        let chestWindow: any = null;
+        let chestWindow: Chest | Dispenser | null = null;
 
         let syncFailures = 0;
 
         try {
+            if (!sCtx.chestBlock) return null;
             chestWindow = await sCtx.bot.openContainer(sCtx.chestBlock);
             await new Promise((r) => setTimeout(r, 500));
 
             for (const item of sCtx.targetItems) {
-                if (sCtx.signal.aborted) throw new Error("aborted");
+                if (sCtx.signal.aborted) throw new TaskAbortError();
 
                 try {
                     await chestWindow.deposit(item.type, null, item.count);
@@ -49,6 +54,7 @@ class DepositState implements FSMState {
 
                     syncFailures = 0;
                 } catch (err: any) {
+                    if (isAbortError(err)) throw new TaskAbortError();
                     syncFailures++;
 
                     if (syncFailures > 3) {
@@ -59,12 +65,13 @@ class DepositState implements FSMState {
                 }
             }
         } catch (err: any) {
+            if (isAbortError(err)) {
+                sCtx.result = { status: "FAILED", reason: "aborted" };
+                return null;
+            }
             sCtx.result = {
                 status: "FAILED",
-                reason:
-                    err.message === "aborted"
-                        ? "aborted"
-                        : `STORE_FAILED: ${err.message}`,
+                reason: `STORE_FAILED: ${err.message}`,
             };
             return null;
         } finally {
@@ -87,6 +94,7 @@ class ApproachChestState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as StoreContext;
+        if (!sCtx.chestBlock) return null;
         const cPos = sCtx.chestBlock.position;
 
         try {
@@ -100,10 +108,14 @@ class ApproachChestState implements FSMState {
                 },
             );
         } catch (err: any) {
-            sCtx.result = {
-                status: "FAILED",
-                reason: err.message || "FAILED_TO_REACH_CHEST",
-            };
+            if (isAbortError(err)) {
+                sCtx.result = { status: "FAILED", reason: "aborted" };
+            } else {
+                sCtx.result = {
+                    status: "FAILED",
+                    reason: err.message || "FAILED_TO_REACH_CHEST",
+                };
+            }
             return null;
         }
 
@@ -160,14 +172,14 @@ class CheckItemsState implements FSMState {
 
             sCtx.targetItems = inventory
                 .filter(
-                    (i: any) =>
+                    (i: Item) =>
                         !keepItems.has(i.name) &&
                         !i.name.includes("pickaxe") &&
                         !i.name.includes("sword"),
                 )
-                .map((i: any) => ({ type: i.type, count: i.count }));
+                .map((i: Item) => ({ type: i.type, count: i.count }));
         } else {
-            const items = inventory.filter((i: any) => i.name === targetName);
+            const items = inventory.filter((i: Item) => i.name === targetName);
 
             if (items.length === 0) {
                 sCtx.result = {
@@ -180,7 +192,7 @@ class CheckItemsState implements FSMState {
             let remainingToStore =
                 sCtx.targetCount > 0
                     ? sCtx.targetCount
-                    : items.reduce((sum: number, i: any) => sum + i.count, 0);
+                    : items.reduce((sum: number, i: Item) => sum + i.count, 0);
 
             sCtx.targetItems = [];
             for (const item of items) {
@@ -215,7 +227,7 @@ export async function handleStore(ctx: TaskContext): Promise<void> {
         targetCount: intent.count || 0,
         targetEntity: null,
         searchRadius: 0,
-        timeoutMs: timeouts.store ?? 20000,
+        timeoutMs: timeouts.store,
         startTime: 0,
         signal,
         chestBlock: null,

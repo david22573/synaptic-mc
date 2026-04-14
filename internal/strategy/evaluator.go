@@ -3,6 +3,7 @@ package strategy
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -10,6 +11,9 @@ import (
 
 	"david22573/synaptic-mc/internal/domain"
 )
+
+//go:embed prompts/strategy.tmpl
+var strategySystemPrompt string
 
 // Directive is the strategic mandate handed to the planner each cycle.
 // Unchanged — the planner consumes this as-is.
@@ -123,37 +127,6 @@ type directiveResponse struct {
 	IsAutonomous  bool   `json:"is_autonomous"`
 }
 
-const strategySystemPrompt = `You are the Strategy Director for an autonomous Minecraft survival bot.
-Analyze the bot's inventory, health, and progression tier, then output the most appropriate strategic objective.
-
-FULL MINECRAFT TECH TREE (your primary reference):
-- Tier 1 WOOD:       Gather logs → planks, sticks, crafting_table, wooden_pickaxe, wooden_sword
-- Tier 2 STONE:      Mine cobblestone → stone_pickaxe, stone_sword, furnace
-- Tier 3 FOOD:       Hunt animals → smelt meat → 8+ cooked food items stockpiled
-- Tier 4 COAL:       Mine coal_ore → fuel for smelting, torches for light
-- Tier 5 IRON:       Mine iron_ore (needs stone_pickaxe) → smelt iron_ingots → iron_pickaxe, iron_sword, iron_chestplate
-- Tier 6 SHIELD:     Craft shield (iron_ingot + oak_planks) — dramatically improves survivability
-- Tier 7 DIAMOND:    Mine diamond_ore at Y=-59 (needs iron_pickaxe) → diamond_pickaxe, diamond_sword, full diamond armor
-- Tier 8 ENCHANTING: Gather lapis_lazuli → craft enchanting_table (diamond + obsidian + book) → craft bookshelves → enchant gear
-- Tier 9 NETHER:     Craft nether portal (obsidian + flint_and_steel) → enter nether → mine blaze_rods, nether_quartz, ancient_debris
-- Tier 10 BREWING:   Craft brewing_stand (blaze_rod + cobblestone) → brew potions for combat
-- Tier 11 END:       Locate stronghold via ender_eye → defeat Ender Dragon
-
-RULES:
-1. Assess the current tier by inspecting the inventory. The bot is on the highest tier where it has ALL prerequisites.
-2. If the current tier is complete, push to the NEXT tier.
-3. Survival (food, health) must be addressed before progression if stocks are low.
-4. Do not repeat a goal that has clearly already been achieved (e.g. do not say "get wooden pickaxe" if one is in inventory).
-5. Be specific — name the exact items to craft, mine, or gather. Avoid vague goals like "progress further".
-6. is_autonomous: true only at Tier 7 or above, where the bot should self-direct freely.
-
-OUTPUT FORMAT (strict JSON, no markdown):
-{
-  "primary_goal": "Specific, actionable primary objective in one sentence.",
-  "secondary_goal": "Concrete secondary objective in one sentence.",
-  "is_autonomous": false
-}`
-
 // cachedLLMDirective returns a cached directive if the state hash and TTL are still valid,
 // otherwise calls the LLM and caches the result for 45 seconds.
 // 45 seconds is long enough to avoid thrashing but short enough to react to major state changes.
@@ -262,10 +235,15 @@ func (e *Evaluator) heuristicProgression(state domain.GameState) Directive {
 	_ = hasFood
 
 	hasLog := false
+	hasPlanks := false
 	for k, v := range inv {
-		if v > 0 && strings.HasSuffix(k, "_log") {
-			hasLog = true
-			break
+		if v > 0 {
+			if strings.HasSuffix(k, "_log") {
+				hasLog = true
+			}
+			if strings.HasSuffix(k, "_planks") {
+				hasPlanks = true
+			}
 		}
 	}
 
@@ -275,7 +253,7 @@ func (e *Evaluator) heuristicProgression(state domain.GameState) Directive {
 
 	// Tier 1: Wood
 	if !hasWoodenPick && !hasStonePick {
-		if !hasLog && inv["oak_planks"] == 0 {
+		if !hasLog && !hasPlanks {
 			return Directive{PrimaryGoal: "TECH TIER 1 (Wood): Gather logs — this is the absolute first step.", SecondaryGoal: "Note stone and coal locations for the next tier."}
 		}
 		return Directive{PrimaryGoal: "TECH TIER 1 (Tools): Craft planks, sticks, crafting_table, wooden_pickaxe.", SecondaryGoal: "Gather more wood if near trees."}

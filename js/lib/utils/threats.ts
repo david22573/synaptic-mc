@@ -58,6 +58,10 @@ export function getThreats(bot: Bot): models.ThreatInfo[] {
 
         if (effectiveDistance > 16) continue;
 
+        // Turn down paranoia: only consider mobs within 8 blocks OR targeting the bot
+        const isTargeting = (e as any).target === bot.entity || (e as any).attackTarget === bot.entity;
+        if (effectiveDistance > 8 && !isTargeting) continue;
+
         const baseThreat =
             config.THREAT_WEIGHTS[e.name?.toLowerCase() || ""] || 5;
 

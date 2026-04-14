@@ -2,6 +2,7 @@
 import WebSocket from "ws";
 import { EventEmitter } from "events";
 import * as models from "../models.js";
+import { log } from "../logger.js";
 
 interface ClientConfig {
     url: string;
@@ -39,18 +40,18 @@ export class SynapticClient extends EventEmitter {
             return;
         }
 
-        console.log(`[Network] Connecting to ${this.config.url}...`);
+        log.info(`[Network] Connecting to ${this.config.url}...`);
 
         try {
             this.ws = new WebSocket(this.config.url);
         } catch (err) {
-            console.error("[Network] Failed to instantiate WebSocket:", err);
+            log.error("[Network] Failed to instantiate WebSocket", { error: err });
             this.scheduleReconnect();
             return;
         }
 
         this.ws.on("open", () => {
-            console.log("[Network] WebSocket connected.");
+            log.info("[Network] WebSocket connected.");
             this.emit("connected");
             this.heartbeat();
 
@@ -73,11 +74,13 @@ export class SynapticClient extends EventEmitter {
 
                 if (msg.type === "DISPATCH_TASK") {
                     this.emit("dispatch", msg.payload as models.Action);
+                } else if (msg.type === "TASK_PRELOAD") {
+                    this.emit("preload", msg.payload as models.Action);
                 } else if (msg.type === "ABORT_TASK") {
                     this.emit("abort", msg.payload);
                 }
             } catch (err) {
-                console.error("[Network] Failed to parse message:", err);
+                log.error("[Network] Failed to parse message", { error: err });
             }
         });
 
@@ -90,11 +93,12 @@ export class SynapticClient extends EventEmitter {
             }
         });
 
-        this.ws.on("error", (err: any) => {
+        this.ws.on("error", (err: unknown) => {
             if (!this.isIntentionallyClosed) {
-                console.error(
-                    "[Network] WebSocket error:",
-                    err?.message || err,
+                const error = err as Error;
+                log.error(
+                    "[Network] WebSocket error",
+                    { error: error.message || err },
                 );
             }
             this.ws?.close();
@@ -105,7 +109,7 @@ export class SynapticClient extends EventEmitter {
         this.clearHeartbeat();
         this.pingTimeout = setTimeout(() => {
             if (this.isIntentionallyClosed) return;
-            console.warn("[Network] Heartbeat timeout. Closing connection.");
+            log.warn("[Network] Heartbeat timeout. Closing connection.");
             this.ws?.terminate();
         }, this.config.pingIntervalMs + 5000);
     }
@@ -128,7 +132,7 @@ export class SynapticClient extends EventEmitter {
             this.config.maxReconnectIntervalMs,
         );
         this.reconnectAttempts++;
-        console.log(`[Network] Reconnecting in ${Math.round(backoff)}ms...`);
+        log.info(`[Network] Reconnecting in ${Math.round(backoff)}ms...`);
         this.reconnectTimer = setTimeout(() => this.connect(), backoff);
     }
 
@@ -176,10 +180,10 @@ export class SynapticClient extends EventEmitter {
         startTime?: number,
         progress?: number,
     ): void;
-    public sendEvent(event: string, payload: Record<string, any>): void;
+    public sendEvent(event: string, payload: Record<string, unknown>): void;
     public sendEvent(
         event: string,
-        arg2: string | Record<string, any>,
+        arg2: string | Record<string, unknown>,
         arg3: string = "",
         commandId = "",
         cause = "",
@@ -189,7 +193,7 @@ export class SynapticClient extends EventEmitter {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
         let msgType = "TASK_END";
-        let payload: any;
+        let payload: Record<string, unknown>;
 
         if (typeof arg2 === "object") {
             payload = arg2;

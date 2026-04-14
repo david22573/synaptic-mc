@@ -8,9 +8,14 @@ import (
 
 func TestHumanizationEngine(t *testing.T) {
 	cfg := Config{
-		AttentionDecay: 0.1,
-		HesitationBase: 100 * time.Millisecond,
-		NoiseLevel:     0.1,
+		AttentionDecay:          0.1,
+		HesitationBase:          100 * time.Millisecond,
+		NoiseLevel:              0.1,
+		CriticalHealthThreshold: 12.0,
+		TaskSpacing:             100 * time.Millisecond,
+		DriftCuriosityThreshold: 0.4,
+		DriftIdleLookThreshold:  0.7,
+		DriftInventoryThreshold: 0.85,
 	}
 	engine := NewEngine(cfg)
 

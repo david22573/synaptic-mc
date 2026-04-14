@@ -2,7 +2,7 @@
 package planner
 
 import (
-	"log"
+	"log/slog"
 	"math/rand"
 	"strings"
 
@@ -13,12 +13,14 @@ import (
 // and mutates the current tactical plan to prevent infinite failure loops.
 // It supports Iterative Prompting by enriching the failure reasons.
 type FeedbackAnalyzer struct {
-	world *domain.WorldModel
+	world  *domain.WorldModel
+	logger *slog.Logger
 }
 
-func NewFeedbackAnalyzer(world *domain.WorldModel) *FeedbackAnalyzer {
+func NewFeedbackAnalyzer(world *domain.WorldModel, logger *slog.Logger) *FeedbackAnalyzer {
 	return &FeedbackAnalyzer{
-		world: world,
+		world:  world,
+		logger: logger.With(slog.String("component", "feedback_analyzer")),
 	}
 }
 
@@ -30,7 +32,10 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 		return nil
 	}
 
-	log.Printf("[FeedbackAnalyzer] Task %s failed: Cause=%s, Progress=%.2f", intent.Action, res.Cause, res.Progress)
+	f.logger.Info("Task failed, analyzing feedback",
+		slog.String("action", intent.Action),
+		slog.String("cause", res.Cause),
+		slog.Float64("progress", res.Progress))
 
 	// If we made significant progress before failing, update our local world weight
 	// so the planner knows this wasn't a total bust.
@@ -40,7 +45,7 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	// Capture JS stack traces for Iterative Prompting / Debugging
 	if strings.Contains(res.Cause, "stack") || strings.Contains(res.Cause, "Error") {
-		log.Printf("[FeedbackAnalyzer] JS Execution Error detected: %s", res.Cause)
+		f.logger.Warn("JS Execution Error detected in feedback", slog.String("error", res.Cause))
 		// We don't necessarily mutate the intent here, but the Critic will pick this up
 		// and add it to the taskHistory for LLM reflection.
 	}
@@ -110,7 +115,7 @@ func (f *FeedbackAnalyzer) generateBackoff(failedIntent domain.ActionIntent) *do
 }
 
 func (f *FeedbackAnalyzer) triggerReevaluation() *domain.ActionIntent {
-	log.Println("[FeedbackAnalyzer] Task interrupted by survival gate. Triggering macro re-evaluation.")
+	f.logger.Info("Task interrupted by survival gate. Triggering macro re-evaluation.")
 	return nil
 }
 
@@ -141,7 +146,7 @@ func (f *FeedbackAnalyzer) generatePrerequisitePlan(failedIntent domain.ActionIn
 	}
 
 	if dep == nil {
-		log.Printf("[FeedbackAnalyzer] Unknown dependency map for %s, dropping to macro strategy", failedIntent.Target)
+		f.logger.Warn("Unknown dependency map, dropping to macro strategy", slog.String("target", failedIntent.Target))
 		return nil
 	}
 

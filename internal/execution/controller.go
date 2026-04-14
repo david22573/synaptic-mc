@@ -10,6 +10,7 @@ import (
 // It is strictly responsible for dispatching commands and signaling control states.
 type Controller interface {
 	Dispatch(ctx context.Context, action domain.Action) error
+	Preload(ctx context.Context, action domain.Action) error
 	AbortCurrent(ctx context.Context, reason string) error
 	Close() error
 	IsReady() bool

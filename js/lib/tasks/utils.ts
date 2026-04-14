@@ -1,9 +1,17 @@
 // js/lib/tasks/utils.ts
 import type { Bot } from "mineflayer";
+import { type Block } from "prismarine-block";
+import { type Item } from "prismarine-item";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
-import { ExecutionError } from "./primitives.js";
+import {
+    TaskAbortError,
+    NoTargetsNearbyError,
+    isAbortError,
+    ExecutionError,
+} from "../errors.js";
 import { steerTowards } from "../movement/navigator.js";
+import { applyWorldMovementReflexes, senseWorld } from "../utils/world.js";
 
 const { goals } = pkg;
 
@@ -48,24 +56,41 @@ const TRASH_ITEMS = new Set([
     "grass",
 ]);
 
-export function isOnSolidGround(bot: any): boolean {
+export function isOnSolidGround(bot: Bot): boolean {
     if (!bot.entity.onGround) return false;
     const pos = bot.entity.position.floored();
     const below = bot.blockAt(pos.offset(0, -1, 0));
     return !!below && !TREE_BLOCKS.has(below.name) && below.name !== "air";
 }
 
-export function isInFoliage(bot: any): boolean {
+export function isInFoliage(bot: Bot): boolean {
     const pos = bot.entity.position.floored();
     const at = bot.blockAt(pos);
     const below = bot.blockAt(pos.offset(0, -1, 0));
-    return (
+    return !!(
         (at && TREE_BLOCKS.has(at.name)) ||
         (below && TREE_BLOCKS.has(below.name))
     );
 }
 
-export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
+let lastAirborneAt = 0;
+let wasAirborneRecently = false;
+
+export async function escapeTree(bot: Bot, signal: AbortSignal): Promise<void> {
+    // Optimization: only check if we might be in a tree (recently in air and falling/landed)
+    const vel = bot.entity.velocity;
+    const now = Date.now();
+
+    if (!bot.entity.onGround) {
+        lastAirborneAt = now;
+        wasAirborneRecently = true;
+    } else if (now - lastAirborneAt > 5000) {
+        wasAirborneRecently = false;
+    }
+
+    // Skip if we are on ground and haven't been in the air for a while
+    if (!wasAirborneRecently && bot.entity.onGround) return;
+
     if (!isInFoliage(bot)) return;
     try {
         bot.pathfinder.setGoal(null);
@@ -74,7 +99,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
 
     const MAX_ATTEMPTS = 30;
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
-        if (signal.aborted) throw new Error("aborted");
+        if (signal.aborted) throw new TaskAbortError();
         if (isOnSolidGround(bot)) return;
 
         const pos = bot.entity.position.floored();
@@ -100,7 +125,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
                     if (tool) await bot.equip(tool, "hand");
                     else await bot.unequip("hand");
 
-                    await bot.dig(targetBlock, true, "ignore");
+                    await bot.dig(targetBlock, true, "auto");
                     clearedSomething = true;
                 } catch (err) {
                     // Ignore dig errors
@@ -130,7 +155,7 @@ export async function escapeTree(bot: any, signal: AbortSignal): Promise<void> {
 export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
         if (signal.aborted) {
-            reject(new Error("aborted"));
+            reject(new TaskAbortError());
             return;
         }
         const timer = setTimeout(() => {
@@ -140,7 +165,7 @@ export function waitForMs(ms: number, signal: AbortSignal): Promise<void> {
         const onAbort = () => {
             clearTimeout(timer);
             cleanup();
-            reject(new Error("aborted"));
+            reject(new TaskAbortError());
         };
         const cleanup = () => {
             signal.removeEventListener("abort", onAbort);
@@ -158,7 +183,7 @@ export interface MoveOptions {
 }
 
 export function moveToGoal(
-    bot: any,
+    bot: Bot,
     goal: any,
     opts: MoveOptions,
 ): Promise<void> {
@@ -172,7 +197,7 @@ export function moveToGoal(
 
     return new Promise((resolve, reject) => {
         if (signal?.aborted) {
-            return reject(new Error("aborted"));
+            return reject(new TaskAbortError());
         }
 
         if (goal.isEnd && goal.isEnd(bot.entity.position)) {
@@ -190,7 +215,7 @@ export function moveToGoal(
         const cleanup = () => {
             bot.removeListener("physicsTick", onTick);
             listeners.forEach((handler, event) =>
-                bot.removeListener(event, handler),
+                bot.removeListener(event as any, handler),
             );
             listeners.clear();
         };
@@ -215,7 +240,7 @@ export function moveToGoal(
             finish(
                 signal?.reason instanceof Error
                     ? signal.reason
-                    : new Error("aborted"),
+                    : new TaskAbortError(),
             );
 
         const onGoalReached = () => {
@@ -232,7 +257,11 @@ export function moveToGoal(
 
         const getGoalPos = (): Vec3 | null => {
             if (goal.x !== undefined && goal.z !== undefined) {
-                return new Vec3(goal.x, goal.y ?? bot.entity.position.y, goal.z);
+                return new Vec3(
+                    goal.x,
+                    goal.y ?? bot.entity.position.y,
+                    goal.z,
+                );
             }
             if ((goal as any).dest) {
                 const dest = (goal as any).dest;
@@ -247,6 +276,7 @@ export function moveToGoal(
         const onTick = () => {
             if (settled) return;
             ticksElapsed++;
+            const world = senseWorld(bot);
 
             if (ticksElapsed > timeoutTicks) {
                 finish(new Error("timeout"));
@@ -262,11 +292,18 @@ export function moveToGoal(
                 const vel = bot.entity.velocity;
                 const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-                // More lenient stuck detection: requires 3 strikes (~2.4s) 
+                // More lenient stuck detection: requires 3 strikes (~2.4s)
                 // Checks if we are trying to move (either via pathfinder or steering hijack)
-                const isTryingToMove = bot.pathfinder.isMoving() || (targetVec && currentPos.distanceTo(targetVec) < 2.5);
-                
-                if (isTryingToMove && distSinceLast < 0.1 && speed < 0.02) {
+                const isTryingToMove =
+                    bot.pathfinder.isMoving() ||
+                    (targetVec && currentPos.distanceTo(targetVec) < 2.5);
+
+                if (
+                    isTryingToMove &&
+                    distSinceLast < 0.1 &&
+                    speed < 0.02 &&
+                    !world.movement.submerged
+                ) {
                     stuckStrikes++;
                     if (stuckStrikes >= 3) {
                         finish(
@@ -294,8 +331,16 @@ export function moveToGoal(
                     if (bot.pathfinder.isMoving()) {
                         bot.pathfinder.setGoal(null);
                     }
+
+                    if (world.movement.steepDropAhead && distToGoal > 1.1) {
+                        bot.setControlState("forward", false);
+                        bot.setControlState("jump", false);
+                        return;
+                    }
+
                     steerTowards(bot, targetVec, 0.8, true);
-                    
+                    applyWorldMovementReflexes(bot, world);
+
                     if (distToGoal < 1.0) {
                         finish();
                     }
@@ -322,22 +367,25 @@ export function moveToGoal(
     });
 }
 
-export function findNearestBlockByName(bot: Bot, blockName: string): any {
+export function findNearestBlockByName(
+    bot: Bot,
+    blockName: string,
+): Block | null {
     return bot.findBlock({
         maxDistance: 32,
-        matching: (block: any) => block?.name === blockName,
+        matching: (block: Block) => block?.name === blockName,
     });
 }
 
 export async function makeRoomInInventory(
-    bot: any,
+    bot: Bot,
     slotsNeeded: number = 1,
 ): Promise<void> {
     if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
 
     const inventory = bot.inventory.items();
-    const trashItems = inventory.filter((i: any) => TRASH_ITEMS.has(i.name));
-    trashItems.sort((a: any, b: any) => a.count - b.count);
+    const trashItems = inventory.filter((i) => TRASH_ITEMS.has(i.name));
+    trashItems.sort((a, b) => a.count - b.count);
 
     let slotsFreed = 0;
     for (const item of trashItems) {
@@ -355,10 +403,10 @@ export async function makeRoomInInventory(
 }
 
 export async function placePortableUtility(
-    bot: any,
+    bot: Bot,
     blockName: string,
-): Promise<any> {
-    const item = bot.inventory.items().find((i: any) => i.name === blockName);
+): Promise<Block | null> {
+    const item = bot.inventory.items().find((i) => i.name === blockName);
     if (!item) return null;
 
     const pos = bot.entity.position.floored();
@@ -395,4 +443,53 @@ export async function placePortableUtility(
         }
     }
     return null;
+}
+
+export async function collectBlocks(
+    bot: Bot,
+    candidateNames: string[],
+    count: number,
+    signal: AbortSignal,
+): Promise<void> {
+    const targets: Block[] = [];
+    for (const name of candidateNames) {
+        const blockId = (bot.registry as any).blocksByName[name]?.id;
+        if (blockId === undefined) continue;
+
+        const blockPositions = bot.findBlocks({
+            matching: blockId,
+            maxDistance: 64,
+            count: count + 5,
+        });
+
+        const candidates = blockPositions
+            .map((pos: Vec3) => bot.blockAt(pos))
+            .filter((b): b is Block => b !== null);
+
+        if (candidates.length > 0) {
+            targets.push(...candidates);
+        }
+
+        if (targets.length >= count) break;
+    }
+
+    if (targets.length === 0) {
+        throw new NoTargetsNearbyError(candidateNames[0]);
+    }
+
+    const onAbort = () => {
+        if ((bot as any).collectBlock) (bot as any).collectBlock.cancelTask();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    try {
+        await (bot as any).collectBlock.collect(targets.slice(0, count));
+    } catch (err: any) {
+        if (isAbortError(err) || signal.aborted) {
+            throw new TaskAbortError();
+        }
+        throw new Error(`COLLECT_FAILED: ${err.message}`);
+    } finally {
+        signal.removeEventListener("abort", onAbort);
+    }
 }

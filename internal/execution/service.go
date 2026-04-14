@@ -97,8 +97,13 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 		return
 	}
 
+	s.engine.mu.RLock()
+	execCfg := s.engine.cfg
+	s.engine.mu.RUnlock()
+
 	// Death loop protection: If we died recently and many times, ignore plans for a bit
-	if deathCount >= 3 && time.Since(lastDeath) < 30*time.Second {
+	deathLoopThreshold := time.Duration(execCfg.DeathLoopThresholdMs) * time.Millisecond
+	if deathCount >= 3 && time.Since(lastDeath) < deathLoopThreshold {
 		s.logger.Warn("Death loop protection active: dropping new plan", slog.Int("death_count", deathCount))
 		return
 	}
@@ -115,6 +120,7 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 		s.failuresMu.RLock()
 		if record, exists := s.failures[task.ID]; exists {
 			// Check if the specific task is currently in a retry backoff window
+			// Base backoff: 1s per failure count
 			backoff := time.Duration(record.Count) * time.Second
 			if time.Since(record.LastFailure) < backoff {
 				s.failuresMu.RUnlock()
@@ -189,11 +195,17 @@ func (s *ControlService) handleBotDeath(ctx context.Context, event domain.Domain
 
 func (s *ControlService) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
 	s.stabilityMu.Lock()
+	defer s.stabilityMu.Unlock()
+
+	s.engine.mu.RLock()
+	execCfg := s.engine.cfg
+	s.engine.mu.RUnlock()
+
 	// If it's been a while since the last death, reset the count
-	if time.Since(s.stability.LastDeath) > 5*time.Minute {
+	resetThreshold := time.Duration(execCfg.DeathCountResetMs) * time.Millisecond
+	if time.Since(s.stability.LastDeath) > resetThreshold {
 		s.stability.DeathCount = 0
 	}
-	s.stabilityMu.Unlock()
 	s.logger.Info("Bot respawned")
 }
 
@@ -223,8 +235,11 @@ func (s *ControlService) handleTaskStart(ctx context.Context, event domain.Domai
 		}
 		s.failuresMu.Unlock()
 
-		// Default timeout: 45s base + 15s grace for network/server lag
-		timeout := 60 * time.Second
+		s.engine.mu.RLock()
+		execCfg := s.engine.cfg
+		s.engine.mu.RUnlock()
+
+		timeout := time.Duration(execCfg.ExecutionWatchdogTimeoutMs) * time.Millisecond
 		sessionID := event.SessionID
 
 		timer := time.AfterFunc(timeout, func() {

@@ -10,7 +10,7 @@ import {
 } from "./recovery.js";
 import { moveToGoal } from "../tasks/utils.js";
 import { log } from "../logger.js";
-import { ExecutionError } from "../tasks/primitives.js";
+import { ExecutionError } from "../errors.js";
 import { applyHesitation } from "./hesitation.js";
 
 export interface NavOpts {
@@ -18,11 +18,12 @@ export interface NavOpts {
     signal?: AbortSignal;
     stopMovement?: () => void;
     maxRetries?: number;
+    skipStop?: boolean; // New option to skip stop for fluidity
 }
 
 async function ensureKinematicStop(
     bot: Bot,
-    timeoutMs: number = 1500,
+    timeoutMs: number = 400, // Reduced from 1500 to 400ms
 ): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -84,19 +85,15 @@ export async function navigateWithFallbacks(
             opts.signal?.addEventListener("abort", onParentAbort);
 
             try {
-                if (attempts === 0) {
-                    await applyHesitation(bot);
-                }
-                
                 // Strategy Selection
                 if (attempts === 0) {
                     await moveToGoal(bot, goal, {
-                        timeoutMs: opts.timeoutMs ?? 15000,
+                        timeoutMs: opts.timeoutMs ?? 20000,
                         dynamic: false,
                         signal: strategySignal,
                         stopMovement: opts.stopMovement,
                     });
-                    await ensureKinematicStop(bot);
+                    if (!opts.skipStop) await ensureKinematicStop(bot);
                     return;
                 }
                 
@@ -122,7 +119,7 @@ export async function navigateWithFallbacks(
                 // After a recovery strategy, try pathfinding again if not yet at goal
                 const dist = tracker.getDistance(bot);
                 if (dist < 2) {
-                    await ensureKinematicStop(bot);
+                    if (!opts.skipStop) await ensureKinematicStop(bot);
                     return;
                 }
                 
@@ -131,7 +128,7 @@ export async function navigateWithFallbacks(
                 // Actually, let's explicitly try pathfinding after recovery.
                 log.info("Recovery complete, retrying pathfinder...");
                 await moveToGoal(bot, goal, {
-                    timeoutMs: 8000,
+                    timeoutMs: 12000,
                     dynamic: false,
                     signal: strategySignal,
                     stopMovement: opts.stopMovement,
@@ -166,7 +163,7 @@ export async function navigateWithFallbacks(
         }
     } finally {
         bot.clearControlStates();
-        await ensureKinematicStop(bot);
+        if (!opts.skipStop) await ensureKinematicStop(bot);
     }
 }
 

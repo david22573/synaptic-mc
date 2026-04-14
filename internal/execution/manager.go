@@ -137,6 +137,22 @@ func (m *ControllerManager) Dispatch(ctx context.Context, action domain.Action) 
 	return vc.Ctrl.Dispatch(ctx, action)
 }
 
+func (m *ControllerManager) Preload(ctx context.Context, action domain.Action) error {
+	vc := m.current.Load()
+	if vc == nil {
+		return errors.New("no active controller")
+	}
+	if vc.draining.Load() {
+		return ErrDraining
+	}
+
+	vc.active.Add(1)
+	defer vc.active.Done()
+
+	action.ControllerID = vc.ID
+	return vc.Ctrl.Preload(ctx, action)
+}
+
 func (m *ControllerManager) AbortCurrent(ctx context.Context, reason string) error {
 	vc := m.current.Load()
 	if vc == nil {

@@ -205,6 +205,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 
 func (tm *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
 	tm.logger.DebugContext(ctx, "Warm starting next task in background", slog.String("action", nextTask.Action))
+	tm.engine.Preload(ctx, *nextTask)
 }
 
 func (tm *TaskManager) IsIdle() bool {

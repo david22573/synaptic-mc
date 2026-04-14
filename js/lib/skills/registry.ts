@@ -1,27 +1,52 @@
 // js/lib/skills/registry.ts
 
+import vm from "node:vm";
+import { type Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import pkg from "mineflayer-pathfinder";
+
+const { goals } = pkg;
+
 export interface ExecutableSkill {
     name: string;
     description: string;
     js_code: string;
 }
 
-type SkillFunction = (bot: any, args: any) => Promise<void>;
+type SkillFunction = (bot: Bot, args: any) => Promise<void>;
 
 export class SkillRegistry {
     private skills: Map<string, SkillFunction> = new Map();
 
     /**
-     * Registers a new skill by compiling the JS string into an executable async function.
-     * The runtime injects the Mineflayer `bot` instance and task `args`.
+     * Registers a new skill by compiling the JS string into an executable async function
+     * using Node's vm module.
      */
     public register(skill: ExecutableSkill): void {
         try {
-            const fn = new Function(
-                "bot",
-                "args",
-                `return (async () => { ${skill.js_code} })();`,
-            ) as SkillFunction;
+            // Compile the script outside the execution to catch syntax errors early.
+            // We wrap it in an async function that receives the injected bindings.
+            const script = new vm.Script(
+                `(async (bot, args, goals, Vec3) => { ${skill.js_code} })`,
+            );
+
+            const fn: SkillFunction = async (bot: Bot, args: any) => {
+                const context = vm.createContext({
+                    console,
+                    // Optionally restrict available globals further here
+                });
+
+                // Run the script with a timeout to prevent infinite loops.
+                const compiledFn = script.runInContext(context, {
+                    timeout: 5000, // Compilation/setup timeout
+                });
+
+                // Execute the actual skill logic.
+                // Note: vm's timeout doesn't cover async execution time, 
+                // so the skill itself should handle internal timeouts/signals.
+                await compiledFn(bot, args, goals, Vec3);
+            };
+
             this.skills.set(skill.name, fn);
             console.log(
                 `[SkillRegistry] Registered executable skill: ${skill.name}`,
@@ -37,7 +62,7 @@ export class SkillRegistry {
     /**
      * Executes a retrieved skill by ID.
      */
-    public async execute(name: string, bot: any, args: any): Promise<void> {
+    public async execute(name: string, bot: Bot, args: any): Promise<void> {
         const skillFn = this.skills.get(name);
         if (!skillFn) {
             throw new Error(

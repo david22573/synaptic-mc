@@ -4,8 +4,14 @@ import pkg from "mineflayer-pathfinder";
 import * as models from "../models.js";
 import { type TaskContext, INTENT_EVALUATORS } from "./registry.js";
 import { log } from "../logger.js";
+import { BotController } from "../control/controller.js";
+
+interface BotWithController extends Bot {
+    controller: BotController;
+}
 
 import { handleGather } from "./handlers/gather.js";
+import { handleHunt } from "./handlers/hunt.js";
 import { handleCraft } from "./handlers/craft.js";
 import { handleBuild } from "./handlers/build.js";
 import { handleExplore } from "./handlers/explore.js";
@@ -20,7 +26,7 @@ import { handleRetrieve } from "./handlers/retrieve.js";
 import { handleUseSkill } from "./handlers/use_skill.js";
 
 import { navigateWithFallbacks } from "../movement/navigator.js";
-import { ExecutionError } from "./primitives.js";
+import { ExecutionError } from "../errors.js";
 import { Vec3 } from "vec3";
 
 const { goals } = pkg;
@@ -31,7 +37,7 @@ export interface ExecutionResult {
     progress: number;
 }
 
-function calculateDynamicTimeout(
+export function calculateDynamicTimeout(
     intent: models.ActionIntent,
     bot: Bot,
     baseTimeouts: Record<string, number>,
@@ -80,7 +86,8 @@ export async function runTask(
 
     try {
         // --- COMPOSITE TASK RUNNER ---
-        const steps = (intent as any).skill_steps || (intent as any).skillSteps;
+        const extIntent = intent as any;
+        const steps = extIntent.skill_steps || extIntent.skillSteps;
         if (steps && Array.isArray(steps) && steps.length > 0) {
             log.info(
                 `Executing composite task '${intent.action}' with ${steps.length} steps`,
@@ -129,7 +136,7 @@ export async function runTask(
 
         // --- CONTINUOUS LOOP BRIDGE ---
         if (INTENT_EVALUATORS[intent.action]) {
-            const controller = (bot as any).controller;
+            const controller = (bot as BotWithController).controller;
             if (!controller) {
                 throw new ExecutionError(
                     "BotController not initialized on bot instance",
@@ -146,8 +153,8 @@ export async function runTask(
                         clearInterval(check);
                         controller.setIntent({
                             action: "idle",
-                            target: { name: "none" },
-                        });
+                            target: { name: "none", type: "location" },
+                        } as models.ActionIntent);
                         resolve({
                             success: false,
                             cause: "aborted",
@@ -179,6 +186,9 @@ export async function runTask(
         switch (intent.action) {
             case "gather":
                 await handleGather(taskCtx);
+                break;
+            case "hunt":
+                await handleHunt(taskCtx);
                 break;
             case "craft":
                 await handleCraft(taskCtx);
@@ -350,15 +360,21 @@ export async function runTask(
                     target: pos,
                 });
 
+                // Force sprint and jump for maximum escape speed
+                bot.setControlState("sprint", true);
+                bot.setControlState("jump", true);
+
                 await navigateWithFallbacks(
                     bot,
                     new goals.GoalNearXZ(pos.x, pos.z, 2),
                     {
                         signal,
-                        timeoutMs: 15000,
+                        timeoutMs: 30000, // Increased timeout for long retreats
                         stopMovement,
                     },
                 );
+                bot.setControlState("sprint", false);
+                bot.setControlState("jump", false);
                 await waitForMs(1000, signal);
                 break;
             }

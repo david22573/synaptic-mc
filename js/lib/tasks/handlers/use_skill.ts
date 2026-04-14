@@ -1,8 +1,10 @@
 // js/lib/tasks/handlers/use_skill.ts
+import vm from "node:vm";
 import type { Bot } from "mineflayer";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
-import { ExecutionError } from "../primitives.js";
+import { ExecutionError } from "../../errors.js";
+import { TaskAbortError, isAbortError } from "../../errors.js";
 import type { TaskContext } from "../registry.js";
 import { log } from "../../logger.js";
 
@@ -13,10 +15,6 @@ interface SkillPayload {
     description: string;
     js_code: string;
 }
-
-// AsyncFunction constructor — lets us create async functions from strings at runtime.
-// Safer than eval(): the code gets its own scope, no access to local variables.
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 export async function handleUseSkill(ctx: TaskContext): Promise<void> {
     const { bot, intent, signal } = ctx;
@@ -79,34 +77,28 @@ export async function handleUseSkill(ctx: TaskContext): Promise<void> {
         codeLen: skillPayload.js_code.length,
     });
 
-    // Compile and execute.
-    // The skill code runs in an async context with bot, goals, Vec3, and signal in scope.
-    // It must NOT use require() or import — only the injected bindings.
-    let fn: (...args: any[]) => Promise<void>;
+    // Compile and execute in a vm context.
     try {
-        fn = new AsyncFunction(
-            "bot",
-            "goals",
-            "Vec3",
-            "signal",
-            skillPayload.js_code,
-        ) as (...args: any[]) => Promise<void>;
-    } catch (compileErr: any) {
-        throw new ExecutionError(
-            `Skill '${skillName}' failed to compile: ${compileErr.message}`,
-            "INVALID",
-            0,
+        const script = new vm.Script(
+            `(async (bot, goals, Vec3, signal) => { ${skillPayload.js_code} })`,
         );
-    }
 
-    try {
-        await fn(bot, goals, Vec3, signal);
-    } catch (runtimeErr: any) {
-        if (runtimeErr?.message === "aborted") {
-            throw new ExecutionError("aborted", "aborted", 0.5);
+        const context = vm.createContext({
+            console,
+            // Add other globals if necessary
+        });
+
+        const compiledFn = script.runInContext(context, {
+            timeout: 5000,
+        });
+
+        await compiledFn(bot, goals, Vec3, signal);
+    } catch (err: any) {
+        if (isAbortError(err)) {
+            throw new TaskAbortError("aborted", 0.5);
         }
         throw new ExecutionError(
-            `Skill '${skillName}' threw at runtime: ${runtimeErr.message}`,
+            `Skill '${skillName}' failed at runtime: ${err.message}`,
             "error",
             0,
         );

@@ -1,3 +1,6 @@
+import { type Bot } from "mineflayer";
+import { type Block } from "prismarine-block";
+import { type Item } from "prismarine-item";
 import {
     type FSMState,
     type StateContext,
@@ -7,6 +10,7 @@ import { type TaskContext } from "../registry.js";
 import { escapeTree, waitForMs } from "../utils.js";
 import { Runtime } from "../../control/runtime.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
+import { TaskAbortError, isAbortError } from "../../errors.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 
@@ -21,9 +25,9 @@ const CROP_DATA: Record<string, { matureAge: number; seedName: string }> = {
 
 interface FarmContext extends StateContext {
     targetCount: number;
-    candidatePositions: any[];
+    candidatePositions: Vec3[];
     currentIndex: number;
-    targetBlock: any;
+    targetBlock: Block | null;
     stopMovement: () => void;
 }
 
@@ -33,12 +37,13 @@ class ReplantState implements FSMState {
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const fCtx = ctx as FarmContext;
         const cropInfo = CROP_DATA[fCtx.targetName];
+        if (!fCtx.targetBlock) return null;
         const farmlandPos = fCtx.targetBlock.position.offset(0, -1, 0);
         const farmlandBlock = fCtx.bot.blockAt(farmlandPos);
         if (farmlandBlock && farmlandBlock.name === "farmland") {
             const seed = fCtx.bot.inventory
                 .items()
-                .find((i: any) => i.name === cropInfo!.seedName);
+                .find((i: Item) => i.name === cropInfo!.seedName);
             if (seed) {
                 try {
                     await fCtx.bot.equip(seed, "hand");
@@ -57,6 +62,7 @@ class HarvestState implements FSMState {
     async enter() {}
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const fCtx = ctx as FarmContext;
+        if (!fCtx.targetBlock) return null;
         const cropBlock = fCtx.bot.blockAt(fCtx.targetBlock.position);
         if (!cropBlock || cropBlock.name !== fCtx.targetName)
             return advanceToNextCrop(fCtx, "CROP_MISSING");
@@ -65,6 +71,7 @@ class HarvestState implements FSMState {
             await waitForMs(1000, fCtx.signal);
             return new ReplantState();
         } catch (err: any) {
+            if (isAbortError(err)) throw new TaskAbortError();
             return advanceToNextCrop(fCtx, `DIG_FAIL: ${err.message}`);
         }
     }
@@ -91,6 +98,7 @@ class NavigateCropState implements FSMState {
             );
             return new HarvestState();
         } catch (err: any) {
+            if (isAbortError(err)) throw new TaskAbortError();
             return advanceToNextCrop(fCtx, `PATH_FAIL: ${err.message}`);
         }
     }
@@ -116,7 +124,7 @@ class SearchCropState implements FSMState {
             count: 128,
         });
         const botPos = fCtx.bot.entity.position;
-        blocks = blocks.filter((pos: any) => {
+        blocks = blocks.filter((pos: Vec3) => {
             const block = fCtx.bot.blockAt(pos);
             return block && block.metadata === cropInfo.matureAge;
         });
@@ -128,7 +136,7 @@ class SearchCropState implements FSMState {
             return null;
         }
         blocks.sort(
-            (a: any, b: any) => a.distanceTo(botPos) - b.distanceTo(botPos),
+            (a: Vec3, b: Vec3) => a.distanceTo(botPos) - b.distanceTo(botPos),
         );
         fCtx.candidatePositions = blocks.slice(0, fCtx.targetCount);
         fCtx.currentIndex = 0;

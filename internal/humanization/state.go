@@ -37,12 +37,12 @@ func (s *State) Evolve(ctx Context, dt time.Duration) {
 	decay := s.cfg.AttentionDecay * dt.Seconds()
 	s.AttentionLevel -= decay
 
-	if ctx.State.Health < 15 || ctx.IsStuck {
+	if ctx.State.Health < s.cfg.CriticalHealthThreshold || ctx.IsStuck {
 		s.AttentionLevel = 1.0
 	}
 
-	if s.AttentionLevel < 0.2 {
-		s.AttentionLevel = 0.2
+	if s.AttentionLevel < s.cfg.MinAttentionLevel {
+		s.AttentionLevel = s.cfg.MinAttentionLevel
 	}
 }
 

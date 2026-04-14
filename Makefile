@@ -45,8 +45,8 @@ run-server: ## Run Go server (dev)
 run-bot: ## Run bot directly (dev)
 	cd js && npx tsx index.ts
 
-dev: ## Development mode (Go spawns bot)
-	go run cmd/server/*.go
+dev: ## Development mode (Go spawns bot with dev flags)
+	go run cmd/server/*.go -hesitation-ms=0 -noise-level=0.0 -ui=ui/dist
 
 clean: ## Clean everything
 	rm -rf js/dist ui/dist bin data

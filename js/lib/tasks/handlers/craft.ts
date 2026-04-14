@@ -1,4 +1,5 @@
 import { type TaskContext } from "../registry.js";
+import { type Block } from "prismarine-block";
 import { Runtime } from "../../control/runtime.js";
 import {
     findNearestBlockByName,
@@ -7,6 +8,7 @@ import {
     escapeTree,
 } from "../utils.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
+import { TaskAbortError, isAbortError, MissingResourceError } from "../../errors.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
@@ -31,6 +33,29 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
 
         let recipes = bot.recipesFor(itemType.id, null, 1, craftingTable);
 
+        // Emergency fallback: if requested a specific plank type but missing ingredients, check for ANY logs
+        if (recipes.length === 0 && (targetName.endsWith("_planks") || targetName === "oak_planks")) {
+            const LOG_TO_PLANK_MAP: Record<string, string> = {
+                oak_log: "oak_planks",
+                birch_log: "birch_planks",
+                spruce_log: "spruce_planks",
+                jungle_log: "jungle_planks",
+                acacia_log: "acacia_planks",
+                dark_oak_log: "dark_oak_planks",
+                mangrove_log: "mangrove_planks",
+                cherry_log: "cherry_planks",
+            };
+
+            const anyLog = bot.inventory.items().find(i => LOG_TO_PLANK_MAP[i.name]);
+            if (anyLog) {
+                const altPlanks = LOG_TO_PLANK_MAP[anyLog.name]!;
+                const altItemType = bot.registry.itemsByName[altPlanks];
+                if (altItemType) {
+                    recipes = bot.recipesFor(altItemType.id, null, 1, craftingTable);
+                }
+            }
+        }
+
         if (recipes.length === 0 && !craftingTable) {
             const hasTableInInv = bot.inventory
                 .items()
@@ -53,7 +78,8 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
         }
 
         if (recipes.length === 0) {
-            throw new Error(
+            throw new MissingResourceError(
+                targetName,
                 `MISSING_INGREDIENTS_OR_CRAFTING_TABLE_FOR_${targetName.toUpperCase()}`,
             );
         }
@@ -76,17 +102,17 @@ export async function handleCraft(ctx: TaskContext): Promise<void> {
                     },
                 );
             } catch (err: any) {
-                throw err.message === "aborted"
-                    ? err
-                    : new Error("FAILED_TO_REACH_TABLE");
+                if (isAbortError(err)) throw new TaskAbortError();
+                throw new Error("FAILED_TO_REACH_TABLE");
             }
         }
 
         try {
             await makeRoomInInventory(bot, 1);
             const tableToUse = recipe.requiresTable ? craftingTable : null;
-            await bot.craft(recipe, count, tableToUse);
+            await bot.craft(recipe, count, tableToUse as Block | undefined);
         } catch (err: any) {
+            if (isAbortError(err)) throw new TaskAbortError();
             throw new Error(`CRAFT_ACTION_FAILED: ${err.message}`);
         } finally {
             if (isPortableTable && craftingTable) {

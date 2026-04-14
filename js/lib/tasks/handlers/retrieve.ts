@@ -1,3 +1,6 @@
+import { type Bot, type Chest, type Dispenser } from "mineflayer";
+import { type Block } from "prismarine-block";
+import { type Item } from "prismarine-item";
 import {
     type FSMState,
     type StateContext,
@@ -7,6 +10,7 @@ import { type TaskContext } from "../registry.js";
 import { escapeTree } from "../utils.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
 import { Runtime } from "../../control/runtime.js";
+import { TaskAbortError, isAbortError } from "../../errors.js";
 import pkg from "mineflayer-pathfinder";
 
 const { goals } = pkg;
@@ -16,7 +20,7 @@ interface RetrieveContext extends StateContext {
     targetCount: number;
     collectedCount: number;
     checkedChests: Set<string>;
-    currentChest: any | null;
+    currentChest: Block | null;
     stopMovement: () => void;
 }
 
@@ -27,20 +31,21 @@ class WithdrawState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as RetrieveContext;
-        let chestWindow: any = null;
+        let chestWindow: Chest | Dispenser | null = null;
         let syncFailures = 0;
 
         try {
+            if (!sCtx.currentChest) return null;
             chestWindow = await sCtx.bot.openContainer(sCtx.currentChest);
             await new Promise((r) => setTimeout(r, 500));
 
             const items = chestWindow.containerItems();
             const targetItems = items.filter(
-                (i: any) => i.name === sCtx.targetName,
+                (i: Item) => i.name === sCtx.targetName,
             );
 
             for (const item of targetItems) {
-                if (sCtx.signal.aborted) throw new Error("aborted");
+                if (sCtx.signal.aborted) throw new TaskAbortError();
 
                 const needed = sCtx.targetCount - sCtx.collectedCount;
                 if (needed <= 0) break;
@@ -57,6 +62,7 @@ class WithdrawState implements FSMState {
 
                     syncFailures = 0;
                 } catch (err: any) {
+                    if (isAbortError(err)) throw new TaskAbortError();
                     syncFailures++;
                     if (syncFailures > 3) {
                         throw new Error(
@@ -66,12 +72,13 @@ class WithdrawState implements FSMState {
                 }
             }
         } catch (err: any) {
+            if (isAbortError(err)) {
+                sCtx.result = { status: "FAILED", reason: "aborted" };
+                return null;
+            }
             sCtx.result = {
                 status: "FAILED",
-                reason:
-                    err.message === "aborted"
-                        ? "aborted"
-                        : `RETRIEVE_FAILED: ${err.message}`,
+                reason: `RETRIEVE_FAILED: ${err.message}`,
             };
             return null;
         } finally {
@@ -98,6 +105,7 @@ class ApproachChestState implements FSMState {
 
     async execute(ctx: StateContext): Promise<FSMState | null> {
         const sCtx = ctx as RetrieveContext;
+        if (!sCtx.currentChest) return null;
         const cPos = sCtx.currentChest.position;
 
         try {
@@ -111,7 +119,7 @@ class ApproachChestState implements FSMState {
                 },
             );
         } catch (err: any) {
-            if (err.message === "aborted") {
+            if (isAbortError(err)) {
                 sCtx.result = { status: "FAILED", reason: "aborted" };
             } else {
                 return new LocateChestState();
@@ -181,7 +189,7 @@ export async function handleRetrieve(ctx: TaskContext): Promise<void> {
         currentChest: null,
         targetEntity: null,
         searchRadius: 0,
-        timeoutMs: timeouts.retrieve ?? 30000,
+        timeoutMs: timeouts.retrieve,
         startTime: 0,
         signal,
         stopMovement,

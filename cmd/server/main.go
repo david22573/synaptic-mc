@@ -111,18 +111,26 @@ func main() {
 	rtBus := domain.NewRealtimeBus()
 	uiHub := observability.NewHub(logger)
 
-	humanCfg := humanization.Config{
-		AttentionDecay: 0.08,
-		HesitationBase: time.Duration(cfg.HesitationMs) * time.Millisecond,
-		NoiseLevel:     cfg.NoiseLevel,
-		BaseDriftRate:  0.08,
-		MaxDriftDelay:  2 * time.Second,
-	}
-	humanizer := humanization.NewEngine(humanCfg)
+	dynFlags := config.NewDynamicFlags(cfg.ConfigPath, logger)
+	initialFlags := dynFlags.Get()
+
+	humanizer := humanization.NewEngine(humanization.MapToHumanizationConfig(initialFlags.Humanization))
 
 	stateSvc := state.NewService(eventBus, logger)
 	ctrlManager := execution.NewControllerManager()
-	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger)
+	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger, initialFlags.Execution)
+	
+	// Hot-reload loop
+	go func() {
+		sub := dynFlags.Subscribe()
+		for range sub {
+			newFlags := dynFlags.Get()
+			humanizer.UpdateConfig(humanization.MapToHumanizationConfig(newFlags.Humanization))
+			execEngine.UpdateConfig(newFlags.Execution)
+			logger.Info("Components updated with new feature flags")
+		}
+	}()
+
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
 
 	execService := execution.NewControlService(rtBus, eventBus, execEngine, taskManager, ctrlManager, humanizer, stateSvc, logger)
@@ -133,8 +141,6 @@ func main() {
 	worldModel := domain.NewWorldModel()
 	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore, worldModel)
 
-	dynFlags := config.NewDynamicFlags(cfg.ConfigPath, logger)
-
 	// Initialize the new SkillManager
 	skillManager := voyager.NewSkillManager(vectorStore, llmClient)
 
@@ -142,23 +148,12 @@ func main() {
 	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
 
 	planManager := decision.NewPlanManager()
-	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel)
-
-	decisionSvc := decision.NewService(cfg.SessionID, eventBus, plannerObj, planManager,
-		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
-	if decisionSvc == nil {
-		logger.Error("Failed to initialize decision service")
-		os.Exit(1)
-	}
-	plannerObj.SetOnPlanReady(decisionSvc.RequestEvaluation)
-	taskManager.OnDrain = decisionSvc.RequestEvaluation
-
+	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel, logger)
 	var latestStateUpdate atomic.Pointer[map[string]interface{}]
 
-	eventBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
-		var stateUpdate struct {
-			POIs []struct {
-				Name string      `json:"name"`
+	eventBus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+	        var stateUpdate struct {
+	                POIs []struct {				Name string      `json:"name"`
 				Type string      `json:"type"`
 				Pos  domain.Vec3 `json:"position"`
 			} `json:"pois"`
@@ -191,6 +186,9 @@ func main() {
 		select {
 		case eventWorkerCh <- ev:
 		default:
+			slog.Warn("Event worker channel full, dropping event", 
+				slog.String("type", string(ev.Type)),
+				slog.String("session", ev.SessionID))
 		}
 	})
 
@@ -212,6 +210,15 @@ func main() {
 	defer cancelRoot()
 
 	g, ctx := errgroup.WithContext(rootCtx)
+
+	decisionSvc := decision.NewService(ctx, cfg.SessionID, eventBus, plannerObj, planManager,
+		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
+	if decisionSvc == nil {
+		logger.Error("Failed to initialize decision service")
+		os.Exit(1)
+	}
+	plannerObj.SetOnPlanReady(decisionSvc.RequestEvaluation)
+	taskManager.OnDrain = decisionSvc.RequestEvaluation
 
 	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
@@ -437,7 +444,13 @@ func parseConfig() Config {
 	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
 	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
 	llmModel := flag.String("llm-model", getEnvOrDefault("LLM_MODEL", "llama3.2"), "LLM generation model name")
-	llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", "nomic-embed-text"), "LLM embedding model name")
+
+	defaultEmbed := "nomic-embed-text"
+	if strings.Contains(*llmURL, "openrouter.ai") {
+	        defaultEmbed = "openai/text-embedding-3-small"
+	}
+	llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", defaultEmbed), "LLM embedding model name")
+
 	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
 	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
 	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "./js/index.ts"), "Path to the compiled TS bot index.js")

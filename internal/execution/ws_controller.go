@@ -103,6 +103,39 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 	}
 }
 
+func (c *WSController) Preload(ctx context.Context, action domain.Action) error {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return errors.New("websocket closed")
+	}
+	c.mu.Unlock()
+
+	c.logger.Debug("Preloading action",
+		slog.String("action", action.Action),
+		slog.String("task_id", action.ID),
+	)
+
+	payload, err := json.Marshal(action)
+	if err != nil {
+		return err
+	}
+
+	msg := WSMessage{
+		Type:    "TASK_PRELOAD",
+		Payload: payload,
+	}
+
+	select {
+	case c.sendCh <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+		return errors.New("websocket send channel timeout")
+	}
+}
+
 func (c *WSController) AbortCurrent(ctx context.Context, reason string) error {
 	payload, _ := json.Marshal(map[string]string{"reason": reason})
 

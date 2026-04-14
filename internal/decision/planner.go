@@ -3,6 +3,7 @@ package decision
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/singleflight"
 
 	"david22573/synaptic-mc/internal/config"
@@ -23,6 +25,9 @@ import (
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/strategy"
 )
+
+//go:embed prompts/base_rules.tmpl
+var baseSystemRules string
 
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
@@ -50,8 +55,7 @@ type AdvancedPlanner struct {
 	latestState atomic.Pointer[domain.GameState]
 	isStuck     atomic.Bool
 
-	planCache map[string]cachedPlan
-	cacheMu   sync.RWMutex
+	planCache *lru.Cache[string, cachedPlan]
 	sf        singleflight.Group
 
 	failures map[string]int
@@ -69,7 +73,6 @@ func (p *AdvancedPlanner) SetMilestoneContext(ctx string) {
 type cachedPlan struct {
 	plan      *domain.Plan
 	createdAt time.Time
-	lastUsed  time.Time
 	cacheKey  string
 }
 
@@ -87,6 +90,12 @@ func NewAdvancedPlanner(
 	flags config.FeatureFlags,
 	skills domain.SkillRetriever,
 ) *AdvancedPlanner {
+	cache, err := lru.New[string, cachedPlan](maxPlanCacheSize)
+	if err != nil {
+		// Should not happen with positive size
+		panic(err)
+	}
+
 	return &AdvancedPlanner{
 		client:     client,
 		evaluator:  evaluator,
@@ -98,47 +107,11 @@ func NewAdvancedPlanner(
 		logger:     logger.With(slog.String("component", "advanced_planner")),
 		flags:      flags,
 		skills:     skills,
-		planCache:  make(map[string]cachedPlan),
+		planCache:  cache,
 		failures:   make(map[string]int),
 		replanChan: make(chan struct{}, 1),
 	}
 }
-
-const BaseSystemRules = `You are the tactical commander of an autonomous Minecraft agent.
-CRITICAL GAME MECHANIC RULES:
-1.  Progression MUST be: logs -> planks -> sticks -> crafting_table -> wooden_pickaxe.
-2.  You CANNOT gather stone or coal without a wooden_pickaxe.
-3.  Keep plans STRICTLY SHORT-HORIZON: 1 to 3 tasks MAXIMUM per candidate.
-4.  SURVIVAL: You CANNOT 'eat' if your inventory has no food.
-    You CANNOT 'hunt' if health is under 12.
-5.  CRAFTING RECIPES:
-      - oak_planks: requires 1 oak_log (yields 4)
-      - stick: requires 2 oak_planks (yields 4)
-      - crafting_table: requires 4 oak_planks
-      - wooden_pickaxe: requires 3 oak_planks + 2 stick + MUST HAVE crafting_table in inventory
-      - stone_pickaxe: requires 3 cobblestone + 2 stick + MUST HAVE crafting_table in inventory
-6.  If you lack prerequisites for an item, your tasks MUST include gathering/crafting those first.
-7.  SKILL UTILIZATION: If a relevant skill exists in AVAILABLE SKILLS, you MUST use it instead of raw actions. 
-    Set the action field to "use_skill" and the target.name field to the exact Skill ID.
-
-VALID TARGET TYPES: "block", "entity", "recipe", "location", "category", "none", "skill".
-VALID ACTIONS: gather, craft, hunt, explore, build, smelt, mine, farm, mark_location, recall_location, idle, sleep, retreat, eat, use_skill.
-OUTPUT REQUIREMENT (ADVANCED PLANNING):
-    You must generate ONE high-level objective, and exactly 2 to 3 DIFFERENT candidate task sequences to achieve that objective.
-    Make candidate 1 the most direct route, and candidate 2/3 alternative or safer routes.
-Response format (JSON only):
-    {
-    "objective": "Sub-goal description",
-    "candidates": [
-    [
-    { "id": "task-1", "action": "use_skill", "target": { "type": "skill", "name": "safe_woodcut_v1" }, "rationale": "Leverage known skill for gathering" }
-    ],
-    [
-    { "id": "task-2", "action": "explore", "target": { "type": "location", "name": "forest" }, "rationale": "Find a safer forest first" },
-    { "id": "task-3", "action": "gather", "target": { "type": "block", "name": "oak_log" }, "rationale": "Gather wood manually if skill fails" }
-    ]
-    ]
-    }`
 
 type multiCandidateResponse struct {
 	Objective  string            `json:"objective"`
@@ -413,33 +386,6 @@ func isFoodBlock(name string) bool {
 	return false
 }
 
-func (p *AdvancedPlanner) evictCache() {
-	p.cacheMu.Lock()
-	defer p.cacheMu.Unlock()
-
-	if len(p.planCache) < maxPlanCacheSize {
-		return
-	}
-
-	type entry struct {
-		key  string
-		used time.Time
-	}
-	entries := make([]entry, 0, len(p.planCache))
-	for k, v := range p.planCache {
-		entries = append(entries, entry{k, v.lastUsed})
-	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].used.Before(entries[j].used)
-	})
-
-	target := maxPlanCacheSize / 5
-	for i := 0; i < target && i < len(entries); i++ {
-		delete(p.planCache, entries[i].key)
-	}
-}
-
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	lastEventID, err := p.store.GetLastEventID(ctx, sessionID)
 	if err != nil {
@@ -451,13 +397,10 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	cacheKey := fmt.Sprintf("%s:%d:%d", sessionID, lastEventID, stateHash)
 	sfKey := cacheKey
 
-	p.cacheMu.RLock()
-	if entry, ok := p.planCache[cacheKey]; ok {
-		if time.Since(entry.createdAt) > 10*time.Second {
-			p.cacheMu.RUnlock()
-			p.cacheMu.Lock()
-			delete(p.planCache, cacheKey)
-			p.cacheMu.Unlock()
+	if entry, ok := p.planCache.Get(cacheKey); ok {
+		// Only invalidate cache if older than 30s OR state changed significantly
+		if time.Since(entry.createdAt) > 30*time.Second {
+			p.planCache.Remove(cacheKey)
 			goto cacheMiss
 		}
 
@@ -467,29 +410,17 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 		p.failMu.Unlock()
 
 		if fails == 0 {
-			p.cacheMu.RUnlock()
-			p.cacheMu.Lock()
-			if entry, ok := p.planCache[cacheKey]; ok {
-				entry.lastUsed = time.Now()
-				p.planCache[cacheKey] = entry
-			}
-			p.cacheMu.Unlock()
-
 			p.logger.Info("Using cached plan for stable state", slog.String("objective", cachedPlan.Objective))
 			return p.clonePlanWithNewIDs(cachedPlan), nil
 		}
 	}
-	p.cacheMu.RUnlock()
 
 cacheMiss:
 
 	val, err, _ := p.sf.Do(sfKey, func() (interface{}, error) {
-		p.cacheMu.RLock()
-		if entry, ok := p.planCache[cacheKey]; ok {
-			p.cacheMu.RUnlock()
+		if entry, ok := p.planCache.Get(cacheKey); ok {
 			return entry.plan, nil
 		}
-		p.cacheMu.RUnlock()
 
 		directive := p.evaluator.Evaluate(state)
 		learnedRules := ""
@@ -532,7 +463,7 @@ cacheMiss:
 		}
 
 		systemPrompt := fmt.Sprintf("%s\n\n%s\n\n%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
-			BaseSystemRules,
+			baseSystemRules,
 			p.milestoneContext,
 			tacticalFeedback,
 			learnedRules,
@@ -545,8 +476,12 @@ cacheMiss:
 
 		userContent := domain.FormatStateForLLM(state)
 
-		events, _ := p.store.GetRecentStream(ctx, sessionID, 100)
-		historySummary := p.client.CompressState(state, events)
+		events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
+		numEventsForCompress := 100
+		if len(events) < 100 {
+			numEventsForCompress = len(events)
+		}
+		historySummary := p.client.CompressState(state, events[:numEventsForCompress])
 		userContent = fmt.Sprintf("%s\n\nEXECUTION_HISTORY_SUMMARY:\n%s", userContent, historySummary)
 
 		rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)
@@ -572,7 +507,6 @@ cacheMiss:
 			}
 		}
 
-		events, _ = p.store.GetRecentStream(ctx, sessionID, 500)
 		stats := learning.CalculateActionStats(nil, events, p.logger)
 
 		p.failMu.Lock()
@@ -605,15 +539,11 @@ cacheMiss:
 			finalPlan.Fallbacks = append(finalPlan.Fallbacks, scored[i].tasks)
 		}
 
-		p.evictCache()
-		p.cacheMu.Lock()
-		p.planCache[cacheKey] = cachedPlan{
+		p.planCache.Add(cacheKey, cachedPlan{
 			plan:      finalPlan,
 			createdAt: time.Now(),
-			lastUsed:  time.Now(),
 			cacheKey:  cacheKey,
-		}
-		p.cacheMu.Unlock()
+		})
 
 		return finalPlan, nil
 	})
@@ -623,6 +553,12 @@ cacheMiss:
 	}
 
 	return p.clonePlanWithNewIDs(val.(*domain.Plan)), nil
+}
+
+func (p *AdvancedPlanner) WarmNextPlan(ctx context.Context, sessionID string, state domain.GameState) {
+	go func() {
+		_, _ = p.generateLLMPlan(ctx, sessionID, state)
+	}()
 }
 
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {

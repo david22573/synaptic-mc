@@ -128,9 +128,9 @@ func (h *Hub) Run(ctx context.Context) {
 			for client := range h.clients {
 				select {
 				case client.send <- message:
-				default:
-					h.logger.Warn("UI Client buffer full, scheduling drop")
-					// FIX: Non-blocking push to unregister channel without spawning excessive goroutines
+				case <-time.After(10 * time.Millisecond):
+					h.logger.Warn("UI Client write timed out, scheduling drop")
+					// Non-blocking push to unregister channel without spawning excessive goroutines
 					select {
 					case h.unregister <- client:
 					default:

@@ -1,9 +1,14 @@
+import { type Bot } from "mineflayer";
+import { type Block } from "prismarine-block";
+import { type Item } from "prismarine-item";
 import { type TaskContext } from "../registry.js";
 import { Runtime } from "../../control/runtime.js";
 import pkg from "mineflayer-pathfinder";
 import { log } from "../../logger.js";
 import { makeRoomInInventory } from "../utils.js";
 import { Vec3 } from "vec3";
+import { navigateWithFallbacks } from "../../movement/navigator.js";
+import { TaskAbortError, isAbortError, MissingResourceError } from "../../errors.js";
 
 const { goals } = pkg;
 
@@ -64,20 +69,22 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
 
         const inputItem = bot.inventory
             .items()
-            .find((item) => acceptedInputs.includes(item.name));
+            .find((item: Item) => acceptedInputs.includes(item.name));
 
         if (!inputItem || inputItem.count < targetCount) {
-            throw new Error(
+            throw new MissingResourceError(
+                acceptedInputs[0],
                 `MISSING_INGREDIENTS: Need at least ${targetCount} of ${acceptedInputs.join(" or ")}`,
             );
         }
 
         const fuelItem = bot.inventory
             .items()
-            .find((item) => FUEL_TYPES.includes(item.name));
+            .find((item: Item) => FUEL_TYPES.includes(item.name));
 
         if (!fuelItem) {
-            throw new Error(
+            throw new MissingResourceError(
+                "fuel",
                 "MISSING_INGREDIENTS: No valid fuel source in inventory",
             );
         }
@@ -92,16 +99,17 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         if (!furnaceBlock) {
             const furnaceInInv = bot.inventory
                 .items()
-                .find((item) => item.name === "furnace");
+                .find((item: Item) => item.name === "furnace");
 
             if (!furnaceInInv) {
-                throw new Error(
+                throw new MissingResourceError(
+                    "furnace",
                     "NO_FURNACE: No furnace nearby and none in inventory",
                 );
             }
 
             const refBlock = bot.findBlock({
-                matching: (b: any): boolean => {
+                matching: (b: Block): boolean => {
                     if (
                         !b ||
                         b.name === "air" ||
@@ -128,6 +136,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
                 placedFurnace = true;
             } catch (err: any) {
+                if (isAbortError(err)) throw new TaskAbortError();
                 throw new Error(
                     `PATH_FAILED: Could not place furnace - ${err.message}`,
                 );
@@ -146,44 +155,19 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
         }
 
         if (bot.entity.position.distanceTo(furnaceBlock.position) > 3) {
-            bot.pathfinder.setGoal(
+            await navigateWithFallbacks(
+                bot,
                 new goals.GoalBlock(
                     furnaceBlock.position.x,
                     furnaceBlock.position.y,
                     furnaceBlock.position.z,
                 ),
-                true,
+                {
+                    signal,
+                    timeoutMs: 30000,
+                    stopMovement,
+                },
             );
-
-            await new Promise<void>((resolve, reject) => {
-                const onGoal = () => {
-                    cleanup();
-                    resolve();
-                };
-                const onStop = (r: any) => {
-                    if (r.status === "noPath") {
-                        cleanup();
-                        reject(
-                            new Error("PATH_FAILED: Navigation interrupted"),
-                        );
-                    }
-                };
-                const onAbort = () => {
-                    cleanup();
-                    reject(new Error("TIMEOUT"));
-                };
-
-                const cleanup = () => {
-                    bot.removeListener("goal_reached", onGoal);
-                    bot.removeListener("path_update", onStop);
-                    signal.removeEventListener("abort", onAbort);
-                    stopMovement();
-                };
-
-                bot.on("goal_reached", onGoal);
-                bot.on("path_update", onStop);
-                signal.addEventListener("abort", onAbort);
-            });
         }
 
         const furnace = await bot.openFurnace(furnaceBlock);
@@ -191,7 +175,7 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
 
         try {
             while (collectedCount < targetCount) {
-                if (signal.aborted) throw new Error("TIMEOUT");
+                if (signal.aborted) throw new TaskAbortError();
 
                 if (
                     !furnace.fuelItem() &&
@@ -199,10 +183,11 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 ) {
                     const currentFuel = bot.inventory
                         .items()
-                        .find((item) => FUEL_TYPES.includes(item.name));
+                        .find((item: Item) => FUEL_TYPES.includes(item.name));
 
                     if (!currentFuel)
-                        throw new Error(
+                        throw new MissingResourceError(
+                            "fuel",
                             "MISSING_INGREDIENTS: Ran out of fuel during smelting",
                         );
 
@@ -212,10 +197,11 @@ export async function handleSmelt(ctx: TaskContext): Promise<void> {
                 if (!furnace.inputItem()) {
                     const currentInput = bot.inventory
                         .items()
-                        .find((item) => acceptedInputs.includes(item.name));
+                        .find((item: Item) => acceptedInputs.includes(item.name));
 
                     if (!currentInput)
-                        throw new Error(
+                        throw new MissingResourceError(
+                            acceptedInputs[0],
                             "MISSING_INGREDIENTS: Ran out of raw materials during smelting",
                         );
 

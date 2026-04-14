@@ -2,7 +2,8 @@
 import type { Bot } from "mineflayer";
 import type * as models from "../models.js";
 import { ActionPlan, Perception } from "../control/controller.js";
-import { evaluateHunt } from "./handlers/hunt.js";
+import { handleHunt, evaluateHunt } from "./handlers/hunt.js";
+import { handleGather } from "./handlers/gather.js";
 
 export interface TaskContext {
     bot: Bot;
@@ -20,7 +21,10 @@ export interface TaskContext {
 export type TaskHandler = (ctx: TaskContext) => Promise<void>;
 
 // Legacy FSM Handlers
-export const TASK_REGISTRY: Record<string, TaskHandler> = {};
+export const TASK_REGISTRY: Record<string, TaskHandler> = {
+    gather: handleGather,
+    hunt: handleHunt,
+};
 
 // Continuous Control Evaluators
 export type IntentEvaluator = (

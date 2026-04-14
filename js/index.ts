@@ -5,17 +5,23 @@ import { plugin as collectBlock } from "mineflayer-collectblock";
 import * as config from "./lib/config.js";
 import { log } from "./lib/logger.js";
 import * as models from "./lib/models.js";
-import { runTask } from "./lib/tasks/task.js";
+import { runTask, calculateDynamicTimeout } from "./lib/tasks/task.js";
 import { SynapticClient } from "./lib/network/client.js";
 import { SurvivalSystem } from "./lib/systems/survival.js";
+import { BotController } from "./lib/control/controller.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 import { getPOIs, clearPOICache } from "./lib/utils/perception.js";
+import { senseWorld } from "./lib/utils/world.js";
 
 const { pathfinder, Movements, goals } = pkg;
 
 let viewerStarted = false;
 
-function isValidPosition(pos: any): boolean {
+interface NetworkError extends Error {
+    code?: string;
+}
+
+function isValidPosition(pos: models.Vec3 | undefined): boolean {
     if (!pos) return false;
     const { x, y, z } = pos;
     return (
@@ -31,11 +37,12 @@ function isValidPosition(pos: any): boolean {
     );
 }
 
-const isIgnorableError = (err: Error | any): boolean => {
+const isIgnorableError = (err: NetworkError | unknown): boolean => {
     if (!err) return false;
-    const msg = String(err?.message || err?.stack || err);
-    const name = String(err?.name || "");
-    const code = String(err?.code || "");
+    const error = err as NetworkError;
+    const msg = String(error.message || error.stack || error);
+    const name = String(error.name || "");
+    const code = String(error.code || "");
 
     const protocolErrors =
         name.includes("PartialReadError") ||
@@ -64,11 +71,12 @@ const isIgnorableError = (err: Error | any): boolean => {
 };
 
 const originalConsoleError = console.error;
-console.error = (...args: any[]) => {
+console.error = (...args: unknown[]) => {
     const firstArg = args[0];
+    const error = firstArg as any;
     const msg =
         typeof firstArg === "object"
-            ? String(firstArg?.err?.message || firstArg?.message || "")
+            ? String(error?.err?.message || error?.message || "")
             : String(firstArg);
 
     if (
@@ -81,26 +89,28 @@ console.error = (...args: any[]) => {
     originalConsoleError.apply(console, args);
 };
 
-process.on("uncaughtException", (err: Error | any) => {
+process.on("uncaughtException", (err: Error) => {
     if (isIgnorableError(err)) return;
     log.error("Fatal uncaught exception", {
-        err: err?.message || String(err),
-        stack: err?.stack || "No stack trace available",
+        err: err.message || String(err),
+        stack: err.stack || "No stack trace available",
     });
     process.exit(1);
 });
 
-process.on("unhandledRejection", (reason: any) => {
+process.on("unhandledRejection", (reason: unknown) => {
     if (isIgnorableError(reason)) return;
     log.error("Unhandled promise rejection", { reason });
 });
 
 let currentTask: models.ActiveTask | null = null;
+let preloadedTask: models.ActionIntent | null = null;
 let taskAbortController: AbortController | null = null;
 
 let bot: mineflayer.Bot;
 let client: SynapticClient;
 let survival: SurvivalSystem;
+let controller: BotController;
 let runtimeConfig: config.Config;
 
 let lastDeathMessage: string = "unknown causes";
@@ -119,7 +129,6 @@ let lastProtocolLogAt = 0;
 
 let hasDied = false;
 
-const knownChests: Record<string, { name: string; count: number }[]> = {};
 let isPathfinding = false;
 let pathProgress = 0.0;
 
@@ -130,7 +139,9 @@ function stopMovement() {
         if (bot.pathfinder) {
             bot.pathfinder.setGoal(null);
         }
-    } catch (e) {}
+    } catch (e) {
+        log.debug("Failed to stop movement cleanly", { error: e });
+    }
 }
 
 function scheduleProtocolRecovery(reason: string) {
@@ -142,6 +153,7 @@ function scheduleProtocolRecovery(reason: string) {
     isBotSpawned = false;
     clearPOICache();
     survival?.reset();
+    controller?.stop();
     abortActiveTask("protocol_desync");
 
     log.warn("Protocol stream desynced; forcing reconnect", { reason });
@@ -179,22 +191,22 @@ function recordProtocolError(reason: string) {
     }
 }
 
-function handleBotProtocolError(err: Error | any) {
+function handleBotProtocolError(err: Error | unknown) {
     if (!err) return;
+    const error = err as Error;
 
-    const msg = String(err?.message || err?.stack || err);
-    const name = String(err?.name || "");
+    const msg = String(error.message || error.stack || error);
+    const name = String(error.name || "");
     const isProtocolError =
         name.includes("PartialReadError") ||
-        msg.includes("PartialReadError") ||
         msg.includes("VarInt") ||
         msg.includes("protodef") ||
         msg.includes("entity_metadata");
 
     if (!isProtocolError) {
         log.error("Bot runtime error", {
-            err: err?.message || String(err),
-            stack: err?.stack,
+            err: error.message || String(error),
+            stack: error.stack,
         });
         return;
     }
@@ -232,6 +244,14 @@ function completeTask(
         task.startTime,
         progress,
     );
+
+    // If we have a preloaded task and the previous one just finished, execute it immediately
+    if (preloadedTask && !currentTask && !isShuttingDown) {
+        const next = preloadedTask;
+        preloadedTask = null;
+        log.info("Immediate transition to preloaded task", { action: next.action });
+        void executeIntent(next);
+    }
 }
 
 function abortActiveTask(reason: string) {
@@ -244,8 +264,9 @@ function abortActiveTask(reason: string) {
     }
 }
 
-function normalizeFailureCause(err: any): string {
-    const msg = String(err?.message || err).toLowerCase();
+function normalizeFailureCause(err: unknown): string {
+    const error = err as Error;
+    const msg = String(error.message || error).toLowerCase();
     if (
         msg.includes("no path") ||
         msg.includes("path_fail") ||
@@ -269,8 +290,8 @@ function normalizeFailureCause(err: any): string {
     return "UNKNOWN";
 }
 
-async function executeAntiStuckReflex() {
-    if (!bot || !bot.entity || bot.health <= 0) return;
+async function executeAntiStuckReflex(signal?: AbortSignal) {
+    if (!bot || !bot.entity || bot.health <= 0 || signal?.aborted) return;
     log.warn("STUCK DETECTED in navigator: Triggering quick jump recovery");
 
     try {
@@ -280,6 +301,7 @@ async function executeAntiStuckReflex() {
         bot.setControlState(dir, true);
 
         await new Promise((r) => setTimeout(r, 500));
+        if (signal?.aborted) return;
         bot.clearControlStates();
 
         const pos = bot.entity.position.floored();
@@ -303,6 +325,7 @@ async function executeAntiStuckReflex() {
                 log.info(`Anti-stuck: Clearing obstacle ${block.name}`);
                 const tool = bot.pathfinder.bestHarvestTool(block);
                 if (tool) await bot.equip(tool.type, "hand");
+                if (signal?.aborted) return;
                 await bot.dig(block);
                 break;
             }
@@ -317,14 +340,7 @@ async function executeIntent(intent: models.ActionIntent) {
         if (!intent?.action || isShuttingDown) return;
 
         if (!bot || !bot.entity || bot.health <= 0 || !isBotSpawned) {
-            client.sendEvent(
-                "task_failed",
-                `${intent.action}`,
-                intent.target?.name || "none",
-                intent.id,
-                "INVALID_BOT_STATE",
-                Date.now(),
-            );
+            log.debug("Dropping intent: bot not alive/spawned", { action: intent.action });
             return;
         }
 
@@ -354,6 +370,7 @@ async function executeIntent(intent: models.ActionIntent) {
         isPathfinding = false;
         pathProgress = 0.0;
 
+        // EMIT IMMEDIATELY TO SYNC STATE
         client.sendEvent(
             "task_start",
             `${intent.action}`,
@@ -369,7 +386,7 @@ async function executeIntent(intent: models.ActionIntent) {
         try {
             const timeouts =
                 runtimeConfig.task_timeouts || config.TASK_TIMEOUTS;
-            const timeoutMs = timeouts[intent.action] || 30000;
+            const timeoutMs = calculateDynamicTimeout(intent, bot, timeouts);
 
             const result = await Promise.race([
                 runTask(
@@ -381,7 +398,7 @@ async function executeIntent(intent: models.ActionIntent) {
                     (t) => computeSafeRetreat(bot, t, 20),
                     stopMovement,
                 ),
-                new Promise<any>((_, r) => {
+                new Promise<models.ExecutionResult>((_, r) => {
                     timeoutId = setTimeout(() => {
                         localController.abort("timeout");
                         stopMovement();
@@ -414,24 +431,25 @@ async function executeIntent(intent: models.ActionIntent) {
                     completeTask(
                         activeTask,
                         "task_aborted",
-                        signal.reason || "preempted",
+                        String(signal.reason) || "preempted",
                         result?.progress ?? 0,
                     );
                 }
             }
-        } catch (err: any) {
-            if (!signal.aborted || err.message === "timeout") {
+        } catch (err: unknown) {
+            const error = err as Error;
+            if (!signal.aborted || error.message === "timeout") {
                 const normalizedCause = normalizeFailureCause(err);
                 log.warn(`Task failed: ${intent.action}`, {
                     cause: normalizedCause,
-                    error: err.message,
+                    error: error.message,
                 });
 
                 if (
                     normalizedCause === "STUCK" ||
                     normalizedCause === "TIMEOUT"
                 ) {
-                    await executeAntiStuckReflex();
+                    await executeAntiStuckReflex(signal);
                 }
 
                 pushState();
@@ -452,9 +470,10 @@ async function executeIntent(intent: models.ActionIntent) {
         } finally {
             if (timeoutId) clearTimeout(timeoutId);
         }
-    } catch (err: any) {
-        log.error("Uncaught intent execution error", { err });
-        client.sendPanic(err instanceof Error ? err : new Error(String(err)));
+    } catch (err: unknown) {
+        const error = err as Error;
+        log.error("Uncaught intent execution error", { err: error });
+        client.sendPanic(error instanceof Error ? error : new Error(String(err)));
     }
 }
 
@@ -472,9 +491,9 @@ function pushState() {
               .sort()
               .join(",")
         : "";
-    const px = hasValidPos ? Math.round(pos.x) : 0;
-    const py = hasValidPos ? Math.round(pos.y) : 0;
-    const pz = hasValidPos ? Math.round(pos.z) : 0;
+    const px = hasValidPos ? Math.round(pos.x!) : 0;
+    const py = hasValidPos ? Math.round(pos.y!) : 0;
+    const pz = hasValidPos ? Math.round(pos.z!) : 0;
 
     const sig = `${bot.health}|${bot.food}|${px},${py},${pz}|${inventoryItems}`;
     if (sig === lastStateSig && now - lastStatePushTime < 2000) return;
@@ -483,6 +502,7 @@ function pushState() {
     lastStatePushTime = now;
 
     const liveThreats = getThreats(bot);
+    const world = senseWorld(bot, liveThreats);
 
     const state: models.GameState = {
         health: Math.round(bot.health || 0),
@@ -522,12 +542,15 @@ function pushState() {
             name: t.name,
             distance: t.distance,
         })),
+        feedback: world.feedback,
         current_task: currentTask,
         task_progress: isPathfinding
             ? pathProgress
             : bot.pathfinder?.isMoving()
               ? 0.5
               : 0,
+        danger_zones: world.dangerZones,
+        terrain_roughness: world.terrainRoughness,
     };
 
     client.sendState(state);
@@ -542,7 +565,9 @@ async function connectWithRetry(maxAttempts = 10) {
         try {
             bot.removeAllListeners();
             bot.quit();
-        } catch (e) {}
+        } catch (e) {
+            log.debug("Bot quit error", { error: e });
+        }
     }
 
     const mcVersion = process.env.MC_VERSION || undefined;
@@ -560,17 +585,28 @@ async function connectWithRetry(maxAttempts = 10) {
     bot.loadPlugin(collectBlock);
     bot.on("error", handleBotProtocolError);
 
+    controller = new BotController(bot, () => getThreats(bot));
+    (bot as any).controller = controller;
+
     if (!client) {
         client = new SynapticClient({
             url: runtimeConfig.bot_ws_url || runtimeConfig.ws_url,
         });
-        client.on("dispatch", (i) => {
+        client.on("dispatch", (i: models.ActionIntent) => {
             log.info("Received task dispatch", {
                 action: i.action,
                 target: i.target?.name,
                 id: i.id,
             });
             void executeIntent(i);
+        });
+        client.on("preload", (i: models.ActionIntent) => {
+            log.info("Received task preload", {
+                action: i.action,
+                target: i.target?.name,
+                id: i.id,
+            });
+            preloadedTask = i;
         });
         client.on("abort", (payload?: { reason?: string }) => {
             const reason = payload?.reason || "unlock";
@@ -649,9 +685,13 @@ async function connectWithRetry(maxAttempts = 10) {
         movements.allowFreeMotion = true;
 
         bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = 5000;
+        bot.pathfinder.thinkTimeout = 20000;
+
+        // Auto-satiate for testing to ensure sprinting isn't blocked by hunger
+        bot.chat("/effect give @s saturation infinite 255 true");
 
         survival.start();
+        controller.start();
         lastStateSig = "";
         lastStatePushTime = 0;
         pushState();
@@ -695,16 +735,26 @@ async function connectWithRetry(maxAttempts = 10) {
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
     await connectWithRetry();
+    
+    // Change-driven push + heartbeat
     stateInterval = setInterval(pushState, 3000);
+    
+    // High-frequency polling for change-driven pushes
+    setInterval(() => {
+        if (isBotSpawned && bot.entity) {
+            pushState();
+        }
+    }, 250);
 }
 
 process.on("SIGINT", () => {
     isShuttingDown = true;
+    if (controller) controller.stop();
     if (bot) bot.quit();
     process.exit(0);
 });
 
-bootstrap().catch((err) => {
+bootstrap().catch((err: Error) => {
     log.error("Fatal startup", { err: err.message });
     process.exit(1);
 });

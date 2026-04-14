@@ -1,3 +1,6 @@
+import { type Bot } from "mineflayer";
+import { type Entity } from "prismarine-entity";
+import { type Block } from "prismarine-block";
 import {
     type FSMState,
     type StateContext,
@@ -7,6 +10,7 @@ import { type TaskContext } from "../registry.js";
 import { escapeTree } from "../utils.js";
 import { Runtime } from "../../control/runtime.js";
 import { navigateWithFallbacks } from "../../movement/navigator.js";
+import { TaskAbortError, isAbortError } from "../../errors.js";
 import { log } from "../../logger.js";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
@@ -15,7 +19,10 @@ const { goals } = pkg;
 
 const MAX_HISTORY_POINTS = 50;
 
+type BotWithHistory = Bot & { explorationHistory?: { x: number; z: number }[] };
+
 interface ExploreContext extends StateContext {
+    bot: BotWithHistory;
     targetX: number;
     targetZ: number;
     attempts: number;
@@ -33,8 +40,8 @@ class NavigateState implements FSMState {
 
         const checkForTargets = () => {
             if (eCtx.targetName === "food_source") {
-                const food = eCtx.bot.nearestEntity((e: any) => 
-                    ["pig", "cow", "sheep", "chicken", "rabbit"].includes(e.name) && 
+                const food = eCtx.bot.nearestEntity((e: Entity) => 
+                    ["pig", "cow", "sheep", "chicken", "rabbit"].includes(e.name!) && 
                     eCtx.bot.entity.position.distanceTo(e.position) < 16
                 );
                 if (food) {
@@ -42,7 +49,7 @@ class NavigateState implements FSMState {
                     return true;
                 }
                 const bush = eCtx.bot.findBlock({
-                    matching: (b: any) => b && b.name === "sweet_berry_bush" && b.metadata >= 2,
+                    matching: (b: Block) => b && b.name === "sweet_berry_bush" && b.metadata >= 2,
                     maxDistance: 16
                 });
                 if (bush) {
@@ -75,9 +82,9 @@ class NavigateState implements FSMState {
                     timeoutMs: 25000, // Increased timeout
                     stopMovement: eCtx.stopMovement,
                     maxRetries: 4, // Increased retries
+                    skipStop: true, // Skip stop for fluidity
                 },
             );
-
             eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
                 z: eCtx.bot.entity.position.z,
@@ -91,20 +98,18 @@ class NavigateState implements FSMState {
             return null;
         } catch (err: any) {
             clearInterval(targetCheckInterval);
-            const msg = String(err?.message ?? err);
-
-            if (combinedSignal.aborted || msg.includes("aborted")) {
+            if (isAbortError(err)) {
                 eCtx.result = { status: "FAILED", reason: "aborted" };
                 return null;
             }
 
-            if (msg.includes("target_found")) {
+            if (err?.message === "target_found" || err === "target_found") {
                 eCtx.result = { status: "SUCCESS", reason: "TARGET_FOUND" };
                 return null;
             }
 
             log.warn("Exploration path failed, picking new direction", {
-                reason: msg,
+                reason: err?.message || String(err),
             });
 
             return new PickDirectionState();
@@ -243,7 +248,7 @@ export async function handleExplore(ctx: TaskContext): Promise<void> {
 
         const fsmCtx: ExploreContext = {
             bot,
-            targetName: "explore",
+            targetName: intent.target?.name || "explore",
             targetEntity: null,
             searchRadius: 0,
             timeoutMs: timeouts.explore ?? 25000,

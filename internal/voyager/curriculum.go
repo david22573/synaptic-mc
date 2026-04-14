@@ -3,6 +3,7 @@ package voyager
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -12,6 +13,12 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/memory"
 )
+
+//go:embed prompts/curriculum.tmpl
+var curriculumSystemPrompt string
+
+//go:embed prompts/synthesis.tmpl
+var codeSynthesisSystemPrompt string
 
 // LLMClient is the minimal interface this package needs from the LLM layer.
 type LLMClient interface {
@@ -51,35 +58,10 @@ func NewAutonomousCurriculum(client LLMClient, vector VectorStore, memStore memo
 // ProposeTask — unchanged contract, same as before.
 // ────────────────────────────────────────────────────────────────────────────
 
-const SystemPrompt = `You are the Curriculum Agent for an autonomous Minecraft bot.
-Your job is to evaluate the current Game State, review recent task history and progression status, and propose an optimal plan to advance the bot's progression or ensure its survival.
-
-CRITICAL RULES:
-1.  SURVIVAL FIRST: If health < 10, your plan MUST be 'eat' or 'retreat'.
-2.  PREREQUISITES: You cannot mine stone without a wooden_pickaxe. You cannot craft a pickaxe without sticks and planks.
-3.  COUNT: The 'count' field determines how many of the target item the bot will attempt to gather/craft. Keep it reasonable (1-10).
-4.  STORAGE: If inventory is full, use the 'store' action to put items in a chest.
-5.  RETRIEVAL: If you need an item and it is in a known chest, use the 'retrieve' action.
-6.  BUILDING: If you need physical protection through the night, use the 'build' action with target 'shelter'.
-7.  SKILLS: If an 'AVAILABLE SKILL' is perfect for this task, use action: "use_skill" and set "target" to the skill name.
-
-AVAILABLE ACTIONS: "gather", "craft", "mine", "smelt", "hunt", "explore", "eat", "retreat", "store", "retrieve", "build", "farm", "use_skill"
-
-OUTPUT FORMAT (Strict JSON, no markdown):
-{
-	"id": "intent-123",
-	"rationale": "Brief explanation of why this is the best next step.",
-	"action": "gather",
-	"target": "oak_log",
-	"count": 5
-}`
-
 func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.GameState, mem []domain.TaskHistory, milestoneContext, sessionID string, horizon int) (*domain.ActionIntent, error) {
 	if state.Health <= 0 {
 		return nil, fmt.Errorf("bot is dead, waiting for respawn")
 	}
-
-	systemPrompt := SystemPrompt
 
 	var historyStrs []string
 	recentHistory := mem
@@ -154,7 +136,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 	var parseErr error
 
 	for attempt := 0; attempt < 3; attempt++ {
-		rawResponse, genErr := c.client.Generate(ctx, systemPrompt, userContent)
+		rawResponse, genErr := c.client.Generate(ctx, curriculumSystemPrompt, userContent)
 		if genErr != nil {
 			return nil, fmt.Errorf("llm api failure: %w", genErr)
 		}
@@ -173,6 +155,8 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			}
 			break
 		}
+		// LOG FAILURE FOR DEBUGGING
+		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nRaw Response: %s\nParse Error: %v\n", attempt, rawResponse, parseErr)
 		userContent += fmt.Sprintf("\n\nSYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
@@ -191,27 +175,6 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 // Implements CodeSynthesizer. Service calls this via type assertion, so the
 // Curriculum interface itself doesn't change.
 // ────────────────────────────────────────────────────────────────────────────
-
-const codeSynthesisSystem = `You are a Minecraft bot programmer. Your output will be executed directly by a Mineflayer bot runtime.
-
-RUNTIME CONTEXT:
-- Your code runs inside an async function body.
-- The following bindings are injected into scope:
-  - bot      — the Mineflayer bot instance
-  - goals    — mineflayer-pathfinder goals (GoalBlock, GoalNear, GoalNearXZ, GoalFollow, GoalLookAtBlock, GoalY, GoalXZ)
-  - Vec3     — the prismarine-math Vec3 class
-  - signal   — an AbortSignal; check signal.aborted periodically in long loops
-
-RULES:
-1. Do NOT use require() or import. All necessary APIs are already in scope via bot.* and the injected bindings.
-2. Navigation: await bot.pathfinder.goto(goal) — use goals.GoalNear, goals.GoalBlock, etc.
-3. Mining: const block = bot.findBlock({ matching: ..., maxDistance: 64 }); await bot.dig(block);
-4. Inventory: bot.inventory.items() — returns Item[]; each item has .name, .count, .type
-5. Collecting drops: await bot.collectBlock.collect(block) — preferred over manual dig+pickup
-6. Throw errors with descriptive ALL_CAPS strings: throw new Error('NO_LOGS_FOUND')
-7. Check signal.aborted in any loop: if (signal.aborted) throw new Error('aborted')
-8. Keep code under 80 lines. Prefer simple, linear logic over complex error recovery.
-9. Output ONLY the JavaScript code body — no function declaration wrapper, no markdown fences.`
 
 // SynthesizeCode asks the LLM to write JavaScript that implements the given completed intent.
 // before/after are passed so the LLM can see what actually changed and write accurate code.
@@ -245,7 +208,7 @@ The code should handle the case where the target might not be immediately visibl
 		before.Health, after.Health,
 	)
 
-	rawCode, err := c.client.Generate(ctx, codeSynthesisSystem, userContent)
+	rawCode, err := c.client.Generate(ctx, codeSynthesisSystemPrompt, userContent)
 	if err != nil {
 		return "", fmt.Errorf("code synthesis llm failure: %w", err)
 	}
