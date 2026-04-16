@@ -31,6 +31,7 @@ var baseSystemRules string
 
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
 	CompressState(state domain.GameState, events []domain.DomainEvent) string
 	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
 }
@@ -114,8 +115,10 @@ func NewAdvancedPlanner(
 }
 
 type multiCandidateResponse struct {
-	Objective  string            `json:"objective"`
-	Candidates [][]domain.Action `json:"candidates"`
+	StrategicGoal string            `json:"strategic_goal"`
+	Subgoals      []string          `json:"subgoals"`
+	Objective     string            `json:"objective"`
+	Candidates    [][]domain.Action `json:"candidates"`
 }
 
 func hashState(state domain.GameState) uint64 {
@@ -163,6 +166,12 @@ func (p *AdvancedPlanner) Close() {
 
 func (p *AdvancedPlanner) SetOnPlanReady(cb func()) {
 	p.onPlanReady = cb
+}
+
+func (p *AdvancedPlanner) SetFailures(failures map[string]int) {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	p.failures = failures
 }
 
 func (p *AdvancedPlanner) RecordFailure(objective string) {
@@ -222,7 +231,10 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 			p.currentPlan.Store(plan)
 			lastPlannedState = *activeState
-			p.logger.Info("Background replan complete", slog.String("objective", plan.Objective))
+			p.logger.Info("Background replan complete",
+				slog.String("strategic_goal", plan.StrategicGoal),
+				slog.Any("subgoals", plan.Subgoals),
+				slog.String("objective", plan.Objective))
 			if p.onPlanReady != nil {
 				go p.onPlanReady()
 			}
@@ -239,7 +251,7 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 	}
 }
 
-func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
+func (p *AdvancedPlanner) FastPlan(ctx context.Context, state domain.GameState) domain.Plan {
 	current := p.currentPlan.Load()
 
 	if current != nil {
@@ -257,7 +269,7 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 	if current != nil && len(current.Tasks) > 0 {
 		return *current
 	}
-	return p.reactivePlan(state)
+	return p.reactivePlan(ctx, state)
 }
 
 func (p *AdvancedPlanner) degradedPlan(state domain.GameState, failureCount int) domain.Plan {
@@ -275,7 +287,7 @@ func (p *AdvancedPlanner) degradedPlan(state domain.GameState, failureCount int)
 	}
 }
 
-func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
+func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameState) domain.Plan {
 	var tasks []domain.Action
 	hasFood := false
 	hasImmediateThreat := false
@@ -305,38 +317,73 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 		}
 	}
 
+	// A-5: Steer toward safe zones and known POIs
+	currentZoneCost := 0.0
+	if p.worldModel != nil {
+		currentZoneCost = p.worldModel.GetZoneCost(domain.Location{X: state.Position.X, Y: state.Position.Y, Z: state.Position.Z})
+	}
+
+	knownNodes := []memory.WorldNode{}
+	if p.memStore != nil {
+		knownNodes, _ = p.memStore.GetNearbyNodes(ctx, state.Position, 5)
+	}
+
+	// Action Weights for priority adjustment
+	getWeight := func(action string) float64 {
+		if p.worldModel == nil {
+			return 0
+		}
+		return p.worldModel.GetActionWeight(action)
+	}
+
 	switch {
-	case hasImmediateThreat:
+	case hasImmediateThreat || currentZoneCost > 2.0:
+		action := "retreat"
+		weight := getWeight(action)
+		priority := int(100 + (weight * 5))
+		
+		// If current zone is bad, but we have no immediate threat, "explore" might be better to find a better zone
+		if !hasImmediateThreat && currentZoneCost > 2.0 {
+			action = "explore"
+		}
+
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-heal-%d", time.Now().UnixNano()),
-			Action:    "retreat",
+			Action:    action,
 			Target:    domain.Target{Name: "none", Type: "none"},
-			Priority:  100,
-			Rationale: "Reactive fast-path fallback: Survival Critical",
+			Priority:  priority,
+			Rationale: fmt.Sprintf("Reactive fast-path fallback: Survival Critical (Zone Cost: %.1f)", currentZoneCost),
 		})
 	case state.Health < domain.DecisionHealthSafe && hasFood:
+		action := "eat"
+		weight := getWeight(action)
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-eat-%d", time.Now().UnixNano()),
-			Action:    "eat",
+			Action:    action,
 			Target:    domain.Target{Name: "best_food", Type: "item"},
-			Priority:  95,
+			Priority:  int(95 + (weight * 5)),
 			Rationale: "Reactive fast-path fallback: Recover health with available food",
 		})
 	case state.Health < domain.SurvivalCriticalHealth || state.Food < 12.0:
-		if nearbyFoodEntity != "" && state.Health > 8.0 {
+		// Prioritize actions that have been successful
+		huntWeight := getWeight("hunt")
+		gatherWeight := getWeight("gather")
+		exploreWeight := getWeight("explore")
+
+		if nearbyFoodEntity != "" && state.Health > 8.0 && huntWeight >= -1.0 {
 			tasks = append(tasks, domain.Action{
 				ID:        fmt.Sprintf("react-hunt-%d", time.Now().UnixNano()),
 				Action:    "hunt",
 				Target:    domain.Target{Name: nearbyFoodEntity, Type: "entity"},
-				Priority:  90,
+				Priority:  int(90 + (huntWeight * 5)),
 				Rationale: "Reactive fast-path: Hunt nearby food source",
 			})
-		} else if nearbyFoodBlock != "" {
+		} else if nearbyFoodBlock != "" && gatherWeight >= -1.0 {
 			tasks = append(tasks, domain.Action{
 				ID:        fmt.Sprintf("react-gather-%d", time.Now().UnixNano()),
 				Action:    "gather",
 				Target:    domain.Target{Name: nearbyFoodBlock, Type: "block"},
-				Priority:  90,
+				Priority:  int(90 + (gatherWeight * 5)),
 				Rationale: "Reactive fast-path: Gather nearby berry bush",
 			})
 		} else {
@@ -344,25 +391,44 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 				ID:        fmt.Sprintf("react-food-%d", time.Now().UnixNano()),
 				Action:    "explore",
 				Target:    domain.Target{Name: "food_source", Type: "category"},
-				Priority:  85,
+				Priority:  int(85 + (exploreWeight * 5)),
 				Rationale: "Reactive fast-path fallback: Seek food or resources",
 			})
 		}
 	}
 
+	// Use known POIs if we are stuck or idle
 	if len(tasks) == 0 {
+		for _, node := range knownNodes {
+			if node.Type == "chest" && state.Food < 15.0 {
+				tasks = append(tasks, domain.Action{
+					ID:        fmt.Sprintf("react-poi-%d", time.Now().UnixNano()),
+					Action:    "retrieve",
+					Target:    domain.Target{Name: "food", Type: "item"},
+					Priority:  40,
+					Rationale: fmt.Sprintf("Stable state: retrieving food from known %s", node.Name),
+				})
+				break
+			}
+		}
+	}
+
+	if len(tasks) == 0 {
+		exploreWeight := getWeight("explore")
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-explore-%d", time.Now().UnixNano()),
 			Action:    "explore",
 			Target:    domain.Target{Name: "surroundings", Type: "category"},
-			Priority:  5,
+			Priority:  int(5 + (exploreWeight * 2)),
 			Rationale: "Reactive fast-path: Stable state, exploring surroundings while waiting for next plan",
 		})
 	}
 
 	return domain.Plan{
-		Objective: "Reactive Fallback Plan",
-		Tasks:     tasks,
+		StrategicGoal: "Survival & Stabilization",
+		Subgoals:      []string{"React to immediate threats", "Recover vital stats", "Maintain situational awareness"},
+		Objective:     "Reactive Fallback Plan",
+		Tasks:         tasks,
 	}
 }
 
@@ -476,6 +542,24 @@ cacheMiss:
 
 		userContent := domain.FormatStateForLLM(state)
 
+		stats, statsLastID, err := learning.GetProjectedStats(ctx, p.store, sessionID, p.logger)
+		if err != nil {
+			p.logger.Warn("Failed to get projected stats, using empty", slog.Any("error", err))
+			stats = make(map[string]*learning.ActionStats)
+		}
+
+		// Periodically save snapshot to bound delta processing time
+		if statsLastID > 0 && statsLastID%100 == 0 {
+			go func(sid string, lid int64, s map[string]*learning.ActionStats) {
+				data, _ := json.Marshal(s)
+				_ = p.store.SaveSnapshot(context.Background(), domain.SessionSnapshot{
+					SessionID:   sid,
+					LastEventID: lid,
+					Data:        data,
+				})
+			}(sessionID, statsLastID, stats)
+		}
+
 		events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
 		numEventsForCompress := 100
 		if len(events) < 100 {
@@ -507,8 +591,6 @@ cacheMiss:
 			}
 		}
 
-		stats := learning.CalculateActionStats(nil, events, p.logger)
-
 		p.failMu.Lock()
 		failureCount := p.failures[parsed.Objective]
 		p.failMu.Unlock()
@@ -518,7 +600,7 @@ cacheMiss:
 			score float64
 		}
 		for _, candidate := range parsed.Candidates {
-			score := p.scoreCandidate(candidate, state, stats, failureCount)
+			score := p.scoreCandidate(ctx, candidate, state, stats, failureCount)
 			scored = append(scored, struct {
 				tasks []domain.Action
 				score float64
@@ -530,9 +612,11 @@ cacheMiss:
 		})
 
 		finalPlan := &domain.Plan{
-			ID:        fmt.Sprintf("plan-%d", time.Now().UnixNano()),
-			Objective: parsed.Objective,
-			Tasks:     scored[0].tasks,
+			ID:            fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			StrategicGoal: parsed.StrategicGoal,
+			Subgoals:      parsed.Subgoals,
+			Objective:     parsed.Objective,
+			Tasks:         scored[0].tasks,
 		}
 
 		for i := 1; i < len(scored); i++ {
@@ -563,9 +647,11 @@ func (p *AdvancedPlanner) WarmNextPlan(ctx context.Context, sessionID string, st
 
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {
 	clone := &domain.Plan{
-		ID:        fmt.Sprintf("cached-plan-%d", time.Now().UnixNano()),
-		Objective: original.Objective,
-		Tasks:     make([]domain.Action, len(original.Tasks)),
+		ID:            fmt.Sprintf("cached-plan-%d", time.Now().UnixNano()),
+		StrategicGoal: original.StrategicGoal,
+		Subgoals:      original.Subgoals,
+		Objective:     original.Objective,
+		Tasks:         make([]domain.Action, len(original.Tasks)),
 	}
 
 	now := time.Now().UnixNano()
@@ -586,43 +672,88 @@ func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Pla
 	return clone
 }
 
-func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats, failureCount int) float64 {
+func (p *AdvancedPlanner) scoreCandidate(ctx context.Context, tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats, failureCount int) float64 {
 	if len(tasks) == 0 {
 		return 0
 	}
 
-	score := 100.0
-	weights := p.flags.Weights
-
-	score -= float64(failureCount) * 15.0
-
-	explorationBonus := weights.ExplorationBonus
-	if failureCount >= 2 {
-		explorationBonus *= 2.5
-	}
-
-	hasExplored := false
+	var totalReward float64
+	var totalUnlock float64
 	var totalRisk float64
+	var totalCost float64
+	urgency := p.calculateUrgency(state)
 
 	for _, t := range tasks {
-		if t.Action == "hunt" {
-			totalRisk += weights.RiskPenalty
-		}
-		if t.Action == "mine" {
-			totalRisk += (weights.RiskPenalty / 2.0)
-		}
+		reward, unlock := domain.GetItemUtility(t.Target.Name)
+		totalReward += reward
+		totalUnlock += unlock
 
+		// Risk assessment
+		actionRisk := 0.0
+		if t.Action == "hunt" {
+			actionRisk = 20.0
+		} else if t.Action == "mine" {
+			actionRisk = 10.0
+		}
+		
+		// WorldModel zone cost contributes to risk
+		if p.worldModel != nil {
+			zoneCost := p.worldModel.GetZoneCost(domain.Location{X: state.Position.X, Y: state.Position.Y, Z: state.Position.Z})
+			actionRisk += zoneCost * 5.0
+		}
+		totalRisk += actionRisk
+
+		// Cost assessment (distance + resources)
+		totalCost += p.estimateDistanceCost(ctx, t, state)
+
+		// Survival chance based on learning
 		if stat, ok := stats[t.Action]; ok && stat.Attempts > 0 {
-			probability := stat.SuccessRate
-			score += (probability * weights.SuccessWeight)
-			score -= ((1.0 - probability) * (weights.SuccessWeight + 10.0))
-		} else if !hasExplored {
-			score += explorationBonus
-			hasExplored = true
+			// Probability reduces the overall utility if low
+			totalReward *= stat.SuccessRate
+			totalUnlock *= stat.SuccessRate
 		}
 	}
 
-	score -= (totalRisk / float64(len(tasks)))
+	// Penalty for repeating failures
+	penalty := math.Min(float64(failureCount)*25.0, 80.0)
+
+	score := totalReward + totalUnlock - totalRisk - totalCost + urgency - penalty
+
+	if score < 0 {
+		score = 0
+	}
 
 	return score
 }
+
+func (p *AdvancedPlanner) calculateUrgency(state domain.GameState) float64 {
+	urgency := 0.0
+	if state.Health < 10 {
+		urgency += (10 - state.Health) * 10.0
+	}
+	if state.Food < 10 {
+		urgency += (10 - state.Food) * 5.0
+	}
+	if len(state.Threats) > 0 {
+		urgency += 20.0
+	}
+	return urgency
+}
+
+func (p *AdvancedPlanner) estimateDistanceCost(ctx context.Context, action domain.Action, state domain.GameState) float64 {
+	// If it's a known POI in memory, we can estimate distance
+	if p.memStore != nil && action.Target.Name != "" {
+		nodes, _ := p.memStore.GetNearbyNodes(ctx, state.Position, 10)
+		for _, n := range nodes {
+			if strings.Contains(strings.ToLower(n.Name), strings.ToLower(action.Target.Name)) {
+				dx, dy, dz := n.Pos.X-state.Position.X, n.Pos.Y-state.Position.Y, n.Pos.Z-state.Position.Z
+				dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+				return dist * 0.1 // 1 utility point per 10 blocks
+			}
+		}
+	}
+	
+	// Default cost for unknown distance
+	return 5.0
+}
+

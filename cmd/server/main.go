@@ -116,10 +116,10 @@ func main() {
 
 	humanizer := humanization.NewEngine(humanization.MapToHumanizationConfig(initialFlags.Humanization))
 
-	stateSvc := state.NewService(eventBus, logger)
+	stateSvc := state.NewService(eventBus, memoryStore, logger)
 	ctrlManager := execution.NewControllerManager()
 	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger, initialFlags.Execution)
-	
+
 	// Hot-reload loop
 	go func() {
 		sub := dynFlags.Subscribe()
@@ -145,15 +145,16 @@ func main() {
 	skillManager := voyager.NewSkillManager(vectorStore, llmClient)
 
 	// Inject skillManager into AdvancedPlanner
-	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
+	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, nil, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
 
 	planManager := decision.NewPlanManager()
 	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel, logger)
 	var latestStateUpdate atomic.Pointer[map[string]interface{}]
 
 	eventBus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
-	        var stateUpdate struct {
-	                POIs []struct {				Name string      `json:"name"`
+		var stateUpdate struct {
+			POIs []struct {
+				Name string      `json:"name"`
 				Type string      `json:"type"`
 				Pos  domain.Vec3 `json:"position"`
 			} `json:"pois"`
@@ -177,21 +178,39 @@ func main() {
 	}))
 
 	eventWorkerCh := make(chan domain.DomainEvent, 1024)
-
+	criticalWorkerCh := make(chan domain.DomainEvent, 512)
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		if ev.Type == "" {
 			return
 		}
 
-		select {
-		case eventWorkerCh <- ev:
-		default:
-			slog.Warn("Event worker channel full, dropping event", 
-				slog.String("type", string(ev.Type)),
-				slog.String("session", ev.SessionID))
+		isCritical := ev.Type == domain.EventTypeTaskStart ||
+			ev.Type == domain.EventTypeTaskEnd ||
+			ev.Type == domain.EventTypePlanCreated ||
+			ev.Type == domain.EventTypePlanInvalidated ||
+			ev.Type == domain.EventTypePlanCompleted ||
+			ev.Type == domain.EventTypePlanFailed
+
+		if isCritical {
+			select {
+			case criticalWorkerCh <- ev:
+			case <-time.After(10 * time.Millisecond):
+				observability.Metrics.DroppedEvents.Inc()
+				slog.Warn("CRITICAL event worker channel full, dropping event",
+					slog.String("type", string(ev.Type)),
+					slog.String("session", ev.SessionID))
+			}
+		} else {
+			select {
+			case eventWorkerCh <- ev:
+			default:
+				observability.Metrics.DroppedEvents.Inc()
+				slog.Warn("Event worker channel full, dropping event",
+					slog.String("type", string(ev.Type)),
+					slog.String("session", ev.SessionID))
+			}
 		}
 	})
-
 	eventTypes := []domain.EventType{
 		domain.EventTypeStateTick, domain.EventTypeStateUpdated,
 		domain.EventTypeTaskStart, domain.EventTypeTaskEnd,
@@ -212,13 +231,43 @@ func main() {
 	g, ctx := errgroup.WithContext(rootCtx)
 
 	decisionSvc := decision.NewService(ctx, cfg.SessionID, eventBus, plannerObj, planManager,
-		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
+		curriculum, critic, stateSvc, execService, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
 	}
 	plannerObj.SetOnPlanReady(decisionSvc.RequestEvaluation)
 	taskManager.OnDrain = decisionSvc.RequestEvaluation
+
+	processEvent := func(ctx context.Context, ev domain.DomainEvent, eventStore domain.EventStore, logger *slog.Logger, latestStateUpdate *atomic.Pointer[map[string]interface{}], uiHub *observability.Hub) {
+		if err := eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
+			logger.Error("Failed to store event", slog.Any("error", err), slog.String("type", string(ev.Type)))
+		}
+
+		var payloadObj interface{}
+		if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
+			logger.Error("Failed to unmarshal event payload for UI broadcast",
+				slog.Any("error", err),
+				slog.String("event_type", string(ev.Type)),
+				slog.String("session_id", ev.SessionID))
+			return
+		}
+
+		broadcastEv := map[string]interface{}{
+			"type":      string(ev.Type),
+			"payload":   payloadObj,
+			"timestamp": ev.CreatedAt.Format(time.Kitchen),
+		}
+
+		isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
+
+		if isState {
+			evCopy := broadcastEv
+			latestStateUpdate.Store(&evCopy)
+		} else {
+			uiHub.Broadcast("EVENT_STREAM", broadcastEv)
+		}
+	}
 
 	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
@@ -227,36 +276,16 @@ func main() {
 				select {
 				case <-ctx.Done():
 					return nil
+				case ev, ok := <-criticalWorkerCh:
+					if !ok {
+						return nil
+					}
+					processEvent(ctx, ev, eventStore, logger, &latestStateUpdate, uiHub)
 				case ev, ok := <-eventWorkerCh:
 					if !ok {
 						return nil
 					}
-
-					_ = eventStore.Append(context.Background(), ev.SessionID, ev.Trace, ev.Type, ev.Payload)
-
-					var payloadObj interface{}
-					if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
-						logger.Error("Failed to unmarshal event payload for UI broadcast",
-							slog.Any("error", err),
-							slog.String("event_type", string(ev.Type)),
-							slog.String("session_id", ev.SessionID))
-						continue
-					}
-
-					broadcastEv := map[string]interface{}{
-						"type":      string(ev.Type),
-						"payload":   payloadObj,
-						"timestamp": ev.CreatedAt.Format(time.Kitchen),
-					}
-
-					isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
-
-					if isState {
-						evCopy := broadcastEv
-						latestStateUpdate.Store(&evCopy)
-					} else {
-						uiHub.Broadcast("EVENT_STREAM", broadcastEv)
-					}
+					processEvent(ctx, ev, eventStore, logger, &latestStateUpdate, uiHub)
 				}
 			}
 		})
@@ -447,7 +476,7 @@ func parseConfig() Config {
 
 	defaultEmbed := "nomic-embed-text"
 	if strings.Contains(*llmURL, "openrouter.ai") {
-	        defaultEmbed = "openai/text-embedding-3-small"
+		defaultEmbed = "openai/text-embedding-3-small"
 	}
 	llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", defaultEmbed), "LLM embedding model name")
 
@@ -531,7 +560,7 @@ func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBu
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			logger.Error("Bot WS up grade failed", slog.Any("error", err))
+			logger.Error("Bot WS upgrade failed", slog.Any("error", err))
 			return
 		}
 

@@ -26,6 +26,7 @@ type Directive struct {
 // LLMClient is the minimal interface this package needs.
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
 }
 
 // Evaluator produces a Directive from the current game state.

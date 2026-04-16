@@ -86,7 +86,7 @@ export class SurvivalSystem {
             (immediateThreats.length > 0 ? immediateThreats[0]!.name : null);
 
         if (panicCause) {
-            const topThreat = immediateThreats[0]!;
+            const topThreat = immediateThreats[0] ?? null;
 
             // If we're panicking or in cooldown, let the current escape plan play out
             if (this.isPanicking || Date.now() < this.panicCooldownUntil)

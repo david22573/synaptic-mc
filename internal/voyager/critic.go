@@ -3,6 +3,7 @@ package voyager
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -11,13 +12,13 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// Critic interface — unchanged.
+// Critic interface — evaluates task outcomes.
 type Critic interface {
-	Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, string)
+	Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, *domain.Reflection)
 }
 
 // StateCritic evaluates task results. It now accepts an optional LLMClient;
-// if provided, failed tasks get LLM-generated critiques instead of generic messages.
+// if provided, failed tasks get LLM-generated reflections instead of generic messages.
 type StateCritic struct {
 	llm LLMClient // optional — set via NewStateCriticWithLLM
 }
@@ -32,26 +33,34 @@ func NewStateCriticWithLLM(client LLMClient) *StateCritic {
 }
 
 // Evaluate checks whether a task succeeded using state diffs, then optionally
-// calls the LLM for a nuanced critique on failure.
-func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, string) {
+// calls the LLM for a nuanced reflection on failure.
+func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, *domain.Reflection) {
 	// Fast-path: execution layer already reported failure with a cause.
 	if !result.Success {
-		baseCritique := fmt.Sprintf("Task '%s' failed. Cause: %s.", intent.Action, result.Cause)
+		refl := &domain.Reflection{
+			Failure: fmt.Sprintf("Task '%s' failed", intent.Action),
+			Cause:   result.Cause,
+			Score:   0.0,
+		}
 		if failureCount >= 2 {
-			baseCritique += fmt.Sprintf(" This is failure #%d — the current approach is deadlocked. Rethink the entire sequence.", failureCount)
+			refl.Fix = "Current approach is deadlocked. Try a completely different strategy or location."
 		}
 		// Enrich with LLM if available.
 		if c.llm != nil {
-			enriched := c.llmCritique(context.Background(), intent, before, after, result, failureCount)
-			if enriched != "" {
+			if enriched := c.llmReflection(context.Background(), intent, before, after, result, failureCount); enriched != nil {
 				return false, enriched
 			}
 		}
-		return false, baseCritique
+		return false, refl
 	}
 
 	if after.Health <= 0 {
-		return false, "Bot died during execution. Re-evaluate threat assessment and survival priorities."
+		return false, &domain.Reflection{
+			Failure: "Bot died during execution",
+			Cause:   "Lethal damage taken",
+			Fix:     "Prioritize armor or avoid hostiles in this area",
+			Score:   0.0,
+		}
 	}
 
 	// Heuristic state-diff checks (fast, no LLM needed for successes).
@@ -59,76 +68,102 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 	afterInv := inventoryMap(after)
 	target := strings.ToLower(strings.TrimSpace(intent.Target))
 
+	successRefl := &domain.Reflection{Score: 1.0}
+
 	switch intent.Action {
 	case "mine", "gather", "farm":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount >= bCount+intent.Count {
-			return true, fmt.Sprintf("Verified: gathered %d %s.", aCount-bCount, intent.Target)
+			return true, successRefl
 		}
 		if aCount > bCount {
-			return true, fmt.Sprintf("Partial: gathered %d %s (wanted %d).", aCount-bCount, intent.Target, intent.Count)
+			return true, &domain.Reflection{Score: 0.7, Cause: "Partial success: gathered fewer items than requested"}
 		}
-		critique := fmt.Sprintf("State diff failed: inventory for '%s' unchanged at %d. Item may have dropped without pickup.", intent.Target, bCount)
+		
+		refl := &domain.Reflection{
+			Failure: "Inventory unchanged",
+			Cause:   fmt.Sprintf("State diff for '%s' failed", intent.Target),
+			Fix:     "Ensure tools are correct and blocks are reachable",
+			Score:   0.0,
+		}
 		if c.llm != nil {
-			if enriched := c.llmCritique(context.Background(), intent, before, after, result, failureCount); enriched != "" {
+			if enriched := c.llmReflection(context.Background(), intent, before, after, result, failureCount); enriched != nil {
 				return false, enriched
 			}
 		}
-		return false, critique
+		return false, refl
 
 	case "craft":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Verified craft: %s increased %d→%d.", intent.Target, bCount, aCount)
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Craft state diff failed: '%s' count did not increase. Check prerequisites and crafting table proximity.", intent.Target)
+		return false, &domain.Reflection{
+			Failure: "Craft failed",
+			Cause:   "Inventory count did not increase",
+			Fix:     "Verify ingredients and proximity to crafting table",
+			Score:   0.0,
+		}
 
 	case "smelt":
 		expectedOutput := getSmeltOutput(target)
 		bCount := beforeInv[expectedOutput]
 		aCount := afterInv[expectedOutput]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Verified smelt: output '%s' increased.", expectedOutput)
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Smelt output '%s' not verified. Check furnace, fuel, and proximity.", expectedOutput)
+		return false, &domain.Reflection{
+			Failure: "Smelt failed",
+			Cause:   "Output item not detected",
+			Fix:     "Ensure fuel is in furnace and you are standing close enough to receive item",
+			Score:   0.0,
+		}
 
 	case "hunt":
 		if after.Health < before.Health && after.Health < 10 {
-			return true, "Hunt completed with critical damage taken — high risk."
+			return true, &domain.Reflection{Score: 0.5, Cause: "Hunt succeeded but with critical health loss"}
 		}
-		return true, "Hunt resolved — survival verified by health delta."
+		return true, successRefl
 
 	case "store":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount < bCount || target == "all" || target == "dump" {
-			return true, "Store verified: items removed from local inventory."
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Store failed: inventory count for '%s' unchanged.", intent.Target)
+		return false, &domain.Reflection{
+			Failure: "Store failed",
+			Cause:   "Items still in inventory",
+			Score:   0.0,
+		}
 
 	case "retrieve":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Retrieve verified: '%s' increased.", intent.Target)
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Retrieve failed: no increase in '%s'.", intent.Target)
+		return false, &domain.Reflection{
+			Failure: "Retrieve failed",
+			Cause:   "No new items in inventory",
+			Score:   0.0,
+		}
 
 	case "eat":
 		if after.Food > before.Food || after.Health > before.Health {
-			return true, "Eat verified: food/health delta is positive."
+			return true, successRefl
 		}
-		return false, "Eat failed: no change in food or health."
+		return false, &domain.Reflection{Failure: "Eat failed", Cause: "No change in food or health", Score: 0.0}
 
 	case "build":
 		beforeTotal := totalItems(beforeInv)
 		afterTotal := totalItems(afterInv)
 		if afterTotal < beforeTotal {
-			return true, fmt.Sprintf("Build verified: %d resources consumed.", beforeTotal-afterTotal)
+			return true, successRefl
 		}
-		return false, "Build failed: no resource consumption detected."
+		return false, &domain.Reflection{Failure: "Build failed", Cause: "No blocks consumed from inventory", Score: 0.0}
 
 	case "explore", "retreat":
 		dx := after.Position.X - before.Position.X
@@ -136,32 +171,37 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 		dz := after.Position.Z - before.Position.Z
 		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
 		if dist > 3.0 {
-			return true, fmt.Sprintf("Movement verified: displaced %.1f blocks.", dist)
+			return true, successRefl
 		}
-		return false, "Stagnant position: bot moved less than 3 blocks. Pathing may be blocked."
+		return false, &domain.Reflection{Failure: "Stagnant position", Cause: "Bot moved less than 3 blocks", Fix: "Check for obstacles or stuck pathfinding", Score: 0.0}
 
 	case "use_skill":
-		// For synthesized skills, trust the execution result; no heuristic available.
-		return true, fmt.Sprintf("Skill '%s' executed without runtime error.", intent.Target)
+		return true, successRefl
 	}
 
-	return true, fmt.Sprintf("%s executed — general state integrity maintained.", intent.Action)
+	return true, successRefl
 }
 
-// llmCritique sends the full execution context to the LLM for a nuanced failure analysis.
-// Returns an empty string if the LLM call fails, so the caller can fall back to heuristic text.
-func (c *StateCritic) llmCritique(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) string {
+// llmReflection sends the full execution context to the LLM for a nuanced failure analysis.
+func (c *StateCritic) llmReflection(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) *domain.Reflection {
 	if c.llm == nil {
-		return ""
+		return nil
 	}
 
-	systemPrompt := `You are the Critic for an autonomous Minecraft bot. Analyze why a task failed and give precise, actionable feedback.
+	systemPrompt := `You are the Ruthless Critic for an autonomous Minecraft bot. 
+Analyze why a task failed and return a JSON reflection object.
+Format:
+{
+  "failure": "concise description of the failure",
+  "cause": "root cause analysis (e.g., night travel no shield)",
+  "fix": "better next strategy (e.g., sleep before travel)",
+  "score": 0.0
+}
 Rules:
-- Be concise (2-4 sentences max).
+- Be brutally honest and precise.
 - Identify the root cause, not just the symptom.
-- If the failure repeats, suggest a completely different approach.
 - Do NOT suggest actions outside the available set: gather, craft, mine, smelt, hunt, explore, eat, retreat, store, retrieve, build, farm, use_skill.
-- Output plain text only — no JSON, no markdown.`
+- Output strictly JSON.`
 
 	userContent := fmt.Sprintf(`FAILED TASK:
 Action: %s | Target: %s | Count: %d
@@ -175,7 +215,7 @@ Inventory: %s
 STATE AFTER:
 Health: %.0f/20, Food: %.0f/20, Position: (%.0f, %.0f, %.0f)
 
-Why did this fail, and what should the bot do differently?`,
+Reflect on this failure.`,
 		intent.Action, intent.Target, intent.Count,
 		failureCount,
 		result.Cause,
@@ -184,14 +224,19 @@ Why did this fail, and what should the bot do differently?`,
 		after.Health, after.Food, after.Position.X, after.Position.Y, after.Position.Z,
 	)
 
-	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx2, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
-	response, err := c.llm.Generate(ctx2, systemPrompt, userContent)
+	response, err := c.llm.GenerateText(ctx2, systemPrompt, userContent)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(response)
+
+	var refl domain.Reflection
+	if err := json.Unmarshal([]byte(domain.CleanJSON(response)), &refl); err != nil {
+		return nil
+	}
+	return &refl
 }
 
 // GenerateRules is kept for interface compatibility but now delegates to the LLM.
@@ -208,7 +253,7 @@ Focus on rules the bot frequently violates. Plain text only, no markdown headers
 	ctx2, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
-	response, err := c.llm.Generate(ctx2, systemPrompt,
+	response, err := c.llm.GenerateText(ctx2, systemPrompt,
 		"Generate the most critical rules for a Minecraft bot to survive and progress efficiently.")
 	if err != nil {
 		return staticSurvivalRules()

@@ -7,10 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
-	"net/url"
-	"strings"
+	"sync"
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
@@ -24,17 +22,26 @@ type Config struct {
 	MaxRetries int
 }
 
+type StateSummary struct {
+	LastAction string         `json:"last_action"`
+	Outcome    string         `json:"outcome"`
+	Failures   []string       `json:"recent_failures"`
+	Variables  map[string]any `json:"vars"`
+}
+
 type Client struct {
 	config Config
 	http   *http.Client
+
+	// Circuit breaker state
+	mu          sync.Mutex
+	errorCount  int
+	lastError   time.Time
+	circuitOpen bool
+	openUntil   time.Time
 }
 
-type StateSummary struct {
-	LastAction string `json:"last_action"`
-	Outcome    string `json:"outcome"`
-	Failures   []string `json:"recent_failures"`
-	Variables  map[string]any `json:"vars"`
-}
+var ErrCircuitOpen = fmt.Errorf("llm circuit is open")
 
 func NewClient(cfg Config) *Client {
 	return &Client{
@@ -42,6 +49,40 @@ func NewClient(cfg Config) *Client {
 		http: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+	}
+}
+
+func (c *Client) IsCircuitOpen() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.circuitOpen && time.Now().After(c.openUntil) {
+		c.circuitOpen = false
+		c.errorCount = 0
+	}
+	return c.circuitOpen
+}
+
+func (c *Client) recordSuccess() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errorCount = 0
+	c.circuitOpen = false
+}
+
+func (c *Client) recordError() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if now.Sub(c.lastError) > 30*time.Second {
+		c.errorCount = 1
+	} else {
+		c.errorCount++
+	}
+	c.lastError = now
+
+	if c.errorCount >= 3 {
+		c.circuitOpen = true
+		c.openUntil = now.Add(60 * time.Second)
 	}
 }
 
@@ -55,7 +96,7 @@ func (c *Client) CompressState(state domain.GameState, events []domain.DomainEve
 	}
 
 	const maxFailureChars = 64
-	const maxKeyItems = 5
+	const maxKeyItems = 10
 
 	// 1. Extract recent failures (last 3 unique reasons), truncated for token efficiency
 	seenFailures := make(map[string]bool)
@@ -86,231 +127,156 @@ func (c *Client) CompressState(state domain.GameState, events []domain.DomainEve
 		}
 	}
 
-	// 2. Filter variables for immediate decision making (stricter set)
+	// 2. Extract critical state variables
 	summary.Variables["health"] = int(state.Health)
 	summary.Variables["food"] = int(state.Food)
-	summary.Variables["stuck"] = len(summary.Failures) > 0
+	summary.Variables["pos"] = fmt.Sprintf("%.0f,%.0f,%.0f", state.Position.X, state.Position.Y, state.Position.Z)
 
-	// 3. Inventory compression (only key tools/resources, capped count)
-	tools := make([]string, 0)
-	for _, item := range state.Inventory {
-		if len(tools) >= maxKeyItems {
-			break
+	if len(state.Inventory) > 0 {
+		inv := make([]string, 0, maxKeyItems)
+		for _, item := range state.Inventory {
+			if item.Count > 0 {
+				inv = append(inv, fmt.Sprintf("%s:%d", item.Name, item.Count))
+			}
+			if len(inv) >= maxKeyItems {
+				break
+			}
 		}
-		name := strings.ToLower(item.Name)
-		if strings.Contains(name, "pickaxe") || strings.Contains(name, "axe") ||
-			strings.Contains(name, "sword") || strings.Contains(name, "table") ||
-			strings.Contains(name, "log") || strings.Contains(name, "plank") ||
-			strings.Contains(name, "stick") {
-			tools = append(tools, fmt.Sprintf("%s:%d", item.Name, item.Count))
-		}
+		summary.Variables["inv"] = inv
 	}
-	summary.Variables["inv"] = tools
 
+	if len(state.Threats) > 0 {
+		summary.Variables["threats"] = len(state.Threats)
+	}
+
+	// 3. Serialize to compact JSON
 	b, _ := json.Marshal(summary)
-	res := string(b)
-	
-	// Final character cap to ensure context window safety (approx 250-300 tokens max)
-	if len(res) > 1000 {
-		return res[:997] + "..."
-	}
-	return res
+	return string(b)
 }
 
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	genCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
+	if c.IsCircuitOpen() {
+		return "", ErrCircuitOpen
+	}
 
-	payload := map[string]any{
-		"model": c.config.Model,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": userContent},
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type request struct {
+		Model    string    `json:"model"`
+		Messages []message `json:"messages"`
+	}
+
+	reqBody := request{
+		Model: c.config.Model,
+		Messages: []message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userContent},
 		},
-		"response_format": map[string]string{"type": "json_object"},
-		"temperature":     0.2,
 	}
 
-	jsonPayload, err := json.Marshal(payload)
+	data, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL, bytes.NewBuffer(data))
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal generation payload: %w", err)
+		return "", err
 	}
-	return c.doRequest(genCtx, c.config.APIURL, jsonPayload)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.recordError()
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.recordError()
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("llm api error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	c.recordSuccess()
+
+	type response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	var res response
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+
+	if len(res.Choices) == 0 {
+		return "", fmt.Errorf("no choices returned from llm")
+	}
+
+	return res.Choices[0].Message.Content, nil
+}
+
+func (c *Client) GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	return c.Generate(ctx, systemPrompt, userContent)
 }
 
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
-	parsedURL, err := url.Parse(c.config.APIURL)
+	if c.IsCircuitOpen() {
+		return nil, ErrCircuitOpen
+	}
+
+	type request struct {
+		Model string `json:"model"`
+		Input string `json:"input"`
+	}
+
+	reqBody := request{
+		Model: c.config.EmbedModel,
+		Input: input,
+	}
+
+	data, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL+"/embeddings", bytes.NewBuffer(data))
 	if err != nil {
-		return nil, fmt.Errorf("invalid APIURL configured: %w", err)
+		return nil, err
 	}
 
-	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/chat/completions")
-	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/completions")
-	if !strings.HasSuffix(parsedURL.Path, "/embeddings") {
-		if !strings.HasSuffix(parsedURL.Path, "/") && parsedURL.Path != "" {
-			parsedURL.Path += "/"
-		}
-		parsedURL.Path += "embeddings"
-	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 
-	embedURL := parsedURL.String()
-
-	embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	payload := map[string]any{
-		"model": c.config.EmbedModel,
-		"input": input,
-	}
-
-	jsonPayload, err := json.Marshal(payload)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal embedding payload: %w", err)
+		c.recordError()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.recordError()
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("llm embedding api error (%d): %s", resp.StatusCode, string(body))
 	}
 
-	var lastErr error
-	baseDelay := 500 * time.Millisecond
+	c.recordSuccess()
 
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		select {
-		case <-embedCtx.Done():
-			return nil, fmt.Errorf("request cancelled or timed out: %w", embedCtx.Err())
-		default:
-		}
-
-		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-embedCtx.Done():
-				return nil, fmt.Errorf("request cancelled or timed out during backoff: %w", embedCtx.Err())
-			case <-time.After(baseDelay + jitter):
-			}
-			baseDelay *= 2
-		}
-
-		req, err := http.NewRequestWithContext(embedCtx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.config.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				return nil, lastErr
-			}
-			continue
-		}
-
-		var result struct {
-			Data []struct {
-				Embedding []float32 `json:"embedding"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			return nil, fmt.Errorf("failed to decode response: %w", err)
-		}
-
-		if len(result.Data) == 0 {
-			return nil, fmt.Errorf("empty embedding array returned")
-		}
-
-		return result.Data[0].Embedding, nil
+	type response struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
 	}
 
-	return nil, fmt.Errorf("max retries exceeded. last error: %w", lastErr)
-}
-
-func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) (string, error) {
-	var lastErr error
-	baseDelay := 500 * time.Millisecond
-
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("request cancelled or timed out: %w", ctx.Err())
-		default:
-		}
-
-		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-ctx.Done():
-				return "", fmt.Errorf("request cancelled or timed out during backoff: %w", ctx.Err())
-			case <-time.After(baseDelay + jitter):
-			}
-			baseDelay *= 2
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.config.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				return "", lastErr
-			}
-			continue
-		}
-
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			return "", fmt.Errorf("failed to decode response: %w", err)
-		}
-
-		if len(result.Choices) == 0 {
-			return "", fmt.Errorf("empty choices array returned")
-		}
-
-		return result.Choices[0].Message.Content, nil
+	var res response
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
 	}
 
-	return "", fmt.Errorf("max retries exceeded. last error: %w", lastErr)
+	if len(res.Data) == 0 {
+		return nil, fmt.Errorf("no embedding returned from llm")
+	}
+
+	return res.Data[0].Embedding, nil
 }

@@ -32,6 +32,7 @@ type Commitment struct {
 }
 
 type Service struct {
+	ctx           context.Context
 	sessionID     string
 	bus           domain.EventBus
 	planner       *AdvancedPlanner
@@ -48,8 +49,7 @@ type Service struct {
 	skillManager  *voyager.SkillManager
 
 	mu            sync.Mutex
-	evalSemaphore chan struct{}
-	evalPending   atomic.Int32
+	evalTrigger   chan struct{}
 	activeIntent  atomic.Pointer[domain.ActionIntent]
 	beforeState   atomic.Pointer[domain.GameState]
 	taskHistory   []domain.TaskHistory
@@ -73,6 +73,29 @@ func hasImmediateThreat(state domain.GameState) bool {
 			return true
 		}
 	}
+	return false
+}
+
+func hasImmediateHazard(state domain.GameState) bool {
+	for _, feedback := range state.Feedback {
+		switch strings.ToLower(strings.TrimSpace(feedback.Cause)) {
+		case "lava_contact", "low_air", "burning", "recent_heavy_damage":
+			return true
+		}
+		if strings.EqualFold(feedback.Type, "hazard") {
+			return true
+		}
+	}
+
+	for _, zone := range state.DangerZones {
+		if zone.Risk < 0.85 {
+			continue
+		}
+		if state.Position.DistanceTo(zone.Center) <= 6.0 {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -120,6 +143,7 @@ func NewService(
 	flags config.FeatureFlags,
 ) *Service {
 	s := &Service{
+		ctx:           ctx,
 		sessionID:     sessionID,
 		bus:           bus,
 		planner:       advPlanner,
@@ -133,7 +157,7 @@ func NewService(
 		feedback:      feedback,
 		logger:        logger.With(slog.String("component", "decision_service")),
 		flags:         flags,
-		evalSemaphore: make(chan struct{}, 1),
+		evalTrigger:   make(chan struct{}, 1),
 		taskHistory:   make([]domain.TaskHistory, 0),
 		milestones:    make([]domain.ProgressionMilestone, 0),
 		skillManager:  skillManager,
@@ -152,6 +176,12 @@ func NewService(
 			s.milestones = milestones
 			s.logger.Info("Loaded milestones from persistent store", slog.Int("count", len(milestones)))
 		}
+
+		failures, err := memStore.GetFailureCounts(ctx, sessionID)
+		if err == nil {
+			s.planner.SetFailures(failures)
+			s.logger.Info("Loaded plan failure counts from persistent store", slog.Int("count", len(failures)))
+		}
 	}
 
 	bus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
@@ -162,8 +192,11 @@ func NewService(
 	// Link planner background completions to service evaluations
 	advPlanner.SetOnPlanReady(func() {
 		s.logger.Info("Background plan ready, requesting evaluation")
-		s.RequestEvaluation()
+		s.evaluateNextPlan()
 	})
+
+	// Evaluation background loop
+	go s.runEvaluationLoop(ctx)
 
 	// Jumpstart background loop: ensures the bot doesn't stay idle if events are missed
 	// or if the state is stable but no plan is active.
@@ -178,7 +211,7 @@ func NewService(
 				if !s.planManager.HasActivePlan() && s.activeIntent.Load() == nil && s.execStatus.IsIdle() {
 					s.logger.Info("Jumpstart: bot is idle, forcing evaluation")
 					s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
-					go s.evaluateNextPlan(context.Background())
+					s.evaluateNextPlan()
 				}
 			}
 		}
@@ -252,7 +285,7 @@ func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEve
 	s.planner.SetMilestoneContext(s.getMilestoneContext())
 	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
 	if !s.planManager.HasActivePlan() {
-		go s.evaluateNextPlan(context.Background())
+		s.evaluateNextPlan()
 	}
 }
 
@@ -290,7 +323,14 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		}
 		adaptedIntent := s.feedback.Analyze(*intent, res)
 
-		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after, res, failureCount)
+		successCritic, reflection := s.critic.Evaluate(*intent, *beforePtr, after, res, failureCount)
+		critique := ""
+		if reflection != nil {
+			critique = reflection.Failure
+			if reflection.Cause != "" {
+				critique += " (Cause: " + reflection.Cause + ")"
+			}
+		}
 
 		if !success {
 			successCritic = false
@@ -301,6 +341,23 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 				s.worldModel.PenalizeAction(intent.Action, 1.0)
 				loc := domain.Location{X: beforePtr.Position.X, Y: beforePtr.Position.Y, Z: beforePtr.Position.Z}
 				s.worldModel.PenalizeZone(loc, 0.5)
+			}
+
+			// A-1: Record skill failure if applicable
+			if intent.Action == "use_skill" && s.skillManager != nil {
+				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, false, payload.DurationMs, payload.Cause)
+			}
+
+			// A-4: Persist failure count for current plan objective
+			currentPlan := s.planManager.GetCurrent()
+			if currentPlan != nil && s.memStore != nil {
+				obj := currentPlan.Objective
+				count := s.planner.GetFailureCount(obj)
+				go func(sid, o string, c int) {
+					dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+					defer cancel()
+					_ = s.memStore.SaveFailureCount(dbCtx, sid, o, c)
+				}(s.sessionID, obj, count)
 			}
 
 			// If analyzer provided a tactical fallback, inject it immediately
@@ -314,6 +371,11 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			// Learn from success: reward the action
 			if s.worldModel != nil {
 				s.worldModel.RecordSuccess(intent.Action, intent.Target)
+			}
+
+			// A-1: Record skill success if applicable
+			if intent.Action == "use_skill" && s.skillManager != nil {
+				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, true, payload.DurationMs, payload.Cause)
 			}
 
 			// Milestone detection
@@ -332,23 +394,25 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
 							// Run synthesis in background so it doesn't block the planning loop.
 							go func(intent domain.ActionIntent, before, after domain.GameState) {
-								ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+								ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
 								defer cancel()
 
-								jsCode, err := synth.SynthesizeCode(ctx, intent, before, after)
+								result, err := synth.SynthesizeCode(ctx, intent, before, after)
 								if err != nil {
 									s.logger.Warn("Skill synthesis failed", slog.String("action", intent.Action), slog.Any("error", err))
 									return
 								}
-								if jsCode == "" {
+								if result.JSCode == "" {
 									return
 								}
 
 								skillName := fmt.Sprintf("%s_%s", intent.Action, sanitizeSkillName(intent.Target))
 								skill := voyager.ExecutableSkill{
-									Name:        skillName,
-									Description: fmt.Sprintf("%s %s (count: %d)", intent.Action, intent.Target, intent.Count),
-									JSCode:      jsCode,
+									Name:          skillName,
+									Description:   fmt.Sprintf("%s %s (count: %d)", intent.Action, intent.Target, intent.Count),
+									JSCode:        result.JSCode,
+									RequiredItems: result.RequiredItems,
+									Version:       1,
 								}
 
 								if err := s.skillManager.SaveSkill(ctx, skill); err != nil {
@@ -365,7 +429,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 
 		s.mu.Lock()
 		newHistory := domain.TaskHistory{
-			Intent: *intent, Success: successCritic, Critique: critique,
+			Intent: *intent, Success: successCritic, Critique: critique, Reflection: reflection,
 		}
 		s.taskHistory = append(s.taskHistory, newHistory)
 
@@ -378,7 +442,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		// Persist to SQLite
 		if s.memStore != nil {
 			go func(h domain.TaskHistory) {
-				dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				dbCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 				defer cancel()
 				if err := s.memStore.SaveTaskHistory(dbCtx, s.sessionID, []domain.TaskHistory{h}); err != nil {
 					s.logger.Error("Failed to persist task history", slog.Any("error", err))
@@ -418,14 +482,14 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			Payload:   []byte(`{}`), // FIX: Prevent EOF unmarshal error on UI broadcast
 			CreatedAt: time.Now(),
 		})
-		go s.evaluateNextPlan(context.Background())
+		go s.evaluateNextPlan()
 		return
 	}
 
 	if controlledStop {
 		s.commitment.Store(nil)
 		if !shouldWaitForFreshState(payload.Cause) {
-			go s.evaluateNextPlan(context.Background())
+			go s.evaluateNextPlan()
 		}
 		return
 	}
@@ -440,13 +504,21 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	currentPlan := s.planManager.GetCurrent()
 	if currentPlan != nil {
 		s.planner.RecordSuccess(currentPlan.Objective)
+		// A-4: Reset persistent failure count on success
+		if s.memStore != nil {
+			go func(sid, o string) {
+				dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+				defer cancel()
+				_ = s.memStore.SaveFailureCount(dbCtx, sid, o, 0)
+			}(s.sessionID, currentPlan.Objective)
+		}
 	}
 
 	// FIX: Tell the planner we finished the plan so it stops serving stale cached pointers
 	s.planner.ClearCurrentPlan()
 
 	_ = s.planManager.Transition(domain.PlanStatusCompleted)
-	go s.evaluateNextPlan(context.Background())
+	go s.evaluateNextPlan()
 }
 
 func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.ActionIntent) {
@@ -501,12 +573,12 @@ func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent
 	s.handlePlanInvalidated(ctx, event)
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		s.evaluateNextPlan(context.Background())
+		s.evaluateNextPlan()
 	}()
 }
 
 func (s *Service) RequestEvaluation() {
-	go s.evaluateNextPlan(context.Background())
+	s.evaluateNextPlan()
 }
 
 func (s *Service) getTaskHistory() []domain.TaskHistory {
@@ -568,7 +640,7 @@ func (s *Service) detectMilestones(before, after *domain.GameState) {
 
 			if s.memStore != nil {
 				go func(name string) {
-					dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					dbCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 					defer cancel()
 					_ = s.memStore.SaveMilestone(dbCtx, s.sessionID, name)
 				}(item)
@@ -615,26 +687,29 @@ func isProgressionMode(state domain.GameState) bool {
 	// health > 14 (enough to survive a surprise),
 	// food > 10 (not starving),
 	// no immediate threats.
-	return state.Health > 14 && state.Food > 10 && len(state.Threats) == 0
+	return state.Health > 14 &&
+		state.Food > 10 &&
+		len(state.Threats) == 0 &&
+		!hasImmediateHazard(state)
 }
 
-func (s *Service) evaluateNextPlan(ctx context.Context) {
-	if !s.evalPending.CompareAndSwap(0, 1) {
-		return // already queued
-	}
-
-	go func() {
-		defer s.evalPending.Store(0)
-
+func (s *Service) runEvaluationLoop(ctx context.Context) {
+	for {
 		select {
-		case s.evalSemaphore <- struct{}{}:
 		case <-ctx.Done():
 			return
+		case <-s.evalTrigger:
+			s.doEvaluateNextPlan(ctx)
 		}
-		defer func() { <-s.evalSemaphore }()
+	}
+}
 
-		s.doEvaluateNextPlan(ctx)
-	}()
+func (s *Service) evaluateNextPlan() {
+	select {
+	case s.evalTrigger <- struct{}{}:
+	default:
+		// already queued
+	}
 }
 
 func (s *Service) doEvaluateNextPlan(ctx context.Context) {
@@ -644,6 +719,7 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 	}
 
 	survivalOverride := hasImmediateThreat(state) ||
+		hasImmediateHazard(state) ||
 		(state.Health < domain.SurvivalCriticalHealth) ||
 		(state.Health < domain.DecisionHealthSafe && state.Food < domain.SurvivalMinFoodForHunt)
 
@@ -667,7 +743,7 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 
 	if survivalOverride {
 		s.logger.Warn("Survival priority override active")
-		plan = s.planner.reactivePlan(state)
+		plan = s.planner.reactivePlan(ctx, state)
 	} else if isProgressionMode(state) && s.curriculum != nil {
 		s.logger.Info("Stable state detected, curriculum driving progression")
 
@@ -712,11 +788,11 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 			} else {
 				s.logger.Info("Curriculum provided no intent, using tactical planner")
 			}
-			plan = s.planner.FastPlan(state)
+			plan = s.planner.FastPlan(ctx, state)
 		}
 	} else {
 		s.logger.Info("Evaluating next tactical objective")
-		plan = s.planner.FastPlan(state)
+		plan = s.planner.FastPlan(ctx, state)
 	}
 
 	if !Validate(&plan, state) {
@@ -769,6 +845,13 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 	}
 
 	firstTask := plan.Tasks[0]
+
+	s.logger.Info("Dispatching active plan",
+		slog.String("strategic_goal", plan.StrategicGoal),
+		slog.Any("subgoals", plan.Subgoals),
+		slog.String("objective", plan.Objective),
+		slog.String("task_action", firstTask.Action),
+		slog.String("task_target", firstTask.Target.Name))
 
 	// Pre-fetch trigger for the NEXT plan if we're starting the last task of the current plan.
 	if len(plan.Tasks) == 1 {

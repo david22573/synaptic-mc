@@ -14,6 +14,24 @@ type Location struct {
 	Z float64 `json:"z"`
 }
 
+type Node struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"` // e.g., "cave", "village", "safe_base", "resource_zone", "danger_area"
+	Pos  Vec3   `json:"pos"`
+}
+
+type Edge struct {
+	FromID string  `json:"from_id"`
+	ToID   string  `json:"to_id"`
+	Cost   float64 `json:"cost"` // e.g., representing travel route difficulty
+}
+
+type Region struct {
+	Name  string   `json:"name"`
+	Nodes []string `json:"nodes"`
+}
+
 // WorldModel acts as the bot's short-term spatial and tactical memory.
 type WorldModel struct {
 	mu sync.RWMutex
@@ -38,9 +56,15 @@ func NewWorldModel() *WorldModel {
 func (w *WorldModel) RecordSuccess(action string, target any) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Exponential moving average to gradually favor successful actions
+	// M-5: Exponential decay 0.95 + add 1.0, clamp to [-5.0, 5.0]
 	current := w.ActionWeights[action]
-	w.ActionWeights[action] = current*0.8 + 1.0*0.2
+	val := current*0.95 + 1.0
+	if val > 5.0 {
+		val = 5.0
+	} else if val < -5.0 {
+		val = -5.0
+	}
+	w.ActionWeights[action] = val
 }
 
 // RewardPath reduces the penalty of a zone if we managed to make progress through it.
@@ -69,8 +93,15 @@ func (w *WorldModel) PenalizeAction(action string, penalty float64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// M-5: Exponential decay 0.95 - penalty, clamp to [-5.0, 5.0]
 	current := w.ActionWeights[action]
-	w.ActionWeights[action] = current*0.8 - (penalty * 0.2)
+	val := current*0.95 - penalty
+	if val > 5.0 {
+		val = 5.0
+	} else if val < -5.0 {
+		val = -5.0
+	}
+	w.ActionWeights[action] = val
 }
 
 // GetZoneCost lets the planner check if a target location is worth trying.
@@ -80,6 +111,13 @@ func (w *WorldModel) GetZoneCost(loc Location) float64 {
 
 	zone := getZoneKey(loc)
 	return w.ZonePenalties[zone]
+}
+
+// GetActionWeight returns the confidence score for a specific action.
+func (w *WorldModel) GetActionWeight(action string) float64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.ActionWeights[action]
 }
 
 // GetTacticalFeedback returns a summary of penalized actions and zones for the LLM.

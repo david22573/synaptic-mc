@@ -189,6 +189,25 @@ func (e *TaskExecutionEngine) handleFailure(ctx context.Context, action domain.A
 	}
 }
 
+func (e *TaskExecutionEngine) RunEmergencyPolicy(ctx context.Context, action domain.Action) {
+	e.logger.Warn("EMERGENCY: Running immediate survival policy", slog.String("action", action.Action))
+	
+	// 1. Interrupt Current
+	_ = e.AbortCurrent(ctx, "emergency_interrupt")
+
+	// 2. Immediate Dispatch (bypass normal queue/locks if necessary, but here we just call controller)
+	go func() {
+		// Create a separate background context for the emergency action to ensure it completes
+		emergencyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		err := e.controller.Dispatch(emergencyCtx, action)
+		if err != nil {
+			e.logger.Error("Emergency policy dispatch failed", slog.Any("error", err))
+		}
+	}()
+}
+
 func (e *TaskExecutionEngine) OnTaskStart(actionID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

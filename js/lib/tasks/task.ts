@@ -28,6 +28,7 @@ import { handleUseSkill } from "./handlers/use_skill.js";
 import { navigateWithFallbacks } from "../movement/navigator.js";
 import { ExecutionError } from "../errors.js";
 import { Vec3 } from "vec3";
+import { randomWalk } from "../movement/recovery.js";
 
 const { goals } = pkg;
 
@@ -47,6 +48,74 @@ export function calculateDynamicTimeout(
     const healthFactor = Math.max(bot.health, 1) / 20;
 
     return baseTimeout * (1 + invCount * 0.02) * (0.5 + healthFactor);
+}
+
+function isStandableRepositionSpot(bot: Bot, pos: Vec3): boolean {
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    const feet = bot.blockAt(pos);
+    const head = bot.blockAt(pos.offset(0, 1, 0));
+
+    if (!below || below.boundingBox !== "block") return false;
+    if (!feet || !head) return false;
+
+    const hazardous = new Set([
+        "water",
+        "flowing_water",
+        "lava",
+        "flowing_lava",
+        "magma_block",
+        "cobweb",
+        "sweet_berry_bush",
+        "cactus",
+        "fire",
+        "soul_fire",
+    ]);
+
+    return (
+        (feet.name === "air" || feet.name === "cave_air") &&
+        (head.name === "air" || head.name === "cave_air") &&
+        !hazardous.has(below.name)
+    );
+}
+
+function chooseRepositionTarget(bot: Bot): Vec3 | null {
+    if (!bot.entity) return null;
+
+    const pos = bot.entity.position.floored();
+    const yaw = bot.entity.yaw;
+    const baseDirections = [
+        new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)),
+        new Vec3(Math.cos(yaw), 0, -Math.sin(yaw)),
+        new Vec3(-Math.cos(yaw), 0, Math.sin(yaw)),
+        new Vec3(Math.sin(yaw), 0, Math.cos(yaw)),
+        new Vec3(-Math.sin(yaw) + Math.cos(yaw), 0, -Math.cos(yaw) - Math.sin(yaw)),
+        new Vec3(-Math.sin(yaw) - Math.cos(yaw), 0, -Math.cos(yaw) + Math.sin(yaw)),
+        new Vec3(Math.sin(yaw), 0, Math.cos(yaw)),
+        new Vec3(Math.sin(yaw) - Math.cos(yaw), 0, Math.cos(yaw) + Math.sin(yaw)),
+    ];
+
+    for (const direction of baseDirections) {
+        const norm =
+            direction.x === 0 && direction.z === 0
+                ? new Vec3(1, 0, 0)
+                : direction.normalize();
+
+        for (const distance of [2, 3, 4, 5, 6]) {
+            for (const yOffset of [1, 0, -1, -2]) {
+                const candidate = pos.offset(
+                    Math.round(norm.x * distance),
+                    yOffset,
+                    Math.round(norm.z * distance),
+                );
+
+                if (isStandableRepositionSpot(bot, candidate)) {
+                    return candidate.offset(0.5, 0, 0.5);
+                }
+            }
+        }
+    }
+
+    return null;
 }
 
 export async function runTask(
@@ -235,6 +304,33 @@ export async function runTask(
             case "idle":
                 await waitForMs(1500, signal);
                 break;
+            case "random_walk":
+                await randomWalk(bot, 2500, signal);
+                break;
+            case "reposition": {
+                await escapeTree(bot, signal);
+
+                const repositionTarget = chooseRepositionTarget(bot);
+                if (repositionTarget) {
+                    await navigateWithFallbacks(
+                        bot,
+                        new goals.GoalNearXZ(
+                            repositionTarget.x,
+                            repositionTarget.z,
+                            1,
+                        ),
+                        {
+                            signal,
+                            timeoutMs: 8000,
+                            stopMovement,
+                            maxRetries: 2,
+                        },
+                    );
+                } else {
+                    await randomWalk(bot, 2000, signal);
+                }
+                break;
+            }
             case "look": {
                 if (intent.target.type === "location") {
                     try {

@@ -71,28 +71,68 @@ export async function handleUseSkill(ctx: TaskContext): Promise<void> {
         );
     }
 
+    // A-1: Confidence threshold check
+    const confidence = (skillPayload as any).confidence ?? 1.0;
+    if (confidence < 0.5) {
+        log.warn("[UseSkill] Skill confidence too low, falling back", {
+            skill: skillName,
+            confidence,
+        });
+        throw new ExecutionError(
+            `Skill '${skillName}' confidence too low (${confidence.toFixed(2)})`,
+            "FALLBACK",
+            0,
+        );
+    }
+
     log.info("[UseSkill] Executing skill", {
         skill: skillName,
         desc: skillPayload.description,
         codeLen: skillPayload.js_code.length,
+        confidence,
     });
 
     // Compile and execute in a vm context.
     try {
-        const script = new vm.Script(
-            `(async (bot, goals, Vec3, signal) => { ${skillPayload.js_code} })`,
-        );
+        const wrappedCode = `(async (bot, goals, Vec3, signal) => { 
+            try {
+                ${skillPayload.js_code} 
+            } catch (err) {
+                throw err;
+            }
+        })`;
 
-        const context = vm.createContext({
+        const script = new vm.Script(wrappedCode, {
+            filename: `skill_${skillName}.js`,
+        });
+
+        const sandbox = {
+            bot,
+            goals,
+            Vec3,
+            signal,
             console,
-            // Add other globals if necessary
+            setTimeout,
+            clearTimeout,
+            setInterval,
+            clearInterval,
+            Promise,
+            Math,
+            Date,
+        };
+
+        const vmContext = vm.createContext(sandbox);
+
+        const compiledFn = script.runInContext(vmContext, {
+            timeout: 10000, // 10s CPU timeout
         });
 
-        const compiledFn = script.runInContext(context, {
-            timeout: 5000,
+        // Execution timeout (async)
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error("SKILL_EXECUTION_TIMEOUT")), 60000); // 60s total
         });
 
-        await compiledFn(bot, goals, Vec3, signal);
+        await Promise.race([compiledFn(bot, goals, Vec3, signal), timeoutPromise]);
     } catch (err: any) {
         if (isAbortError(err)) {
             throw new TaskAbortError("aborted", 0.5);

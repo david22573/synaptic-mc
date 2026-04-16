@@ -123,6 +123,7 @@ export async function sideStepRecovery(
     bot.setControlState(left ? "left" : "right", true);
     bot.setControlState("forward", true);
     bot.setControlState("jump", true);
+    bot.setControlState("sprint", true);
 
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -152,6 +153,7 @@ export async function backOffRecovery(
     if (signal?.aborted) return;
 
     bot.setControlState("back", true);
+    bot.setControlState("sprint", false);
     if (Math.random() > 0.5) {
         bot.setControlState(Math.random() > 0.5 ? "left" : "right", true);
     }
@@ -172,6 +174,62 @@ export async function backOffRecovery(
             signal.addEventListener("abort", onAbort, { once: true });
         }
     });
+}
+
+export async function emergencyFlee(
+    bot: Bot,
+    durationMs: number = 3000,
+): Promise<void> {
+    bot.clearControlStates();
+    if (!bot.entity) return;
+
+    // Turn 180 degrees from current look
+    bot.look(bot.entity.yaw + Math.PI, bot.entity.pitch, true);
+    bot.setControlState("forward", true);
+    bot.setControlState("sprint", true);
+    bot.setControlState("jump", true);
+
+    return new Promise((resolve) => {
+        setTimeout(() => {
+            bot.clearControlStates();
+            resolve();
+        }, durationMs);
+    });
+}
+
+export async function autoEat(bot: Bot): Promise<void> {
+    const food = bot.inventory
+        .items()
+        .find((item) => item.name.includes("cooked") || item.name === "apple");
+    if (food) {
+        try {
+            await bot.equip(food, "hand");
+            await bot.consume();
+        } catch (err) {
+            // ignore eat errors
+        }
+    }
+}
+
+export function preventFall(bot: Bot) {
+    if (!bot.entity) return;
+    // Simple reflex: if vertical velocity is negative and large, try to sneak or water bucket (if we had one)
+    if (bot.entity.velocity.y < -0.6) {
+        bot.setControlState("sneak", true);
+    } else {
+        bot.setControlState("sneak", false);
+    }
+}
+
+export async function unstuckLogic(bot: Bot): Promise<void> {
+    bot.clearControlStates();
+    bot.setControlState("jump", true);
+    bot.setControlState("back", true);
+    await new Promise((r) => setTimeout(r, 500));
+    bot.setControlState("back", false);
+    bot.setControlState("left", Math.random() > 0.5);
+    await new Promise((r) => setTimeout(r, 500));
+    bot.clearControlStates();
 }
 
 export async function jumpRecovery(

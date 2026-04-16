@@ -56,6 +56,7 @@ const SCHEMATICS: Record<string, BlueprintNode[]> = {
         { dx: -1, dy: 1, dz: 0 },
         { dx: 1, dy: 1, dz: 0 },
         { dx: -1, dy: 1, dz: 1 },
+        { dx: 0, dy: 1, dz: 1 },
         { dx: 1, dy: 1, dz: 1 },
         { dx: -1, dy: 2, dz: -1 },
         { dx: 0, dy: 2, dz: -1 },

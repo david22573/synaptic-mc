@@ -41,6 +41,8 @@ export const TASK_TIMEOUTS: Record<string, number> = {
     mark_location: 5000,
     recall_location: 5000,
     idle: 3000,
+    random_walk: 5000,
+    reposition: 10000,
 };
 
 export const THREAT_WEIGHTS: Record<string, number> = {

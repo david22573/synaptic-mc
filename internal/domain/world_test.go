@@ -32,13 +32,31 @@ func TestWorldModel_SpatialLearning(t *testing.T) {
 func TestWorldModel_ActionLearning(t *testing.T) {
 	wm := NewWorldModel()
 	
-	// Record success
-	wm.RecordSuccess("mine", Target{Name: "diamond_ore"})
-	
-	// Record failure
-	wm.PenalizeAction("mine", 0.5)
-	
-	if len(wm.ActionWeights) == 0 {
-		t.Error("ActionWeights map not populated")
+	// Record success: 0 * 0.95 + 1.0 = 1.0
+	wm.RecordSuccess("mine", nil)
+	if wm.ActionWeights["mine"] != 1.0 {
+		t.Errorf("Expected weight 1.0, got %f", wm.ActionWeights["mine"])
+	}
+
+	// Repeated success should clamp at 5.0
+	for i := 0; i < 20; i++ {
+		wm.RecordSuccess("mine", nil)
+	}
+	if wm.ActionWeights["mine"] != 5.0 {
+		t.Errorf("Expected weight 5.0 (clamped), got %f", wm.ActionWeights["mine"])
+	}
+
+	// Record failure: 5.0 * 0.95 - 2.0 = 4.75 - 2.0 = 2.75
+	wm.PenalizeAction("mine", 2.0)
+	if wm.ActionWeights["mine"] != 2.75 {
+		t.Errorf("Expected weight 2.75, got %f", wm.ActionWeights["mine"])
+	}
+
+	// Repeated penalty should clamp at -5.0
+	for i := 0; i < 20; i++ {
+		wm.PenalizeAction("mine", 2.0)
+	}
+	if wm.ActionWeights["mine"] != -5.0 {
+		t.Errorf("Expected weight -5.0 (clamped), got %f", wm.ActionWeights["mine"])
 	}
 }

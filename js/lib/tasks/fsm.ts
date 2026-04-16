@@ -86,15 +86,7 @@ export class DynamicSkillSandbox {
                 filename: "voyager_skill.js",
             });
 
-            // 1. CPU Timeout (Synchronous)
-            // Node's vm timeout option only limits synchronous execution time.
-            script.runInContext(vmContext, {
-                timeout: context.timeoutMs,
-                displayErrors: true,
-                breakOnSigint: true,
-            });
-
-            // 2. Wall Clock Timeout (Asynchronous)
+            // Wall Clock Timeout (Asynchronous)
             // We race the script's internal async execution (which populates context.result)
             // against a timer and the AbortSignal.
             const timeoutPromise = new Promise<TaskResult>((_, reject) => {
@@ -111,8 +103,12 @@ export class DynamicSkillSandbox {
             // The wrappedCode is an IIFE that returns a promise (via async ())
             // However, script.runInContext returns the result of the last statement,
             // which in our case is the Promise from the IIFE.
+            // 
+            // timeout: Limits synchronous execution time (CPU Timeout).
             const scriptResult = script.runInContext(vmContext, {
                 timeout: context.timeoutMs,
+                displayErrors: true,
+                breakOnSigint: true,
             }) as Promise<void>;
 
             await Promise.race([

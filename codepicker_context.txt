@@ -1,7 +1,7 @@
-Project Context Dump (14 Apr 26 12:54 PDT)
+Project Context Dump (15 Apr 26 18:04 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 104
+Total Files: 108
 
 # Project Structure
 <file_tree>
@@ -9,6 +9,7 @@ Total Files: 104
 - cmd\replay\main.go
 - cmd\server\main.go
 - internal\config\flags.go
+- internal\decision\integration\integration_test.go
 - internal\decision\plan_manager.go
 - internal\decision\plan_manager_test.go
 - internal\decision\planner.go
@@ -53,7 +54,9 @@ Total Files: 104
 - internal\observability\hub.go
 - internal\observability\metrics.go
 - internal\planner\feedback.go
+- internal\planner\feedback_test.go
 - internal\state\service.go
+- internal\state\service_test.go
 - internal\strategy\evaluator.go
 - internal\supervisor\runner.go
 - internal\voyager\critic.go
@@ -96,6 +99,7 @@ Total Files: 104
 - js\lib\utils\errors.ts
 - js\lib\utils\perception.ts
 - js\lib\utils\threats.ts
+- js\lib\utils\world.ts
 - ui\index.html
 - ui\src\App.svelte
 - ui\src\app.css
@@ -425,7 +429,7 @@ func main() {
 	stateSvc := state.NewService(eventBus, logger)
 	ctrlManager := execution.NewControllerManager()
 	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger, initialFlags.Execution)
-	
+
 	// Hot-reload loop
 	go func() {
 		sub := dynFlags.Subscribe()
@@ -451,15 +455,16 @@ func main() {
 	skillManager := voyager.NewSkillManager(vectorStore, llmClient)
 
 	// Inject skillManager into AdvancedPlanner
-	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, critic, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
+	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, nil, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
 
 	planManager := decision.NewPlanManager()
 	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel, logger)
 	var latestStateUpdate atomic.Pointer[map[string]interface{}]
 
 	eventBus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
-	        var stateUpdate struct {
-	                POIs []struct {				Name string      `json:"name"`
+		var stateUpdate struct {
+			POIs []struct {
+				Name string      `json:"name"`
 				Type string      `json:"type"`
 				Pos  domain.Vec3 `json:"position"`
 			} `json:"pois"`
@@ -483,18 +488,39 @@ func main() {
 	}))
 
 	eventWorkerCh := make(chan domain.DomainEvent, 1024)
-
+	criticalWorkerCh := make(chan domain.DomainEvent, 512)
 	globalSink := domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
 		if ev.Type == "" {
 			return
 		}
 
-		select {
-		case eventWorkerCh <- ev:
-		default:
+		isCritical := ev.Type == domain.EventTypeTaskStart ||
+			ev.Type == domain.EventTypeTaskEnd ||
+			ev.Type == domain.EventTypePlanCreated ||
+			ev.Type == domain.EventTypePlanInvalidated ||
+			ev.Type == domain.EventTypePlanCompleted ||
+			ev.Type == domain.EventTypePlanFailed
+
+		if isCritical {
+			select {
+			case criticalWorkerCh <- ev:
+			case <-time.After(10 * time.Millisecond):
+				observability.Metrics.DroppedEvents.Inc()
+				slog.Warn("CRITICAL event worker channel full, dropping event",
+					slog.String("type", string(ev.Type)),
+					slog.String("session", ev.SessionID))
+			}
+		} else {
+			select {
+			case eventWorkerCh <- ev:
+			default:
+				observability.Metrics.DroppedEvents.Inc()
+				slog.Warn("Event worker channel full, dropping event",
+					slog.String("type", string(ev.Type)),
+					slog.String("session", ev.SessionID))
+			}
 		}
 	})
-
 	eventTypes := []domain.EventType{
 		domain.EventTypeStateTick, domain.EventTypeStateUpdated,
 		domain.EventTypeTaskStart, domain.EventTypeTaskEnd,
@@ -515,13 +541,43 @@ func main() {
 	g, ctx := errgroup.WithContext(rootCtx)
 
 	decisionSvc := decision.NewService(ctx, cfg.SessionID, eventBus, plannerObj, planManager,
-		curriculum, critic, stateSvc, taskManager, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
+		curriculum, critic, stateSvc, execService, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
 	}
 	plannerObj.SetOnPlanReady(decisionSvc.RequestEvaluation)
 	taskManager.OnDrain = decisionSvc.RequestEvaluation
+
+	processEvent := func(ctx context.Context, ev domain.DomainEvent, eventStore domain.EventStore, logger *slog.Logger, latestStateUpdate *atomic.Pointer[map[string]interface{}], uiHub *observability.Hub) {
+		if err := eventStore.Append(ctx, ev.SessionID, ev.Trace, ev.Type, ev.Payload); err != nil {
+			logger.Error("Failed to store event", slog.Any("error", err), slog.String("type", string(ev.Type)))
+		}
+
+		var payloadObj interface{}
+		if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
+			logger.Error("Failed to unmarshal event payload for UI broadcast",
+				slog.Any("error", err),
+				slog.String("event_type", string(ev.Type)),
+				slog.String("session_id", ev.SessionID))
+			return
+		}
+
+		broadcastEv := map[string]interface{}{
+			"type":      string(ev.Type),
+			"payload":   payloadObj,
+			"timestamp": ev.CreatedAt.Format(time.Kitchen),
+		}
+
+		isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
+
+		if isState {
+			evCopy := broadcastEv
+			latestStateUpdate.Store(&evCopy)
+		} else {
+			uiHub.Broadcast("EVENT_STREAM", broadcastEv)
+		}
+	}
 
 	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
@@ -530,36 +586,16 @@ func main() {
 				select {
 				case <-ctx.Done():
 					return nil
+				case ev, ok := <-criticalWorkerCh:
+					if !ok {
+						return nil
+					}
+					processEvent(ctx, ev, eventStore, logger, &latestStateUpdate, uiHub)
 				case ev, ok := <-eventWorkerCh:
 					if !ok {
 						return nil
 					}
-
-					_ = eventStore.Append(context.Background(), ev.SessionID, ev.Trace, ev.Type, ev.Payload)
-
-					var payloadObj interface{}
-					if err := json.Unmarshal(ev.Payload, &payloadObj); err != nil {
-						logger.Error("Failed to unmarshal event payload for UI broadcast",
-							slog.Any("error", err),
-							slog.String("event_type", string(ev.Type)),
-							slog.String("session_id", ev.SessionID))
-						continue
-					}
-
-					broadcastEv := map[string]interface{}{
-						"type":      string(ev.Type),
-						"payload":   payloadObj,
-						"timestamp": ev.CreatedAt.Format(time.Kitchen),
-					}
-
-					isState := ev.Type == domain.EventTypeStateUpdated || ev.Type == domain.EventTypeStateTick
-
-					if isState {
-						evCopy := broadcastEv
-						latestStateUpdate.Store(&evCopy)
-					} else {
-						uiHub.Broadcast("EVENT_STREAM", broadcastEv)
-					}
+					processEvent(ctx, ev, eventStore, logger, &latestStateUpdate, uiHub)
 				}
 			}
 		})
@@ -750,7 +786,7 @@ func parseConfig() Config {
 
 	defaultEmbed := "nomic-embed-text"
 	if strings.Contains(*llmURL, "openrouter.ai") {
-	        defaultEmbed = "openai/text-embedding-3-small"
+		defaultEmbed = "openai/text-embedding-3-small"
 	}
 	llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", defaultEmbed), "LLM embedding model name")
 
@@ -834,7 +870,7 @@ func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBu
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			logger.Error("Bot WS up grade failed", slog.Any("error", err))
+			logger.Error("Bot WS upgrade failed", slog.Any("error", err))
 			return
 		}
 
@@ -1087,6 +1123,184 @@ func (f *DynamicFlags) Watch(ctx context.Context) {
 			}
 		}
 	}
+}
+
+</file>
+
+<file path="internal\decision\integration\integration_test.go">
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"david22573/synaptic-mc/internal/config"
+	"david22573/synaptic-mc/internal/decision"
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/planner"
+	"david22573/synaptic-mc/internal/voyager"
+	"david22573/synaptic-mc/internal/strategy"
+	"david22573/synaptic-mc/internal/eventstore"
+)
+
+// MockLLM implements the decision.LLMClient interface for deterministic testing.
+type MockLLM struct {
+	responses map[string]string
+	mu        sync.Mutex
+}
+
+func NewMockLLM() *MockLLM {
+	return &MockLLM{responses: make(map[string]string)}
+}
+
+func (m *MockLLM) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if resp, ok := m.responses[systemPrompt+userContent]; ok {
+		return resp, nil
+	}
+	return `{"action": "explore", "target": "surface", "count": 1, "rationale": "mock"}`, nil
+}
+
+func (m *MockLLM) GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	return "mock text response", nil
+}
+
+func (m *MockLLM) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
+	return []float32{0.1, 0.2, 0.3, 0.4}, nil
+}
+
+func (m *MockLLM) CompressState(state domain.GameState, events []domain.DomainEvent) string {
+	return "mock compressed state"
+}
+
+// MockExecutionStatus implements decision.ExecutionStatus.
+type MockExecutionStatus struct {
+	idle bool
+}
+
+func (m *MockExecutionStatus) IsIdle() bool { return m.idle }
+
+// MockStateProvider implements decision.StateProvider.
+type MockStateProvider struct {
+	state domain.GameState
+}
+
+func (m *MockStateProvider) GetCurrentState() domain.VersionedState {
+	return domain.VersionedState{State: m.state, Version: 1}
+}
+
+func TestEndToEndPlanning(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	bus := domain.NewEventBus()
+	
+	llm := NewMockLLM()
+	evaluator := strategy.NewEvaluatorWithLLM(llm)
+	critic := voyager.NewStateCritic()
+	worldModel := domain.NewWorldModel()
+	
+	vStore, err := voyager.NewSQLiteVectorStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create vector store: %v", err)
+	}
+	defer vStore.Close()
+
+	eStore, err := eventstore.NewSQLiteStore(":memory:", logger)
+	if err != nil {
+		t.Fatalf("failed to create event store: %v", err)
+	}
+	defer eStore.Close()
+
+	curriculum := voyager.NewAutonomousCurriculum(llm, vStore, nil, worldModel)
+	skillManager := voyager.NewSkillManager(vStore, llm)
+
+	advPlanner := decision.NewAdvancedPlanner(llm, evaluator, critic, nil, eStore, worldModel, nil, logger, config.FeatureFlags{}, skillManager)
+	pm := decision.NewPlanManager()
+	
+	stateProv := &MockStateProvider{
+		state: domain.GameState{
+			Health: 20,
+			Food: 20,
+			Position: domain.Vec3{X: 0, Y: 64, Z: 0},
+			Inventory: []domain.Item{{Name: "wooden_pickaxe", Count: 1}},
+			Initialized: true,
+		},
+	}
+	
+	execStatus := &MockExecutionStatus{idle: true}
+	feedback := planner.NewFeedbackAnalyzer(worldModel, logger)
+
+	svc := decision.NewService(
+		ctx, "test-session", bus, advPlanner, pm, curriculum, critic,
+		stateProv, execStatus, worldModel, nil, feedback, skillManager, logger, config.FeatureFlags{},
+	)
+
+	// Capture events using a channel to avoid race conditions
+	planEvents := make(chan domain.DomainEvent, 10)
+	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		planEvents <- ev
+	}))
+
+	// 1. Trigger State Update
+	bus.Publish(ctx, domain.DomainEvent{
+		Type: domain.EventTypeStateUpdated,
+		Payload: []byte(`{}`),
+		CreatedAt: time.Now(),
+	})
+
+	// Wait for first plan
+	var firstPlan domain.Plan
+	select {
+	case ev := <-planEvents:
+		if err := json.Unmarshal(ev.Payload, &firstPlan); err != nil {
+			t.Fatalf("Failed to unmarshal plan: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for first plan")
+	}
+
+	if len(firstPlan.Tasks) == 0 {
+		t.Fatal("Plan should have at least one task")
+	}
+	t.Logf("First Plan Created: %s", firstPlan.Objective)
+
+	// 2. Simulate Task Completion
+	taskID := firstPlan.Tasks[0].ID
+	taskEndPayload, _ := json.Marshal(domain.TaskEndPayload{
+		CommandID: taskID,
+		Status:    "COMPLETED",
+		Success:   true,
+		Action:    firstPlan.Tasks[0].Action,
+		Target:    firstPlan.Tasks[0].Target.Name,
+	})
+
+	bus.Publish(ctx, domain.DomainEvent{
+		Type: domain.EventTypeTaskEnd,
+		Payload: taskEndPayload,
+		CreatedAt: time.Now(),
+	})
+
+	// Wait for second plan
+	select {
+	case ev := <-planEvents:
+		var secondPlan domain.Plan
+		if err := json.Unmarshal(ev.Payload, &secondPlan); err != nil {
+			t.Fatalf("Failed to unmarshal next plan: %v", err)
+		}
+		t.Logf("Next Plan Created: %s", secondPlan.Objective)
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for next plan after task completion")
+	}
+	
+	_ = svc
 }
 
 </file>
@@ -1455,6 +1669,7 @@ var baseSystemRules string
 
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
 	CompressState(state domain.GameState, events []domain.DomainEvent) string
 	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
 }
@@ -1589,6 +1804,12 @@ func (p *AdvancedPlanner) SetOnPlanReady(cb func()) {
 	p.onPlanReady = cb
 }
 
+func (p *AdvancedPlanner) SetFailures(failures map[string]int) {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	p.failures = failures
+}
+
 func (p *AdvancedPlanner) RecordFailure(objective string) {
 	p.failMu.Lock()
 	p.failures[objective]++
@@ -1663,7 +1884,7 @@ func (p *AdvancedPlanner) TriggerReplan(state domain.GameState) {
 	}
 }
 
-func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
+func (p *AdvancedPlanner) FastPlan(ctx context.Context, state domain.GameState) domain.Plan {
 	current := p.currentPlan.Load()
 
 	if current != nil {
@@ -1681,7 +1902,7 @@ func (p *AdvancedPlanner) FastPlan(state domain.GameState) domain.Plan {
 	if current != nil && len(current.Tasks) > 0 {
 		return *current
 	}
-	return p.reactivePlan(state)
+	return p.reactivePlan(ctx, state)
 }
 
 func (p *AdvancedPlanner) degradedPlan(state domain.GameState, failureCount int) domain.Plan {
@@ -1699,7 +1920,7 @@ func (p *AdvancedPlanner) degradedPlan(state domain.GameState, failureCount int)
 	}
 }
 
-func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
+func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameState) domain.Plan {
 	var tasks []domain.Action
 	hasFood := false
 	hasImmediateThreat := false
@@ -1729,38 +1950,73 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 		}
 	}
 
+	// A-5: Steer toward safe zones and known POIs
+	currentZoneCost := 0.0
+	if p.worldModel != nil {
+		currentZoneCost = p.worldModel.GetZoneCost(domain.Location{X: state.Position.X, Y: state.Position.Y, Z: state.Position.Z})
+	}
+
+	knownNodes := []memory.WorldNode{}
+	if p.memStore != nil {
+		knownNodes, _ = p.memStore.GetNearbyNodes(ctx, state.Position, 5)
+	}
+
+	// Action Weights for priority adjustment
+	getWeight := func(action string) float64 {
+		if p.worldModel == nil {
+			return 0
+		}
+		return p.worldModel.GetActionWeight(action)
+	}
+
 	switch {
-	case hasImmediateThreat:
+	case hasImmediateThreat || currentZoneCost > 2.0:
+		action := "retreat"
+		weight := getWeight(action)
+		priority := int(100 + (weight * 5))
+		
+		// If current zone is bad, but we have no immediate threat, "explore" might be better to find a better zone
+		if !hasImmediateThreat && currentZoneCost > 2.0 {
+			action = "explore"
+		}
+
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-heal-%d", time.Now().UnixNano()),
-			Action:    "retreat",
+			Action:    action,
 			Target:    domain.Target{Name: "none", Type: "none"},
-			Priority:  100,
-			Rationale: "Reactive fast-path fallback: Survival Critical",
+			Priority:  priority,
+			Rationale: fmt.Sprintf("Reactive fast-path fallback: Survival Critical (Zone Cost: %.1f)", currentZoneCost),
 		})
 	case state.Health < domain.DecisionHealthSafe && hasFood:
+		action := "eat"
+		weight := getWeight(action)
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-eat-%d", time.Now().UnixNano()),
-			Action:    "eat",
+			Action:    action,
 			Target:    domain.Target{Name: "best_food", Type: "item"},
-			Priority:  95,
+			Priority:  int(95 + (weight * 5)),
 			Rationale: "Reactive fast-path fallback: Recover health with available food",
 		})
 	case state.Health < domain.SurvivalCriticalHealth || state.Food < 12.0:
-		if nearbyFoodEntity != "" && state.Health > 8.0 {
+		// Prioritize actions that have been successful
+		huntWeight := getWeight("hunt")
+		gatherWeight := getWeight("gather")
+		exploreWeight := getWeight("explore")
+
+		if nearbyFoodEntity != "" && state.Health > 8.0 && huntWeight >= -1.0 {
 			tasks = append(tasks, domain.Action{
 				ID:        fmt.Sprintf("react-hunt-%d", time.Now().UnixNano()),
 				Action:    "hunt",
 				Target:    domain.Target{Name: nearbyFoodEntity, Type: "entity"},
-				Priority:  90,
+				Priority:  int(90 + (huntWeight * 5)),
 				Rationale: "Reactive fast-path: Hunt nearby food source",
 			})
-		} else if nearbyFoodBlock != "" {
+		} else if nearbyFoodBlock != "" && gatherWeight >= -1.0 {
 			tasks = append(tasks, domain.Action{
 				ID:        fmt.Sprintf("react-gather-%d", time.Now().UnixNano()),
 				Action:    "gather",
 				Target:    domain.Target{Name: nearbyFoodBlock, Type: "block"},
-				Priority:  90,
+				Priority:  int(90 + (gatherWeight * 5)),
 				Rationale: "Reactive fast-path: Gather nearby berry bush",
 			})
 		} else {
@@ -1768,18 +2024,35 @@ func (p *AdvancedPlanner) reactivePlan(state domain.GameState) domain.Plan {
 				ID:        fmt.Sprintf("react-food-%d", time.Now().UnixNano()),
 				Action:    "explore",
 				Target:    domain.Target{Name: "food_source", Type: "category"},
-				Priority:  85,
+				Priority:  int(85 + (exploreWeight * 5)),
 				Rationale: "Reactive fast-path fallback: Seek food or resources",
 			})
 		}
 	}
 
+	// Use known POIs if we are stuck or idle
 	if len(tasks) == 0 {
+		for _, node := range knownNodes {
+			if node.Type == "chest" && state.Food < 15.0 {
+				tasks = append(tasks, domain.Action{
+					ID:        fmt.Sprintf("react-poi-%d", time.Now().UnixNano()),
+					Action:    "retrieve",
+					Target:    domain.Target{Name: "food", Type: "item"},
+					Priority:  40,
+					Rationale: fmt.Sprintf("Stable state: retrieving food from known %s", node.Name),
+				})
+				break
+			}
+		}
+	}
+
+	if len(tasks) == 0 {
+		exploreWeight := getWeight("explore")
 		tasks = append(tasks, domain.Action{
 			ID:        fmt.Sprintf("react-explore-%d", time.Now().UnixNano()),
 			Action:    "explore",
 			Target:    domain.Target{Name: "surroundings", Type: "category"},
-			Priority:  5,
+			Priority:  int(5 + (exploreWeight * 2)),
 			Rationale: "Reactive fast-path: Stable state, exploring surroundings while waiting for next plan",
 		})
 	}
@@ -1822,7 +2095,8 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	sfKey := cacheKey
 
 	if entry, ok := p.planCache.Get(cacheKey); ok {
-		if time.Since(entry.createdAt) > 10*time.Second {
+		// Only invalidate cache if older than 30s OR state changed significantly
+		if time.Since(entry.createdAt) > 30*time.Second {
 			p.planCache.Remove(cacheKey)
 			goto cacheMiss
 		}
@@ -1899,8 +2173,30 @@ cacheMiss:
 
 		userContent := domain.FormatStateForLLM(state)
 
-		events, _ := p.store.GetRecentStream(ctx, sessionID, 100)
-		historySummary := p.client.CompressState(state, events)
+		stats, statsLastID, err := learning.GetProjectedStats(ctx, p.store, sessionID, p.logger)
+		if err != nil {
+			p.logger.Warn("Failed to get projected stats, using empty", slog.Any("error", err))
+			stats = make(map[string]*learning.ActionStats)
+		}
+
+		// Periodically save snapshot to bound delta processing time
+		if statsLastID > 0 && statsLastID%100 == 0 {
+			go func(sid string, lid int64, s map[string]*learning.ActionStats) {
+				data, _ := json.Marshal(s)
+				_ = p.store.SaveSnapshot(context.Background(), domain.SessionSnapshot{
+					SessionID:   sid,
+					LastEventID: lid,
+					Data:        data,
+				})
+			}(sessionID, statsLastID, stats)
+		}
+
+		events, _ := p.store.GetRecentStream(ctx, sessionID, 500)
+		numEventsForCompress := 100
+		if len(events) < 100 {
+			numEventsForCompress = len(events)
+		}
+		historySummary := p.client.CompressState(state, events[:numEventsForCompress])
 		userContent = fmt.Sprintf("%s\n\nEXECUTION_HISTORY_SUMMARY:\n%s", userContent, historySummary)
 
 		rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)
@@ -1925,9 +2221,6 @@ cacheMiss:
 				}
 			}
 		}
-
-		events, _ = p.store.GetRecentStream(ctx, sessionID, 500)
-		stats := learning.CalculateActionStats(nil, events, p.logger)
 
 		p.failMu.Lock()
 		failureCount := p.failures[parsed.Objective]
@@ -1975,6 +2268,12 @@ cacheMiss:
 	return p.clonePlanWithNewIDs(val.(*domain.Plan)), nil
 }
 
+func (p *AdvancedPlanner) WarmNextPlan(ctx context.Context, sessionID string, state domain.GameState) {
+	go func() {
+		_, _ = p.generateLLMPlan(ctx, sessionID, state)
+	}()
+}
+
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {
 	clone := &domain.Plan{
 		ID:        fmt.Sprintf("cached-plan-%d", time.Now().UnixNano()),
@@ -2008,10 +2307,13 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 	score := 100.0
 	weights := p.flags.Weights
 
-	score -= float64(failureCount) * 15.0
+	penalty := math.Min(float64(failureCount)*15.0, 60.0)
+	score -= penalty
 
 	explorationBonus := weights.ExplorationBonus
-	if failureCount >= 2 {
+	if failureCount >= 3 {
+		explorationBonus *= 4.0
+	} else if failureCount >= 2 {
 		explorationBonus *= 2.5
 	}
 
@@ -2037,6 +2339,10 @@ func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.Gam
 	}
 
 	score -= (totalRisk / float64(len(tasks)))
+
+	if score < 10 {
+		score = 10
+	}
 
 	return score
 }
@@ -2078,6 +2384,7 @@ type Commitment struct {
 }
 
 type Service struct {
+	ctx           context.Context
 	sessionID     string
 	bus           domain.EventBus
 	planner       *AdvancedPlanner
@@ -2094,7 +2401,7 @@ type Service struct {
 	skillManager  *voyager.SkillManager
 
 	mu            sync.Mutex
-	evalSemaphore chan struct{}
+	evalTrigger   chan struct{}
 	activeIntent  atomic.Pointer[domain.ActionIntent]
 	beforeState   atomic.Pointer[domain.GameState]
 	taskHistory   []domain.TaskHistory
@@ -2118,6 +2425,29 @@ func hasImmediateThreat(state domain.GameState) bool {
 			return true
 		}
 	}
+	return false
+}
+
+func hasImmediateHazard(state domain.GameState) bool {
+	for _, feedback := range state.Feedback {
+		switch strings.ToLower(strings.TrimSpace(feedback.Cause)) {
+		case "lava_contact", "low_air", "burning", "recent_heavy_damage":
+			return true
+		}
+		if strings.EqualFold(feedback.Type, "hazard") {
+			return true
+		}
+	}
+
+	for _, zone := range state.DangerZones {
+		if zone.Risk < 0.85 {
+			continue
+		}
+		if state.Position.DistanceTo(zone.Center) <= 6.0 {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -2165,6 +2495,7 @@ func NewService(
 	flags config.FeatureFlags,
 ) *Service {
 	s := &Service{
+		ctx:           ctx,
 		sessionID:     sessionID,
 		bus:           bus,
 		planner:       advPlanner,
@@ -2178,7 +2509,7 @@ func NewService(
 		feedback:      feedback,
 		logger:        logger.With(slog.String("component", "decision_service")),
 		flags:         flags,
-		evalSemaphore: make(chan struct{}, 1),
+		evalTrigger:   make(chan struct{}, 1),
 		taskHistory:   make([]domain.TaskHistory, 0),
 		milestones:    make([]domain.ProgressionMilestone, 0),
 		skillManager:  skillManager,
@@ -2197,6 +2528,12 @@ func NewService(
 			s.milestones = milestones
 			s.logger.Info("Loaded milestones from persistent store", slog.Int("count", len(milestones)))
 		}
+
+		failures, err := memStore.GetFailureCounts(ctx, sessionID)
+		if err == nil {
+			s.planner.SetFailures(failures)
+			s.logger.Info("Loaded plan failure counts from persistent store", slog.Int("count", len(failures)))
+		}
 	}
 
 	bus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
@@ -2207,8 +2544,11 @@ func NewService(
 	// Link planner background completions to service evaluations
 	advPlanner.SetOnPlanReady(func() {
 		s.logger.Info("Background plan ready, requesting evaluation")
-		s.RequestEvaluation()
+		s.evaluateNextPlan()
 	})
+
+	// Evaluation background loop
+	go s.runEvaluationLoop(ctx)
 
 	// Jumpstart background loop: ensures the bot doesn't stay idle if events are missed
 	// or if the state is stable but no plan is active.
@@ -2223,7 +2563,7 @@ func NewService(
 				if !s.planManager.HasActivePlan() && s.activeIntent.Load() == nil && s.execStatus.IsIdle() {
 					s.logger.Info("Jumpstart: bot is idle, forcing evaluation")
 					s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
-					go s.evaluateNextPlan(context.Background())
+					s.evaluateNextPlan()
 				}
 			}
 		}
@@ -2297,7 +2637,7 @@ func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEve
 	s.planner.SetMilestoneContext(s.getMilestoneContext())
 	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
 	if !s.planManager.HasActivePlan() {
-		go s.evaluateNextPlan(context.Background())
+		s.evaluateNextPlan()
 	}
 }
 
@@ -2348,6 +2688,23 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 				s.worldModel.PenalizeZone(loc, 0.5)
 			}
 
+			// A-1: Record skill failure if applicable
+			if intent.Action == "use_skill" && s.skillManager != nil {
+				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, false)
+			}
+
+			// A-4: Persist failure count for current plan objective
+			currentPlan := s.planManager.GetCurrent()
+			if currentPlan != nil && s.memStore != nil {
+				obj := currentPlan.Objective
+				count := s.planner.GetFailureCount(obj)
+				go func(sid, o string, c int) {
+					dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+					defer cancel()
+					_ = s.memStore.SaveFailureCount(dbCtx, sid, o, c)
+				}(s.sessionID, obj, count)
+			}
+
 			// If analyzer provided a tactical fallback, inject it immediately
 			if adaptedIntent != nil && adaptedIntent.ID != intent.ID {
 				s.logger.Info("FeedbackAnalyzer injected tactical fallback", slog.String("action", adaptedIntent.Action))
@@ -2359,6 +2716,11 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			// Learn from success: reward the action
 			if s.worldModel != nil {
 				s.worldModel.RecordSuccess(intent.Action, intent.Target)
+			}
+
+			// A-1: Record skill success if applicable
+			if intent.Action == "use_skill" && s.skillManager != nil {
+				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, true)
 			}
 
 			// Milestone detection
@@ -2377,7 +2739,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
 							// Run synthesis in background so it doesn't block the planning loop.
 							go func(intent domain.ActionIntent, before, after domain.GameState) {
-								ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+								ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
 								defer cancel()
 
 								jsCode, err := synth.SynthesizeCode(ctx, intent, before, after)
@@ -2423,7 +2785,7 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		// Persist to SQLite
 		if s.memStore != nil {
 			go func(h domain.TaskHistory) {
-				dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				dbCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 				defer cancel()
 				if err := s.memStore.SaveTaskHistory(dbCtx, s.sessionID, []domain.TaskHistory{h}); err != nil {
 					s.logger.Error("Failed to persist task history", slog.Any("error", err))
@@ -2463,14 +2825,14 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 			Payload:   []byte(`{}`), // FIX: Prevent EOF unmarshal error on UI broadcast
 			CreatedAt: time.Now(),
 		})
-		go s.evaluateNextPlan(context.Background())
+		go s.evaluateNextPlan()
 		return
 	}
 
 	if controlledStop {
 		s.commitment.Store(nil)
 		if !shouldWaitForFreshState(payload.Cause) {
-			go s.evaluateNextPlan(context.Background())
+			go s.evaluateNextPlan()
 		}
 		return
 	}
@@ -2485,13 +2847,21 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	currentPlan := s.planManager.GetCurrent()
 	if currentPlan != nil {
 		s.planner.RecordSuccess(currentPlan.Objective)
+		// A-4: Reset persistent failure count on success
+		if s.memStore != nil {
+			go func(sid, o string) {
+				dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+				defer cancel()
+				_ = s.memStore.SaveFailureCount(dbCtx, sid, o, 0)
+			}(s.sessionID, currentPlan.Objective)
+		}
 	}
 
 	// FIX: Tell the planner we finished the plan so it stops serving stale cached pointers
 	s.planner.ClearCurrentPlan()
 
 	_ = s.planManager.Transition(domain.PlanStatusCompleted)
-	go s.evaluateNextPlan(context.Background())
+	go s.evaluateNextPlan()
 }
 
 func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.ActionIntent) {
@@ -2546,12 +2916,12 @@ func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent
 	s.handlePlanInvalidated(ctx, event)
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		s.evaluateNextPlan(context.Background())
+		s.evaluateNextPlan()
 	}()
 }
 
 func (s *Service) RequestEvaluation() {
-	go s.evaluateNextPlan(context.Background())
+	s.evaluateNextPlan()
 }
 
 func (s *Service) getTaskHistory() []domain.TaskHistory {
@@ -2613,7 +2983,7 @@ func (s *Service) detectMilestones(before, after *domain.GameState) {
 
 			if s.memStore != nil {
 				go func(name string) {
-					dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					dbCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 					defer cancel()
 					_ = s.memStore.SaveMilestone(dbCtx, s.sessionID, name)
 				}(item)
@@ -2660,23 +3030,39 @@ func isProgressionMode(state domain.GameState) bool {
 	// health > 14 (enough to survive a surprise),
 	// food > 10 (not starving),
 	// no immediate threats.
-	return state.Health > 14 && state.Food > 10 && len(state.Threats) == 0
+	return state.Health > 14 &&
+		state.Food > 10 &&
+		len(state.Threats) == 0 &&
+		!hasImmediateHazard(state)
 }
 
-func (s *Service) evaluateNextPlan(ctx context.Context) {
-	select {
-	case s.evalSemaphore <- struct{}{}:
-	default:
-		return
+func (s *Service) runEvaluationLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.evalTrigger:
+			s.doEvaluateNextPlan(ctx)
+		}
 	}
-	defer func() { <-s.evalSemaphore }()
+}
 
+func (s *Service) evaluateNextPlan() {
+	select {
+	case s.evalTrigger <- struct{}{}:
+	default:
+		// already queued
+	}
+}
+
+func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 	state := s.stateProvider.GetCurrentState().State
 	if state.Health <= 0 {
 		return
 	}
 
 	survivalOverride := hasImmediateThreat(state) ||
+		hasImmediateHazard(state) ||
 		(state.Health < domain.SurvivalCriticalHealth) ||
 		(state.Health < domain.DecisionHealthSafe && state.Food < domain.SurvivalMinFoodForHunt)
 
@@ -2700,7 +3086,7 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 
 	if survivalOverride {
 		s.logger.Warn("Survival priority override active")
-		plan = s.planner.reactivePlan(state)
+		plan = s.planner.reactivePlan(ctx, state)
 	} else if isProgressionMode(state) && s.curriculum != nil {
 		s.logger.Info("Stable state detected, curriculum driving progression")
 
@@ -2745,11 +3131,11 @@ func (s *Service) evaluateNextPlan(ctx context.Context) {
 			} else {
 				s.logger.Info("Curriculum provided no intent, using tactical planner")
 			}
-			plan = s.planner.FastPlan(state)
+			plan = s.planner.FastPlan(ctx, state)
 		}
 	} else {
 		s.logger.Info("Evaluating next tactical objective")
-		plan = s.planner.FastPlan(state)
+		plan = s.planner.FastPlan(ctx, state)
 	}
 
 	if !Validate(&plan, state) {
@@ -2802,6 +3188,12 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 	}
 
 	firstTask := plan.Tasks[0]
+
+	// Pre-fetch trigger for the NEXT plan if we're starting the last task of the current plan.
+	if len(plan.Tasks) == 1 {
+		s.logger.Debug("Last task in plan starting; warming next plan")
+		s.planner.WarmNextPlan(ctx, s.sessionID, s.stateProvider.GetCurrentState().State)
+	}
 
 	s.commitment.Store(&Commitment{
 		TaskID:      firstTask.ID,
@@ -3206,9 +3598,10 @@ import "context"
 
 // ExecutableSkill replaces the old StoredSkill intent-sequence concept.
 type ExecutableSkill struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	JSCode      string `json:"js_code"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	JSCode      string  `json:"js_code"`
+	Confidence  float64 `json:"confidence"`
 }
 
 type SkillRecord struct {
@@ -3747,9 +4140,15 @@ func NewWorldModel() *WorldModel {
 func (w *WorldModel) RecordSuccess(action string, target any) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Exponential moving average to gradually favor successful actions
+	// M-5: Exponential decay 0.95 + add 1.0, clamp to [-5.0, 5.0]
 	current := w.ActionWeights[action]
-	w.ActionWeights[action] = current*0.8 + 1.0*0.2
+	val := current*0.95 + 1.0
+	if val > 5.0 {
+		val = 5.0
+	} else if val < -5.0 {
+		val = -5.0
+	}
+	w.ActionWeights[action] = val
 }
 
 // RewardPath reduces the penalty of a zone if we managed to make progress through it.
@@ -3778,8 +4177,15 @@ func (w *WorldModel) PenalizeAction(action string, penalty float64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// M-5: Exponential decay 0.95 - penalty, clamp to [-5.0, 5.0]
 	current := w.ActionWeights[action]
-	w.ActionWeights[action] = current*0.8 - (penalty * 0.2)
+	val := current*0.95 - penalty
+	if val > 5.0 {
+		val = 5.0
+	} else if val < -5.0 {
+		val = -5.0
+	}
+	w.ActionWeights[action] = val
 }
 
 // GetZoneCost lets the planner check if a target location is worth trying.
@@ -3789,6 +4195,13 @@ func (w *WorldModel) GetZoneCost(loc Location) float64 {
 
 	zone := getZoneKey(loc)
 	return w.ZonePenalties[zone]
+}
+
+// GetActionWeight returns the confidence score for a specific action.
+func (w *WorldModel) GetActionWeight(action string) float64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.ActionWeights[action]
 }
 
 // GetTacticalFeedback returns a summary of penalized actions and zones for the LLM.
@@ -3863,14 +4276,32 @@ func TestWorldModel_SpatialLearning(t *testing.T) {
 func TestWorldModel_ActionLearning(t *testing.T) {
 	wm := NewWorldModel()
 	
-	// Record success
-	wm.RecordSuccess("mine", Target{Name: "diamond_ore"})
-	
-	// Record failure
-	wm.PenalizeAction("mine", 0.5)
-	
-	if len(wm.ActionWeights) == 0 {
-		t.Error("ActionWeights map not populated")
+	// Record success: 0 * 0.95 + 1.0 = 1.0
+	wm.RecordSuccess("mine", nil)
+	if wm.ActionWeights["mine"] != 1.0 {
+		t.Errorf("Expected weight 1.0, got %f", wm.ActionWeights["mine"])
+	}
+
+	// Repeated success should clamp at 5.0
+	for i := 0; i < 20; i++ {
+		wm.RecordSuccess("mine", nil)
+	}
+	if wm.ActionWeights["mine"] != 5.0 {
+		t.Errorf("Expected weight 5.0 (clamped), got %f", wm.ActionWeights["mine"])
+	}
+
+	// Record failure: 5.0 * 0.95 - 2.0 = 4.75 - 2.0 = 2.75
+	wm.PenalizeAction("mine", 2.0)
+	if wm.ActionWeights["mine"] != 2.75 {
+		t.Errorf("Expected weight 2.75, got %f", wm.ActionWeights["mine"])
+	}
+
+	// Repeated penalty should clamp at -5.0
+	for i := 0; i < 20; i++ {
+		wm.PenalizeAction("mine", 2.0)
+	}
+	if wm.ActionWeights["mine"] != -5.0 {
+		t.Errorf("Expected weight -5.0 (clamped), got %f", wm.ActionWeights["mine"])
 	}
 }
 
@@ -4258,6 +4689,7 @@ import (
 // It is strictly responsible for dispatching commands and signaling control states.
 type Controller interface {
 	Dispatch(ctx context.Context, action domain.Action) error
+	Preload(ctx context.Context, action domain.Action) error
 	AbortCurrent(ctx context.Context, reason string) error
 	Close() error
 	IsReady() bool
@@ -4409,6 +4841,21 @@ func (e *TaskExecutionEngine) ExecuteAsync(ctx context.Context, action domain.Ac
 				}
 			}
 		}
+	}()
+}
+
+func (e *TaskExecutionEngine) Preload(ctx context.Context, action domain.Action) {
+	e.mu.RLock()
+	inFlight := e.inFlight
+	e.mu.RUnlock()
+
+	// Only preload if we're already running something else
+	if inFlight == nil || inFlight.Action.ID == action.ID {
+		return
+	}
+
+	go func() {
+		_ = e.controller.Preload(ctx, action)
 	}()
 }
 
@@ -4566,6 +5013,27 @@ func (c *IdempotentController) Dispatch(ctx context.Context, action domain.Actio
 	c.mu.Unlock()
 
 	return c.base.Dispatch(ctx, action)
+}
+
+func (c *IdempotentController) Preload(ctx context.Context, action domain.Action) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	c.mu.Lock()
+	c.cleanupExpired()
+
+	if ts, exists := c.seen[action.ID]; exists {
+		if time.Since(ts) < c.ttl {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	c.mu.Unlock()
+
+	return c.base.Preload(ctx, action)
 }
 
 func (c *IdempotentController) cleanupExpired() {
@@ -4739,6 +5207,22 @@ func (m *ControllerManager) Dispatch(ctx context.Context, action domain.Action) 
 
 	action.ControllerID = vc.ID
 	return vc.Ctrl.Dispatch(ctx, action)
+}
+
+func (m *ControllerManager) Preload(ctx context.Context, action domain.Action) error {
+	vc := m.current.Load()
+	if vc == nil {
+		return errors.New("no active controller")
+	}
+	if vc.draining.Load() {
+		return ErrDraining
+	}
+
+	vc.active.Add(1)
+	defer vc.active.Done()
+
+	action.ControllerID = vc.ID
+	return vc.Ctrl.Preload(ctx, action)
 }
 
 func (m *ControllerManager) AbortCurrent(ctx context.Context, reason string) error {
@@ -4942,6 +5426,7 @@ func (m *MockDrainingController) Close() error {
 	return nil
 }
 func (m *MockDrainingController) IsReady() bool { return m.isReady }
+func (m *MockDrainingController) Preload(ctx context.Context, action domain.Action) error { return nil }
 
 func TestControllerManager_SetController(t *testing.T) {
 	m := NewControllerManager()
@@ -5079,6 +5564,10 @@ func (s *ControlService) SetReflexActive(active bool) {
 	s.stabilityMu.Lock()
 	defer s.stabilityMu.Unlock()
 	s.stability.ReflexActive = active
+}
+
+func (s *ControlService) IsIdle() bool {
+	return s.taskManager.IsIdle()
 }
 
 func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.DomainEvent) {
@@ -5674,6 +6163,7 @@ func (tm *TaskManager) Run(ctx context.Context) {
 
 func (tm *TaskManager) warmStartNext(ctx context.Context, nextTask *domain.Action) {
 	tm.logger.DebugContext(ctx, "Warm starting next task in background", slog.String("action", nextTask.Action))
+	tm.engine.Preload(ctx, *nextTask)
 }
 
 func (tm *TaskManager) IsIdle() bool {
@@ -5976,6 +6466,39 @@ func (c *WSController) Dispatch(ctx context.Context, action domain.Action) error
 
 	msg := WSMessage{
 		Type:    "DISPATCH_TASK",
+		Payload: payload,
+	}
+
+	select {
+	case c.sendCh <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+		return errors.New("websocket send channel timeout")
+	}
+}
+
+func (c *WSController) Preload(ctx context.Context, action domain.Action) error {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return errors.New("websocket closed")
+	}
+	c.mu.Unlock()
+
+	c.logger.Debug("Preloading action",
+		slog.String("action", action.Action),
+		slog.String("task_id", action.ID),
+	)
+
+	payload, err := json.Marshal(action)
+	if err != nil {
+		return err
+	}
+
+	msg := WSMessage{
+		Type:    "TASK_PRELOAD",
 		Payload: payload,
 	}
 
@@ -6919,10 +7442,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
-	"net/url"
-	"strings"
+	"sync"
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
@@ -6936,17 +7457,26 @@ type Config struct {
 	MaxRetries int
 }
 
+type StateSummary struct {
+	LastAction string         `json:"last_action"`
+	Outcome    string         `json:"outcome"`
+	Failures   []string       `json:"recent_failures"`
+	Variables  map[string]any `json:"vars"`
+}
+
 type Client struct {
 	config Config
 	http   *http.Client
+
+	// Circuit breaker state
+	mu          sync.Mutex
+	errorCount  int
+	lastError   time.Time
+	circuitOpen bool
+	openUntil   time.Time
 }
 
-type StateSummary struct {
-	LastAction string `json:"last_action"`
-	Outcome    string `json:"outcome"`
-	Failures   []string `json:"recent_failures"`
-	Variables  map[string]any `json:"vars"`
-}
+var ErrCircuitOpen = fmt.Errorf("llm circuit is open")
 
 func NewClient(cfg Config) *Client {
 	return &Client{
@@ -6954,6 +7484,40 @@ func NewClient(cfg Config) *Client {
 		http: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+	}
+}
+
+func (c *Client) IsCircuitOpen() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.circuitOpen && time.Now().After(c.openUntil) {
+		c.circuitOpen = false
+		c.errorCount = 0
+	}
+	return c.circuitOpen
+}
+
+func (c *Client) recordSuccess() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errorCount = 0
+	c.circuitOpen = false
+}
+
+func (c *Client) recordError() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if now.Sub(c.lastError) > 30*time.Second {
+		c.errorCount = 1
+	} else {
+		c.errorCount++
+	}
+	c.lastError = now
+
+	if c.errorCount >= 3 {
+		c.circuitOpen = true
+		c.openUntil = now.Add(60 * time.Second)
 	}
 }
 
@@ -6967,7 +7531,7 @@ func (c *Client) CompressState(state domain.GameState, events []domain.DomainEve
 	}
 
 	const maxFailureChars = 64
-	const maxKeyItems = 5
+	const maxKeyItems = 10
 
 	// 1. Extract recent failures (last 3 unique reasons), truncated for token efficiency
 	seenFailures := make(map[string]bool)
@@ -6998,233 +7562,158 @@ func (c *Client) CompressState(state domain.GameState, events []domain.DomainEve
 		}
 	}
 
-	// 2. Filter variables for immediate decision making (stricter set)
+	// 2. Extract critical state variables
 	summary.Variables["health"] = int(state.Health)
 	summary.Variables["food"] = int(state.Food)
-	summary.Variables["stuck"] = len(summary.Failures) > 0
+	summary.Variables["pos"] = fmt.Sprintf("%.0f,%.0f,%.0f", state.Position.X, state.Position.Y, state.Position.Z)
 
-	// 3. Inventory compression (only key tools/resources, capped count)
-	tools := make([]string, 0)
-	for _, item := range state.Inventory {
-		if len(tools) >= maxKeyItems {
-			break
+	if len(state.Inventory) > 0 {
+		inv := make([]string, 0, maxKeyItems)
+		for _, item := range state.Inventory {
+			if item.Count > 0 {
+				inv = append(inv, fmt.Sprintf("%s:%d", item.Name, item.Count))
+			}
+			if len(inv) >= maxKeyItems {
+				break
+			}
 		}
-		name := strings.ToLower(item.Name)
-		if strings.Contains(name, "pickaxe") || strings.Contains(name, "axe") ||
-			strings.Contains(name, "sword") || strings.Contains(name, "table") ||
-			strings.Contains(name, "log") || strings.Contains(name, "plank") ||
-			strings.Contains(name, "stick") {
-			tools = append(tools, fmt.Sprintf("%s:%d", item.Name, item.Count))
-		}
+		summary.Variables["inv"] = inv
 	}
-	summary.Variables["inv"] = tools
 
+	if len(state.Threats) > 0 {
+		summary.Variables["threats"] = len(state.Threats)
+	}
+
+	// 3. Serialize to compact JSON
 	b, _ := json.Marshal(summary)
-	res := string(b)
-	
-	// Final character cap to ensure context window safety (approx 250-300 tokens max)
-	if len(res) > 1000 {
-		return res[:997] + "..."
-	}
-	return res
+	return string(b)
 }
 
 func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	genCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
+	if c.IsCircuitOpen() {
+		return "", ErrCircuitOpen
+	}
 
-	payload := map[string]any{
-		"model": c.config.Model,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": userContent},
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type request struct {
+		Model    string    `json:"model"`
+		Messages []message `json:"messages"`
+	}
+
+	reqBody := request{
+		Model: c.config.Model,
+		Messages: []message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userContent},
 		},
-		"response_format": map[string]string{"type": "json_object"},
-		"temperature":     0.2,
 	}
 
-	jsonPayload, err := json.Marshal(payload)
+	data, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL, bytes.NewBuffer(data))
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal generation payload: %w", err)
+		return "", err
 	}
-	return c.doRequest(genCtx, c.config.APIURL, jsonPayload)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.recordError()
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.recordError()
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("llm api error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	c.recordSuccess()
+
+	type response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	var res response
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+
+	if len(res.Choices) == 0 {
+		return "", fmt.Errorf("no choices returned from llm")
+	}
+
+	return res.Choices[0].Message.Content, nil
+}
+
+func (c *Client) GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	return c.Generate(ctx, systemPrompt, userContent)
 }
 
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {
-	parsedURL, err := url.Parse(c.config.APIURL)
+	if c.IsCircuitOpen() {
+		return nil, ErrCircuitOpen
+	}
+
+	type request struct {
+		Model string `json:"model"`
+		Input string `json:"input"`
+	}
+
+	reqBody := request{
+		Model: c.config.EmbedModel,
+		Input: input,
+	}
+
+	data, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL+"/embeddings", bytes.NewBuffer(data))
 	if err != nil {
-		return nil, fmt.Errorf("invalid APIURL configured: %w", err)
+		return nil, err
 	}
 
-	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/chat/completions")
-	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/completions")
-	if !strings.HasSuffix(parsedURL.Path, "/embeddings") {
-		if !strings.HasSuffix(parsedURL.Path, "/") && parsedURL.Path != "" {
-			parsedURL.Path += "/"
-		}
-		parsedURL.Path += "embeddings"
-	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 
-	embedURL := parsedURL.String()
-
-	embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	payload := map[string]any{
-		"model": c.config.EmbedModel,
-		"input": input,
-	}
-
-	jsonPayload, err := json.Marshal(payload)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal embedding payload: %w", err)
+		c.recordError()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.recordError()
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("llm embedding api error (%d): %s", resp.StatusCode, string(body))
 	}
 
-	var lastErr error
-	baseDelay := 500 * time.Millisecond
+	c.recordSuccess()
 
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		select {
-		case <-embedCtx.Done():
-			return nil, fmt.Errorf("request cancelled or timed out: %w", embedCtx.Err())
-		default:
-		}
-
-		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-embedCtx.Done():
-				return nil, fmt.Errorf("request cancelled or timed out during backoff: %w", embedCtx.Err())
-			case <-time.After(baseDelay + jitter):
-			}
-			baseDelay *= 2
-		}
-
-		req, err := http.NewRequestWithContext(embedCtx, http.MethodPost, embedURL, bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.config.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				return nil, lastErr
-			}
-			continue
-		}
-
-		var result struct {
-			Data []struct {
-				Embedding []float32 `json:"embedding"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			return nil, fmt.Errorf("failed to decode response: %w", err)
-		}
-
-		if len(result.Data) == 0 {
-			return nil, fmt.Errorf("empty embedding array returned")
-		}
-
-		return result.Data[0].Embedding, nil
+	type response struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
 	}
 
-	return nil, fmt.Errorf("max retries exceeded. last error: %w", lastErr)
-}
-
-func (c *Client) doRequest(ctx context.Context, url string, jsonPayload []byte) (string, error) {
-	var lastErr error
-	baseDelay := 500 * time.Millisecond
-
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("request cancelled or timed out: %w", ctx.Err())
-		default:
-		}
-
-		if attempt > 0 {
-			jitter := time.Duration(rand.Int63n(int64(baseDelay) / 2))
-			select {
-			case <-ctx.Done():
-				return "", fmt.Errorf("request cancelled or timed out during backoff: %w", ctx.Err())
-			case <-time.After(baseDelay + jitter):
-			}
-			baseDelay *= 2
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.config.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				return "", lastErr
-			}
-			continue
-		}
-
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &result); err != nil {
-			return "", fmt.Errorf("failed to decode response: %w", err)
-		}
-
-		if len(result.Choices) == 0 {
-			return "", fmt.Errorf("empty choices array returned")
-		}
-
-		return result.Choices[0].Message.Content, nil
+	var res response
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
 	}
 
-	return "", fmt.Errorf("max retries exceeded. last error: %w", lastErr)
+	if len(res.Data) == 0 {
+		return nil, fmt.Errorf("no embedding returned from llm")
+	}
+
+	return res.Data[0].Embedding, nil
 }
 
 </file>
@@ -7247,15 +7736,24 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type WorldNode struct {
+	Name string
+	Type string
+	Pos  domain.Vec3
+}
+
 type Store interface {
 	MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error
 	GetKnownWorld(ctx context.Context, pos domain.Vec3) (string, error)
+	GetNearbyNodes(ctx context.Context, pos domain.Vec3, limit int) ([]WorldNode, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	SaveTaskHistory(ctx context.Context, sessionID string, history []domain.TaskHistory) error
 	GetTaskHistory(ctx context.Context, sessionID string, limit int) ([]domain.TaskHistory, error)
 	SaveMilestone(ctx context.Context, sessionID string, name string) error
 	GetMilestones(ctx context.Context, sessionID string) ([]domain.ProgressionMilestone, error)
+	SaveFailureCount(ctx context.Context, sessionID, objective string, count int) error
+	GetFailureCounts(ctx context.Context, sessionID string) (map[string]int, error)
 	Close() error
 }
 
@@ -7309,6 +7807,14 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		name TEXT NOT NULL,
 		unlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (session_id, name)
+	);
+
+	CREATE TABLE IF NOT EXISTS plan_failures (
+		session_id TEXT NOT NULL,
+		objective TEXT NOT NULL,
+		count INTEGER DEFAULT 0,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (session_id, objective)
 	);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -7459,6 +7965,46 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 	return strings.TrimSpace(out.String()), nil
 }
 
+func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, limit int) ([]WorldNode, error) {
+	query := `SELECT name, type, x, y, z FROM world_nodes`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type nodeDist struct {
+		node WorldNode
+		dist float64
+	}
+	var nodes []nodeDist
+
+	for rows.Next() {
+		var n WorldNode
+		if err := rows.Scan(&n.Name, &n.Type, &n.Pos.X, &n.Pos.Y, &n.Pos.Z); err == nil {
+			dx, dy, dz := n.Pos.X-botPos.X, n.Pos.Y-botPos.Y, n.Pos.Z-botPos.Z
+			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+			nodes = append(nodes, nodeDist{node: n, dist: dist})
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].dist < nodes[j].dist })
+
+	if len(nodes) > limit {
+		nodes = nodes[:limit]
+	}
+
+	result := make([]WorldNode, len(nodes))
+	for i, nd := range nodes {
+		result[i] = nd.node
+	}
+	return result, nil
+}
+
 func (s *SQLiteStore) SetSummary(ctx context.Context, sessionID, key, value string) error {
 	query := `
 	INSERT INTO session_summary (session_id, key, value, updated_at) 
@@ -7494,6 +8040,37 @@ func (s *SQLiteStore) GetSummary(ctx context.Context, sessionID string) (string,
 		return "No active summary.", nil
 	}
 	return summary.String(), nil
+}
+
+func (s *SQLiteStore) SaveFailureCount(ctx context.Context, sessionID, objective string, count int) error {
+	query := `
+	INSERT INTO plan_failures (session_id, objective, count, updated_at) 
+	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(session_id, objective) DO UPDATE SET 
+		count = excluded.count, 
+		updated_at = CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, sessionID, objective, count)
+	return err
+}
+
+func (s *SQLiteStore) GetFailureCounts(ctx context.Context, sessionID string) (map[string]int, error) {
+	query := `SELECT objective, count FROM plan_failures WHERE session_id = ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	failures := make(map[string]int)
+	for rows.Next() {
+		var objective string
+		var count int
+		if err := rows.Scan(&objective, &count); err != nil {
+			return nil, err
+		}
+		failures[objective] = count
+	}
+	return failures, nil
 }
 
 func (s *SQLiteStore) Close() error {
@@ -7835,6 +8412,7 @@ type SystemMetrics struct {
 	StuckEvents    prometheus.Counter
 	ReflexTriggers prometheus.Counter
 	FailureLoops   prometheus.Counter
+	DroppedEvents  prometheus.Counter
 }
 
 var Metrics = &SystemMetrics{
@@ -7897,6 +8475,10 @@ var Metrics = &SystemMetrics{
 		Name: "agent_failure_loops_total",
 		Help: "Number of times a task hit the infinite failure loop threshold",
 	}),
+	DroppedEvents: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_dropped_events_total",
+		Help: "Number of events dropped due to worker saturation",
+	}),
 }
 
 </file>
@@ -7932,7 +8514,9 @@ func NewFeedbackAnalyzer(world *domain.WorldModel, logger *slog.Logger) *Feedbac
 // If it returns nil, the task was successful or should be dropped.
 func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.ExecutionResult) *domain.ActionIntent {
 	if res.Success {
-		f.world.RecordSuccess(intent.Action, intent.Target)
+		if f.world != nil {
+			f.world.RecordSuccess(intent.Action, intent.Target)
+		}
 		return nil
 	}
 
@@ -7943,7 +8527,7 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	// If we made significant progress before failing, update our local world weight
 	// so the planner knows this wasn't a total bust.
-	if res.Progress > 0.5 && intent.TargetLocation != nil {
+	if f.world != nil && res.Progress > 0.5 && intent.TargetLocation != nil {
 		f.world.RewardPath(*intent.TargetLocation, res.Progress)
 	}
 
@@ -7957,7 +8541,7 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 	switch res.Cause {
 	case domain.CauseBlocked, domain.CauseStuck:
 		// Bot is physically trapped or pathing is deadlocking.
-		if intent.TargetLocation != nil {
+		if f.world != nil && intent.TargetLocation != nil {
 			f.world.PenalizeZone(*intent.TargetLocation, 10.0)
 		}
 		return f.generateFallback(intent)
@@ -7974,13 +8558,20 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 		// Survival system took over in TS.
 		return f.triggerReevaluation()
 
+	case "FALLBACK":
+		// Skill confidence low or manual fallback triggered.
+		f.logger.Info("Manual fallback triggered, dropping to macro re-evaluation")
+		return f.triggerReevaluation()
+
 	case domain.CauseMissingResource:
 		// TS realized it doesn't have the mats.
 		return f.generatePrerequisitePlan(intent)
 
 	default:
 		// Blind retry as a last resort, but down-weight it so we don't spam it.
-		f.world.PenalizeAction(intent.Action, 2.0)
+		if f.world != nil {
+			f.world.PenalizeAction(intent.Action, 2.0)
+		}
 		return &intent
 	}
 }
@@ -7989,7 +8580,13 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 func (f *FeedbackAnalyzer) generateFallback(failedIntent domain.ActionIntent) *domain.ActionIntent {
 	if failedIntent.TargetLocation == nil {
-		return &failedIntent
+		return &domain.ActionIntent{
+			ID:        "reposition_" + failedIntent.ID,
+			Action:    "reposition",
+			Target:    "nearby_safe_ground",
+			Count:     1,
+			Rationale: "FALLBACK: Physically blocked without stable target location. Reposition locally and retry.",
+		}
 	}
 
 	// Offset the target by 1.5 to 3.0 blocks to try a different physical angle
@@ -8011,10 +8608,10 @@ func (f *FeedbackAnalyzer) generateFallback(failedIntent domain.ActionIntent) *d
 func (f *FeedbackAnalyzer) generateBackoff(failedIntent domain.ActionIntent) *domain.ActionIntent {
 	return &domain.ActionIntent{
 		ID:        "backoff_" + failedIntent.ID,
-		Action:    "explore",
-		Target:    "nearby",
+		Action:    "reposition",
+		Target:    "nearby_safe_ground",
 		Count:     1,
-		Rationale: "BACKOFF: Pathing timeout detected. Exploring nearby to reset physical state.",
+		Rationale: "BACKOFF: Pathing timeout detected. Reposition locally to reset physical state before retry.",
 	}
 }
 
@@ -8065,12 +8662,77 @@ func (f *FeedbackAnalyzer) generatePrerequisitePlan(failedIntent domain.ActionIn
 
 </file>
 
+<file path="internal\planner\feedback_test.go">
+package planner
+
+import (
+	"io"
+	"log/slog"
+	"testing"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+func testFeedbackAnalyzer() *FeedbackAnalyzer {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewFeedbackAnalyzer(domain.NewWorldModel(), logger)
+}
+
+func TestFeedbackAnalyzerTimeoutBackoffUsesReposition(t *testing.T) {
+	analyzer := testFeedbackAnalyzer()
+
+	intent := domain.ActionIntent{
+		ID:     "task-1",
+		Action: "explore",
+		Target: "surroundings",
+	}
+	res := domain.ExecutionResult{
+		Success:  false,
+		Cause:    domain.CauseTimeout,
+		Progress: 0,
+	}
+
+	next := analyzer.Analyze(intent, res)
+	if next == nil {
+		t.Fatal("expected adapted intent")
+	}
+	if next.Action != "reposition" {
+		t.Fatalf("expected reposition fallback, got %s", next.Action)
+	}
+}
+
+func TestFeedbackAnalyzerBlockedWithoutTargetLocationUsesReposition(t *testing.T) {
+	analyzer := testFeedbackAnalyzer()
+
+	intent := domain.ActionIntent{
+		ID:     "task-2",
+		Action: "mine",
+		Target: "iron_ore",
+	}
+	res := domain.ExecutionResult{
+		Success:  false,
+		Cause:    domain.CauseBlocked,
+		Progress: 0,
+	}
+
+	next := analyzer.Analyze(intent, res)
+	if next == nil {
+		t.Fatal("expected adapted intent")
+	}
+	if next.Action != "reposition" {
+		t.Fatalf("expected reposition fallback, got %s", next.Action)
+	}
+}
+
+</file>
+
 <file path="internal\state\service.go">
 package state
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -8121,12 +8783,11 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 	// Phase 5: Build world model - Track chunks visited from heartbeat
 	newState.RecordChunkVisit(int(newState.Position.X)>>4, int(newState.Position.Z)>>4)
 
-	// Preserve existing DangerZones and VisitedChunks across ticks
+	// Preserve and merge long-lived world memory across ticks.
 	curr := s.GetCurrentState()
-	newState.DangerZones = curr.State.DangerZones
-	if len(curr.State.VisitedChunks) > len(newState.VisitedChunks) {
-		newState.VisitedChunks = curr.State.VisitedChunks
-	}
+	newState.DangerZones = mergeDangerZones(curr.State.DangerZones, newState.DangerZones)
+	newState.VisitedChunks = mergeVisitedChunks(curr.State.VisitedChunks, newState.VisitedChunks)
+	newState.TerrainRoughness = mergeTerrainRoughness(curr.State.TerrainRoughness, newState.TerrainRoughness)
 
 	s.saveState(ctx, newState, event)
 }
@@ -8158,6 +8819,97 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	}
 }
 
+func mergeDangerZones(existing, incoming []domain.DangerZone) []domain.DangerZone {
+	if len(existing) == 0 {
+		return append([]domain.DangerZone{}, incoming...)
+	}
+	if len(incoming) == 0 {
+		return append([]domain.DangerZone{}, existing...)
+	}
+
+	merged := make([]domain.DangerZone, 0, len(incoming)+len(existing))
+	seen := make(map[string]int, len(incoming)+len(existing))
+
+	add := func(zone domain.DangerZone) {
+		key := fmt.Sprintf(
+			"%s:%d:%d:%d",
+			zone.Reason,
+			int(zone.Center.X)/4,
+			int(zone.Center.Y)/4,
+			int(zone.Center.Z)/4,
+		)
+
+		if idx, ok := seen[key]; ok {
+			if zone.Risk > merged[idx].Risk {
+				merged[idx] = zone
+			}
+			return
+		}
+
+		seen[key] = len(merged)
+		merged = append(merged, zone)
+	}
+
+	for _, zone := range incoming {
+		add(zone)
+	}
+	for _, zone := range existing {
+		add(zone)
+	}
+
+	if len(merged) > 64 {
+		merged = merged[:64]
+	}
+
+	return merged
+}
+
+func mergeVisitedChunks(existing, incoming []domain.ChunkCoord) []domain.ChunkCoord {
+	if len(existing) == 0 {
+		return append([]domain.ChunkCoord{}, incoming...)
+	}
+	if len(incoming) == 0 {
+		return append([]domain.ChunkCoord{}, existing...)
+	}
+
+	merged := make([]domain.ChunkCoord, 0, len(existing)+len(incoming))
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+
+	add := func(chunk domain.ChunkCoord) {
+		key := fmt.Sprintf("%d,%d", chunk.X, chunk.Z)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, chunk)
+	}
+
+	for _, chunk := range existing {
+		add(chunk)
+	}
+	for _, chunk := range incoming {
+		add(chunk)
+	}
+
+	return merged
+}
+
+func mergeTerrainRoughness(existing, incoming map[string]float64) map[string]float64 {
+	if len(existing) == 0 && len(incoming) == 0 {
+		return nil
+	}
+
+	merged := make(map[string]float64, len(existing)+len(incoming))
+	for key, value := range existing {
+		merged[key] = value
+	}
+	for key, value := range incoming {
+		merged[key] = value
+	}
+
+	return merged
+}
+
 func (s *Service) saveState(ctx context.Context, newState domain.GameState, triggerEvent domain.DomainEvent) {
 	vState := domain.VersionedState{
 		Version: s.stateVersion.Add(1),
@@ -8176,6 +8928,74 @@ func (s *Service) saveState(ctx context.Context, newState domain.GameState, trig
 		Payload:   payload,
 		CreatedAt: time.Now(),
 	})
+}
+
+</file>
+
+<file path="internal\state\service_test.go">
+package state
+
+import (
+	"testing"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+func TestMergeDangerZonesPrefersIncomingAndPreservesExisting(t *testing.T) {
+	existing := []domain.DangerZone{
+		{
+			Center: domain.Vec3{X: 10, Y: 64, Z: 10},
+			Radius: 8,
+			Reason: "lava",
+			Risk:   0.7,
+		},
+	}
+	incoming := []domain.DangerZone{
+		{
+			Center: domain.Vec3{X: 11, Y: 64, Z: 11},
+			Radius: 6,
+			Reason: "lava",
+			Risk:   0.95,
+		},
+		{
+			Center: domain.Vec3{X: 40, Y: 64, Z: 40},
+			Radius: 4,
+			Reason: "cliff",
+			Risk:   0.6,
+		},
+	}
+
+	merged := mergeDangerZones(existing, incoming)
+	if len(merged) != 2 {
+		t.Fatalf("expected 2 merged danger zones, got %d", len(merged))
+	}
+
+	if merged[0].Reason != "lava" || merged[0].Risk != 0.95 {
+		t.Fatalf("expected incoming lava zone to win, got %+v", merged[0])
+	}
+}
+
+func TestMergeVisitedChunksDedupes(t *testing.T) {
+	existing := []domain.ChunkCoord{{X: 1, Z: 2}, {X: 3, Z: 4}}
+	incoming := []domain.ChunkCoord{{X: 3, Z: 4}, {X: 5, Z: 6}}
+
+	merged := mergeVisitedChunks(existing, incoming)
+	if len(merged) != 3 {
+		t.Fatalf("expected 3 unique chunks, got %d", len(merged))
+	}
+}
+
+func TestMergeTerrainRoughnessIncomingOverrides(t *testing.T) {
+	existing := map[string]float64{"0,0": 0.2, "1,1": 0.4}
+	incoming := map[string]float64{"1,1": 0.9, "2,2": 0.3}
+
+	merged := mergeTerrainRoughness(existing, incoming)
+	if merged["1,1"] != 0.9 {
+		t.Fatalf("expected incoming roughness override, got %v", merged["1,1"])
+	}
+	if merged["0,0"] != 0.2 || merged["2,2"] != 0.3 {
+		t.Fatalf("unexpected merged terrain roughness: %+v", merged)
+	}
 }
 
 </file>
@@ -8209,6 +9029,7 @@ type Directive struct {
 // LLMClient is the minimal interface this package needs.
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
 }
 
 // Evaluator produces a Directive from the current game state.
@@ -8858,7 +9679,7 @@ Why did this fail, and what should the bot do differently?`,
 	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	response, err := c.llm.Generate(ctx2, systemPrompt, userContent)
+	response, err := c.llm.GenerateText(ctx2, systemPrompt, userContent)
 	if err != nil {
 		return ""
 	}
@@ -8879,7 +9700,7 @@ Focus on rules the bot frequently violates. Plain text only, no markdown headers
 	ctx2, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
-	response, err := c.llm.Generate(ctx2, systemPrompt,
+	response, err := c.llm.GenerateText(ctx2, systemPrompt,
 		"Generate the most critical rules for a Minecraft bot to survive and progress efficiently.")
 	if err != nil {
 		return staticSurvivalRules()
@@ -8988,6 +9809,7 @@ var codeSynthesisSystemPrompt string
 // LLMClient is the minimal interface this package needs from the LLM layer.
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
 	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
 }
 
@@ -9089,7 +9911,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%s%s%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
+	baseUserContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%s%s%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
 		stateContext,
 		memoryContext.String(),
 		milestoneContext,
@@ -9099,9 +9921,15 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 
 	var intent domain.ActionIntent
 	var parseErr error
+	var errorHint string
 
 	for attempt := 0; attempt < 3; attempt++ {
-		rawResponse, genErr := c.client.Generate(ctx, curriculumSystemPrompt, userContent)
+		currentPrompt := baseUserContent
+		if errorHint != "" {
+			currentPrompt += "\n\n" + errorHint
+		}
+
+		rawResponse, genErr := c.client.Generate(ctx, curriculumSystemPrompt, currentPrompt)
 		if genErr != nil {
 			return nil, fmt.Errorf("llm api failure: %w", genErr)
 		}
@@ -9114,7 +9942,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 					intent.SkillName = skill.Name
 				} else {
 					parseErr = fmt.Errorf("skill '%s' not found", intent.Target)
-					userContent += fmt.Sprintf("\n\nSYSTEM: Skill '%s' not found. Choose from the AVAILABLE SKILLS list or use a standard action.", intent.Target)
+					errorHint = fmt.Sprintf("SYSTEM: Skill '%s' not found. Choose from the AVAILABLE SKILLS list or use a standard action.", intent.Target)
 					continue
 				}
 			}
@@ -9122,7 +9950,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 		// LOG FAILURE FOR DEBUGGING
 		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nRaw Response: %s\nParse Error: %v\n", attempt, rawResponse, parseErr)
-		userContent += fmt.Sprintf("\n\nSYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
+		errorHint = fmt.Sprintf("SYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
 	if parseErr != nil || intent.Action == "" {
@@ -9173,7 +10001,7 @@ The code should handle the case where the target might not be immediately visibl
 		before.Health, after.Health,
 	)
 
-	rawCode, err := c.client.Generate(ctx, codeSynthesisSystemPrompt, userContent)
+	rawCode, err := c.client.GenerateText(ctx, codeSynthesisSystemPrompt, userContent)
 	if err != nil {
 		return "", fmt.Errorf("code synthesis llm failure: %w", err)
 	}
@@ -9268,15 +10096,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
+	"strings"
 
 	"david22573/synaptic-mc/internal/domain"
 )
 
 // ExecutableSkill represents a JS function stored in the vector database.
 type ExecutableSkill struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	JSCode      string `json:"js_code"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	JSCode      string  `json:"js_code"`
+	Confidence  float64 `json:"confidence"`
 }
 
 // SkillManager bridges the vector store and the decision planner.
@@ -9319,8 +10150,47 @@ func (sm *SkillManager) RetrieveSkills(ctx context.Context, query string, limit 
 	return results, nil
 }
 
+// ValidateSkill performs static analysis and dry-runs to ensure safety.
+func (sm *SkillManager) ValidateSkill(ctx context.Context, jsCode string) error {
+	// A-1: Static Lint: check for banned patterns
+	bannedPatterns := []string{
+		"bot.quit",
+		"bot.drop",
+		"eval(",
+		"require(",
+		"process.exit",
+		"process.kill",
+	}
+	for _, pattern := range bannedPatterns {
+		if strings.Contains(jsCode, pattern) {
+			return fmt.Errorf("skill contains banned pattern: %s", pattern)
+		}
+	}
+
+	// Basic check: must look like an async function expression
+	trimmed := strings.TrimSpace(jsCode)
+	if !strings.HasPrefix(trimmed, "async") {
+		return fmt.Errorf("skill must be an async function (starts with 'async')")
+	}
+
+	// A-1: Dry-run in headless mock environment
+	// This ensures the code is syntactically valid and compiles.
+	cmd := exec.CommandContext(ctx, "npx", "tsx", "js/scripts/validate_skill.ts", jsCode)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dry-run validation failed: %s", string(output))
+	}
+
+	return nil
+}
+
 // SaveSkill stores an executable JS behavior back into the vector database.
 func (sm *SkillManager) SaveSkill(ctx context.Context, skill ExecutableSkill) error {
+	// A-1: Validate before saving
+	if err := sm.ValidateSkill(ctx, skill.JSCode); err != nil {
+		return fmt.Errorf("skill validation failed: %w", err)
+	}
+
 	emb, err := sm.client.CreateEmbedding(ctx, skill.Description)
 	if err != nil {
 		return fmt.Errorf("failed to embed skill description: %w", err)
@@ -9332,6 +10202,10 @@ func (sm *SkillManager) SaveSkill(ctx context.Context, skill ExecutableSkill) er
 	}
 
 	return sm.store.SaveSkill(ctx, skill.Description, string(codeBytes), emb)
+}
+
+func (sm *SkillManager) RecordSkillResult(ctx context.Context, name string, success bool) error {
+	return sm.store.RecordSkillResult(ctx, name, success)
 }
 
 </file>
@@ -9357,6 +10231,7 @@ type VectorStore interface {
 	SaveSkill(ctx context.Context, description string, code string, embedding []float32) error
 	RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error)
 	RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error)
+	RecordSkillResult(ctx context.Context, name string, success bool) error
 	Close() error
 }
 
@@ -9385,19 +10260,51 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		description TEXT NOT NULL UNIQUE,
 		code TEXT NOT NULL,
 		embedding_json TEXT NOT NULL,
+		bucket_id INTEGER DEFAULT 0,
 		success_count INTEGER DEFAULT 0,
+		total_runs INTEGER DEFAULT 0,
+		total_successes INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);`
+	);
+	CREATE INDEX IF NOT EXISTS idx_skills_bucket ON skills(bucket_id);`
 
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply vector store schema: %w", err)
 	}
 
+	// Migrations: ensure columns exist (ignore errors if they already exist)
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN total_runs INTEGER DEFAULT 0")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN total_successes INTEGER DEFAULT 0")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN bucket_id INTEGER DEFAULT 0")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_skills_bucket ON skills(bucket_id)")
+
 	return &SQLiteVectorStore{db: db}, nil
+}
+
+func getBucketID(emb []float32) int {
+	if len(emb) < 4 {
+		return 0
+	}
+	bucket := 0
+	for i := 0; i < 4; i++ {
+		// Quantize into 4 levels: < -0.5, -0.5 to 0, 0 to 0.5, > 0.5
+		v := emb[i]
+		q := 0
+		if v > 0.5 {
+			q = 3
+		} else if v > 0 {
+			q = 2
+		} else if v > -0.5 {
+			q = 1
+		}
+		bucket = (bucket << 2) | q
+	}
+	return bucket
 }
 
 func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, code string, embedding []float32) error {
 	embeddingBytes, _ := json.Marshal(embedding)
+	bucketID := getBucketID(embedding)
 
 	var name sql.NullString
 	var skill domain.ExecutableSkill
@@ -9406,20 +10313,33 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, c
 		name.Valid = true
 	}
 
-	query := `INSERT INTO skills (name, description, code, embedding_json, success_count) VALUES (?, ?, ?, ?, 1) 
+	// When saving a newly synthesized skill, we start with 1 run/success to give it initial confidence
+	query := `INSERT INTO skills (name, description, code, embedding_json, bucket_id, success_count, total_runs, total_successes) 
+	          VALUES (?, ?, ?, ?, ?, 1, 1, 1) 
 	          ON CONFLICT(description) DO UPDATE SET 
 	          code=excluded.code, 
 	          embedding_json=excluded.embedding_json,
-	          success_count=success_count+1`
-	_, err := s.db.ExecContext(ctx, query, name, description, code, string(embeddingBytes))
+	          bucket_id=excluded.bucket_id`
+	_, err := s.db.ExecContext(ctx, query, name, description, code, string(embeddingBytes), bucketID)
 
 	return err
 }
 
+func (s *SQLiteVectorStore) RecordSkillResult(ctx context.Context, name string, success bool) error {
+	successInc := 0
+	if success {
+		successInc = 1
+	}
+	query := `UPDATE skills SET total_runs = total_runs + 1, total_successes = total_successes + ? WHERE name = ?`
+	_, err := s.db.ExecContext(ctx, query, successInc, name)
+	return err
+}
+
 func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error) {
-	query := `SELECT code FROM skills WHERE name = ?`
+	query := `SELECT code, total_runs, total_successes FROM skills WHERE name = ?`
 	var code string
-	err := s.db.QueryRowContext(ctx, query, name).Scan(&code)
+	var runs, successes int
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&code, &runs, &successes)
 	if err != nil {
 		return nil, err
 	}
@@ -9428,16 +10348,26 @@ func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string)
 	if err := json.Unmarshal([]byte(code), &skill); err != nil {
 		return nil, err
 	}
+
+	// Calculate confidence score (0.0 to 1.0)
+	if runs > 0 {
+		skill.Confidence = float64(successes) / float64(runs)
+	} else {
+		skill.Confidence = 0.0
+	}
+
 	return &skill, nil
 }
 
 func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error) {
-	// Candidate selection: load at most 500 skills to avoid unbounded linear scans.
-	// We prioritize skills with higher success counts.
-	query := `SELECT description, code, embedding_json FROM skills 
-	          ORDER BY success_count DESC LIMIT 500`
+	bucketID := getBucketID(queryEmbedding)
 
-	rows, err := s.db.QueryContext(ctx, query)
+	// Candidate selection: filter by bucket_id and prioritize high success
+	query := `SELECT description, code, embedding_json, total_runs, total_successes FROM skills 
+	          WHERE bucket_id = ?
+	          ORDER BY total_successes DESC LIMIT 500`
+
+	rows, err := s.db.QueryContext(ctx, query, bucketID)
 	if err != nil {
 		return nil, err
 	}
@@ -9453,7 +10383,8 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 		}
 
 		var desc, code, embJSON string
-		if err := rows.Scan(&desc, &code, &embJSON); err != nil {
+		var runs, successes int
+		if err := rows.Scan(&desc, &code, &embJSON, &runs, &successes); err != nil {
 			continue
 		}
 
@@ -9472,6 +10403,32 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+
+	// Fallback: if bucket is empty or too small, search all as a safety net (limited)
+	if len(records) < limit {
+		extraQuery := `SELECT description, code, embedding_json, total_runs, total_successes FROM skills 
+		               WHERE bucket_id != ?
+		               ORDER BY total_successes DESC LIMIT ?`
+		extraRows, err := s.db.QueryContext(ctx, extraQuery, bucketID, limit*2)
+		if err == nil {
+			defer extraRows.Close()
+			for extraRows.Next() {
+				var desc, code, embJSON string
+				var runs, successes int
+				if err := extraRows.Scan(&desc, &code, &embJSON, &runs, &successes); err == nil {
+					var embedding []float32
+					if err := json.Unmarshal([]byte(embJSON), &embedding); err == nil {
+						sim := cosineSimilarity(queryEmbedding, embedding)
+						records = append(records, SkillRecord{
+							Description: desc,
+							Code:        code,
+							Similarity:  sim,
+						})
+					}
+				}
+			}
+		}
 	}
 
 	sort.Slice(records, func(i, j int) bool {
@@ -9521,6 +10478,7 @@ import { SurvivalSystem } from "./lib/systems/survival.js";
 import { BotController } from "./lib/control/controller.js";
 import { getThreats, computeSafeRetreat } from "./lib/utils/threats.js";
 import { getPOIs, clearPOICache } from "./lib/utils/perception.js";
+import { senseWorld } from "./lib/utils/world.js";
 
 const { pathfinder, Movements, goals } = pkg;
 
@@ -9613,6 +10571,7 @@ process.on("unhandledRejection", (reason: unknown) => {
 });
 
 let currentTask: models.ActiveTask | null = null;
+let preloadedTask: models.ActionIntent | null = null;
 let taskAbortController: AbortController | null = null;
 
 let bot: mineflayer.Bot;
@@ -9752,6 +10711,14 @@ function completeTask(
         task.startTime,
         progress,
     );
+
+    // If we have a preloaded task and the previous one just finished, execute it immediately
+    if (preloadedTask && !currentTask && !isShuttingDown) {
+        const next = preloadedTask;
+        preloadedTask = null;
+        log.info("Immediate transition to preloaded task", { action: next.action });
+        void executeIntent(next);
+    }
 }
 
 function abortActiveTask(reason: string) {
@@ -10002,6 +10969,7 @@ function pushState() {
     lastStatePushTime = now;
 
     const liveThreats = getThreats(bot);
+    const world = senseWorld(bot, liveThreats);
 
     const state: models.GameState = {
         health: Math.round(bot.health || 0),
@@ -10041,12 +11009,15 @@ function pushState() {
             name: t.name,
             distance: t.distance,
         })),
+        feedback: world.feedback,
         current_task: currentTask,
         task_progress: isPathfinding
             ? pathProgress
             : bot.pathfinder?.isMoving()
               ? 0.5
               : 0,
+        danger_zones: world.dangerZones,
+        terrain_roughness: world.terrainRoughness,
     };
 
     client.sendState(state);
@@ -10095,6 +11066,14 @@ async function connectWithRetry(maxAttempts = 10) {
                 id: i.id,
             });
             void executeIntent(i);
+        });
+        client.on("preload", (i: models.ActionIntent) => {
+            log.info("Received task preload", {
+                action: i.action,
+                target: i.target?.name,
+                id: i.id,
+            });
+            preloadedTask = i;
         });
         client.on("abort", (payload?: { reason?: string }) => {
             const reason = payload?.reason || "unlock";
@@ -10223,7 +11202,16 @@ async function connectWithRetry(maxAttempts = 10) {
 async function bootstrap() {
     runtimeConfig = await config.loadConfig();
     await connectWithRetry();
+    
+    // Change-driven push + heartbeat
     stateInterval = setInterval(pushState, 3000);
+    
+    // High-frequency polling for change-driven pushes
+    setInterval(() => {
+        if (isBotSpawned && bot.entity) {
+            pushState();
+        }
+    }, 250);
 }
 
 process.on("SIGINT", () => {
@@ -10284,6 +11272,8 @@ export const TASK_TIMEOUTS: Record<string, number> = {
     mark_location: 5000,
     recall_location: 5000,
     idle: 3000,
+    random_walk: 5000,
+    reposition: 10000,
 };
 
 export const THREAT_WEIGHTS: Record<string, number> = {
@@ -10364,6 +11354,11 @@ import { ControlLoop } from "./loop.js";
 import { INTENT_EVALUATORS } from "../tasks/registry.js";
 import { log } from "../logger.js";
 import { Vec3 } from "vec3";
+import {
+    getWorldControlOverrides,
+    senseWorld,
+    type WorldAwareness,
+} from "../utils/world.js";
 
 export interface Perception {
     pos: Vec3;
@@ -10371,6 +11366,7 @@ export interface Perception {
     intent: ActionIntent | null;
     state: Record<string, any>;
     threats: ThreatInfo[];
+    world: WorldAwareness;
 }
 
 export interface ActionPlan {
@@ -10402,12 +11398,14 @@ export class BotController {
     }
 
     public sense(): Perception {
+        const threats = this.getThreats();
         return {
             pos: this.bot.entity?.position || new Vec3(0, 0, 0),
             health: this.bot.health,
             intent: this.activeIntent,
             state: this.intentState,
-            threats: this.getThreats(),
+            threats,
+            world: senseWorld(this.bot, threats),
         };
     }
 
@@ -10428,7 +11426,7 @@ export class BotController {
         };
 
         if (!perception.intent || !this.bot.entity) {
-            return defaultPlan;
+            return this.mergeWorldReflexes(defaultPlan, perception.world);
         }
 
         const evaluator = INTENT_EVALUATORS[perception.intent.action];
@@ -10436,10 +11434,11 @@ export class BotController {
             log.warn(
                 `No continuous evaluator found for intent: ${perception.intent.action}`,
             );
-            return defaultPlan;
+            return this.mergeWorldReflexes(defaultPlan, perception.world);
         }
 
-        return evaluator(this.bot, perception, defaultPlan);
+        const plan = evaluator(this.bot, perception, defaultPlan);
+        return this.mergeWorldReflexes(plan, perception.world);
     }
 
     public async act(plan: ActionPlan) {
@@ -10470,6 +11469,41 @@ export class BotController {
     }
     public stop() {
         this.loop.stop();
+    }
+
+    private mergeWorldReflexes(
+        plan: ActionPlan,
+        world: WorldAwareness,
+    ): ActionPlan {
+        const overrides = getWorldControlOverrides(this.bot, world);
+        if (
+            Object.keys(overrides.controls).length === 0 &&
+            !overrides.clearPathfinder &&
+            !overrides.lookAt
+        ) {
+            return plan;
+        }
+
+        const baseControls = overrides.urgent
+            ? {
+                  forward: false,
+                  back: false,
+                  left: false,
+                  right: false,
+                  jump: false,
+                  sprint: false,
+              }
+            : plan.controls;
+
+        return {
+            ...plan,
+            controls: {
+                ...baseControls,
+                ...overrides.controls,
+            },
+            lookAt: overrides.lookAt || plan.lookAt,
+            clearPathfinder: plan.clearPathfinder || overrides.clearPathfinder,
+        };
     }
 }
 
@@ -10522,9 +11556,11 @@ export class ControlLoop {
 <file path="js\lib\control\runtime.ts">
 // js/lib/control/runtime.ts
 import { Bot } from "mineflayer";
+import { applyWorldMovementReflexes, senseWorld } from "../utils/world.js";
 
 export class Runtime {
     private active = true;
+    private lastJumpAt = 0;
 
     constructor(private bot: Bot) {}
 
@@ -10542,7 +11578,10 @@ export class Runtime {
 
         while (this.active && !signal.aborted) {
             this.readStateAndAdjust();
-            await this.bot.waitForTicks(2);
+            
+            const isMoving = (this.bot as any).pathfinder?.isMoving();
+            // Poll faster when moving (100ms), slower when stationary (250ms)
+            await this.bot.waitForTicks(isMoving ? 2 : 5);
         }
 
         return await taskPromise;
@@ -10551,23 +11590,55 @@ export class Runtime {
     private readStateAndAdjust() {
         if (!this.bot.entity) return;
 
-        const isMoving = this.bot.pathfinder?.isMoving();
+        const isMoving = (this.bot as any).pathfinder?.isMoving();
+        const world = senseWorld(this.bot);
 
-        // Cast to any to bypass missing TS definitions for physics properties
+        if (!isMoving) {
+            this.bot.setControlState("jump", false);
+            return;
+        }
+
+        // Only let world sensor take over locomotion for immediate danger.
+        if (world.panicCause && world.escapeTarget) {
+            applyWorldMovementReflexes(this.bot, world);
+        }
+
+        const controls = (this.bot as any).controlState || {};
         const collided = (this.bot.entity as any).isCollidedHorizontally;
         const vel = this.bot.entity.velocity;
+        const horizontalSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+        const wantsMotion =
+            Boolean(
+                controls.forward ||
+                    controls.back ||
+                    controls.left ||
+                    controls.right,
+            ) || isMoving;
 
-        if (isMoving) {
-            // Dynamic mid-task correction: Unstuck logic
-            if (
-                collided ||
-                (Math.abs(vel.x) < 0.01 && Math.abs(vel.z) < 0.01)
-            ) {
-                this.bot.setControlState("jump", true);
-            } else if (this.bot.entity.onGround) {
-                this.bot.setControlState("jump", false);
-            }
-        } else {
+        const shouldJump =
+            world.movement.inWater ||
+            world.movement.submerged ||
+            world.movement.inLava ||
+            world.movement.inCobweb ||
+            world.movement.inBerryBush ||
+            ((collided || world.movement.frontBlocked) &&
+                wantsMotion &&
+                horizontalSpeed < 0.03);
+
+        const canPulseJump =
+            this.bot.entity.onGround ||
+            world.movement.inWater ||
+            world.movement.submerged ||
+            world.movement.inLava;
+
+        if (
+            shouldJump &&
+            canPulseJump &&
+            Date.now() - this.lastJumpAt >= 400
+        ) {
+            this.lastJumpAt = Date.now();
+            this.bot.setControlState("jump", true);
+        } else if (!shouldJump || this.bot.entity.onGround) {
             this.bot.setControlState("jump", false);
         }
     }
@@ -10709,6 +11780,8 @@ export enum ActionType {
     Retrieve = "retrieve",
     Look = "look",
     CameraMove = "camera_move",
+    RandomWalk = "random_walk",
+    Reposition = "reposition",
 }
 
 export enum ClientEventType {
@@ -10841,11 +11914,18 @@ export interface ExecutionResult {
 // js/lib/movement/hesitation.ts
 import type { Bot } from "mineflayer";
 
+let lastHesitationAt = 0;
+const HESITATION_COOLDOWN_MS = 2000;
+
 /**
  * Applies situational hesitation before movement starts.
  * Synced to server physics ticks to prevent event loop drift.
  */
 export async function applyHesitation(bot: Bot): Promise<void> {
+    const now = Date.now();
+    if (now - lastHesitationAt < HESITATION_COOLDOWN_MS) return;
+    lastHesitationAt = now;
+
     let baseTicks = 1; // base reaction time (~50ms)
 
     // Risk-Based Hesitation (Caution factor)
@@ -10900,11 +11980,12 @@ export interface NavOpts {
     signal?: AbortSignal;
     stopMovement?: () => void;
     maxRetries?: number;
+    skipStop?: boolean; // New option to skip stop for fluidity
 }
 
 async function ensureKinematicStop(
     bot: Bot,
-    timeoutMs: number = 1500,
+    timeoutMs: number = 400, // Reduced from 1500 to 400ms
 ): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -10974,7 +12055,7 @@ export async function navigateWithFallbacks(
                         signal: strategySignal,
                         stopMovement: opts.stopMovement,
                     });
-                    await ensureKinematicStop(bot);
+                    if (!opts.skipStop) await ensureKinematicStop(bot);
                     return;
                 }
                 
@@ -11000,7 +12081,7 @@ export async function navigateWithFallbacks(
                 // After a recovery strategy, try pathfinding again if not yet at goal
                 const dist = tracker.getDistance(bot);
                 if (dist < 2) {
-                    await ensureKinematicStop(bot);
+                    if (!opts.skipStop) await ensureKinematicStop(bot);
                     return;
                 }
                 
@@ -11044,7 +12125,7 @@ export async function navigateWithFallbacks(
         }
     } finally {
         bot.clearControlStates();
-        await ensureKinematicStop(bot);
+        if (!opts.skipStop) await ensureKinematicStop(bot);
     }
 }
 
@@ -11464,6 +12545,8 @@ export class SynapticClient extends EventEmitter {
 
                 if (msg.type === "DISPATCH_TASK") {
                     this.emit("dispatch", msg.payload as models.Action);
+                } else if (msg.type === "TASK_PRELOAD") {
+                    this.emit("preload", msg.payload as models.Action);
                 } else if (msg.type === "ABORT_TASK") {
                     this.emit("abort", msg.payload);
                 }
@@ -11735,6 +12818,7 @@ export class SkillRegistry {
 import type { Bot } from "mineflayer";
 import { log } from "../logger.js";
 import { getThreats } from "../utils/threats.js";
+import { senseWorld } from "../utils/world.js";
 
 export interface SurvivalConfig {
     onInterrupt: (reason: string) => void;
@@ -11796,6 +12880,7 @@ export class SurvivalSystem {
 
     private checkSurvival() {
         const threats = getThreats(this.bot);
+        const world = senseWorld(this.bot, threats);
 
         const criticalMobNames = new Set(["creeper", "skeleton", "witch"]);
 
@@ -11812,28 +12897,43 @@ export class SurvivalSystem {
                 t.name !== "starvation",
         );
 
-        if (immediateThreats.length > 0) {
-            const topThreat = immediateThreats[0]!;
+        const panicCause =
+            world.panicCause ||
+            (immediateThreats.length > 0 ? immediateThreats[0]!.name : null);
+
+        if (panicCause) {
+            const topThreat = immediateThreats[0] ?? null;
 
             // If we're panicking or in cooldown, let the current escape plan play out
             if (this.isPanicking || Date.now() < this.panicCooldownUntil)
                 return;
 
             this.isPanicking = true;
-            this.panicCooldownUntil = Date.now() + 15000; // 15-second cooldown to avoid retreat thrashing
+            this.panicCooldownUntil =
+                Date.now() +
+                (world.panicCause === "lava" || world.panicCause === "drowning"
+                    ? 8000
+                    : 15000);
 
             log.warn(
                 "SENSOR: Critical Threat Detected. Interrupting TS execution loop.",
                 {
-                    cause: topThreat.name,
+                    cause: panicCause,
                     health: Math.round(this.bot.health),
-                    distance: Math.round(topThreat.distance),
+                    distance:
+                        topThreat?.distance !== undefined
+                            ? Math.round(topThreat.distance)
+                            : 0,
                 },
             );
 
-            this.config.onPanicStart?.(topThreat.name);
-            this.config.onInterrupt(`panic_${topThreat.name}`);
-        } else if (this.isPanicking && Date.now() > this.panicCooldownUntil) {
+            this.config.onPanicStart?.(panicCause);
+            this.config.onInterrupt(`panic_${panicCause}`);
+        } else if (
+            this.isPanicking &&
+            Date.now() > this.panicCooldownUntil &&
+            !world.panicCause
+        ) {
             // Coast is clear and cooldown finished. Drop the panic lock.
             this.isPanicking = false;
             log.info("SENSOR: Threat passed; releasing panic lock.");
@@ -11933,15 +13033,7 @@ export class DynamicSkillSandbox {
                 filename: "voyager_skill.js",
             });
 
-            // 1. CPU Timeout (Synchronous)
-            // Node's vm timeout option only limits synchronous execution time.
-            script.runInContext(vmContext, {
-                timeout: context.timeoutMs,
-                displayErrors: true,
-                breakOnSigint: true,
-            });
-
-            // 2. Wall Clock Timeout (Asynchronous)
+            // Wall Clock Timeout (Asynchronous)
             // We race the script's internal async execution (which populates context.result)
             // against a timer and the AbortSignal.
             const timeoutPromise = new Promise<TaskResult>((_, reject) => {
@@ -11958,8 +13050,12 @@ export class DynamicSkillSandbox {
             // The wrappedCode is an IIFE that returns a promise (via async ())
             // However, script.runInContext returns the result of the last statement,
             // which in our case is the Promise from the IIFE.
+            // 
+            // timeout: Limits synchronous execution time (CPU Timeout).
             const scriptResult = script.runInContext(vmContext, {
                 timeout: context.timeoutMs,
+                displayErrors: true,
+                breakOnSigint: true,
             }) as Promise<void>;
 
             await Promise.race([
@@ -12140,6 +13236,7 @@ const SCHEMATICS: Record<string, BlueprintNode[]> = {
         { dx: -1, dy: 1, dz: 0 },
         { dx: 1, dy: 1, dz: 0 },
         { dx: -1, dy: 1, dz: 1 },
+        { dx: 0, dy: 1, dz: 1 },
         { dx: 1, dy: 1, dz: 1 },
         { dx: -1, dy: 2, dz: -1 },
         { dx: 0, dy: 2, dz: -1 },
@@ -12598,9 +13695,9 @@ class NavigateState implements FSMState {
                     timeoutMs: 25000, // Increased timeout
                     stopMovement: eCtx.stopMovement,
                     maxRetries: 4, // Increased retries
+                    skipStop: true, // Skip stop for fluidity
                 },
             );
-
             eCtx.visitedPoints.push({
                 x: eCtx.bot.entity.position.x,
                 z: eCtx.bot.entity.position.z,
@@ -14064,28 +15161,68 @@ export async function handleUseSkill(ctx: TaskContext): Promise<void> {
         );
     }
 
+    // A-1: Confidence threshold check
+    const confidence = (skillPayload as any).confidence ?? 1.0;
+    if (confidence < 0.5) {
+        log.warn("[UseSkill] Skill confidence too low, falling back", {
+            skill: skillName,
+            confidence,
+        });
+        throw new ExecutionError(
+            `Skill '${skillName}' confidence too low (${confidence.toFixed(2)})`,
+            "FALLBACK",
+            0,
+        );
+    }
+
     log.info("[UseSkill] Executing skill", {
         skill: skillName,
         desc: skillPayload.description,
         codeLen: skillPayload.js_code.length,
+        confidence,
     });
 
     // Compile and execute in a vm context.
     try {
-        const script = new vm.Script(
-            `(async (bot, goals, Vec3, signal) => { ${skillPayload.js_code} })`,
-        );
+        const wrappedCode = `(async (bot, goals, Vec3, signal) => { 
+            try {
+                ${skillPayload.js_code} 
+            } catch (err) {
+                throw err;
+            }
+        })`;
 
-        const context = vm.createContext({
+        const script = new vm.Script(wrappedCode, {
+            filename: `skill_${skillName}.js`,
+        });
+
+        const sandbox = {
+            bot,
+            goals,
+            Vec3,
+            signal,
             console,
-            // Add other globals if necessary
+            setTimeout,
+            clearTimeout,
+            setInterval,
+            clearInterval,
+            Promise,
+            Math,
+            Date,
+        };
+
+        const vmContext = vm.createContext(sandbox);
+
+        const compiledFn = script.runInContext(vmContext, {
+            timeout: 10000, // 10s CPU timeout
         });
 
-        const compiledFn = script.runInContext(context, {
-            timeout: 5000,
+        // Execution timeout (async)
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error("SKILL_EXECUTION_TIMEOUT")), 60000); // 60s total
         });
 
-        await compiledFn(bot, goals, Vec3, signal);
+        await Promise.race([compiledFn(bot, goals, Vec3, signal), timeoutPromise]);
     } catch (err: any) {
         if (isAbortError(err)) {
             throw new TaskAbortError("aborted", 0.5);
@@ -14418,6 +15555,7 @@ import { handleUseSkill } from "./handlers/use_skill.js";
 import { navigateWithFallbacks } from "../movement/navigator.js";
 import { ExecutionError } from "../errors.js";
 import { Vec3 } from "vec3";
+import { randomWalk } from "../movement/recovery.js";
 
 const { goals } = pkg;
 
@@ -14437,6 +15575,74 @@ export function calculateDynamicTimeout(
     const healthFactor = Math.max(bot.health, 1) / 20;
 
     return baseTimeout * (1 + invCount * 0.02) * (0.5 + healthFactor);
+}
+
+function isStandableRepositionSpot(bot: Bot, pos: Vec3): boolean {
+    const below = bot.blockAt(pos.offset(0, -1, 0));
+    const feet = bot.blockAt(pos);
+    const head = bot.blockAt(pos.offset(0, 1, 0));
+
+    if (!below || below.boundingBox !== "block") return false;
+    if (!feet || !head) return false;
+
+    const hazardous = new Set([
+        "water",
+        "flowing_water",
+        "lava",
+        "flowing_lava",
+        "magma_block",
+        "cobweb",
+        "sweet_berry_bush",
+        "cactus",
+        "fire",
+        "soul_fire",
+    ]);
+
+    return (
+        (feet.name === "air" || feet.name === "cave_air") &&
+        (head.name === "air" || head.name === "cave_air") &&
+        !hazardous.has(below.name)
+    );
+}
+
+function chooseRepositionTarget(bot: Bot): Vec3 | null {
+    if (!bot.entity) return null;
+
+    const pos = bot.entity.position.floored();
+    const yaw = bot.entity.yaw;
+    const baseDirections = [
+        new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)),
+        new Vec3(Math.cos(yaw), 0, -Math.sin(yaw)),
+        new Vec3(-Math.cos(yaw), 0, Math.sin(yaw)),
+        new Vec3(Math.sin(yaw), 0, Math.cos(yaw)),
+        new Vec3(-Math.sin(yaw) + Math.cos(yaw), 0, -Math.cos(yaw) - Math.sin(yaw)),
+        new Vec3(-Math.sin(yaw) - Math.cos(yaw), 0, -Math.cos(yaw) + Math.sin(yaw)),
+        new Vec3(Math.sin(yaw), 0, Math.cos(yaw)),
+        new Vec3(Math.sin(yaw) - Math.cos(yaw), 0, Math.cos(yaw) + Math.sin(yaw)),
+    ];
+
+    for (const direction of baseDirections) {
+        const norm =
+            direction.x === 0 && direction.z === 0
+                ? new Vec3(1, 0, 0)
+                : direction.normalize();
+
+        for (const distance of [2, 3, 4, 5, 6]) {
+            for (const yOffset of [1, 0, -1, -2]) {
+                const candidate = pos.offset(
+                    Math.round(norm.x * distance),
+                    yOffset,
+                    Math.round(norm.z * distance),
+                );
+
+                if (isStandableRepositionSpot(bot, candidate)) {
+                    return candidate.offset(0.5, 0, 0.5);
+                }
+            }
+        }
+    }
+
+    return null;
 }
 
 export async function runTask(
@@ -14625,6 +15831,33 @@ export async function runTask(
             case "idle":
                 await waitForMs(1500, signal);
                 break;
+            case "random_walk":
+                await randomWalk(bot, 2500, signal);
+                break;
+            case "reposition": {
+                await escapeTree(bot, signal);
+
+                const repositionTarget = chooseRepositionTarget(bot);
+                if (repositionTarget) {
+                    await navigateWithFallbacks(
+                        bot,
+                        new goals.GoalNearXZ(
+                            repositionTarget.x,
+                            repositionTarget.z,
+                            1,
+                        ),
+                        {
+                            signal,
+                            timeoutMs: 8000,
+                            stopMovement,
+                            maxRetries: 2,
+                        },
+                    );
+                } else {
+                    await randomWalk(bot, 2000, signal);
+                }
+                break;
+            }
             case "look": {
                 if (intent.target.type === "location") {
                     try {
@@ -14819,8 +16052,14 @@ import { type Block } from "prismarine-block";
 import { type Item } from "prismarine-item";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
-import { TaskAbortError, NoTargetsNearbyError, isAbortError, ExecutionError } from "../errors.js";
+import {
+    TaskAbortError,
+    NoTargetsNearbyError,
+    isAbortError,
+    ExecutionError,
+} from "../errors.js";
 import { steerTowards } from "../movement/navigator.js";
+import { applyWorldMovementReflexes, senseWorld } from "../utils/world.js";
 
 const { goals } = pkg;
 
@@ -14876,13 +16115,30 @@ export function isInFoliage(bot: Bot): boolean {
     const pos = bot.entity.position.floored();
     const at = bot.blockAt(pos);
     const below = bot.blockAt(pos.offset(0, -1, 0));
-    return (
-        !!((at && TREE_BLOCKS.has(at.name)) ||
-        (below && TREE_BLOCKS.has(below.name)))
+    return !!(
+        (at && TREE_BLOCKS.has(at.name)) ||
+        (below && TREE_BLOCKS.has(below.name))
     );
 }
 
+let lastAirborneAt = 0;
+let wasAirborneRecently = false;
+
 export async function escapeTree(bot: Bot, signal: AbortSignal): Promise<void> {
+    // Optimization: only check if we might be in a tree (recently in air and falling/landed)
+    const vel = bot.entity.velocity;
+    const now = Date.now();
+
+    if (!bot.entity.onGround) {
+        lastAirborneAt = now;
+        wasAirborneRecently = true;
+    } else if (now - lastAirborneAt > 5000) {
+        wasAirborneRecently = false;
+    }
+
+    // Skip if we are on ground and haven't been in the air for a while
+    if (!wasAirborneRecently && bot.entity.onGround) return;
+
     if (!isInFoliage(bot)) return;
     try {
         bot.pathfinder.setGoal(null);
@@ -15049,7 +16305,11 @@ export function moveToGoal(
 
         const getGoalPos = (): Vec3 | null => {
             if (goal.x !== undefined && goal.z !== undefined) {
-                return new Vec3(goal.x, goal.y ?? bot.entity.position.y, goal.z);
+                return new Vec3(
+                    goal.x,
+                    goal.y ?? bot.entity.position.y,
+                    goal.z,
+                );
             }
             if ((goal as any).dest) {
                 const dest = (goal as any).dest;
@@ -15064,6 +16324,7 @@ export function moveToGoal(
         const onTick = () => {
             if (settled) return;
             ticksElapsed++;
+            const world = senseWorld(bot);
 
             if (ticksElapsed > timeoutTicks) {
                 finish(new Error("timeout"));
@@ -15079,11 +16340,18 @@ export function moveToGoal(
                 const vel = bot.entity.velocity;
                 const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-                // More lenient stuck detection: requires 3 strikes (~2.4s) 
+                // More lenient stuck detection: requires 3 strikes (~2.4s)
                 // Checks if we are trying to move (either via pathfinder or steering hijack)
-                const isTryingToMove = bot.pathfinder.isMoving() || (targetVec && currentPos.distanceTo(targetVec) < 2.5);
-                
-                if (isTryingToMove && distSinceLast < 0.1 && speed < 0.02) {
+                const isTryingToMove =
+                    bot.pathfinder.isMoving() ||
+                    (targetVec && currentPos.distanceTo(targetVec) < 2.5);
+
+                if (
+                    isTryingToMove &&
+                    distSinceLast < 0.1 &&
+                    speed < 0.02 &&
+                    !world.movement.submerged
+                ) {
                     stuckStrikes++;
                     if (stuckStrikes >= 3) {
                         finish(
@@ -15108,11 +16376,19 @@ export function moveToGoal(
 
                 // If very close, override pathfinder completely with steering
                 if (distToGoal < 2.5) {
+                    if (world.movement.steepDropAhead && distToGoal > 1.1) {
+                        // Let pathfinder keep owning cliff-adjacent micro-positioning.
+                        // Cancelling it here can leave the bot frozen until timeout.
+                        return;
+                    }
+
                     if (bot.pathfinder.isMoving()) {
                         bot.pathfinder.setGoal(null);
                     }
+
                     steerTowards(bot, targetVec, 0.8, true);
-                    
+                    applyWorldMovementReflexes(bot, world);
+
                     if (distToGoal < 1.0) {
                         finish();
                     }
@@ -15139,7 +16415,10 @@ export function moveToGoal(
     });
 }
 
-export function findNearestBlockByName(bot: Bot, blockName: string): Block | null {
+export function findNearestBlockByName(
+    bot: Bot,
+    blockName: string,
+): Block | null {
     return bot.findBlock({
         maxDistance: 32,
         matching: (block: Block) => block?.name === blockName,
@@ -15153,8 +16432,8 @@ export async function makeRoomInInventory(
     if (bot.inventory.emptySlotCount() >= slotsNeeded) return;
 
     const inventory = bot.inventory.items();
-    const trashItems = inventory.filter((i: Item) => TRASH_ITEMS.has(i.name));
-    trashItems.sort((a: Item, b: Item) => a.count - b.count);
+    const trashItems = inventory.filter((i) => TRASH_ITEMS.has(i.name));
+    trashItems.sort((a, b) => a.count - b.count);
 
     let slotsFreed = 0;
     for (const item of trashItems) {
@@ -15175,7 +16454,7 @@ export async function placePortableUtility(
     bot: Bot,
     blockName: string,
 ): Promise<Block | null> {
-    const item = bot.inventory.items().find((i: Item) => i.name === blockName);
+    const item = bot.inventory.items().find((i) => i.name === blockName);
     if (!item) return null;
 
     const pos = bot.entity.position.floored();
@@ -15222,7 +16501,7 @@ export async function collectBlocks(
 ): Promise<void> {
     const targets: Block[] = [];
     for (const name of candidateNames) {
-        const blockId = bot.registry.blocksByName[name]?.id;
+        const blockId = (bot.registry as any).blocksByName[name]?.id;
         if (blockId === undefined) continue;
 
         const blockPositions = bot.findBlocks({
@@ -15233,7 +16512,7 @@ export async function collectBlocks(
 
         const candidates = blockPositions
             .map((pos: Vec3) => bot.blockAt(pos))
-            .filter((b: Block | null): b is Block => b !== null);
+            .filter((b): b is Block => b !== null);
 
         if (candidates.length > 0) {
             targets.push(...candidates);
@@ -15616,6 +16895,727 @@ export function computeSafeRetreat(
         x: botPos.x + Math.cos(baseAngle) * distance,
         z: botPos.z + Math.sin(baseAngle) * distance,
     };
+}
+
+</file>
+
+<file path="js\lib\utils\world.ts">
+import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import type * as models from "../models.js";
+
+type ControlName =
+    | "forward"
+    | "back"
+    | "left"
+    | "right"
+    | "jump"
+    | "sprint";
+
+type HazardKind =
+    | "lava"
+    | "drowning"
+    | "burning"
+    | "ensnared"
+    | "heavy_damage"
+    | "cliff";
+
+interface SensorMemory {
+    lastHealth: number;
+    lastDamage: number;
+    lastDamageAt: number;
+    submergedSince: number;
+    lastEvalAt: number;
+    lastYaw: number;
+    lastPos: Vec3 | null;
+    lastResult: WorldAwareness | null;
+}
+
+const PASSABLE_BLOCKS = new Set([
+    "air",
+    "cave_air",
+    "void_air",
+    "water",
+    "flowing_water",
+    "lava",
+    "flowing_lava",
+    "tall_grass",
+    "grass",
+    "short_grass",
+    "fern",
+    "large_fern",
+    "vine",
+    "cobweb",
+    "sweet_berry_bush",
+]);
+
+const LIQUID_BLOCKS = new Set([
+    "water",
+    "flowing_water",
+    "lava",
+    "flowing_lava",
+]);
+
+const FIRE_BLOCKS = new Set([
+    "fire",
+    "soul_fire",
+    "campfire",
+    "soul_campfire",
+    "magma_block",
+]);
+
+const TRAP_BLOCKS = new Set(["cobweb", "sweet_berry_bush"]);
+
+const SENSOR_CACHE_MS = 75;
+const SENSOR_MEMORY = new WeakMap<Bot, SensorMemory>();
+
+const EMPTY_CONTROLS: Record<ControlName, boolean> = {
+    forward: false,
+    back: false,
+    left: false,
+    right: false,
+    jump: false,
+    sprint: false,
+};
+
+export interface WorldAwareness {
+    hazard: HazardKind | null;
+    panicCause: string | null;
+    feedback: models.Feedback[];
+    dangerZones: models.DangerZone[];
+    terrainRoughness: Record<string, number>;
+    escapeTarget: Vec3 | null;
+    recentDamage: number;
+    threatName: string | null;
+    topThreatDistance: number | null;
+    movement: {
+        inWater: boolean;
+        submerged: boolean;
+        inLava: boolean;
+        onFire: boolean;
+        inCobweb: boolean;
+        inBerryBush: boolean;
+        frontBlocked: boolean;
+        steepDropAhead: boolean;
+        fallingFast: boolean;
+        lowAir: boolean;
+    };
+}
+
+export interface WorldControlOverrides {
+    controls: Partial<Record<ControlName, boolean>>;
+    clearPathfinder: boolean;
+    urgent: boolean;
+    lookAt: Vec3 | null;
+}
+
+function cloneEmptyWorld(): WorldAwareness {
+    return {
+        hazard: null,
+        panicCause: null,
+        feedback: [],
+        dangerZones: [],
+        terrainRoughness: {},
+        escapeTarget: null,
+        recentDamage: 0,
+        threatName: null,
+        topThreatDistance: null,
+        movement: {
+            inWater: false,
+            submerged: false,
+            inLava: false,
+            onFire: false,
+            inCobweb: false,
+            inBerryBush: false,
+            frontBlocked: false,
+            steepDropAhead: false,
+            fallingFast: false,
+            lowAir: false,
+        },
+    };
+}
+
+function isPassable(block: any): boolean {
+    if (!block) return true;
+    return PASSABLE_BLOCKS.has(block.name) || block.boundingBox === "empty";
+}
+
+function isLiquid(block: any): boolean {
+    return !!block && LIQUID_BLOCKS.has(block.name);
+}
+
+function isWater(block: any): boolean {
+    return !!block && (block.name === "water" || block.name === "flowing_water");
+}
+
+function isLava(block: any): boolean {
+    return !!block && (block.name === "lava" || block.name === "flowing_lava");
+}
+
+function isFire(block: any): boolean {
+    return !!block && FIRE_BLOCKS.has(block.name);
+}
+
+function isSolidGround(block: any): boolean {
+    return (
+        !!block &&
+        block.boundingBox === "block" &&
+        !LIQUID_BLOCKS.has(block.name) &&
+        !TRAP_BLOCKS.has(block.name)
+    );
+}
+
+function blockRiskScore(block: any): number {
+    if (!block) return 2.5;
+    if (isLava(block) || isFire(block)) return 5;
+    if (TRAP_BLOCKS.has(block.name)) return 3;
+    if (isLiquid(block)) return 2;
+    if (block.boundingBox !== "block") return 0.5;
+    return 0;
+}
+
+function makeDangerZone(
+    center: Vec3,
+    radius: number,
+    reason: string,
+    risk: number,
+): models.DangerZone {
+    return {
+        center: { x: center.x, y: center.y, z: center.z },
+        radius,
+        reason,
+        risk,
+    };
+}
+
+function normalizeYaw(angle: number): number {
+    while (angle > Math.PI) angle -= Math.PI * 2;
+    while (angle < -Math.PI) angle += Math.PI * 2;
+    return angle;
+}
+
+function currentChunkKey(pos: Vec3): string {
+    return `${Math.floor(pos.x) >> 4},${Math.floor(pos.z) >> 4}`;
+}
+
+function computeTerrainRoughness(bot: Bot, feetPos: Vec3): number {
+    let samples = 0;
+    let risk = 0;
+
+    for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+            if (dx === 0 && dz === 0) continue;
+
+            const candidate = feetPos.offset(dx, 0, dz);
+            const below = bot.blockAt(candidate.offset(0, -1, 0));
+            const feet = bot.blockAt(candidate);
+            const head = bot.blockAt(candidate.offset(0, 1, 0));
+
+            samples++;
+
+            if (!isSolidGround(below)) {
+                risk += 1;
+                continue;
+            }
+
+            if (!isPassable(feet)) risk += 0.75;
+            if (!isPassable(head)) risk += 0.5;
+            risk += blockRiskScore(feet) * 0.25;
+            risk += blockRiskScore(head) * 0.25;
+        }
+    }
+
+    return Number((risk / Math.max(samples, 1)).toFixed(2));
+}
+
+function findStandablePosition(bot: Bot, base: Vec3): Vec3 | null {
+    const x = Math.round(base.x);
+    const z = Math.round(base.z);
+    const baseY = Math.floor(base.y);
+
+    for (let y = baseY + 1; y >= baseY - 2; y--) {
+        const feetPos = new Vec3(x, y, z);
+        const below = bot.blockAt(feetPos.offset(0, -1, 0));
+        const feet = bot.blockAt(feetPos);
+        const head = bot.blockAt(feetPos.offset(0, 1, 0));
+
+        if (!isSolidGround(below)) continue;
+        if (!isPassable(feet) || !isPassable(head)) continue;
+        if (blockRiskScore(feet) >= 4 || blockRiskScore(head) >= 4) continue;
+
+        return feetPos.offset(0.5, 0, 0.5);
+    }
+
+    return null;
+}
+
+function scoreEscapeCandidate(
+    bot: Bot,
+    pos: Vec3,
+    candidate: Vec3,
+    threats: models.ThreatInfo[],
+    hazard: HazardKind | null,
+    forwardDir: Vec3,
+): number {
+    const feetPos = candidate.floored();
+    const below = bot.blockAt(feetPos.offset(0, -1, 0));
+    const feet = bot.blockAt(feetPos);
+    const head = bot.blockAt(feetPos.offset(0, 1, 0));
+    const heading = candidate.minus(pos);
+
+    let score = candidate.distanceTo(pos) * 1.2;
+    score -= Math.abs(candidate.y - pos.y) * 1.5;
+    score -= blockRiskScore(below) * 2;
+    score -= blockRiskScore(feet) * 2;
+    score -= blockRiskScore(head) * 2;
+
+    if (hazard === "burning") {
+        const waterNearby = [
+            bot.blockAt(feetPos),
+            bot.blockAt(feetPos.offset(1, 0, 0)),
+            bot.blockAt(feetPos.offset(-1, 0, 0)),
+            bot.blockAt(feetPos.offset(0, 0, 1)),
+            bot.blockAt(feetPos.offset(0, 0, -1)),
+        ].some((block) => isWater(block));
+        if (waterNearby) score += 5;
+    }
+
+    if (hazard === "cliff") {
+        const forwardDot =
+            heading.distanceTo(new Vec3(0, 0, 0)) > 0
+                ? heading.normalize().dot(forwardDir)
+                : 0;
+        score -= Math.max(0, forwardDot) * 4;
+    }
+
+    if (threats.length > 0) {
+        const topThreat = threats[0]!;
+        if (topThreat.position) {
+            const threatPos = new Vec3(
+                topThreat.position.x,
+                topThreat.position.y,
+                topThreat.position.z,
+            );
+            score += Math.min(candidate.distanceTo(threatPos), 16) * 0.5;
+        }
+    }
+
+    return score;
+}
+
+function findEscapeTarget(
+    bot: Bot,
+    pos: Vec3,
+    threats: models.ThreatInfo[],
+    hazard: HazardKind | null,
+): Vec3 | null {
+    const yaw = bot.entity.yaw;
+    const forwardDir = new Vec3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
+    const directions = [
+        forwardDir,
+        new Vec3(forwardDir.z, 0, -forwardDir.x),
+        new Vec3(-forwardDir.z, 0, forwardDir.x),
+        forwardDir.scaled(-1),
+        forwardDir.plus(new Vec3(forwardDir.z, 0, -forwardDir.x)).normalize(),
+        forwardDir.plus(new Vec3(-forwardDir.z, 0, forwardDir.x)).normalize(),
+        forwardDir
+            .scaled(-1)
+            .plus(new Vec3(forwardDir.z, 0, -forwardDir.x))
+            .normalize(),
+        forwardDir
+            .scaled(-1)
+            .plus(new Vec3(-forwardDir.z, 0, forwardDir.x))
+            .normalize(),
+    ];
+
+    let best: Vec3 | null = null;
+    let bestScore = -Infinity;
+
+    for (const dir of directions) {
+        for (const distance of [2, 3, 4]) {
+            const candidateBase = pos.offset(
+                Math.round(dir.x * distance),
+                0,
+                Math.round(dir.z * distance),
+            );
+            const candidate = findStandablePosition(bot, candidateBase);
+            if (!candidate) continue;
+
+            const score = scoreEscapeCandidate(
+                bot,
+                pos,
+                candidate,
+                threats,
+                hazard,
+                forwardDir,
+            );
+
+            if (score > bestScore) {
+                best = candidate;
+                bestScore = score;
+            }
+        }
+    }
+
+    return best;
+}
+
+function buildFeedback(
+    bot: Bot,
+    movement: WorldAwareness["movement"],
+    recentDamage: number,
+): models.Feedback[] {
+    const feedback: models.Feedback[] = [];
+
+    if (movement.inLava) {
+        feedback.push({
+            type: "hazard",
+            cause: "lava_contact",
+            action: "retreat",
+            hint: "step onto nearest solid block immediately",
+        });
+    } else if (movement.onFire) {
+        feedback.push({
+            type: "hazard",
+            cause: "burning",
+            action: "retreat",
+            hint: "seek water or open ground",
+        });
+    }
+
+    if (movement.lowAir) {
+        feedback.push({
+            type: "hazard",
+            cause: "low_air",
+            action: "retreat",
+            hint: "surface now",
+        });
+    } else if (movement.submerged) {
+        feedback.push({
+            type: "movement",
+            cause: "swimming",
+            action: "jump",
+            hint: "keep head above water",
+        });
+    }
+
+    if (movement.inCobweb || movement.inBerryBush) {
+        feedback.push({
+            type: "movement",
+            cause: movement.inCobweb ? "cobweb" : "berry_bush",
+            action: "jump",
+            hint: "free movement before resuming task",
+        });
+    }
+
+    if (movement.steepDropAhead) {
+        feedback.push({
+            type: "terrain",
+            cause: "cliff_ahead",
+            action: "reroute",
+            hint: "avoid blind forward sprint",
+        });
+    }
+
+    if (recentDamage >= 3) {
+        feedback.push({
+            type: "combat",
+            cause: "recent_heavy_damage",
+            action: "retreat",
+            hint: `lost ${Math.round(recentDamage)} hp recently`,
+        });
+    }
+
+    return feedback;
+}
+
+export function senseWorld(
+    bot: Bot,
+    threats: models.ThreatInfo[] = [],
+): WorldAwareness {
+    if (!bot.entity) return cloneEmptyWorld();
+
+    const pos = bot.entity.position;
+    const yaw = bot.entity.yaw;
+    const now = Date.now();
+    const memory =
+        SENSOR_MEMORY.get(bot) ??
+        ({
+            lastHealth: bot.health,
+            lastDamage: 0,
+            lastDamageAt: 0,
+            submergedSince: 0,
+            lastEvalAt: 0,
+            lastYaw: yaw,
+            lastPos: pos.clone(),
+            lastResult: null,
+        } satisfies SensorMemory);
+
+    if (
+        memory.lastResult &&
+        now - memory.lastEvalAt < SENSOR_CACHE_MS &&
+        memory.lastPos &&
+        memory.lastPos.distanceTo(pos) < 0.25 &&
+        Math.abs(memory.lastYaw - yaw) < 0.08 &&
+        Math.abs(memory.lastHealth - bot.health) < 0.1
+    ) {
+        return memory.lastResult;
+    }
+
+    if (bot.health < memory.lastHealth - 0.1) {
+        memory.lastDamage = memory.lastHealth - bot.health;
+        memory.lastDamageAt = now;
+    } else if (now - memory.lastDamageAt > 3000) {
+        memory.lastDamage = 0;
+    }
+
+    const recentDamage =
+        now - memory.lastDamageAt <= 3000 ? memory.lastDamage : 0;
+
+    const feetPos = pos.floored();
+    const dirX = Math.round(-Math.sin(yaw));
+    const dirZ = Math.round(-Math.cos(yaw));
+
+    const feetBlock = bot.blockAt(feetPos);
+    const headBlock = bot.blockAt(feetPos.offset(0, 1, 0));
+    const belowBlock = bot.blockAt(feetPos.offset(0, -1, 0));
+    const frontFeetBlock = bot.blockAt(feetPos.offset(dirX, 0, dirZ));
+    const frontHeadBlock = bot.blockAt(feetPos.offset(dirX, 1, dirZ));
+    const frontBelowBlock = bot.blockAt(feetPos.offset(dirX, -1, dirZ));
+    const frontDeepBlock = bot.blockAt(feetPos.offset(dirX, -2, dirZ));
+
+    const inWater =
+        Boolean((bot.entity as any).isInWater) ||
+        isWater(feetBlock) ||
+        isWater(headBlock);
+    const submerged = inWater && isWater(headBlock);
+    const inLava =
+        Boolean((bot.entity as any).isInLava) ||
+        isLava(feetBlock) ||
+        isLava(headBlock);
+    const onFire =
+        Boolean((bot.entity as any).isOnFire) ||
+        Number((bot.entity as any).fireTicks || 0) > 0 ||
+        isFire(feetBlock) ||
+        isFire(headBlock);
+
+    if (submerged) {
+        if (memory.submergedSince === 0) memory.submergedSince = now;
+    } else {
+        memory.submergedSince = 0;
+    }
+
+    const movement = {
+        inWater,
+        submerged,
+        inLava,
+        onFire,
+        inCobweb:
+            feetBlock?.name === "cobweb" || headBlock?.name === "cobweb",
+        inBerryBush:
+            feetBlock?.name === "sweet_berry_bush" ||
+            headBlock?.name === "sweet_berry_bush",
+        frontBlocked:
+            !!frontFeetBlock &&
+            !isPassable(frontFeetBlock) &&
+            frontFeetBlock.boundingBox === "block" ||
+            !!frontHeadBlock &&
+                !isPassable(frontHeadBlock) &&
+                frontHeadBlock.boundingBox === "block",
+        steepDropAhead:
+            !inWater &&
+            !inLava &&
+            !isSolidGround(frontBelowBlock) &&
+            !isSolidGround(frontDeepBlock),
+        fallingFast: bot.entity.velocity.y < -0.55 && !bot.entity.onGround,
+        lowAir:
+            submerged &&
+            memory.submergedSince > 0 &&
+            now - memory.submergedSince > 4000,
+    };
+
+    const roughness = computeTerrainRoughness(bot, feetPos);
+    const threatName = threats[0]?.name || null;
+    const topThreatDistance = threats[0]?.distance ?? null;
+
+    let hazard: HazardKind | null = null;
+    let panicCause: string | null = null;
+
+    if (movement.inLava) {
+        hazard = "lava";
+        panicCause = "lava";
+    } else if (movement.lowAir) {
+        hazard = "drowning";
+        panicCause = "drowning";
+    } else if (movement.onFire && bot.health <= 12) {
+        hazard = "burning";
+        panicCause = "burning";
+    } else if (
+        (movement.inCobweb || movement.inBerryBush) &&
+        topThreatDistance !== null &&
+        topThreatDistance <= 6
+    ) {
+        hazard = "ensnared";
+        panicCause = "ensnared";
+    } else if (recentDamage >= 4 && topThreatDistance !== null && topThreatDistance <= 10) {
+        hazard = "heavy_damage";
+        panicCause = "under_attack";
+    } else if (movement.steepDropAhead) {
+        hazard = "cliff";
+    }
+
+    const escapeTarget =
+        movement.inLava ||
+        movement.lowAir ||
+        movement.onFire ||
+        movement.inCobweb ||
+        movement.inBerryBush ||
+        movement.steepDropAhead
+            ? findEscapeTarget(bot, pos, threats, hazard)
+            : null;
+
+    const feedback = buildFeedback(bot, movement, recentDamage);
+    const dangerZones: models.DangerZone[] = [];
+
+    if (movement.inLava) {
+        dangerZones.push(makeDangerZone(pos, 6, "lava", 1));
+    } else if (movement.onFire) {
+        dangerZones.push(makeDangerZone(pos, 6, "fire", 0.85));
+    }
+
+    if (movement.steepDropAhead) {
+        dangerZones.push(
+            makeDangerZone(pos.offset(dirX * 2, 0, dirZ * 2), 4, "cliff", 0.7),
+        );
+    }
+
+    if (
+        threats[0]?.position &&
+        topThreatDistance !== null &&
+        topThreatDistance <= 8
+    ) {
+        dangerZones.push(
+            makeDangerZone(
+                new Vec3(
+                    threats[0].position.x,
+                    threats[0].position.y,
+                    threats[0].position.z,
+                ),
+                8,
+                `mob_${threats[0].name}`,
+                Math.min(1, (threats[0].threatScore ?? 8) / 10),
+            ),
+        );
+    }
+
+    if (!isSolidGround(belowBlock) && !inWater && !inLava) {
+        dangerZones.push(makeDangerZone(pos, 4, "unstable_ground", 0.55));
+    }
+
+    const result: WorldAwareness = {
+        hazard,
+        panicCause,
+        feedback,
+        dangerZones,
+        terrainRoughness: { [currentChunkKey(pos)]: roughness },
+        escapeTarget,
+        recentDamage,
+        threatName,
+        topThreatDistance,
+        movement,
+    };
+
+    memory.lastEvalAt = now;
+    memory.lastHealth = bot.health;
+    memory.lastYaw = yaw;
+    memory.lastPos = pos.clone();
+    memory.lastResult = result;
+    SENSOR_MEMORY.set(bot, memory);
+
+    return result;
+}
+
+function controlsToward(bot: Bot, target: Vec3): Record<ControlName, boolean> {
+    const controls = { ...EMPTY_CONTROLS };
+    if (!bot.entity) return controls;
+
+    const pos = bot.entity.position;
+    const dx = target.x - pos.x;
+    const dz = target.z - pos.z;
+    const desiredYaw = Math.atan2(-dx, -dz);
+    const yawDiff = normalizeYaw(desiredYaw - bot.entity.yaw);
+
+    controls.forward = Math.abs(yawDiff) < Math.PI * 0.75;
+    controls.back = Math.abs(yawDiff) > Math.PI * 0.75;
+    controls.left = yawDiff > 0.2;
+    controls.right = yawDiff < -0.2;
+    controls.sprint = !controls.back;
+
+    return controls;
+}
+
+export function getWorldControlOverrides(
+    bot: Bot,
+    world: WorldAwareness,
+): WorldControlOverrides {
+    const controls: Partial<Record<ControlName, boolean>> = {};
+    let lookAt: Vec3 | null = null;
+    let urgent = false;
+    let clearPathfinder = false;
+
+    if (world.panicCause && world.escapeTarget) {
+        urgent = true;
+        clearPathfinder = true;
+        lookAt = world.escapeTarget.offset(0, 1, 0);
+        Object.assign(controls, controlsToward(bot, world.escapeTarget));
+        controls.jump = true;
+        controls.sprint = true;
+        return { controls, clearPathfinder, urgent, lookAt };
+    }
+
+    if (world.escapeTarget && world.movement.steepDropAhead) {
+        lookAt = world.escapeTarget.offset(0, 1, 0);
+    }
+
+    if (
+        world.movement.inWater ||
+        world.movement.submerged ||
+        world.movement.inLava ||
+        world.movement.inCobweb ||
+        world.movement.inBerryBush
+    ) {
+        controls.jump = true;
+    }
+
+    if (
+        world.movement.onFire ||
+        world.movement.inLava ||
+        world.recentDamage >= 3
+    ) {
+        controls.sprint = true;
+    }
+
+    if (world.movement.steepDropAhead && !world.movement.inWater) {
+        controls.forward = false;
+        controls.jump = false;
+    }
+
+    return { controls, clearPathfinder, urgent, lookAt };
+}
+
+export function applyWorldMovementReflexes(
+    bot: Bot,
+    world: WorldAwareness,
+): void {
+    const overrides = getWorldControlOverrides(bot, world);
+
+    if (overrides.lookAt) {
+        bot.lookAt(overrides.lookAt, true).catch(() => {});
+    }
+
+    for (const [control, value] of Object.entries(overrides.controls)) {
+        bot.setControlState(control as ControlName, value);
+    }
 }
 
 </file>
@@ -17422,10 +19422,10 @@ export default defineConfig({
 
 ```json
 {
-  "total_bytes": 506454,
-  "file_count": 104,
-  "estimated_tokens": 128744,
+  "total_bytes": 562619,
+  "file_count": 108,
+  "estimated_tokens": 142880,
   "mode": "full",
-  "generated_at": "2026-04-14T12:54:06.1535028-07:00"
+  "generated_at": "2026-04-15T18:04:44.4798025-07:00"
 }
 ```

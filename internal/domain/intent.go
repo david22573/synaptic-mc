@@ -34,7 +34,16 @@ type ProgressionMilestone struct {
 
 // TaskHistory stores the full lifecycle of a task for Phase 4 Vector Memory.
 type TaskHistory struct {
-	Intent   ActionIntent
-	Success  bool
-	Critique string
+	Intent     ActionIntent `json:"intent"`
+	Success    bool         `json:"success"`
+	Critique   string       `json:"critique"` // Legacy field for plain-text logs
+	Reflection *Reflection  `json:"reflection,omitempty"`
+}
+
+// Reflection provides detailed structured feedback on task execution.
+type Reflection struct {
+	Failure string  `json:"failure"`
+	Cause   string  `json:"cause"`
+	Fix     string  `json:"fix"`
+	Score   float64 `json:"score"` // Confidence score 0.0 - 1.0
 }

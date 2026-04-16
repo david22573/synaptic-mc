@@ -84,6 +84,10 @@ func (s *ControlService) SetReflexActive(active bool) {
 	s.stability.ReflexActive = active
 }
 
+func (s *ControlService) IsIdle() bool {
+	return s.taskManager.IsIdle()
+}
+
 func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.DomainEvent) {
 	s.stabilityMu.RLock()
 	reflexActive := s.stability.ReflexActive
@@ -167,6 +171,16 @@ func (s *ControlService) handlePanic(ctx context.Context, event domain.DomainEve
 	s.SetReflexActive(true)
 	_ = s.taskManager.Halt(ctx, "panic_triggered")
 	s.clearAllWatchdogs()
+
+	// Run Emergency Policy (Reflexive)
+	emergencyAction := domain.Action{
+		ID:        fmt.Sprintf("panic-reflex-%d", time.Now().UnixNano()),
+		Action:    "emergency_reflex",
+		Target:    domain.Target{Name: "survival"},
+		Priority:  1000,
+		Rationale: "High-priority survival reflex triggered by sensor data",
+	}
+	s.engine.RunEmergencyPolicy(ctx, emergencyAction)
 }
 
 func (s *ControlService) handleBotDeath(ctx context.Context, event domain.DomainEvent) {

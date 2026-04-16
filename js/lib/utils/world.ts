@@ -680,8 +680,7 @@ export function getWorldControlOverrides(
         world.movement.submerged ||
         world.movement.inLava ||
         world.movement.inCobweb ||
-        world.movement.inBerryBush ||
-        world.movement.frontBlocked
+        world.movement.inBerryBush
     ) {
         controls.jump = true;
     }

@@ -15,15 +15,27 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type WorldNode struct {
+	Name string
+	Type string
+	Pos  domain.Vec3
+}
+
 type Store interface {
 	MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error
 	GetKnownWorld(ctx context.Context, pos domain.Vec3) (string, error)
+	GetNearbyNodes(ctx context.Context, pos domain.Vec3, limit int) ([]WorldNode, error)
+	AddEdge(ctx context.Context, fromID, toID string, cost float64) error
+	AddRegion(ctx context.Context, name string, nodeIDs []string) error
+	GetRegions(ctx context.Context) ([]domain.Region, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	SaveTaskHistory(ctx context.Context, sessionID string, history []domain.TaskHistory) error
 	GetTaskHistory(ctx context.Context, sessionID string, limit int) ([]domain.TaskHistory, error)
 	SaveMilestone(ctx context.Context, sessionID string, name string) error
 	GetMilestones(ctx context.Context, sessionID string) ([]domain.ProgressionMilestone, error)
+	SaveFailureCount(ctx context.Context, sessionID, objective string, count int) error
+	GetFailureCounts(ctx context.Context, sessionID string) (map[string]int, error)
 	Close() error
 }
 
@@ -63,12 +75,27 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS world_edges (
+		from_id TEXT NOT NULL,
+		to_id TEXT NOT NULL,
+		cost REAL DEFAULT 1.0,
+		PRIMARY KEY (from_id, to_id),
+		FOREIGN KEY (from_id) REFERENCES world_nodes(id),
+		FOREIGN KEY (to_id) REFERENCES world_nodes(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS world_regions (
+		name TEXT PRIMARY KEY,
+		node_ids TEXT NOT NULL -- stored as JSON array
+	);
+
 	CREATE TABLE IF NOT EXISTS task_history (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		session_id TEXT NOT NULL,
 		intent_json TEXT NOT NULL,
 		success BOOLEAN NOT NULL,
 		critique TEXT NOT NULL,
+		reflection_json TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	
@@ -77,6 +104,14 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		name TEXT NOT NULL,
 		unlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (session_id, name)
+	);
+
+	CREATE TABLE IF NOT EXISTS plan_failures (
+		session_id TEXT NOT NULL,
+		objective TEXT NOT NULL,
+		count INTEGER DEFAULT 0,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (session_id, objective)
 	);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -118,13 +153,19 @@ func (s *SQLiteStore) SaveTaskHistory(ctx context.Context, sessionID string, his
 	}
 	defer tx.Rollback()
 
-	query := `INSERT INTO task_history (session_id, intent_json, success, critique) VALUES (?, ?, ?, ?)`
+	query := `INSERT INTO task_history (session_id, intent_json, success, critique, reflection_json) VALUES (?, ?, ?, ?, ?)`
 	for _, h := range history {
 		intentJSON, err := json.Marshal(h.Intent)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, query, sessionID, string(intentJSON), h.Success, h.Critique); err != nil {
+		var reflJSON sql.NullString
+		if h.Reflection != nil {
+			b, _ := json.Marshal(h.Reflection)
+			reflJSON.String = string(b)
+			reflJSON.Valid = true
+		}
+		if _, err := tx.ExecContext(ctx, query, sessionID, string(intentJSON), h.Success, h.Critique, reflJSON); err != nil {
 			return err
 		}
 	}
@@ -133,7 +174,7 @@ func (s *SQLiteStore) SaveTaskHistory(ctx context.Context, sessionID string, his
 }
 
 func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limit int) ([]domain.TaskHistory, error) {
-	query := `SELECT intent_json, success, critique FROM task_history WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`
+	query := `SELECT intent_json, success, critique, reflection_json FROM task_history WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {
 		return nil, err
@@ -144,11 +185,15 @@ func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limi
 	for rows.Next() {
 		var h domain.TaskHistory
 		var intentJSON string
-		if err := rows.Scan(&intentJSON, &h.Success, &h.Critique); err != nil {
+		var reflJSON sql.NullString
+		if err := rows.Scan(&intentJSON, &h.Success, &h.Critique, &reflJSON); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(intentJSON), &h.Intent); err != nil {
 			return nil, err
+		}
+		if reflJSON.Valid {
+			_ = json.Unmarshal([]byte(reflJSON.String), &h.Reflection)
 		}
 		history = append(history, h)
 	}
@@ -224,7 +269,83 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 		n := nodes[i]
 		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f)\n", n.Type, n.Name, n.Dist, n.Pos.X, n.Pos.Y, n.Pos.Z))
 	}
+
+	// Region and route info could be appended here too
 	return strings.TrimSpace(out.String()), nil
+}
+
+func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, limit int) ([]WorldNode, error) {
+	query := `SELECT name, type, x, y, z FROM world_nodes`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type nodeDist struct {
+		node WorldNode
+		dist float64
+	}
+	var nodes []nodeDist
+
+	for rows.Next() {
+		var n WorldNode
+		if err := rows.Scan(&n.Name, &n.Type, &n.Pos.X, &n.Pos.Y, &n.Pos.Z); err == nil {
+			dx, dy, dz := n.Pos.X-botPos.X, n.Pos.Y-botPos.Y, n.Pos.Z-botPos.Z
+			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+			nodes = append(nodes, nodeDist{node: n, dist: dist})
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].dist < nodes[j].dist })
+
+	if len(nodes) > limit {
+		nodes = nodes[:limit]
+	}
+
+	result := make([]WorldNode, len(nodes))
+	for i, nd := range nodes {
+		result[i] = nd.node
+	}
+	return result, nil
+}
+
+func (s *SQLiteStore) AddEdge(ctx context.Context, fromID, toID string, cost float64) error {
+	query := `INSERT INTO world_edges (from_id, to_id, cost) VALUES (?, ?, ?) ON CONFLICT(from_id, to_id) DO UPDATE SET cost = excluded.cost`
+	_, err := s.db.ExecContext(ctx, query, fromID, toID, cost)
+	return err
+}
+
+func (s *SQLiteStore) AddRegion(ctx context.Context, name string, nodeIDs []string) error {
+	idsJSON, _ := json.Marshal(nodeIDs)
+	query := `INSERT INTO world_regions (name, node_ids) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET node_ids = excluded.node_ids`
+	_, err := s.db.ExecContext(ctx, query, name, string(idsJSON))
+	return err
+}
+
+func (s *SQLiteStore) GetRegions(ctx context.Context) ([]domain.Region, error) {
+	query := `SELECT name, node_ids FROM world_regions`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var regions []domain.Region
+	for rows.Next() {
+		var r domain.Region
+		var idsJSON string
+		if err := rows.Scan(&r.Name, &idsJSON); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(idsJSON), &r.Nodes)
+		regions = append(regions, r)
+	}
+	return regions, nil
 }
 
 func (s *SQLiteStore) SetSummary(ctx context.Context, sessionID, key, value string) error {
@@ -262,6 +383,37 @@ func (s *SQLiteStore) GetSummary(ctx context.Context, sessionID string) (string,
 		return "No active summary.", nil
 	}
 	return summary.String(), nil
+}
+
+func (s *SQLiteStore) SaveFailureCount(ctx context.Context, sessionID, objective string, count int) error {
+	query := `
+	INSERT INTO plan_failures (session_id, objective, count, updated_at) 
+	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(session_id, objective) DO UPDATE SET 
+		count = excluded.count, 
+		updated_at = CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, sessionID, objective, count)
+	return err
+}
+
+func (s *SQLiteStore) GetFailureCounts(ctx context.Context, sessionID string) (map[string]int, error) {
+	query := `SELECT objective, count FROM plan_failures WHERE session_id = ?`
+	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	failures := make(map[string]int)
+	for rows.Next() {
+		var objective string
+		var count int
+		if err := rows.Scan(&objective, &count); err != nil {
+			return nil, err
+		}
+		failures[objective] = count
+	}
+	return failures, nil
 }
 
 func (s *SQLiteStore) Close() error {

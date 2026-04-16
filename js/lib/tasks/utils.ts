@@ -182,6 +182,9 @@ export interface MoveOptions {
     stuckTimeoutMs?: number;
 }
 
+import { Navigation } from "../movement/navigation.js";
+import { RollingPathfinder } from "../movement/pathfinder.js";
+
 export function moveToGoal(
     bot: Bot,
     goal: any,
@@ -191,18 +194,16 @@ export function moveToGoal(
         signal,
         timeoutMs,
         stopMovement,
-        dynamic = false,
         stuckTimeoutMs = 2000,
     } = opts;
 
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
         if (signal?.aborted) {
             return reject(new TaskAbortError());
         }
 
-        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
-            return resolve();
-        }
+        const pathfinder = new RollingPathfinder(bot);
+        const navigation = new Navigation(bot);
 
         let settled = false;
         let lastPos = bot.entity.position.clone();
@@ -210,14 +211,9 @@ export function moveToGoal(
         let ticksElapsed = 0;
         const timeoutTicks = Math.floor(timeoutMs / 50);
 
-        const listeners = new Map<string, any>();
-
         const cleanup = () => {
             bot.removeListener("physicsTick", onTick);
-            listeners.forEach((handler, event) =>
-                bot.removeListener(event as any, handler),
-            );
-            listeners.clear();
+            bot.clearControlStates();
         };
 
         const finish = (err?: Error) => {
@@ -243,127 +239,65 @@ export function moveToGoal(
                     : new TaskAbortError(),
             );
 
-        const onGoalReached = () => {
-            finish();
-        };
+        if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+        }
 
-        const onPathUpdate = (results: any) => {
-            if (results.status === "noPath") {
-                finish(new Error("no_path"));
-            } else if (results.status === "timeout") {
-                finish(new Error("pathfinder_timeout"));
-            }
-        };
-
-        const getGoalPos = (): Vec3 | null => {
-            if (goal.x !== undefined && goal.z !== undefined) {
-                return new Vec3(
-                    goal.x,
-                    goal.y ?? bot.entity.position.y,
-                    goal.z,
-                );
-            }
-            if ((goal as any).dest) {
-                const dest = (goal as any).dest;
-                return new Vec3(dest.x, dest.y, dest.z);
-            }
-            if ((goal as any).entity?.position) {
-                return (goal as any).entity.position;
-            }
-            return null;
-        };
-
-        const onTick = () => {
+        const onTick = async () => {
             if (settled) return;
             ticksElapsed++;
-            const world = senseWorld(bot);
 
             if (ticksElapsed > timeoutTicks) {
                 finish(new Error("timeout"));
                 return;
             }
 
-            const targetVec = getGoalPos();
+            // 1. Rolling Path Update
+            await pathfinder.updatePath(goal);
+            const waypoint = pathfinder.getNextWaypoint(3);
 
-            // Engine-synced stuck checking (~800ms intervals)
-            if (ticksElapsed % 16 === 0) {
+            if (!waypoint) {
+                // If no waypoint and not at goal, we might be lost
+                if (bot.entity.position.distanceTo(goal) > 2) {
+                    stuckStrikes++;
+                    if (stuckStrikes > 40) finish(new Error("no_path"));
+                } else {
+                    finish();
+                }
+                return;
+            }
+
+            // 2. Predictive Steering
+            const controls = navigation.steer(waypoint);
+            for (const [state, active] of Object.entries(controls)) {
+                bot.setControlState(state as any, active);
+            }
+
+            // 3. Stuck Detection (using velocity and distance)
+            if (ticksElapsed % 10 === 0) {
                 const currentPos = bot.entity.position;
-                const distSinceLast = lastPos.distanceTo(currentPos);
+                const distMoved = lastPos.distanceTo(currentPos);
                 const vel = bot.entity.velocity;
                 const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-                // More lenient stuck detection: requires 3 strikes (~2.4s)
-                // Checks if we are trying to move (either via pathfinder or steering hijack)
-                const isTryingToMove =
-                    bot.pathfinder.isMoving() ||
-                    (targetVec && currentPos.distanceTo(targetVec) < 2.5);
-
-                if (
-                    isTryingToMove &&
-                    distSinceLast < 0.1 &&
-                    speed < 0.02 &&
-                    !world.movement.submerged
-                ) {
+                if (distMoved < 0.1 && speed < 0.05) {
                     stuckStrikes++;
                     if (stuckStrikes >= 3) {
-                        finish(
-                            new ExecutionError(
-                                "bot physically stuck during movement",
-                                "STUCK",
-                                0.0,
-                            ),
-                        );
+                        finish(new ExecutionError("stuck", "STUCK", 0));
                     }
                 } else {
-                    // Decaying strikes to handle intermittent slow-downs
                     stuckStrikes = Math.max(0, stuckStrikes - 1);
                 }
                 lastPos = currentPos.clone();
             }
 
-            // Hijack the final approach with per-tick continuous steering
-            if (targetVec) {
-                const currentPos = bot.entity.position;
-                const distToGoal = currentPos.distanceTo(targetVec);
-
-                // If very close, override pathfinder completely with steering
-                if (distToGoal < 2.5) {
-                    if (bot.pathfinder.isMoving()) {
-                        bot.pathfinder.setGoal(null);
-                    }
-
-                    if (world.movement.steepDropAhead && distToGoal > 1.1) {
-                        bot.setControlState("forward", false);
-                        bot.setControlState("jump", false);
-                        return;
-                    }
-
-                    steerTowards(bot, targetVec, 0.8, true);
-                    applyWorldMovementReflexes(bot, world);
-
-                    if (distToGoal < 1.0) {
-                        finish();
-                    }
-                }
+            // 4. Goal Check
+            if (bot.entity.position.distanceTo(goal) < 1.0) {
+                finish();
             }
         };
 
-        listeners.set("goal_reached", onGoalReached);
-        listeners.set("path_update", onPathUpdate);
-
-        if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-        }
-
-        bot.on("goal_reached", onGoalReached);
-        bot.on("path_update", onPathUpdate);
         bot.on("physicsTick", onTick);
-
-        try {
-            bot.pathfinder.setGoal(goal, dynamic);
-        } catch (err) {
-            finish(err instanceof Error ? err : new Error(String(err)));
-        }
     });
 }
 

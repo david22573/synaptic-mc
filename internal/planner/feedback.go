@@ -28,7 +28,9 @@ func NewFeedbackAnalyzer(world *domain.WorldModel, logger *slog.Logger) *Feedbac
 // If it returns nil, the task was successful or should be dropped.
 func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.ExecutionResult) *domain.ActionIntent {
 	if res.Success {
-		f.world.RecordSuccess(intent.Action, intent.Target)
+		if f.world != nil {
+			f.world.RecordSuccess(intent.Action, intent.Target)
+		}
 		return nil
 	}
 
@@ -39,7 +41,7 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	// If we made significant progress before failing, update our local world weight
 	// so the planner knows this wasn't a total bust.
-	if res.Progress > 0.5 && intent.TargetLocation != nil {
+	if f.world != nil && res.Progress > 0.5 && intent.TargetLocation != nil {
 		f.world.RewardPath(*intent.TargetLocation, res.Progress)
 	}
 
@@ -53,7 +55,7 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 	switch res.Cause {
 	case domain.CauseBlocked, domain.CauseStuck:
 		// Bot is physically trapped or pathing is deadlocking.
-		if intent.TargetLocation != nil {
+		if f.world != nil && intent.TargetLocation != nil {
 			f.world.PenalizeZone(*intent.TargetLocation, 10.0)
 		}
 		return f.generateFallback(intent)
@@ -70,13 +72,20 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 		// Survival system took over in TS.
 		return f.triggerReevaluation()
 
+	case "FALLBACK":
+		// Skill confidence low or manual fallback triggered.
+		f.logger.Info("Manual fallback triggered, dropping to macro re-evaluation")
+		return f.triggerReevaluation()
+
 	case domain.CauseMissingResource:
 		// TS realized it doesn't have the mats.
 		return f.generatePrerequisitePlan(intent)
 
 	default:
 		// Blind retry as a last resort, but down-weight it so we don't spam it.
-		f.world.PenalizeAction(intent.Action, 2.0)
+		if f.world != nil {
+			f.world.PenalizeAction(intent.Action, 2.0)
+		}
 		return &intent
 	}
 }
@@ -85,7 +94,13 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 func (f *FeedbackAnalyzer) generateFallback(failedIntent domain.ActionIntent) *domain.ActionIntent {
 	if failedIntent.TargetLocation == nil {
-		return &failedIntent
+		return &domain.ActionIntent{
+			ID:        "reposition_" + failedIntent.ID,
+			Action:    "reposition",
+			Target:    "nearby_safe_ground",
+			Count:     1,
+			Rationale: "FALLBACK: Physically blocked without stable target location. Reposition locally and retry.",
+		}
 	}
 
 	// Offset the target by 1.5 to 3.0 blocks to try a different physical angle
@@ -107,10 +122,10 @@ func (f *FeedbackAnalyzer) generateFallback(failedIntent domain.ActionIntent) *d
 func (f *FeedbackAnalyzer) generateBackoff(failedIntent domain.ActionIntent) *domain.ActionIntent {
 	return &domain.ActionIntent{
 		ID:        "backoff_" + failedIntent.ID,
-		Action:    "explore",
-		Target:    "nearby",
+		Action:    "reposition",
+		Target:    "nearby_safe_ground",
 		Count:     1,
-		Rationale: "BACKOFF: Pathing timeout detected. Exploring nearby to reset physical state.",
+		Rationale: "BACKOFF: Pathing timeout detected. Reposition locally to reset physical state before retry.",
 	}
 }
 

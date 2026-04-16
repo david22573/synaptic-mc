@@ -23,6 +23,7 @@ var codeSynthesisSystemPrompt string
 // LLMClient is the minimal interface this package needs from the LLM layer.
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
 	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
 }
 
@@ -34,7 +35,7 @@ type Curriculum interface {
 // CodeSynthesizer can be implemented by a Curriculum to generate executable JS programs.
 // Service checks for this interface via type assertion — it is not required by Curriculum.
 type CodeSynthesizer interface {
-	SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (string, error)
+	SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (CodeSynthesisResult, error)
 }
 
 // AutonomousCurriculum is the live implementation.
@@ -73,7 +74,11 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		if m.Success {
 			status = "SUCCESS"
 		}
-		historyStrs = append(historyStrs, fmt.Sprintf("[%s] Intent: %s %d %s | Critic: %s", status, m.Intent.Action, m.Intent.Count, m.Intent.Target, m.Critique))
+		crit := m.Critique
+		if m.Reflection != nil && m.Reflection.Failure != "" {
+			crit = fmt.Sprintf("%s (Cause: %s, Fix: %s)", m.Reflection.Failure, m.Reflection.Cause, m.Reflection.Fix)
+		}
+		historyStrs = append(historyStrs, fmt.Sprintf("[%s] Intent: %s %d %s | Critic: %s", status, m.Intent.Action, m.Intent.Count, m.Intent.Target, crit))
 	}
 	historyContext := "No recent history."
 	if len(historyStrs) > 0 {
@@ -92,7 +97,19 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			for _, s := range skills {
 				var skill domain.ExecutableSkill
 				if err := json.Unmarshal([]byte(s.Code), &skill); err == nil && skill.Name != "" {
-					skillStrs = append(skillStrs, fmt.Sprintf("- Skill: %s (%s)", skill.Name, skill.Description))
+					// Fetch full metadata for the prompt
+					fullSkill, err := c.vector.RetrieveNamedSkill(ctx, skill.Name)
+					if err == nil && fullSkill != nil {
+						skill = *fullSkill
+					}
+					
+					meta := fmt.Sprintf("Confidence: %.2f, AvgTime: %.1fs, Version: %d", 
+						skill.Confidence, skill.AvgTime/1000.0, skill.Version)
+					if len(skill.FailureCauses) > 0 {
+						meta += fmt.Sprintf(", RecentFailures: %s", strings.Join(skill.FailureCauses, "|"))
+					}
+					
+					skillStrs = append(skillStrs, fmt.Sprintf("- Skill: %s (%s) | %s", skill.Name, skill.Description, meta))
 				}
 			}
 			if len(skillStrs) > 0 {
@@ -124,7 +141,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 	}
 
-	userContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%s%s%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
+	baseUserContent := fmt.Sprintf("CURRENT STATE:\n%s\n\n%s%s%sRECENT HISTORY (Learn from these):\n%s\n\n%s\n\nProvide the next JSON intent.",
 		stateContext,
 		memoryContext.String(),
 		milestoneContext,
@@ -134,9 +151,15 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 
 	var intent domain.ActionIntent
 	var parseErr error
+	var errorHint string
 
 	for attempt := 0; attempt < 3; attempt++ {
-		rawResponse, genErr := c.client.Generate(ctx, curriculumSystemPrompt, userContent)
+		currentPrompt := baseUserContent
+		if errorHint != "" {
+			currentPrompt += "\n\n" + errorHint
+		}
+
+		rawResponse, genErr := c.client.Generate(ctx, curriculumSystemPrompt, currentPrompt)
 		if genErr != nil {
 			return nil, fmt.Errorf("llm api failure: %w", genErr)
 		}
@@ -149,7 +172,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 					intent.SkillName = skill.Name
 				} else {
 					parseErr = fmt.Errorf("skill '%s' not found", intent.Target)
-					userContent += fmt.Sprintf("\n\nSYSTEM: Skill '%s' not found. Choose from the AVAILABLE SKILLS list or use a standard action.", intent.Target)
+					errorHint = fmt.Sprintf("SYSTEM: Skill '%s' not found. Choose from the AVAILABLE SKILLS list or use a standard action.", intent.Target)
 					continue
 				}
 			}
@@ -157,7 +180,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		}
 		// LOG FAILURE FOR DEBUGGING
 		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nRaw Response: %s\nParse Error: %v\n", attempt, rawResponse, parseErr)
-		userContent += fmt.Sprintf("\n\nSYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
+		errorHint = fmt.Sprintf("SYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
 	if parseErr != nil || intent.Action == "" {
@@ -176,10 +199,19 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 // Curriculum interface itself doesn't change.
 // ────────────────────────────────────────────────────────────────────────────
 
+type CodeSynthesisResult struct {
+	JSCode        string
+	RequiredItems []string
+}
+
 // SynthesizeCode asks the LLM to write JavaScript that implements the given completed intent.
-// before/after are passed so the LLM can see what actually changed and write accurate code.
-func (c *AutonomousCurriculum) SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (string, error) {
+func (c *AutonomousCurriculum) SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (CodeSynthesisResult, error) {
 	invDiff := buildInventoryDiff(before, after)
+	
+	// Identify required items (items that were used up or required to be there)
+	// For now, we assume items in inventory BEFORE that decreased in count might be required.
+	// But it's better to ask the LLM.
+	
 	positionDelta := fmt.Sprintf("moved %.1f blocks (%.1f, %.1f, %.1f) → (%.1f, %.1f, %.1f)",
 		distance(before.Position, after.Position),
 		before.Position.X, before.Position.Y, before.Position.Z,
@@ -192,13 +224,19 @@ Target: %s
 Count: %d
 Rationale: %s
 
-WHAT ACTUALLY HAPPENED (use this to write accurate code):
+WHAT ACTUALLY HAPPENED:
 Inventory change: %s
 Position: %s
 Health before/after: %.0f / %.0f
 
 Write JavaScript code that performs this task reliably for future runs.
-The code should handle the case where the target might not be immediately visible.`,
+Identify any items required to perform this task (e.g., ["wooden_pickaxe"]).
+
+Format your response as a JSON object:
+{
+  "js_code": "async (bot, goals, Vec3, signal) => { ... }",
+  "required_items": ["item1", "item2"]
+}`,
 		intent.Action,
 		intent.Target,
 		intent.Count,
@@ -208,20 +246,24 @@ The code should handle the case where the target might not be immediately visibl
 		before.Health, after.Health,
 	)
 
-	rawCode, err := c.client.Generate(ctx, codeSynthesisSystemPrompt, userContent)
+	rawResponse, err := c.client.Generate(ctx, codeSynthesisSystemPrompt, userContent)
 	if err != nil {
-		return "", fmt.Errorf("code synthesis llm failure: %w", err)
+		return CodeSynthesisResult{}, fmt.Errorf("code synthesis llm failure: %w", err)
 	}
 
-	// Strip any markdown fences the LLM might have added despite instructions.
-	code := domain.CleanJSON(rawCode) // reuse the JSON fence stripper
-	code = strings.TrimPrefix(code, "```javascript")
-	code = strings.TrimPrefix(code, "```js")
-	code = strings.TrimPrefix(code, "```")
-	code = strings.TrimSuffix(code, "```")
-	code = strings.TrimSpace(code)
+	var res struct {
+		JSCode        string   `json:"js_code"`
+		RequiredItems []string `json:"required_items"`
+	}
+	if err := json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &res); err != nil {
+		// Fallback to old behavior if JSON fails
+		return CodeSynthesisResult{JSCode: domain.CleanJSON(rawResponse)}, nil
+	}
 
-	return code, nil
+	return CodeSynthesisResult{
+		JSCode:        res.JSCode,
+		RequiredItems: res.RequiredItems,
+	}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────

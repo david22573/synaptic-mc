@@ -5,6 +5,7 @@ import { ControlLoop } from "./loop.js";
 import { INTENT_EVALUATORS } from "../tasks/registry.js";
 import { log } from "../logger.js";
 import { Vec3 } from "vec3";
+import { CombatController } from "../combat/controller.js";
 import {
     getWorldControlOverrides,
     senseWorld,
@@ -32,12 +33,14 @@ export class BotController {
     public activeIntent: ActionIntent | null = null;
     public intentState: Record<string, any> = {};
     private loop: ControlLoop;
+    private combat: CombatController;
 
     constructor(
         public bot: Bot,
         private getThreats: () => ThreatInfo[] = () => [],
     ) {
         this.loop = new ControlLoop(this);
+        this.combat = new CombatController(bot);
     }
 
     public setIntent(intent: ActionIntent) {
@@ -75,6 +78,14 @@ export class BotController {
             interactTarget: null,
             clearPathfinder: false,
         };
+
+        // Combat disengage reflex
+        const closeThreats = perception.threats.filter(t => t.distance < 5);
+        if ((this.bot.health < 10 || closeThreats.length >= 3) && perception.intent?.action !== 'retreat') {
+            log.warn("[Reflex] Survival critical: triggering combat disengage");
+            this.combat.disengage(); // Fire and forget async
+            return this.mergeWorldReflexes(defaultPlan, perception.world);
+        }
 
         if (!perception.intent || !this.bot.entity) {
             return this.mergeWorldReflexes(defaultPlan, perception.world);

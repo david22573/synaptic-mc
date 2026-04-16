@@ -30,13 +30,14 @@ const (
 )
 
 type TaskEndPayload struct {
-	Success   bool    `json:"success"`
-	Status    string  `json:"status"`
-	Action    string  `json:"action"`
-	Target    string  `json:"target"`
-	CommandID string  `json:"command_id"`
-	Cause     string  `json:"cause"`
-	Progress  float64 `json:"progress"`
+	Success    bool    `json:"success"`
+	Status     string  `json:"status"`
+	Action     string  `json:"action"`
+	Target     string  `json:"target"`
+	CommandID  string  `json:"command_id"`
+	Cause      string  `json:"cause"`
+	Progress   float64 `json:"progress"`
+	DurationMs int64   `json:"duration_ms"`
 }
 
 type ExecutionResult struct {
@@ -176,6 +177,8 @@ type Plan struct {
 	Status        PlanStatus `json:"status"`
 	CreatedAt     time.Time  `json:"created_at"`
 	InvalidatedAt *time.Time `json:"invalidated_at,omitempty"`
+	StrategicGoal string     `json:"strategic_goal"`
+	Subgoals      []string   `json:"subgoals"`
 	Objective     string     `json:"objective"`
 	Tasks         []Action   `json:"tasks"`
 	Fallbacks     [][]Action `json:"fallbacks,omitempty"` // Week 4: Multi-Plan Fallback

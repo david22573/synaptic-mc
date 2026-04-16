@@ -23,6 +23,7 @@ type SystemMetrics struct {
 	StuckEvents    prometheus.Counter
 	ReflexTriggers prometheus.Counter
 	FailureLoops   prometheus.Counter
+	DroppedEvents  prometheus.Counter
 }
 
 var Metrics = &SystemMetrics{
@@ -84,5 +85,9 @@ var Metrics = &SystemMetrics{
 	FailureLoops: promauto.NewCounter(prometheus.CounterOpts{
 		Name: "agent_failure_loops_total",
 		Help: "Number of times a task hit the infinite failure loop threshold",
+	}),
+	DroppedEvents: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_dropped_events_total",
+		Help: "Number of events dropped due to worker saturation",
 	}),
 }

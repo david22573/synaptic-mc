@@ -20,6 +20,8 @@ export enum ActionType {
     Retrieve = "retrieve",
     Look = "look",
     CameraMove = "camera_move",
+    RandomWalk = "random_walk",
+    Reposition = "reposition",
 }
 
 export enum ClientEventType {
