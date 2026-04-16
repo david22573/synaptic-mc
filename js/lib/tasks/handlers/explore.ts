@@ -218,9 +218,12 @@ class PickDirectionState implements FSMState {
                 "Exploration raymarch failed, picking random fallback target",
                 { attempt: eCtx.attempts },
             );
+            // Ensure fallback is at least 8 blocks away
+            const angle = Math.random() * Math.PI * 2;
+            const fallbackDist = 8 + Math.random() * 8;
             bestTarget = {
-                x: pos.x + (Math.random() * 16 - 8),
-                z: pos.z + (Math.random() * 16 - 8),
+                x: pos.x + Math.cos(angle) * fallbackDist,
+                z: pos.z + Math.sin(angle) * fallbackDist,
             };
         }
 

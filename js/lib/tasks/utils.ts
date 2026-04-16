@@ -263,7 +263,7 @@ export function moveToGoal(
             if (!waypoint) {
                 // If no waypoint and not at goal, we might be lost
                 const distToGoal = bot.entity.position.distanceTo(goal);
-                if (distToGoal > 2) {
+                if (distToGoal > 1.0) {
                     stuckStrikes++;
                     if (stuckStrikes > 40) finish(new UnreachableError(`Cannot find path to goal (${distToGoal.toFixed(1)}m away)`));
                 } else {

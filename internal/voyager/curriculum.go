@@ -188,9 +188,13 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			break
 		}
 		
+		if parseErr == nil && intent.Action == "" {
+			parseErr = fmt.Errorf("JSON parsed but 'action' field was empty")
+		}
+		
 		// Only retry on parse failures with an error hint to the LLM
-		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nParse Error: %v\n", attempt, parseErr)
-		errorHint = fmt.Sprintf("SYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
+		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nParse Error: %v\nRaw Response: %s\n", attempt, parseErr, rawResponse)
+		errorHint = fmt.Sprintf("SYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON matching the requested schema.", parseErr)
 	}
 
 	if parseErr != nil || intent.Action == "" {
