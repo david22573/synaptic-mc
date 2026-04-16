@@ -40,22 +40,22 @@ import (
 )
 
 type Config struct {
-        HTTPAddr      string
-        EventStoreDB  string
-        MemoryDB      string
-        VectorDB      string
-        UIPath        string
-        LLMURL        string
-        LLMKey        string
-        LLMStrongModel string
-        LLMCheapModel  string
-        LLMEmbedModel string
-        SessionID     string
-        DataDir       string
-        BotScript     string
-        HesitationMs  int
-        NoiseLevel    float64
-        ConfigPath    string
+	HTTPAddr       string
+	EventStoreDB   string
+	MemoryDB       string
+	VectorDB       string
+	UIPath         string
+	LLMURL         string
+	LLMKey         string
+	LLMStrongModel string
+	LLMCheapModel  string
+	LLMEmbedModel  string
+	SessionID      string
+	DataDir        string
+	BotScript      string
+	HesitationMs   int
+	NoiseLevel     float64
+	ConfigPath     string
 }
 
 func main() {
@@ -101,13 +101,13 @@ func main() {
 	defer vectorStore.Close()
 
 	llmClient := llm.NewClient(llm.Config{
-                APIURL:      cfg.LLMURL,
-                APIKey:      cfg.LLMKey,
-                StrongModel: cfg.LLMStrongModel,
-                CheapModel:  cfg.LLMCheapModel,
-                EmbedModel:  cfg.LLMEmbedModel,
-                MaxRetries:  3,
-        })
+		APIURL:      cfg.LLMURL,
+		APIKey:      cfg.LLMKey,
+		StrongModel: cfg.LLMStrongModel,
+		CheapModel:  cfg.LLMCheapModel,
+		EmbedModel:  cfg.LLMEmbedModel,
+		MaxRetries:  3,
+	})
 
 	eventBus := domain.NewEventBus()
 	rtBus := domain.NewRealtimeBus()
@@ -136,7 +136,10 @@ func main() {
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
 
 	execSupervisor := execution.NewSupervisor(eventBus, logger)
-	execService := execution.NewControlService(rtBus, eventBus, execEngine, taskManager, ctrlManager, execSupervisor, humanizer, stateSvc, logger)
+	actionArbiter := execution.NewActionArbiter(execSupervisor, logger)
+	taskManager.SetDangerProvider(actionArbiter)
+	
+	execService := execution.NewControlService(rtBus, eventBus, execEngine, taskManager, ctrlManager, execSupervisor, actionArbiter, humanizer, stateSvc, logger)
 	uiHub.SetOrchestrator(execService)
 
 	evaluator := strategy.NewEvaluatorWithLLM(llmClient)
@@ -232,10 +235,21 @@ func main() {
 	defer cancelRoot()
 
 	g, ctx := errgroup.WithContext(rootCtx)
-        g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } })
+	g.Go(func() error {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+				observability.Metrics.AddSurvivalTime(1)
+			}
+		}
+	})
 
 	decisionSvc := decision.NewService(ctx, cfg.SessionID, eventBus, plannerObj, planManager,
-		curriculum, critic, stateSvc, execService, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get())
+		curriculum, critic, stateSvc, execEngine, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get(), actionArbiter)
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
@@ -477,12 +491,12 @@ func parseConfig() Config {
 	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
 	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
 	defaultEmbed := "nomic-embed-text"
-        if strings.Contains(*llmURL, "openrouter.ai") {
-                defaultEmbed = "openai/text-embedding-3-small"
-        }
-        llmStrongModel := flag.String("llm-strong-model", getEnvOrDefault("LLM_STRONG_MODEL", "llama3.1-70b"), "LLM strong generation model")
-        llmCheapModel := flag.String("llm-cheap-model", getEnvOrDefault("LLM_CHEAP_MODEL", "llama3.2-3b"), "LLM cheap classification model")
-        llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", defaultEmbed), "LLM embedding model name")
+	if strings.Contains(*llmURL, "openrouter.ai") {
+		defaultEmbed = "openai/text-embedding-3-small"
+	}
+	llmStrongModel := flag.String("llm-strong-model", getEnvOrDefault("LLM_STRONG_MODEL", "openai/gpt-4o-mini"), "LLM strong generation model")
+	llmCheapModel := flag.String("llm-cheap-model", getEnvOrDefault("LLM_CHEAP_MODEL", "openai/gpt-4o-mini"), "LLM cheap classification model")
+	llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", defaultEmbed), "LLM embedding model name")
 
 	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
 	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
@@ -494,22 +508,22 @@ func parseConfig() Config {
 	flag.Parse()
 
 	return Config{
-		HTTPAddr:      *httpAddr,
-		EventStoreDB:  *eventsDB,
-		MemoryDB:      *memoryDB,
-		VectorDB:      *vectorDB,
-		UIPath:        *uiPath,
-		LLMURL:        *llmURL,
-		LLMKey:        *llmKey,
+		HTTPAddr:       *httpAddr,
+		EventStoreDB:   *eventsDB,
+		MemoryDB:       *memoryDB,
+		VectorDB:       *vectorDB,
+		UIPath:         *uiPath,
+		LLMURL:         *llmURL,
+		LLMKey:         *llmKey,
 		LLMStrongModel: *llmStrongModel,
-                LLMCheapModel:  *llmCheapModel,
-		LLMEmbedModel: *llmEmbedModel,
-		SessionID:     *sessionID,
-		DataDir:       *dataDir,
-		BotScript:     *botScript,
-		HesitationMs:  *hesitationMs,
-		NoiseLevel:    *noiseLevel,
-		ConfigPath:    *configPath,
+		LLMCheapModel:  *llmCheapModel,
+		LLMEmbedModel:  *llmEmbedModel,
+		SessionID:      *sessionID,
+		DataDir:        *dataDir,
+		BotScript:      *botScript,
+		HesitationMs:   *hesitationMs,
+		NoiseLevel:     *noiseLevel,
+		ConfigPath:     *configPath,
 	}
 }
 
@@ -604,10 +618,3 @@ func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBu
 		cm.SetController(controllerID, idempotentController)
 	}
 }
-
-
-
-
-
-
-

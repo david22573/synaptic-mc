@@ -65,7 +65,7 @@ func NewEnemyPredictor() *EnemyPredictor {
 	}
 }
 
-func (p *EnemyPredictor) Predict(threats []domain.Threat) map[string]domain.Vec3 {
+func (p *EnemyPredictor) Predict(threats []domain.ThreatInfo) map[string]domain.Vec3 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

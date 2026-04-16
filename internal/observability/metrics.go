@@ -31,6 +31,7 @@ type SystemMetrics struct {
 	PlannerDuration    prometheus.Histogram
 	TaskExecDuration   prometheus.Histogram
 	TaskDispatchTotal  prometheus.Counter
+	TaskPreemptionTotal prometheus.Counter
 	StateAgeMs         prometheus.Histogram
 	ReplanCount        prometheus.Counter
 	TaskInterruptCount prometheus.Counter
@@ -55,6 +56,7 @@ type SystemMetrics struct {
 	interrupts atomic.Uint64
 	stuck      atomic.Uint64
 	dispatches atomic.Uint64
+	preemptions atomic.Uint64
 
 	// Offline Trainer Metrics
 	OfflineTrainingRuns   prometheus.Counter
@@ -102,6 +104,11 @@ func (s *SystemMetrics) IncInterrupt() {
 	s.interrupts.Add(1)
 }
 
+func (s *SystemMetrics) IncPreemption() {
+	s.TaskPreemptionTotal.Inc()
+	s.preemptions.Add(1)
+}
+
 func (s *SystemMetrics) IncDispatch() {
 	s.TaskDispatchTotal.Inc()
 	s.dispatches.Add(1)
@@ -116,17 +123,25 @@ func (s *SystemMetrics) GetStats() map[string]any {
 	tasks := s.tasks.Load()
 	paths := s.paths.Load()
 	dispatches := s.dispatches.Load()
+	preemptions := s.preemptions.Load()
 
 	failureRate := 0.0
 	if dispatches > 0 {
 		failureRate = float64(paths) / float64(dispatches)
 	}
 
+	preemptionRate := 0.0
+	if dispatches > 0 {
+		preemptionRate = float64(preemptions) / float64(dispatches)
+	}
+
 	return map[string]any{
 		"deaths":             s.deaths.Load(),
 		"tasks_completed":    tasks,
 		"task_dispatch":      dispatches,
+		"task_preemption":    preemptions,
 		"failure_rate":       failureRate,
+		"preemption_rate":    preemptionRate,
 		"resources_gathered": s.resources.Load(),
 		"path_failures":      paths,
 		"skill_reuse":        s.skills.Load(),
@@ -216,6 +231,10 @@ var Metrics = &SystemMetrics{
 	TaskDispatchTotal: promauto.NewCounter(prometheus.CounterOpts{
 		Name: "agent_task_dispatch_total",
 		Help: "Total number of tasks dispatched by the supervisor",
+	}),
+	TaskPreemptionTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_task_preemption_total",
+		Help: "Total number of tasks preempted by higher priority actions",
 	}),
 	StateAgeMs: promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "agent_state_age_ms",

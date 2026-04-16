@@ -10,6 +10,7 @@ import { RollingPathfinder } from "../movement/pathfinder.js";
 import { steerTowards } from "../movement/navigator.js";
 import { getWorldControlOverrides, senseWorld, type WorldAwareness } from "../utils/world.js";
 import { ProgressTracker } from "../movement/progress.js";
+import { CircuitBreaker } from "../utils/circuit_breaker.js";
 
 export interface Perception {
     pos: Vec3;
@@ -26,7 +27,16 @@ export interface ActionPlan {
     interact: "attack" | "use" | null;
     interactTarget: any | null;
     clearPathfinder: boolean;
-    pathfindingGoal: any | null; // New field for continuous pathing
+
+    // Kinematic Steering (Roadmap Item 5)
+    kinematic?: {
+        desiredHeading?: number; // radians
+        desiredSpeed?: number;   // 0.0 - 1.0
+        avoidanceVector?: Vec3;  // vector to add to heading
+        lookTarget?: Vec3;       // precision look
+    };
+    
+    pathfindingGoal: any | null;
 }
 
 export class BotController {
@@ -35,8 +45,11 @@ export class BotController {
     private loop: ControlLoop;
     private combat: CombatController;
     private pathfinder: RollingPathfinder;
-    private lastDisengageAt: number = 0;
+    private intentStartedAt: number = 0;
+    private minHoldDuration: number = 0;
+    private canPreempt: boolean = true;
     private progress: ProgressTracker | null = null;
+    private breaker: CircuitBreaker;
 
     constructor(
         public bot: Bot,
@@ -45,21 +58,51 @@ export class BotController {
         this.loop = new ControlLoop(this);
         this.combat = new CombatController(bot);
         this.pathfinder = new RollingPathfinder(bot);
+        this.breaker = new CircuitBreaker();
     }
 
     public setIntent(intent: ActionIntent) {
         const now = Date.now();
 
-        if (now - this.lastDisengageAt < 2000) {
+        // Phase 1: Stop Action Thrashing (Intent Lease System)
+        if (now - this.intentStartedAt < this.minHoldDuration) {
+            // Cannot preempt during MinHold unless it's a higher priority survival action
+            // In TS, we treat retreat and random_walk as absolute overrides
             if (intent.action !== 'retreat' && intent.action !== 'random_walk') {
-                log.warn(`[Reflex] Ignoring intent swap to '${intent.action}' during active escape`);
+                log.warn(`[Reflex] Ignoring intent swap to '${intent.action}' (MinHold active)`);
                 return;
             }
         }
 
+        // Check preemption lock
+        if (!this.canPreempt && (now - this.intentStartedAt < 10000)) { // Hard 10s cap on non-preemptable tasks
+            if (intent.action !== 'retreat' && intent.action !== 'random_walk') {
+                log.warn(`[Reflex] Ignoring intent swap to '${intent.action}' (Non-preemptable active)`);
+                return;
+            }
+        }
+
+        if (this.activeIntent) {
+            log.info(`Preempting intent '${this.activeIntent.action}' -> '${intent.action}'`);
+            this.intentState.preempted = true;
+            this.intentState.reason = "preempted";
+        }
+
         log.info(`Swapping intent -> ${intent.action}`);
         this.activeIntent = intent;
-        this.intentState = { completed: false, failed: false, reason: "" };
+        this.intentState = { completed: false, failed: false, preempted: false, reason: "" };
+        this.intentStartedAt = now;
+        
+        // Default lease rules
+        this.minHoldDuration = 0;
+        this.canPreempt = true;
+
+        // Specialized rules for survival actions
+        if (intent.action === 'retreat' || intent.action === 'random_walk') {
+            this.minHoldDuration = 2000;
+            this.canPreempt = false;
+        }
+
         this.bot.clearControlStates();
         
         if (this.bot.pathfinder && this.bot.pathfinder.goal) {
@@ -80,7 +123,7 @@ export class BotController {
         };
     }
 
-    public adjust(perception: Perception): ActionPlan {
+    public async adjust(perception: Perception): Promise<ActionPlan> {
         const defaultPlan: ActionPlan = {
             controls: {
                 forward: false,
@@ -102,9 +145,14 @@ export class BotController {
 
         // Survival Reflex
         if (this.bot.health < 10 || closeThreats.length >= 3) {
-            if (now - this.lastDisengageAt > 2000) {
-                this.lastDisengageAt = now;
-                log.warn("[Reflex] Survival critical: triggering mechanical disengage");
+            if (now - this.intentStartedAt > 2000) {
+                // If not already in a survival intent, force one
+                if (perception.intent?.action !== 'retreat' && perception.intent?.action !== 'random_walk') {
+                    log.warn("[Reflex] Survival critical: triggering mechanical disengage");
+                    this.intentStartedAt = now;
+                    this.minHoldDuration = 2000;
+                    this.canPreempt = false;
+                }
 
                 const nearest = closeThreats.sort((a, b) => a.distance - b.distance)[0];
                 if (nearest && nearest.position && this.bot.entity) {
@@ -116,7 +164,8 @@ export class BotController {
             }
         }
 
-        if (now - this.lastDisengageAt < 2000) {
+        // Mechanical Escape Override (Phase 1/5)
+        if (now - this.intentStartedAt < this.minHoldDuration && !this.canPreempt) {
             defaultPlan.controls.forward = true;
             defaultPlan.controls.sprint = true;
             defaultPlan.controls.jump = true;
@@ -142,25 +191,66 @@ export class BotController {
                 this.progress = new ProgressTracker(this.bot, this.bot.entity.position.clone());
             }
             if (this.progress.checkStuck(this.bot)) {
-                log.warn("[Stuck] Bot detected as stuck. Applying recovery ladder.");
-                
-                // Recovery Ladder
-                if (Math.random() < 0.3) {
-                    plan.controls.jump = true;
-                } else if (Math.random() < 0.6) {
+                if (this.breaker.canExecute()) {
+                    log.warn("[Stuck] Bot detected as stuck. Applying recovery ladder.");
+                    this.breaker.recordFailure();
+                    
+                    // Recovery Ladder
+                    if (Math.random() < 0.3) {
+                        plan.controls.jump = true;
+                    } else if (Math.random() < 0.6) {
+                        plan.controls.left = Math.random() > 0.5;
+                        plan.controls.right = !plan.controls.left;
+                    } else {
+                        // Force a repath by clearing current path
+                        plan.clearPathfinder = true;
+                    }
+                } else {
+                    // Circuit breaker open: don't spam recovery, try a simple random walk fallback
+                    plan.controls.forward = true;
                     plan.controls.left = Math.random() > 0.5;
                     plan.controls.right = !plan.controls.left;
-                } else {
-                    // Force a repath by clearing current path
                     plan.clearPathfinder = true;
                 }
+            } else {
+                this.breaker.recordSuccess();
             }
         }
 
-        // 3. Handle Continuous Pathing (Roadmap Item 7)
+        // 3. Handle Kinematic Steering (Roadmap Item 5)
+        if (plan.kinematic) {
+            const k = plan.kinematic;
+            if (k.desiredHeading !== undefined) {
+                let finalHeading = k.desiredHeading;
+                if (k.avoidanceVector) {
+                    const avoidanceYaw = Math.atan2(k.avoidanceVector.x, k.avoidanceVector.z);
+                    finalHeading = (finalHeading + avoidanceYaw) / 2; // Simple blend
+                }
+                
+                // Set yaw
+                this.bot.look(finalHeading, this.bot.entity.pitch, true).catch(() => {});
+                
+                if (k.desiredSpeed && k.desiredSpeed > 0) {
+                    plan.controls.forward = true;
+                    plan.controls.sprint = k.desiredSpeed > 0.5;
+                }
+            }
+            
+            if (k.lookTarget) {
+                plan.lookAt = k.lookTarget;
+            }
+        }
+
+        // 4. Handle Continuous Pathing (Roadmap Item 7)
         if (plan.pathfindingGoal) {
             // Update rolling path
-            this.pathfinder.updatePath(plan.pathfindingGoal);
+            const result = await this.pathfinder.updatePath(plan.pathfindingGoal);
+            if (result.status === "noPath") {
+                log.warn("[Reflex] Path calculation failed. Reporting failure to decision layer.");
+                this.intentState.failed = true;
+                this.intentState.reason = "no_path";
+            }
+            
             const waypoint = this.pathfinder.getNextWaypoint();
             if (waypoint) {
                 // Determine motor inputs toward waypoint

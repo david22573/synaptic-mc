@@ -90,7 +90,7 @@ type GameState struct {
 	Level              int               `json:"level"`
 	HasBedNearby bool              `json:"has_bed_nearby"`
 	Position     Vec3              `json:"position"`
-	Threats      []Threat          `json:"threats"`
+	Threats      []ThreatInfo      `json:"threats"`
 	POIs         []POI             `json:"pois"`
 	Inventory    []Item            `json:"inventory"`
 	Hotbar       []*Item           `json:"hotbar"`
@@ -131,7 +131,7 @@ type VersionedState struct {
 	State   GameState
 }
 
-type Threat struct {
+type ThreatInfo struct {
 	Name     string  `json:"name"`
 	Distance float64 `json:"distance"`
 }

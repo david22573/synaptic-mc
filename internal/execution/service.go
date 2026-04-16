@@ -25,6 +25,7 @@ type ControlService struct {
 	taskManager *TaskManager
 	ctrlManager *ControllerManager
 	supervisor  *Supervisor
+	arbiter     *ActionArbiter
 	humanizer   *humanization.Engine
 	stateProv   StateProvider
 	logger      *slog.Logger
@@ -49,6 +50,7 @@ func NewControlService(
 	tm *TaskManager,
 	cm *ControllerManager,
 	supervisor *Supervisor,
+	arbiter *ActionArbiter,
 	humanizer *humanization.Engine,
 	sp StateProvider,
 	logger *slog.Logger,
@@ -60,11 +62,12 @@ func NewControlService(
 		taskManager:  tm,
 		ctrlManager:  cm,
 		supervisor:   supervisor,
+		arbiter:      arbiter,
 		humanizer:    humanizer,
 		stateProv:    sp,
 		logger:       logger.With(slog.String("component", "control_service")),
 		activeTimers: make(map[string]*time.Timer),
-		prep:         NewPrepOrchestrator(engine, logger),
+		prep:         NewPrepOrchestrator(engine, arbiter, logger),
 	}
 
 	// Plans arrive from the slower, async pipeline
@@ -134,9 +137,9 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 	if len(plan.Tasks) > 0 {
 		task := plan.Tasks[0]
 
-		// Use Supervisor as mandatory gate
-		if !s.supervisor.Dispatch(ctx, task) {
-			s.logger.Debug("Supervisor denied task dispatch", slog.String("task_id", task.ID))
+		// Phase 4: Single Writer Action Bus
+		if !s.arbiter.Request(ctx, task) {
+			s.logger.Debug("Arbiter denied task request", slog.String("task_id", task.ID))
 			return
 		}
 
@@ -187,7 +190,9 @@ func (s *ControlService) handlePanic(ctx context.Context, event domain.DomainEve
 		Priority:  1000, // Absolute highest priority
 		Rationale: "High-priority survival reflex triggered by sensor data",
 	}
-	s.engine.RunEmergencyPolicy(ctx, emergencyAction)
+	
+	// Phase 4: Single Writer Action Bus
+	s.arbiter.Request(ctx, emergencyAction)
 }
 
 func (s *ControlService) handleBotDeath(ctx context.Context, event domain.DomainEvent) {
@@ -428,9 +433,8 @@ func (s *ControlService) IngestControlInput(ctx context.Context, input domain.Co
 		Rationale: "Direct user control input",
 	}
 
-	err = s.ctrlManager.Dispatch(ctx, action)
-
-	if err != nil {
-		s.logger.Error("Failed to dispatch control input", slog.Any("error", err))
+	// Phase 4: Single Writer Action Bus
+	if !s.arbiter.Request(ctx, action) {
+		s.logger.Debug("Arbiter denied direct control request", slog.String("action", action.Action))
 	}
 }

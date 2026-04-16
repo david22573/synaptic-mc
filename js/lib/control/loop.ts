@@ -29,7 +29,7 @@ export class ControlLoop {
             const perception = this.controller.sense();
 
             // 2. ADJUST: Evaluate current intent to determine ideal physical state
-            const plan = this.controller.adjust(perception);
+            const plan = await this.controller.adjust(perception);
 
             // 3. ACT: Apply calculated mechanical inputs
             await this.controller.act(plan);

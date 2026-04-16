@@ -4,10 +4,12 @@ package decision
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/state"
 )
 
 func (s *Service) runEvaluationLoop(ctx context.Context) {
@@ -29,23 +31,25 @@ func (s *Service) evaluateNextPlan() {
 }
 
 func (s *Service) doEvaluateNextPlan(ctx context.Context) {
-	state := s.stateProvider.GetCurrentState().State
-	if state.Health <= 0 {
+	gs := s.stateProvider.GetCurrentState().State
+	if gs.Health <= 0 {
 		return
 	}
 
+	// Phase 3: Danger State Machine
+	dangerState := s.arbiter.UpdateDanger(gs)
+
 	// Near-Cheating: Predictive Nightfall Prep
-	nightfall := s.predictor.PredictNightfall(state)
+	nightfall := s.predictor.PredictNightfall(gs)
 
 	// TIER 1: Instant Reaction (Hardcoded Heuristics - No LLM)
-	survivalOverride := hasImmediateThreat(state) ||
-		hasImmediateHazard(state) ||
-		(state.Health < domain.SurvivalCriticalHealth) ||
-		(state.Health < domain.DecisionHealthSafe && state.Food < domain.SurvivalMinFoodForHunt) ||
+	survivalOverride := dangerState == state.DangerEscape ||
+		dangerState == state.DangerAlert ||
+		(gs.Health < domain.DecisionHealthSafe && gs.Food < domain.SurvivalMinFoodForHunt) ||
 		nightfall
 
 	if survivalOverride {
-		s.handleTier1Reaction(ctx, state, nightfall)
+		s.handleTier1Reaction(ctx, gs, nightfall)
 		return
 	}
 
@@ -55,7 +59,7 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 	}
 
 	// TIER 2: Fast Heuristic (Check if simple goal suffices before calling LLM)
-	if plan, ok := s.tryFastHeuristic(ctx, state); ok {
+	if plan, ok := s.tryFastHeuristic(ctx, gs); ok {
 		s.dispatchPlan(ctx, plan)
 		return
 	}
@@ -65,10 +69,10 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 		s.logger.Warn("System in CRISIS mode, skipping Tier 3 strategic reasoning")
 		return
 	}
-	s.handleTier3Strategic(ctx, state)
+	s.handleTier3Strategic(ctx, gs)
 }
 
-func (s *Service) handleTier1Reaction(ctx context.Context, state domain.GameState, nightfall bool) {
+func (s *Service) handleTier1Reaction(ctx context.Context, gs domain.GameState, nightfall bool) {
 	s.logger.Warn("Survival priority override active (Tier 1)")
 	
 	// Prevent lock breaking if we're already executing a survival task
@@ -104,7 +108,7 @@ func (s *Service) handleTier1Reaction(ctx context.Context, state domain.GameStat
 			},
 		}
 	} else {
-		plan = s.planner.reactivePlan(ctx, state)
+		plan = s.planner.reactivePlan(ctx, gs)
 	}
 
 	if nightfall && plan.Objective != "Degraded Recovery state" {
@@ -121,9 +125,9 @@ func (s *Service) handleTier1Reaction(ctx context.Context, state domain.GameStat
 	s.dispatchPlan(ctx, plan)
 }
 
-func (s *Service) tryFastHeuristic(ctx context.Context, state domain.GameState) (domain.Plan, bool) {
+func (s *Service) tryFastHeuristic(ctx context.Context, gs domain.GameState) (domain.Plan, bool) {
 	// Simple wood/food gathering if we have none and are in a safe spot
-	inventory := inventoryMap(state)
+	inventory := inventoryMap(gs)
 	
 	if inventory["oak_log"] == 0 && inventory["birch_log"] == 0 && inventory["spruce_log"] == 0 {
 		return domain.Plan{
@@ -141,16 +145,36 @@ func (s *Service) tryFastHeuristic(ctx context.Context, state domain.GameState) 
 	return domain.Plan{}, false
 }
 
-func (s *Service) handleTier3Strategic(ctx context.Context, state domain.GameState) {
+func (s *Service) handleTier3Strategic(ctx context.Context, gs domain.GameState) {
+	// Phase 7: Hierarchical Task Network (HTN)
+	// Try deterministic HTN decomposition for common high-level goals first
+	danger := s.arbiter.GetDangerState()
+	
+	if danger != state.DangerSafe {
+		if htnPlan, err := s.htn.Decompose(ctx, "survive", gs, danger); err == nil && htnPlan != nil && len(htnPlan.Tasks) > 0 {
+			s.logger.Info("HTN: Decomposed survival goal", slog.String("objective", htnPlan.Objective))
+			s.dispatchPlan(ctx, *htnPlan)
+			return
+		}
+	}
+
+	if isProgressionMode(danger, gs) {
+		if htnPlan, err := s.htn.Decompose(ctx, "progression", gs, danger); err == nil && htnPlan != nil && len(htnPlan.Tasks) > 0 {
+			s.logger.Info("HTN: Decomposed progression goal", slog.String("objective", htnPlan.Objective))
+			s.dispatchPlan(ctx, *htnPlan)
+			return
+		}
+	}
+
 	var plan domain.Plan
 	var proposedIntent *domain.ActionIntent
 	var proposeErr error
 
-	if isProgressionMode(state) && s.curriculum != nil {
+	if isProgressionMode(danger, gs) && s.curriculum != nil {
 		s.logger.Info("Stable state detected, curriculum driving progression (Tier 3)")
 
-		proposedIntent, proposeErr = s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
-		if proposeErr == nil && proposedIntent != nil && isValidCurriculumIntent(state, proposedIntent) {
+		proposedIntent, proposeErr = s.curriculum.ProposeTask(ctx, gs, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+		if proposeErr == nil && proposedIntent != nil && isValidCurriculumIntent(gs, proposedIntent) {
 			if proposedIntent.Action == "use_skill" && len(proposedIntent.SkillSteps) > 0 {
 				plan = domain.Plan{
 					Objective:  proposedIntent.Rationale,
@@ -182,13 +206,13 @@ func (s *Service) handleTier3Strategic(ctx context.Context, state domain.GameSta
 				}
 			}
 		} else {
-			plan = s.planner.FastPlan(ctx, state)
+			plan = s.planner.FastPlan(ctx, gs)
 		}
 	} else {
-		plan = s.planner.FastPlan(ctx, state)
+		plan = s.planner.FastPlan(ctx, gs)
 	}
 
-	if !Validate(&plan, state) {
+	if !Validate(&plan, gs) {
 		plan.IsFallback = true
 		plan.Tasks = nil
 	}
@@ -199,10 +223,10 @@ func (s *Service) handleTier3Strategic(ctx context.Context, state domain.GameSta
 			intent := proposedIntent
 			err := proposeErr
 			if intent == nil && err == nil {
-				intent, err = s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+				intent, err = s.curriculum.ProposeTask(ctx, gs, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
 			}
 
-			if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
+			if err == nil && intent != nil && isValidCurriculumIntent(gs, intent) {
 				plan = domain.Plan{
 					Objective:  "Curriculum Fallback",
 					IsFallback: true,
@@ -230,7 +254,7 @@ func (s *Service) dispatchPlan(ctx context.Context, plan domain.Plan) {
 	s.dispatchActivePlan(ctx)
 }
 
-func Validate(plan *domain.Plan, state domain.GameState) bool {
+func Validate(plan *domain.Plan, gs domain.GameState) bool {
 	if plan == nil || len(plan.Tasks) == 0 {
 		return false
 	}
@@ -239,7 +263,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 	hasPickaxe := false
 	hasCraftingTable := false
 
-	for _, item := range state.Inventory {
+	for _, item := range gs.Inventory {
 		if strings.Contains(item.Name, "pickaxe") {
 			hasPickaxe = true
 		}
@@ -248,7 +272,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 		}
 	}
 
-	for _, poi := range state.POIs {
+	for _, poi := range gs.POIs {
 		if poi.Name == "crafting_table" {
 			hasCraftingTable = true
 		}
@@ -256,11 +280,11 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 
 	switch task.Action {
 	case "eat":
-		if state.Food >= domain.DecisionFoodMax {
+		if gs.Food >= domain.DecisionFoodMax {
 			return false
 		}
 		hasFood := false
-		for _, item := range state.Inventory {
+		for _, item := range gs.Inventory {
 			if domain.IsFood(item.Name) {
 				hasFood = true
 				break
@@ -268,7 +292,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 		}
 		return hasFood
 	case "craft":
-		if len(state.Inventory) == 0 {
+		if len(gs.Inventory) == 0 {
 			return false
 		}
 		if strings.Contains(task.Target.Name, "pickaxe") && !hasCraftingTable {
@@ -279,7 +303,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 			return false
 		}
 	case "hunt":
-		if state.Health < domain.DecisionHealthHunt {
+		if gs.Health < domain.DecisionHealthHunt {
 			return false
 		}
 	}
@@ -287,7 +311,7 @@ func Validate(plan *domain.Plan, state domain.GameState) bool {
 	return true
 }
 
-func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent) bool {
+func isValidCurriculumIntent(gs domain.GameState, intent *domain.ActionIntent) bool {
 	if intent == nil || intent.Action == "" {
 		return false
 	}
@@ -302,7 +326,7 @@ func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent
 			return false
 		}
 	case "eat":
-		for _, item := range state.Inventory {
+		for _, item := range gs.Inventory {
 			if strings.EqualFold(item.Name, target) && item.Count > 0 && domain.IsFood(item.Name) {
 				return true
 			}
@@ -313,41 +337,8 @@ func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent
 	return true
 }
 
-func isProgressionMode(state domain.GameState) bool {
-	return state.Health > 14 &&
-		state.Food > 10 &&
-		len(state.Threats) == 0 &&
-		!hasImmediateHazard(state)
-}
-
-func hasImmediateThreat(state domain.GameState) bool {
-	for _, threat := range state.Threats {
-		if threat.Distance <= domain.SurvivalMaxThreatDist {
-			return true
-		}
-	}
-	return false
-}
-
-func hasImmediateHazard(state domain.GameState) bool {
-	for _, feedback := range state.Feedback {
-		switch strings.ToLower(strings.TrimSpace(feedback.Cause)) {
-		case "lava_contact", "low_air", "burning", "recent_heavy_damage":
-			return true
-		}
-		if strings.EqualFold(feedback.Type, "hazard") {
-			return true
-		}
-	}
-
-	for _, zone := range state.DangerZones {
-		if zone.Risk < 0.85 {
-			continue
-		}
-		if state.Position.DistanceTo(zone.Center) <= 6.0 {
-			return true
-		}
-	}
-
-	return false
+func isProgressionMode(danger state.DangerState, gs domain.GameState) bool {
+	return danger == state.DangerSafe &&
+		gs.Health > 14 &&
+		gs.Food > 10
 }

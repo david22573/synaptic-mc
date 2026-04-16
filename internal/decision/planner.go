@@ -79,13 +79,13 @@ var planResponseFormat = &llm.ResponseFormat{
 								"priority":  map[string]any{"type": "integer"},
 								"rationale": map[string]any{"type": "string"},
 							},
-							"required": []string{"action", "target", "rationale"},
+							"required":             []string{"id", "action", "target", "count", "priority", "rationale"},
 							"additionalProperties": false,
 						},
 					},
 				},
 			},
-			"required": []string{"strategic_goal", "subgoals", "objective", "candidates"},
+			"required":             []string{"strategic_goal", "subgoals", "objective", "candidates"},
 			"additionalProperties": false,
 		},
 	},
@@ -293,7 +293,9 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 			plan, err := p.generateLLMPlan(ctx, sessionID, *activeState)
 			if err != nil {
-				p.logger.Error("Background LLM planning failed", slog.Any("error", err))
+				p.logger.Error("Background LLM planning failed, falling back to heuristic", slog.Any("error", err))
+				heuristicPlan := p.FastPlan(ctx, *activeState)
+				p.currentPlan.Store(&heuristicPlan)
 				continue
 			}
 

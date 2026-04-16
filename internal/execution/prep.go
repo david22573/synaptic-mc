@@ -11,14 +11,19 @@ import (
 
 // PrepOrchestrator handles proactive actions like food farming and pre-escape.
 type PrepOrchestrator struct {
-	logger *slog.Logger
-	engine *TaskExecutionEngine
+	logger               *slog.Logger
+	engine               *TaskExecutionEngine
+	arbiter              *ActionArbiter
+	lastEscapeDispatch   time.Time
+	escapeCooldown       time.Duration
 }
 
-func NewPrepOrchestrator(engine *TaskExecutionEngine, logger *slog.Logger) *PrepOrchestrator {
+func NewPrepOrchestrator(engine *TaskExecutionEngine, arbiter *ActionArbiter, logger *slog.Logger) *PrepOrchestrator {
 	return &PrepOrchestrator{
-		engine: engine,
-		logger: logger.With(slog.String("component", "prep_orchestrator")),
+		engine:         engine,
+		arbiter:        arbiter,
+		logger:         logger.With(slog.String("component", "prep_orchestrator")),
+		escapeCooldown: 5 * time.Second,
 	}
 }
 
@@ -33,7 +38,9 @@ func (o *PrepOrchestrator) CheckProactiveFarming(ctx context.Context, state doma
 			Priority:  40,
 			Rationale: "Proactive farming based on declining food levels",
 		}
-		o.engine.ExecuteAsync(ctx, action)
+		
+		// Phase 4: Single Writer Action Bus
+		o.arbiter.Request(ctx, action)
 	}
 }
 
@@ -53,6 +60,11 @@ func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState
 	}
 
 	if dangerRising {
+		if time.Since(o.lastEscapeDispatch) < o.escapeCooldown {
+			return
+		}
+		o.lastEscapeDispatch = time.Now()
+
 		o.logger.Warn("Danger rising: initiating pre-escape")
 		action := domain.Action{
 			ID:        fmt.Sprintf("prep-escape-%d", time.Now().UnixNano()),
@@ -61,6 +73,8 @@ func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState
 			Priority:  90,
 			Rationale: "Predictive escape: threat density increasing",
 		}
-		o.engine.RunEmergencyPolicy(ctx, action)
+		
+		// Phase 4: Single Writer Action Bus
+		o.arbiter.Request(ctx, action)
 	}
 }

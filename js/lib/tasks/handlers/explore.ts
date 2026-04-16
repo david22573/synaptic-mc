@@ -1,17 +1,7 @@
 import { type Bot } from "mineflayer";
 import { type Entity } from "prismarine-entity";
 import { type Block } from "prismarine-block";
-import {
-    type FSMState,
-    type StateContext,
-    StateMachineRunner,
-} from "../fsm.js";
-import { type TaskContext } from "../registry.js";
-import { escapeTree } from "../utils.js";
-import { Runtime } from "../../control/runtime.js";
-import { navigateWithFallbacks } from "../../movement/navigator.js";
-import { TaskAbortError, isAbortError } from "../../errors.js";
-import { log } from "../../logger.js";
+import { ActionPlan, Perception } from "../../control/controller.js";
 import pkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 
@@ -21,252 +11,102 @@ const MAX_HISTORY_POINTS = 50;
 
 type BotWithHistory = Bot & { explorationHistory?: { x: number; z: number }[] };
 
-interface ExploreContext extends StateContext {
-    bot: BotWithHistory;
-    targetX: number;
-    targetZ: number;
-    attempts: number;
-    stopMovement: () => void;
-    visitedPoints: { x: number; z: number }[];
-}
+export function evaluateExplore(
+    bot: Bot,
+    perception: Perception,
+    plan: ActionPlan,
+): ActionPlan {
+    const { intent, state } = perception;
+    const botWithHistory = bot as BotWithHistory;
+    botWithHistory.explorationHistory = botWithHistory.explorationHistory || [];
 
-class NavigateState implements FSMState {
-    name = "NAVIGATING";
+    // If we have a current exploration target and haven't reached it, keep going
+    if (state.targetX !== undefined && state.targetZ !== undefined) {
+        const dist = Math.sqrt(
+            (bot.entity.position.x - state.targetX) ** 2 +
+            (bot.entity.position.z - state.targetZ) ** 2
+        );
+        
+        if (dist > 2) {
+            plan.pathfindingGoal = new goals.GoalNearXZ(state.targetX, state.targetZ, 2);
+            return plan;
+        }
+        
+        // Target reached, pick a new one
+        botWithHistory.explorationHistory.push({ x: state.targetX, z: state.targetZ });
+        while (botWithHistory.explorationHistory.length > MAX_HISTORY_POINTS) {
+            botWithHistory.explorationHistory.shift();
+        }
+        delete state.targetX;
+        delete state.targetZ;
+    }
 
-    async enter() {}
+    // Pick a new direction
+    const dist = 16 + Math.random() * 16;
+    let bestTarget = null;
+    let maxRepulsionScore = -1;
+    const pos = bot.entity.position.floored();
 
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const eCtx = ctx as ExploreContext;
+    for (let i = 0; i < 24; i++) {
+        const testAngle = Math.random() * Math.PI * 2;
+        let tx = pos.x;
+        let tz = pos.z;
+        let ty = pos.y;
+        let validLength = 0;
 
-        const checkForTargets = () => {
-            if (eCtx.targetName === "food_source") {
-                const food = eCtx.bot.nearestEntity((e: Entity) => 
-                    ["pig", "cow", "sheep", "chicken", "rabbit"].includes(e.name!) && 
-                    eCtx.bot.entity.position.distanceTo(e.position) < 16
-                );
-                if (food) {
-                    log.info("Exploration: Found food source nearby, stopping exploration early.");
-                    return true;
-                }
-                const bush = eCtx.bot.findBlock({
-                    matching: (b: Block) => b && b.name === "sweet_berry_bush" && b.metadata >= 2,
-                    maxDistance: 16
-                });
-                if (bush) {
-                    log.info("Exploration: Found berry bush nearby, stopping exploration early.");
-                    return true;
+        for (let step = 1; step <= dist; step++) {
+            const checkX = Math.floor(pos.x + Math.cos(testAngle) * step);
+            const checkZ = Math.floor(pos.z + Math.sin(testAngle) * step);
+            let foundSurface = false;
+
+            for (let yOffset = 2; yOffset >= -3; yOffset--) {
+                const block = bot.blockAt(new Vec3(checkX, ty + yOffset, checkZ));
+                const blockAbove = bot.blockAt(new Vec3(checkX, ty + yOffset + 1, checkZ));
+                const blockAbove2 = bot.blockAt(new Vec3(checkX, ty + yOffset + 2, checkZ));
+
+                if (!block || !blockAbove || !blockAbove2) break;
+
+                if (block.boundingBox === "block" && blockAbove.name === "air" && blockAbove2.name === "air" &&
+                    !["water", "lava", "magma_block", "cactus", "sweet_berry_bush"].includes(block.name)) {
+                    tx = checkX;
+                    tz = checkZ;
+                    ty = ty + yOffset;
+                    validLength = step;
+                    foundSurface = true;
+                    break;
                 }
             }
-            return false;
+            if (!foundSurface) break;
+        }
+
+        if (validLength < 4) continue;
+
+        let minDistanceToHistory = 999999;
+        for (const pt of botWithHistory.explorationHistory) {
+            const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
+            if (d < minDistanceToHistory) minDistanceToHistory = d;
+        }
+        if (botWithHistory.explorationHistory.length === 0) minDistanceToHistory = validLength;
+
+        const score = validLength * 0.3 + minDistanceToHistory * 0.7;
+        if (score > maxRepulsionScore) {
+            maxRepulsionScore = score;
+            bestTarget = { x: tx, z: tz };
+        }
+    }
+
+    if (!bestTarget) {
+        const angle = Math.random() * Math.PI * 2;
+        const fallbackDist = 8 + Math.random() * 8;
+        bestTarget = {
+            x: pos.x + Math.cos(angle) * fallbackDist,
+            z: pos.z + Math.sin(angle) * fallbackDist,
         };
-
-        const targetAbort = new AbortController();
-        const onParentAbort = () => targetAbort.abort(eCtx.signal.reason);
-        eCtx.signal.addEventListener("abort", onParentAbort, { once: true });
-
-        const combinedSignal = targetAbort.signal;
-
-        // Interval check for targets while moving
-        const targetCheckInterval = setInterval(() => {
-            if (checkForTargets()) {
-                targetAbort.abort("target_found");
-            }
-        }, 500);
-
-        try {
-            await navigateWithFallbacks(
-                eCtx.bot,
-                new goals.GoalNearXZ(eCtx.targetX, eCtx.targetZ, 2),
-                {
-                    signal: combinedSignal,
-                    timeoutMs: 25000, // Increased timeout
-                    stopMovement: eCtx.stopMovement,
-                    maxRetries: 4, // Increased retries
-                    skipStop: true, // Skip stop for fluidity
-                },
-            );
-            eCtx.visitedPoints.push({
-                x: eCtx.bot.entity.position.x,
-                z: eCtx.bot.entity.position.z,
-            });
-
-            while (eCtx.visitedPoints.length > MAX_HISTORY_POINTS) {
-                eCtx.visitedPoints.shift();
-            }
-
-            eCtx.result = { status: "SUCCESS", reason: "EXPLORED_TARGET_AREA" };
-            return null;
-        } catch (err: any) {
-            clearInterval(targetCheckInterval);
-            if (isAbortError(err)) {
-                eCtx.result = { status: "FAILED", reason: "aborted" };
-                return null;
-            }
-
-            if (err?.message === "target_found" || err === "target_found") {
-                eCtx.result = { status: "SUCCESS", reason: "TARGET_FOUND" };
-                return null;
-            }
-
-            log.warn("Exploration path failed, picking new direction", {
-                reason: err?.message || String(err),
-            });
-
-            return new PickDirectionState();
-        } finally {
-            clearInterval(targetCheckInterval);
-        }
     }
-}
 
-class PickDirectionState implements FSMState {
-    name = "PICKING_DIRECTION";
-
-    async enter() {}
-
-    async execute(ctx: StateContext): Promise<FSMState | null> {
-        const eCtx = ctx as ExploreContext;
-        eCtx.attempts++;
-
-        if (eCtx.attempts > 3) {
-            eCtx.result = {
-                status: "FAILED",
-                reason: "SURROUNDED_BY_OBSTACLES_OR_WATER",
-            };
-            return null;
-        }
-
-        const dist = 16 + Math.random() * 16;
-        let bestTarget = null;
-        let maxRepulsionScore = -1;
-
-        const pos = eCtx.bot.entity.position.floored();
-
-        for (let i = 0; i < 24; i++) {
-            if (i > 0 && i % 4 === 0) {
-                await new Promise((r) => setTimeout(r, 0));
-            }
-
-            if (eCtx.signal.aborted) throw new Error("aborted");
-
-            const testAngle = Math.random() * Math.PI * 2;
-            let tx = pos.x;
-            let tz = pos.z;
-            let ty = pos.y;
-            let validLength = 0;
-
-            for (let step = 1; step <= dist; step++) {
-                const checkX = Math.floor(pos.x + Math.cos(testAngle) * step);
-                const checkZ = Math.floor(pos.z + Math.sin(testAngle) * step);
-
-                let foundSurface = false;
-
-                for (let yOffset = 2; yOffset >= -3; yOffset--) {
-                    const block = eCtx.bot.blockAt(
-                        new Vec3(checkX, ty + yOffset, checkZ),
-                    );
-                    const blockAbove = eCtx.bot.blockAt(
-                        new Vec3(checkX, ty + yOffset + 1, checkZ),
-                    );
-                    const blockAbove2 = eCtx.bot.blockAt(
-                        new Vec3(checkX, ty + yOffset + 2, checkZ),
-                    );
-
-                    if (!block || !blockAbove || !blockAbove2) break;
-
-                    if (
-                        block.boundingBox === "block" &&
-                        blockAbove.name === "air" &&
-                        blockAbove2.name === "air" &&
-                        block.name !== "water" &&
-                        block.name !== "lava" &&
-                        block.name !== "magma_block" &&
-                        block.name !== "cactus" &&
-                        block.name !== "sweet_berry_bush"
-                    ) {
-                        tx = checkX;
-                        tz = checkZ;
-                        ty = ty + yOffset;
-                        validLength = step;
-                        foundSurface = true;
-                        break;
-                    }
-                }
-                if (!foundSurface) break;
-            }
-
-            if (validLength < 4) continue;
-
-            let minDistanceToHistory = 999999;
-            for (const pt of eCtx.visitedPoints) {
-                const d = Math.sqrt((tx - pt.x) ** 2 + (tz - pt.z) ** 2);
-                if (d < minDistanceToHistory) minDistanceToHistory = d;
-            }
-            if (eCtx.visitedPoints.length === 0)
-                minDistanceToHistory = validLength;
-
-            const score = validLength * 0.3 + minDistanceToHistory * 0.7;
-
-            if (score > maxRepulsionScore) {
-                maxRepulsionScore = score;
-                bestTarget = { x: tx, z: tz };
-            }
-        }
-
-        if (!bestTarget) {
-            log.warn(
-                "Exploration raymarch failed, picking random fallback target",
-                { attempt: eCtx.attempts },
-            );
-            // Ensure fallback is at least 8 blocks away
-            const angle = Math.random() * Math.PI * 2;
-            const fallbackDist = 8 + Math.random() * 8;
-            bestTarget = {
-                x: pos.x + Math.cos(angle) * fallbackDist,
-                z: pos.z + Math.sin(angle) * fallbackDist,
-            };
-        }
-
-        eCtx.targetX = bestTarget.x;
-        eCtx.targetZ = bestTarget.z;
-
-        log.info("Picked exploration vector", {
-            targetX: Math.round(eCtx.targetX),
-            targetZ: Math.round(eCtx.targetZ),
-            attempt: eCtx.attempts,
-        });
-
-        return new NavigateState();
-    }
-}
-
-export async function handleExplore(ctx: TaskContext): Promise<void> {
-    const { bot, intent, signal, timeouts, stopMovement } = ctx;
-
-    try {
-        await escapeTree(bot, signal);
-
-        const botRef = bot as any;
-        botRef.explorationHistory = botRef.explorationHistory || [];
-
-        const fsmCtx: ExploreContext = {
-            bot,
-            targetName: intent.target?.name || "explore",
-            targetEntity: null,
-            searchRadius: 0,
-            timeoutMs: timeouts.explore ?? 25000,
-            startTime: 0,
-            signal,
-            targetX: 0,
-            targetZ: 0,
-            attempts: 0,
-            stopMovement,
-            visitedPoints: botRef.explorationHistory,
-        };
-
-        const fsm = new StateMachineRunner(new PickDirectionState(), fsmCtx);
-        await new Runtime(bot).execute(fsm.run(), signal);
-    } catch (err: any) {
-        log.warn("Explore task aborted or crashed", { reason: err.message });
-    }
+    state.targetX = bestTarget.x;
+    state.targetZ = bestTarget.z;
+    
+    plan.pathfindingGoal = new goals.GoalNearXZ(state.targetX, state.targetZ, 2);
+    return plan;
 }

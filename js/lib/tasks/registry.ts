@@ -4,6 +4,7 @@ import type * as models from "../models.js";
 import { ActionPlan, Perception } from "../control/controller.js";
 import { evaluateHunt } from "./handlers/hunt.js";
 import { evaluateGather } from "./handlers/gather.js";
+import { evaluateExplore } from "./handlers/explore.js";
 import { evaluateRandomWalk } from "./handlers/random_walk.js";
 import { evaluateRetreat } from "./handlers/retreat.js";
 
@@ -35,6 +36,7 @@ export type IntentEvaluator = (
 export const INTENT_EVALUATORS: Record<string, IntentEvaluator> = {
     hunt: evaluateHunt,
     gather: evaluateGather,
+    explore: evaluateExplore,
     random_walk: evaluateRandomWalk,
     retreat: evaluateRetreat,
 };

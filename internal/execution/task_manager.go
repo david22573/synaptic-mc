@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/state"
 )
 
 type ActionPriorityQueue []*domain.Action
@@ -45,6 +46,10 @@ type scheduledItem struct {
 	executeAt time.Time
 }
 
+type DangerStateProvider interface {
+	GetDangerState() state.DangerState
+}
+
 type TaskManager struct {
 	engine      *TaskExecutionEngine
 	ctrlManager *ControllerManager
@@ -69,6 +74,7 @@ type TaskManager struct {
 
 	isSystemLocked func() bool
 	isBotReady     func() bool
+	dangerProvider DangerStateProvider
 }
 
 func NewTaskManager(
@@ -93,6 +99,12 @@ func NewTaskManager(
 
 	heap.Init(&tm.queue)
 	return tm
+}
+
+func (tm *TaskManager) SetDangerProvider(provider DangerStateProvider) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.dangerProvider = provider
 }
 
 func (tm *TaskManager) SetLockChecker(checker func() bool) {
@@ -145,8 +157,13 @@ func (tm *TaskManager) Run(ctx context.Context) {
 			systemLocked := tm.isSystemLocked != nil && tm.isSystemLocked()
 			hasController := tm.engine.HasController()
 			botReady := tm.isBotReady == nil || tm.isBotReady()
+			
+			dangerSafe := true
+			if tm.dangerProvider != nil {
+				dangerSafe = tm.dangerProvider.GetDangerState() == state.DangerSafe
+			}
 
-			shouldRunCuriosity := tm.activeTask == nil && tm.queue.Len() == 0 && !systemLocked && hasController && botReady
+			shouldRunCuriosity := tm.activeTask == nil && tm.queue.Len() == 0 && !systemLocked && hasController && botReady && dangerSafe
 
 			if shouldRunCuriosity {
 				if tm.idleSince.IsZero() {

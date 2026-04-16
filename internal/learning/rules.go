@@ -49,7 +49,8 @@ func (p *PolicyExtractor) GenerateRules(ctx context.Context, sessionID string) s
 					causes[key] = make(map[string]int)
 				}
 				causes[key][payload.Cause]++
-			case "COMPLETED":
+			case "COMPLETED", "PREEMPTED", "CANCELED":
+				// These are not failures, so clear recent failure counts for this action
 				delete(failures, key)
 				delete(causes, key)
 			}

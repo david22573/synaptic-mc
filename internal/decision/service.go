@@ -9,6 +9,7 @@ import (
 
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/execution"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/voyager"
@@ -56,6 +57,8 @@ type Service struct {
 	lastOverrideTime time.Time
 	overrideCooldown time.Duration
 	modeManager      *ModeManager
+	arbiter          *execution.ActionArbiter
+	htn              *HTNPlanner
 }
 
 func NewService(
@@ -74,6 +77,7 @@ func NewService(
 	skillManager *voyager.SkillManager,
 	logger *slog.Logger,
 	flags config.FeatureFlags,
+	arbiter *execution.ActionArbiter,
 ) *Service {
 	s := &Service{
 		ctx:              ctx,
@@ -99,6 +103,8 @@ func NewService(
 		synthesisCache:   make(map[string]bool),
 		overrideCooldown: 2 * time.Second,
 		modeManager:      NewModeManager(),
+		arbiter:          arbiter,
+		htn:              NewHTNPlanner(worldModel),
 	}
 
 	// Load persistent state

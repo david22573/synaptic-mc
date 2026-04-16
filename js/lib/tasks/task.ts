@@ -12,7 +12,6 @@ interface BotWithController extends Bot {
 
 import { handleCraft } from "./handlers/craft.js";
 import { handleBuild } from "./handlers/build.js";
-import { handleExplore } from "./handlers/explore.js";
 import { handleSmelt } from "./handlers/smelt.js";
 import { handleMine } from "./handlers/mine.js";
 import { handleFarm } from "./handlers/farm.js";
@@ -218,10 +217,8 @@ export async function runTask(
                 const check = setInterval(() => {
                     if (signal.aborted) {
                         clearInterval(check);
-                        controller.setIntent({
-                            action: "idle",
-                            target: { name: "none", type: "location" },
-                        } as models.ActionIntent);
+                        // If we are aborted via parent signal, we don't return preempted
+                        // but regular aborted status
                         resolve({
                             success: false,
                             cause: "aborted",
@@ -242,6 +239,13 @@ export async function runTask(
                         resolve({
                             success: false,
                             cause: state.reason || "failed",
+                            progress: 0.0,
+                        });
+                    } else if (state.preempted) {
+                        clearInterval(check);
+                        resolve({
+                            success: false,
+                            cause: "preempted",
                             progress: 0.0,
                         });
                     }
@@ -265,9 +269,6 @@ export async function runTask(
                 break;
             case "farm":
                 await handleFarm(taskCtx);
-                break;
-            case "explore":
-                await handleExplore(taskCtx);
                 break;
             case "store":
                 await handleStore(taskCtx);

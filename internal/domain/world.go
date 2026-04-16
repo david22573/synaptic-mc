@@ -39,18 +39,25 @@ type WorldModel struct {
 	mu sync.RWMutex
 
 	// ZonePenalties maps a spatial chunk (e.g., "x,z") to a cost multiplier.
-	// High cost = don't path here, it's a death trap or physically blocked.
 	ZonePenalties map[string]float64
 
 	// ActionWeights tracks the success rate of specific actions.
-	// Useful if the bot needs to learn that hunting is currently failing.
 	ActionWeights map[string]float64
+
+	// Phase 6: World Model Memory
+	LastThreats        []ThreatInfo
+	SafeZones          []WorldNode
+	RecentDamageSource string
+	FailedPaths        []Location
 }
 
 func NewWorldModel() *WorldModel {
 	return &WorldModel{
 		ZonePenalties: make(map[string]float64),
 		ActionWeights: make(map[string]float64),
+		LastThreats:   make([]ThreatInfo, 0),
+		SafeZones:     make([]WorldNode, 0),
+		FailedPaths:   make([]Location, 0),
 	}
 }
 

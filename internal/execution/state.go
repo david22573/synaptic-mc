@@ -13,6 +13,8 @@ type ExecutionState struct {
 	activeTask    *domain.Action
 	startTime     time.Time
 	leaseTimeout  time.Duration
+	minHold       time.Duration // Minimum duration to hold the lease regardless of priority
+	canPreempt    bool          // Whether this task can be preempted by higher priority tasks
 	retryCount    map[string]int
 	lastFailTime  map[string]time.Time
 }
@@ -24,12 +26,25 @@ func NewExecutionState() *ExecutionState {
 	}
 }
 
-func (s *ExecutionState) AcquireLease(task domain.Action, timeout time.Duration) bool {
+func (s *ExecutionState) AcquireLease(task domain.Action, timeout time.Duration, minHold time.Duration, canPreempt bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.activeTask != nil {
-		// Only allow preempting with higher priority
+		// 1. Check MinHold
+		if time.Since(s.startTime) < s.minHold {
+			return false
+		}
+
+		// 2. Check Preemptability
+		if !s.canPreempt {
+			// Even if higher priority, if non-preemptable we must wait for timeout or completion
+			if time.Since(s.startTime) < s.leaseTimeout {
+				return false
+			}
+		}
+
+		// 3. Check Priority
 		if GetPriority(task.Action) <= GetPriority(s.activeTask.Action) {
 			return false
 		}
@@ -38,6 +53,8 @@ func (s *ExecutionState) AcquireLease(task domain.Action, timeout time.Duration)
 	s.activeTask = &task
 	s.startTime = time.Now()
 	s.leaseTimeout = timeout
+	s.minHold = minHold
+	s.canPreempt = canPreempt
 	return true
 }
 

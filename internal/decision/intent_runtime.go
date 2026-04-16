@@ -10,19 +10,23 @@ import (
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/state"
 	"david22573/synaptic-mc/internal/voyager"
 )
 
 func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
-	state := s.stateProvider.GetCurrentState().State
+	gs := s.stateProvider.GetCurrentState().State
+
+	// Phase 3: Danger State Machine
+	dangerState := s.arbiter.UpdateDanger(gs)
 
 	// PROACTIVE: Break commitment lock for survival panics only if cooldown allows
-	if hasImmediateThreat(state) || hasImmediateHazard(state) || state.Health < domain.SurvivalCriticalHealth {
+	if dangerState == state.DangerEscape || dangerState == state.DangerAlert {
 		s.mu.Lock()
 		if time.Since(s.lastOverrideTime) >= s.overrideCooldown {
 			s.lastOverrideTime = time.Now()
 			s.mu.Unlock()
-			s.logger.Warn("Survival priority override active, breaking lock")
+			s.logger.Warn("Survival priority override active (Arbiter), breaking lock", slog.String("danger", string(dangerState)))
 			s.commitment.Store(nil)
 			s.evaluateNextPlan()
 			return
@@ -31,9 +35,9 @@ func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEve
 	}
 
 	// Trigger Discipline: Only replan on meaningful state changes
-	if s.shouldReplan(state) {
+	if s.shouldReplan(gs) {
 		s.planner.SetMilestoneContext(s.getMilestoneContext())
-		s.planner.TriggerReplan(state)
+		s.planner.TriggerReplan(gs)
 
 		if !s.planManager.HasActivePlan() && s.execStatus.IsIdle() {
 			s.evaluateNextPlan()
@@ -41,34 +45,34 @@ func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEve
 	}
 }
 
-func (s *Service) shouldReplan(state domain.GameState) bool {
+func (s *Service) shouldReplan(gs domain.GameState) bool {
 	before := s.beforeState.Load()
 	if before == nil {
 		return true
 	}
 
 	// 1. Danger resolved
-	if len(before.Threats) > 0 && len(state.Threats) == 0 {
+	if len(before.Threats) > 0 && len(gs.Threats) == 0 {
 		return true
 	}
 
 	// 2. Health/Food milestone (bucketed)
-	if int(state.Health)/2 != int(before.Health)/2 || int(state.Food)/2 != int(before.Food)/2 {
+	if int(gs.Health)/2 != int(before.Health)/2 || int(gs.Food)/2 != int(before.Food)/2 {
 		return true
 	}
 
 	// 3. TimeOfDay change (significant - transition to night/day)
-	if (state.TimeOfDay < 12000 && before.TimeOfDay >= 12000) || (state.TimeOfDay >= 12000 && before.TimeOfDay < 12000) {
+	if (gs.TimeOfDay < 12000 && before.TimeOfDay >= 12000) || (gs.TimeOfDay >= 12000 && before.TimeOfDay < 12000) {
 		return true
 	}
 
 	// 4. Large position change (> 50 blocks)
-	if state.Position.DistanceTo(before.Position) > 50 {
+	if gs.Position.DistanceTo(before.Position) > 50 {
 		return true
 	}
 
 	// 5. Significant inventory change (new item type)
-	if len(state.Inventory) != len(before.Inventory) {
+	if len(gs.Inventory) != len(before.Inventory) {
 		return true
 	}
 
@@ -88,11 +92,19 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	}
 
 	success := payload.Status == "COMPLETED"
-	if success {
+	preempted := payload.Status == "PREEMPTED"
+
+	if success || preempted {
 		s.modeManager.RecordSuccess()
+		if preempted {
+			observability.Metrics.IncPreemption()
+		}
 	} else if !domain.IsControlledStop(payload.Cause) {
 		s.modeManager.RecordFailure()
 	}
+
+	// Phase 4: Single Writer Action Bus
+	s.arbiter.HandleTaskEnd(payload)
 
 	controlledStop := domain.IsControlledStop(payload.Cause)
 
@@ -381,6 +393,12 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 	currentState := s.stateProvider.GetCurrentState().State
 	s.beforeState.Store(&currentState)
 
+	// Phase 4: Single Writer Action Bus
+	if !s.arbiter.Request(ctx, firstTask) {
+		s.logger.Debug("Arbiter denied plan dispatch", slog.String("task_id", firstTask.ID))
+		return
+	}
+
 	payload, _ := json.Marshal(plan)
 	s.bus.Publish(ctx, domain.DomainEvent{
 		SessionID: s.sessionID,
@@ -421,6 +439,12 @@ func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.Actio
 		},
 	}
 
+	// Phase 4: Single Writer Action Bus
+	if !s.arbiter.Request(ctx, plan.Tasks[0]) {
+		s.logger.Debug("Arbiter denied adapted intent dispatch", slog.String("task_id", intent.ID))
+		return
+	}
+
 	payload, _ := json.Marshal(plan)
 	s.bus.Publish(ctx, domain.DomainEvent{
 		SessionID: s.sessionID,
@@ -437,7 +461,7 @@ func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.Actio
 func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.DomainEvent) {
 	// Performance Budgeting: Track interruptions
 	if s.activeIntent.Load() != nil {
-		observability.Metrics.IncInterrupt()
+		observability.Metrics.IncPreemption()
 	}
 
 	s.commitment.Store(nil)
@@ -449,8 +473,17 @@ func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.Domain
 
 func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
 	s.handlePlanInvalidated(ctx, event)
+	
+	// Phase 5: Death / Respawn Recovery
+	s.modeManager.mu.Lock()
+	s.modeManager.current = ModeRecovery
+	s.modeManager.mu.Unlock()
+	
+	s.logger.Warn("Bot respawned, entering recovery mode for 5s")
+	
 	go func() {
-		time.Sleep(1500 * time.Millisecond)
+		// Assess threats/heal during freeze if needed
+		time.Sleep(5 * time.Second)
 		s.evaluateNextPlan()
 	}()
 }
