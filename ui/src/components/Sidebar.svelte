@@ -1,6 +1,7 @@
 <script lang="ts">
     import { botStore, uiStore, clearEventLog } from "../lib/store.svelte";
     import ItemIcon from "./ItemIcon.svelte";
+    import Metrics from "./Metrics.svelte";
 
     let { isOpen = true } = $props();
 
@@ -68,6 +69,8 @@
             </div>
         </div>
     </section>
+
+    <Metrics />
 
     <section class="card">
         <h3>🎒 Inventory ({inventory.length} items)</h3>

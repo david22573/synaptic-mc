@@ -85,11 +85,30 @@ export async function handleUseSkill(ctx: TaskContext): Promise<void> {
         );
     }
 
+    // Required items check
+    const requiredItems = (skillPayload as any).required_items || [];
+    if (requiredItems.length > 0) {
+        const inventory = bot.inventory.items().map(i => i.name);
+        const missing = requiredItems.filter((item: string) => !inventory.includes(item));
+        if (missing.length > 0) {
+            log.warn("[UseSkill] Missing required items for skill", {
+                skill: skillName,
+                missing,
+            });
+            throw new ExecutionError(
+                `Skill '${skillName}' missing requirements: ${missing.join(", ")}`,
+                "MISSING_RESOURCE",
+                0,
+            );
+        }
+    }
+
     log.info("[UseSkill] Executing skill", {
         skill: skillName,
         desc: skillPayload.description,
         codeLen: skillPayload.js_code.length,
         confidence,
+        version: (skillPayload as any).version,
     });
 
     // Compile and execute in a vm context.

@@ -14,17 +14,19 @@ type Location struct {
 	Z float64 `json:"z"`
 }
 
-type Node struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Type string `json:"type"` // e.g., "cave", "village", "safe_base", "resource_zone", "danger_area"
-	Pos  Vec3   `json:"pos"`
+type WorldNode struct {
+	ID    string  `json:"id"`
+	Name  string  `json:"name"`
+	Kind  string  `json:"kind"` // cave, village, tree_cluster, furnace_base, safe_base, resource_zone, danger_area
+	Pos   Vec3    `json:"pos"`
+	Score float64 `json:"score"`
 }
 
 type Edge struct {
 	FromID string  `json:"from_id"`
 	ToID   string  `json:"to_id"`
 	Cost   float64 `json:"cost"` // e.g., representing travel route difficulty
+	Risk   float64 `json:"risk"`
 }
 
 type Region struct {

@@ -8,6 +8,8 @@ import (
 
 // Config holds the tuning parameters for the humanization engine.
 type Config struct {
+	Enabled bool
+
 	// AttentionDecay is the rate at which focus drops per second (0.0 to 1.0)
 	AttentionDecay float64
 
@@ -37,6 +39,7 @@ type Config struct {
 
 func MapToHumanizationConfig(c config.HumanizationConfig) Config {
 	return Config{
+		Enabled:                 c.Enabled,
 		AttentionDecay:          c.AttentionDecay,
 		HesitationBase:          time.Duration(c.HesitationBaseMs) * time.Millisecond,
 		NoiseLevel:              c.NoiseLevel,

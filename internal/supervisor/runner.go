@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// NodeRunner treats the TS process as a disposable worker.
+// NodeRunner treats the TS process as a disposable worker with exponential backoff.
 type NodeRunner struct {
 	scriptPath string
 	logger     *slog.Logger
@@ -28,8 +28,11 @@ func (r *NodeRunner) Ping() {
 	r.lastPing.Store(time.Now().UnixNano())
 }
 
-// Start begins the process loop.
+// Start begins the process loop with exponential backoff.
 func (r *NodeRunner) Start(ctx context.Context) {
+	crashCount := 0
+	lastStartTime := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -37,19 +40,26 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		default:
 		}
 
-		r.Ping() // Reset on startup
+		// Reset crash counter if stable for 5 minutes
+		if crashCount > 0 && time.Since(lastStartTime) > 5*time.Minute {
+			r.logger.Info("Process stable for 5m, resetting crash counter", slog.Int("previous_crashes", crashCount))
+			crashCount = 0
+		}
 
-		// Resolve absolute path to make chdir bulletproof
+		r.Ping() // Reset on startup
+		lastStartTime = time.Now()
+
+		// Resolve absolute path
 		absScriptPath, err := filepath.Abs(r.scriptPath)
 		if err != nil {
-			r.logger.Error("Failed to resolve absolute path for TS script", slog.String("path", r.scriptPath), slog.Any("error", err))
+			r.logger.Error("Failed to resolve absolute path", slog.String("path", r.scriptPath), slog.Any("error", err))
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		workDir := filepath.Dir(absScriptPath)
-
-		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir))
+		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir), slog.Int("attempt", crashCount+1))
+		
 		cmd := exec.CommandContext(ctx, "node", absScriptPath)
 		cmd.Dir = workDir
 		cmd.Stdout = r.loggerWriter("STDOUT")
@@ -57,7 +67,7 @@ func (r *NodeRunner) Start(ctx context.Context) {
 
 		if err := cmd.Start(); err != nil {
 			r.logger.Error("Failed to start TS process", slog.Any("error", err))
-			time.Sleep(5 * time.Second)
+			r.waitBeforeRestart(&crashCount)
 			continue
 		}
 
@@ -66,7 +76,6 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
-
 			for {
 				select {
 				case <-watchdogCtx.Done():
@@ -74,7 +83,7 @@ func (r *NodeRunner) Start(ctx context.Context) {
 				case <-ticker.C:
 					last := time.Unix(0, r.lastPing.Load())
 					if time.Since(last) > 45*time.Second {
-						r.logger.Warn("TS process starved (no state tick for 45s). Sending SIGKILL.")
+						r.logger.Warn("TS process starved (no state tick for 45s). SIGKILL.")
 						_ = cmd.Process.Kill()
 						return
 					}
@@ -86,12 +95,31 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		cancelWatchdog()
 
 		if ctx.Err() != nil {
-			return // Shutting down cleanly
+			return
 		}
 
-		r.logger.Warn("TS process died or was killed. Restarting in 3 seconds...", slog.Any("error", err))
-		time.Sleep(3 * time.Second)
+		r.logger.Warn("TS process died or was killed", slog.Any("error", err))
+		r.waitBeforeRestart(&crashCount)
 	}
+}
+
+func (r *NodeRunner) waitBeforeRestart(crashCount *int) {
+	*crashCount++
+	
+	var delay time.Duration
+	switch *crashCount {
+	case 1:
+		delay = 1 * time.Second
+	case 2:
+		delay = 3 * time.Second
+	case 3:
+		delay = 10 * time.Second
+	default:
+		delay = 30 * time.Second // Cap at 30s
+	}
+
+	r.logger.Info("Waiting before restart", slog.Duration("delay", delay), slog.Int("crash_count", *crashCount))
+	time.Sleep(delay)
 }
 
 func (r *NodeRunner) loggerWriter(stream string) *streamWriter {
@@ -110,7 +138,6 @@ func (w *streamWriter) Write(p []byte) (n int, err error) {
 	if w.stream == "STDERR" {
 		w.logger.Warn("TS Engine Error", slog.String("msg", string(p)))
 	} else {
-		// FIX: Use Info level here so standard TS logs aren't swallowed by Go's default log filter
 		w.logger.Info("TS Engine Output", slog.String("msg", string(p)))
 	}
 	return len(p), nil

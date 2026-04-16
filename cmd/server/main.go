@@ -164,7 +164,7 @@ func main() {
 			return
 		}
 		for _, poi := range stateUpdate.POIs {
-			_ = memoryStore.MarkWorldNode(ctx, poi.Name, poi.Type, poi.Pos)
+			_ = memoryStore.MarkWorldNode(ctx, domain.WorldNode{Name: poi.Name, Kind: poi.Type, Pos: poi.Pos})
 		}
 	}))
 
@@ -271,7 +271,7 @@ func main() {
 
 	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
-		g.Go(func() error {
+		g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 			for {
 				select {
 				case <-ctx.Done():
@@ -291,7 +291,7 @@ func main() {
 		})
 	}
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -373,43 +373,43 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Dynamic Config Watcher")
 		dynFlags.Watch(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting UI hub")
 		uiHub.Run(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting TS supervisor")
 		runner.Start(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Planner slow loop")
 		plannerObj.SlowReplanLoop(ctx, cfg.SessionID)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Task Execution Engine")
 		execEngine.Start(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Task Manager Queue")
 		taskManager.Run(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting HTTP server", slog.String("addr", cfg.HTTPAddr))
 		err := server.ListenAndServe()
 		if err != http.ErrServerClosed {

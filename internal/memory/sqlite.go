@@ -15,17 +15,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type WorldNode struct {
-	Name string
-	Type string
-	Pos  domain.Vec3
-}
-
 type Store interface {
-	MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error
+	MarkWorldNode(ctx context.Context, node domain.WorldNode) error
 	GetKnownWorld(ctx context.Context, pos domain.Vec3) (string, error)
-	GetNearbyNodes(ctx context.Context, pos domain.Vec3, limit int) ([]WorldNode, error)
-	AddEdge(ctx context.Context, fromID, toID string, cost float64) error
+	GetNearbyNodes(ctx context.Context, pos domain.Vec3, limit int) ([]domain.WorldNode, error)
+	AddEdge(ctx context.Context, fromID, toID string, cost, risk float64) error
 	AddRegion(ctx context.Context, name string, nodeIDs []string) error
 	GetRegions(ctx context.Context) ([]domain.Region, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
@@ -68,10 +62,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	CREATE TABLE IF NOT EXISTS world_nodes (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
-		type TEXT NOT NULL,
+		kind TEXT NOT NULL,
 		x REAL,
 		y REAL,
 		z REAL,
+		score REAL DEFAULT 0.0,
 		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -79,6 +74,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		from_id TEXT NOT NULL,
 		to_id TEXT NOT NULL,
 		cost REAL DEFAULT 1.0,
+		risk REAL DEFAULT 0.0,
 		PRIMARY KEY (from_id, to_id),
 		FOREIGN KEY (from_id) REFERENCES world_nodes(id),
 		FOREIGN KEY (to_id) REFERENCES world_nodes(id)
@@ -117,6 +113,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply memory schema: %w", err)
 	}
+
+	// Migrations for Graph Memory
+	_, _ = db.Exec("ALTER TABLE world_nodes ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown'")
+	_, _ = db.Exec("ALTER TABLE world_nodes ADD COLUMN score REAL DEFAULT 0.0")
+	_, _ = db.Exec("ALTER TABLE world_edges ADD COLUMN risk REAL DEFAULT 0.0")
 
 	return &SQLiteStore{db: db}, nil
 }
@@ -206,21 +207,23 @@ func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limi
 	return history, nil
 }
 
-func (s *SQLiteStore) MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error {
-	// Create a positional composite key so the bot can remember thousands of unique blocks
-	id := fmt.Sprintf("%s_%d_%d_%d", name, int(pos.X), int(pos.Y), int(pos.Z))
+func (s *SQLiteStore) MarkWorldNode(ctx context.Context, node domain.WorldNode) error {
+	if node.ID == "" {
+		node.ID = fmt.Sprintf("%s_%d_%d_%d", node.Name, int(node.Pos.X), int(node.Pos.Y), int(node.Pos.Z))
+	}
 
 	query := `
-	INSERT INTO world_nodes (id, name, type, x, y, z, last_seen) 
-	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO world_nodes (id, name, kind, x, y, z, score, last_seen) 
+	VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT(id) DO UPDATE SET 
+		score = excluded.score,
 		last_seen=CURRENT_TIMESTAMP;`
-	_, err := s.db.ExecContext(ctx, query, id, name, nodeType, pos.X, pos.Y, pos.Z)
+	_, err := s.db.ExecContext(ctx, query, node.ID, node.Name, node.Kind, node.Pos.X, node.Pos.Y, node.Pos.Z, node.Score)
 	return err
 }
 
 func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (string, error) {
-	query := `SELECT name, type, x, y, z, last_seen FROM world_nodes`
+	query := `SELECT name, kind, x, y, z, score, last_seen FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return "KNOWN WORLD: empty", nil
@@ -228,18 +231,19 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 	defer rows.Close()
 
 	type nodeDist struct {
-		Name string
-		Type string
-		Dist float64
-		Pos  domain.Vec3
+		Name  string
+		Kind  string
+		Dist  float64
+		Pos   domain.Vec3
+		Score float64
 	}
 	var nodes []nodeDist
 
 	for rows.Next() {
 		var n nodeDist
 		var lastSeen time.Time
-		if err := rows.Scan(&n.Name, &n.Type, &n.Pos.X, &n.Pos.Y, &n.Pos.Z, &lastSeen); err == nil {
-			if n.Type == "hazard" && time.Since(lastSeen) > 30*time.Minute {
+		if err := rows.Scan(&n.Name, &n.Kind, &n.Pos.X, &n.Pos.Y, &n.Pos.Z, &n.Score, &lastSeen); err == nil {
+			if n.Kind == "hazard" && time.Since(lastSeen) > 30*time.Minute {
 				continue // Decay old death zones
 			}
 			dx, dy, dz := n.Pos.X-botPos.X, n.Pos.Y-botPos.Y, n.Pos.Z-botPos.Z
@@ -267,15 +271,14 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 
 	for i := 0; i < limit; i++ {
 		n := nodes[i]
-		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f)\n", n.Type, n.Name, n.Dist, n.Pos.X, n.Pos.Y, n.Pos.Z))
+		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f) | Score: %.1f\n", n.Kind, n.Name, n.Dist, n.Pos.X, n.Pos.Y, n.Pos.Z, n.Score))
 	}
 
-	// Region and route info could be appended here too
 	return strings.TrimSpace(out.String()), nil
 }
 
-func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, limit int) ([]WorldNode, error) {
-	query := `SELECT name, type, x, y, z FROM world_nodes`
+func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, limit int) ([]domain.WorldNode, error) {
+	query := `SELECT id, name, kind, x, y, z, score FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -283,14 +286,14 @@ func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, li
 	defer rows.Close()
 
 	type nodeDist struct {
-		node WorldNode
+		node domain.WorldNode
 		dist float64
 	}
 	var nodes []nodeDist
 
 	for rows.Next() {
-		var n WorldNode
-		if err := rows.Scan(&n.Name, &n.Type, &n.Pos.X, &n.Pos.Y, &n.Pos.Z); err == nil {
+		var n domain.WorldNode
+		if err := rows.Scan(&n.ID, &n.Name, &n.Kind, &n.Pos.X, &n.Pos.Y, &n.Pos.Z, &n.Score); err == nil {
 			dx, dy, dz := n.Pos.X-botPos.X, n.Pos.Y-botPos.Y, n.Pos.Z-botPos.Z
 			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
 			nodes = append(nodes, nodeDist{node: n, dist: dist})
@@ -307,16 +310,16 @@ func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, li
 		nodes = nodes[:limit]
 	}
 
-	result := make([]WorldNode, len(nodes))
+	result := make([]domain.WorldNode, len(nodes))
 	for i, nd := range nodes {
 		result[i] = nd.node
 	}
 	return result, nil
 }
 
-func (s *SQLiteStore) AddEdge(ctx context.Context, fromID, toID string, cost float64) error {
-	query := `INSERT INTO world_edges (from_id, to_id, cost) VALUES (?, ?, ?) ON CONFLICT(from_id, to_id) DO UPDATE SET cost = excluded.cost`
-	_, err := s.db.ExecContext(ctx, query, fromID, toID, cost)
+func (s *SQLiteStore) AddEdge(ctx context.Context, fromID, toID string, cost, risk float64) error {
+	query := `INSERT INTO world_edges (from_id, to_id, cost, risk) VALUES (?, ?, ?, ?) ON CONFLICT(from_id, to_id) DO UPDATE SET cost = excluded.cost, risk = excluded.risk`
+	_, err := s.db.ExecContext(ctx, query, fromID, toID, cost, risk)
 	return err
 }
 

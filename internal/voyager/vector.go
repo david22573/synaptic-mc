@@ -54,6 +54,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		avg_time_ms REAL DEFAULT 0,
 		failure_causes TEXT DEFAULT '[]',
 		required_items TEXT DEFAULT '[]',
+		context_tags TEXT DEFAULT '[]',
 		version INTEGER DEFAULT 1,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
@@ -70,6 +71,7 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN avg_time_ms REAL DEFAULT 0")
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN failure_causes TEXT DEFAULT '[]'")
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN required_items TEXT DEFAULT '[]'")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN context_tags TEXT DEFAULT '[]'")
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN version INTEGER DEFAULT 1")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_skills_bucket ON skills(bucket_id)")
 
@@ -108,15 +110,18 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, c
 		name.Valid = true
 	}
 
+	tagsJSON, _ := json.Marshal(skill.ContextTags)
+
 	// When saving a newly synthesized skill, we start with 1 run/success to give it initial confidence
-	query := `INSERT INTO skills (name, description, code, bucket_id, embedding_json, success_count, total_runs, total_successes, version) 
-	          VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?) 
+	query := `INSERT INTO skills (name, description, code, bucket_id, embedding_json, success_count, total_runs, total_successes, version, context_tags) 
+	          VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?, ?) 
 	          ON CONFLICT(description) DO UPDATE SET 
 	          code=excluded.code, 
 	          embedding_json=excluded.embedding_json,
 	          bucket_id=excluded.bucket_id,
-	          version=skills.version + 1`
-	_, err := s.db.ExecContext(ctx, query, name, description, code, bucketID, string(embeddingBytes), skill.Version)
+	          version=skills.version + 1,
+	          context_tags=excluded.context_tags`
+	_, err := s.db.ExecContext(ctx, query, name, description, code, bucketID, string(embeddingBytes), skill.Version, string(tagsJSON))
 
 	return err
 }
@@ -167,12 +172,12 @@ func (s *SQLiteVectorStore) RecordSkillResult(ctx context.Context, name string, 
 }
 
 func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error) {
-	query := `SELECT code, total_runs, total_successes, avg_time_ms, failure_causes, required_items, version FROM skills WHERE name = ?`
+	query := `SELECT code, total_runs, total_successes, avg_time_ms, failure_causes, required_items, context_tags, version FROM skills WHERE name = ?`
 	var code string
 	var runs, successes, version int
 	var avgTime float64
-	var causesJSON, itemsJSON string
-	err := s.db.QueryRowContext(ctx, query, name).Scan(&code, &runs, &successes, &avgTime, &causesJSON, &itemsJSON, &version)
+	var causesJSON, itemsJSON, tagsJSON string
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&code, &runs, &successes, &avgTime, &causesJSON, &itemsJSON, &tagsJSON, &version)
 	if err != nil {
 		return nil, err
 	}
@@ -188,10 +193,13 @@ func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string)
 	} else {
 		skill.Confidence = 0.0
 	}
+	skill.TotalRuns = runs
+	skill.TotalSuccesses = successes
 	skill.AvgTime = avgTime
 	skill.Version = version
 	_ = json.Unmarshal([]byte(causesJSON), &skill.FailureCauses)
 	_ = json.Unmarshal([]byte(itemsJSON), &skill.RequiredItems)
+	_ = json.Unmarshal([]byte(tagsJSON), &skill.ContextTags)
 
 	return &skill, nil
 }
@@ -200,9 +208,10 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 	bucketID := getBucketID(queryEmbedding)
 
 	// Candidate selection: filter by bucket_id and prioritize high success
-	query := `SELECT description, code, embedding_json, total_runs, total_successes FROM skills 
+	// Statistical Ranking: Weight similarity by success rate
+	query := `SELECT description, code, embedding_json, total_runs, total_successes, avg_time_ms FROM skills 
 	          WHERE bucket_id = ?
-	          ORDER BY total_successes DESC LIMIT 500`
+	          ORDER BY (CAST(total_successes AS FLOAT) / MAX(total_runs, 1)) DESC, total_successes DESC LIMIT 500`
 
 	rows, err := s.db.QueryContext(ctx, query, bucketID)
 	if err != nil {
@@ -221,7 +230,8 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 
 		var desc, code, embJSON string
 		var runs, successes int
-		if err := rows.Scan(&desc, &code, &embJSON, &runs, &successes); err != nil {
+		var avgTime float64
+		if err := rows.Scan(&desc, &code, &embJSON, &runs, &successes, &avgTime); err != nil {
 			continue
 		}
 
@@ -231,10 +241,15 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 		}
 
 		sim := cosineSimilarity(queryEmbedding, embedding)
+		
+		// Evidence-based weighting: boost similarity for reliable skills
+		successRate := float32(successes) / float32(math.Max(float64(runs), 1))
+		weightedSim := sim * (0.5 + (0.5 * successRate))
+
 		records = append(records, SkillRecord{
 			Description: desc,
 			Code:        code,
-			Similarity:  sim,
+			Similarity:  weightedSim,
 		})
 	}
 
@@ -244,23 +259,27 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 
 	// Fallback: if bucket is empty or too small, search all as a safety net (limited)
 	if len(records) < limit {
-		extraQuery := `SELECT description, code, embedding_json, total_runs, total_successes FROM skills 
+		extraQuery := `SELECT description, code, embedding_json, total_runs, total_successes, avg_time_ms FROM skills 
 		               WHERE bucket_id != ?
-		               ORDER BY total_successes DESC LIMIT ?`
+		               ORDER BY (CAST(total_successes AS FLOAT) / MAX(total_runs, 1)) DESC LIMIT ?`
 		extraRows, err := s.db.QueryContext(ctx, extraQuery, bucketID, limit*2)
 		if err == nil {
 			defer extraRows.Close()
 			for extraRows.Next() {
 				var desc, code, embJSON string
 				var runs, successes int
-				if err := extraRows.Scan(&desc, &code, &embJSON, &runs, &successes); err == nil {
+				var avgTime float64
+				if err := extraRows.Scan(&desc, &code, &embJSON, &runs, &successes, &avgTime); err == nil {
 					var embedding []float32
 					if err := json.Unmarshal([]byte(embJSON), &embedding); err == nil {
 						sim := cosineSimilarity(queryEmbedding, embedding)
+						successRate := float32(successes) / float32(math.Max(float64(runs), 1))
+						weightedSim := sim * (0.5 + (0.5 * successRate))
+						
 						records = append(records, SkillRecord{
 							Description: desc,
 							Code:        code,
-							Similarity:  sim,
+							Similarity:  weightedSim,
 						})
 					}
 				}

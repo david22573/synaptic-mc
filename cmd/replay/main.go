@@ -96,17 +96,20 @@ func main() {
 		case domain.EventTypeTaskStart:
 			fmt.Printf("[%s] 🚀 TASK START: %s\n", ev.CreatedAt.Format(time.RFC3339), ev.Trace.ActionID)
 		case domain.EventTypeTaskEnd:
-			var payload map[string]string
+			var payload domain.TaskEndPayload
 			if err := json.Unmarshal(ev.Payload, &payload); err != nil {
 				fmt.Printf("[%s] Error unmarshaling TaskEnd payload: %v\n", ev.CreatedAt.Format(time.RFC3339), err)
 			} else {
-				status := payload["status"]
+				status := payload.Status
 				if status == "FAILED" {
-					fmt.Printf("[%s] ❌ TASK FAILED: %s (Cause: %s)\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"], payload["cause"])
+					fmt.Printf("[%s] ❌ TASK FAILED: %s (Cause: %s)\n", ev.CreatedAt.Format(time.RFC3339), payload.CommandID, payload.Cause)
+					// (Concept) In a real replay we'd fetch reflection from task_history if not in payload
 				} else {
-					fmt.Printf("[%s] ✅ TASK COMPLETED: %s\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"])
+					fmt.Printf("[%s] ✅ TASK COMPLETED: %s (Duration: %dms)\n", ev.CreatedAt.Format(time.RFC3339), payload.CommandID, payload.DurationMs)
 				}
 			}
+		case domain.EventBotDeath:
+			fmt.Printf("[%s] 💀 BOT DIED\n", ev.CreatedAt.Format(time.RFC3339))
 		case domain.EventTypePlanInvalidated:
 			fmt.Printf("[%s] ⚠️ PLAN INVALIDATED\n", ev.CreatedAt.Format(time.RFC3339))
 		default:

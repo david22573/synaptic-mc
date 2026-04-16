@@ -18,6 +18,7 @@ type ScoreWeights struct {
 }
 
 type HumanizationConfig struct {
+	Enabled              bool    `json:"enabled"`
 	AttentionDecay       float64 `json:"attention_decay"`
 	HesitationBaseMs     int     `json:"hesitation_base_ms"`
 	NoiseLevel           float64 `json:"noise_level"`
@@ -60,6 +61,7 @@ func DefaultFlags() FeatureFlags {
 			ExplorationBonus: 5.0,
 		},
 		Humanization: HumanizationConfig{
+			Enabled:              true,
 			AttentionDecay:       0.05,
 			HesitationBaseMs:     200,
 			NoiseLevel:           0.1,

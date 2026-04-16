@@ -43,6 +43,34 @@ export class StuckError extends ExecutionError {
     }
 }
 
+export class StuckTerrainError extends ExecutionError {
+    constructor(message: string = "STUCK_TERRAIN") {
+        super(message, "STUCK_TERRAIN", 0);
+        this.name = "StuckTerrainError";
+    }
+}
+
+export class BlockedMobError extends ExecutionError {
+    constructor(message: string = "BLOCKED_MOB") {
+        super(message, "BLOCKED_MOB", 0);
+        this.name = "BlockedMobError";
+    }
+}
+
+export class NoToolError extends ExecutionError {
+    constructor(message: string = "NO_TOOL") {
+        super(message, "NO_TOOL", 0);
+        this.name = "NoToolError";
+    }
+}
+
+export class UnreachableError extends ExecutionError {
+    constructor(message: string = "UNREACHABLE") {
+        super(message, "UNREACHABLE", 0);
+        this.name = "UnreachableError";
+    }
+}
+
 /**
  * Thrown when a resource (item, tool, etc.) is missing.
  */

@@ -1,23 +1,31 @@
-Project Context Dump (15 Apr 26 18:04 PDT)
+Project Context Dump (16 Apr 26 01:21 PDT)
 Format: xml
 Mode: FULL (No Truncation)
-Total Files: 108
+Total Files: 124
 
 # Project Structure
 <file_tree>
 - Makefile
 - cmd\replay\main.go
 - cmd\server\main.go
+- cmd\train\main.go
 - internal\config\flags.go
+- internal\decision\commitment.go
+- internal\decision\evaluator.go
 - internal\decision\integration\integration_test.go
+- internal\decision\integration\scenarios_test.go
+- internal\decision\intent_runtime.go
 - internal\decision\plan_manager.go
 - internal\decision\plan_manager_test.go
 - internal\decision\planner.go
+- internal\decision\predictor.go
+- internal\decision\progression.go
 - internal\decision\service.go
 - internal\decision\types.go
 - internal\domain\bus.go
 - internal\domain\causes.go
 - internal\domain\event_normalizer.go
+- internal\domain\goal.go
 - internal\domain\intent.go
 - internal\domain\json.go
 - internal\domain\realtime_bus.go
@@ -35,6 +43,7 @@ Total Files: 108
 - internal\execution\idempotency.go
 - internal\execution\manager.go
 - internal\execution\manager_test.go
+- internal\execution\prep.go
 - internal\execution\service.go
 - internal\execution\task.go
 - internal\execution\task_manager.go
@@ -55,8 +64,11 @@ Total Files: 108
 - internal\observability\metrics.go
 - internal\planner\feedback.go
 - internal\planner\feedback_test.go
+- internal\state\reducer.go
+- internal\state\reducer_test.go
 - internal\state\service.go
 - internal\state\service_test.go
+- internal\state\threat.go
 - internal\strategy\evaluator.go
 - internal\supervisor\runner.go
 - internal\voyager\critic.go
@@ -64,6 +76,7 @@ Total Files: 108
 - internal\voyager\skills.go
 - internal\voyager\vector.go
 - js\index.ts
+- js\lib\combat\controller.ts
 - js\lib\config.ts
 - js\lib\control\controller.ts
 - js\lib\control\loop.ts
@@ -72,7 +85,9 @@ Total Files: 108
 - js\lib\logger.ts
 - js\lib\models.ts
 - js\lib\movement\hesitation.ts
+- js\lib\movement\navigation.ts
 - js\lib\movement\navigator.ts
+- js\lib\movement\pathfinder.ts
 - js\lib\movement\progress.ts
 - js\lib\movement\recovery.ts
 - js\lib\network\client.ts
@@ -105,6 +120,7 @@ Total Files: 108
 - ui\src\app.css
 - ui\src\components\HUD.svelte
 - ui\src\components\ItemIcon.svelte
+- ui\src\components\Metrics.svelte
 - ui\src\components\Sidebar.svelte
 - ui\src\lib\agent-controller.ts
 - ui\src\lib\models.ts
@@ -275,17 +291,20 @@ func main() {
 		case domain.EventTypeTaskStart:
 			fmt.Printf("[%s] 🚀 TASK START: %s\n", ev.CreatedAt.Format(time.RFC3339), ev.Trace.ActionID)
 		case domain.EventTypeTaskEnd:
-			var payload map[string]string
+			var payload domain.TaskEndPayload
 			if err := json.Unmarshal(ev.Payload, &payload); err != nil {
 				fmt.Printf("[%s] Error unmarshaling TaskEnd payload: %v\n", ev.CreatedAt.Format(time.RFC3339), err)
 			} else {
-				status := payload["status"]
+				status := payload.Status
 				if status == "FAILED" {
-					fmt.Printf("[%s] ❌ TASK FAILED: %s (Cause: %s)\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"], payload["cause"])
+					fmt.Printf("[%s] ❌ TASK FAILED: %s (Cause: %s)\n", ev.CreatedAt.Format(time.RFC3339), payload.CommandID, payload.Cause)
+					// (Concept) In a real replay we'd fetch reflection from task_history if not in payload
 				} else {
-					fmt.Printf("[%s] ✅ TASK COMPLETED: %s\n", ev.CreatedAt.Format(time.RFC3339), payload["command_id"])
+					fmt.Printf("[%s] ✅ TASK COMPLETED: %s (Duration: %dms)\n", ev.CreatedAt.Format(time.RFC3339), payload.CommandID, payload.DurationMs)
 				}
 			}
+		case domain.EventBotDeath:
+			fmt.Printf("[%s] 💀 BOT DIED\n", ev.CreatedAt.Format(time.RFC3339))
 		case domain.EventTypePlanInvalidated:
 			fmt.Printf("[%s] ⚠️ PLAN INVALIDATED\n", ev.CreatedAt.Format(time.RFC3339))
 		default:
@@ -426,7 +445,7 @@ func main() {
 
 	humanizer := humanization.NewEngine(humanization.MapToHumanizationConfig(initialFlags.Humanization))
 
-	stateSvc := state.NewService(eventBus, logger)
+	stateSvc := state.NewService(eventBus, memoryStore, logger)
 	ctrlManager := execution.NewControllerManager()
 	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger, initialFlags.Execution)
 
@@ -474,7 +493,7 @@ func main() {
 			return
 		}
 		for _, poi := range stateUpdate.POIs {
-			_ = memoryStore.MarkWorldNode(ctx, poi.Name, poi.Type, poi.Pos)
+			_ = memoryStore.MarkWorldNode(ctx, domain.WorldNode{Name: poi.Name, Kind: poi.Type, Pos: poi.Pos})
 		}
 	}))
 
@@ -581,7 +600,7 @@ func main() {
 
 	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
-		g.Go(func() error {
+		g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 			for {
 				select {
 				case <-ctx.Done():
@@ -601,7 +620,7 @@ func main() {
 		})
 	}
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -683,43 +702,43 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Dynamic Config Watcher")
 		dynFlags.Watch(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting UI hub")
 		uiHub.Run(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting TS supervisor")
 		runner.Start(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Planner slow loop")
 		plannerObj.SlowReplanLoop(ctx, cfg.SessionID)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Task Execution Engine")
 		execEngine.Start(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting Task Manager Queue")
 		taskManager.Run(ctx)
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() error { ticker := time.NewTicker(1 * time.Second); defer ticker.Stop(); for { select { case <-ctx.Done(): return nil; case <-ticker.C: observability.Metrics.AddSurvivalTime(1); } } }); g.Go(func() error {
 		logger.Info("Starting HTTP server", slog.String("addr", cfg.HTTPAddr))
 		err := server.ListenAndServe()
 		if err != http.ErrServerClosed {
@@ -912,6 +931,211 @@ func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBu
 
 </file>
 
+<file path="cmd\train\main.go">
+// cmd/train/main.go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/eventstore"
+	"david22573/synaptic-mc/internal/llm"
+	"david22573/synaptic-mc/internal/memory"
+	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/voyager"
+	"github.com/joho/godotenv"
+)
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		slog.Debug("No .env file found")
+	}
+
+	dbDir := flag.String("data-dir", "data", "Data directory containing DB files")
+	sessionID := flag.String("session", "", "Optional session ID to focus training on")
+	llmURL := flag.String("llm-url", getEnvOrDefault("LLM_URL", "http://localhost:11434/v1/chat/completions"), "LLM API URL")
+	llmKey := flag.String("llm-key", getEnvOrDefault("LLM_API_KEY", ""), "LLM API key")
+	llmModel := flag.String("llm-model", getEnvOrDefault("LLM_MODEL", "llama3.2"), "LLM generation model name")
+	flag.Parse()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx := context.Background()
+
+	eventStorePath := filepath.Join(*dbDir, "events.db")
+	memoryStorePath := filepath.Join(*dbDir, "memory.db")
+	vectorStorePath := filepath.Join(*dbDir, "skills.db")
+
+	eStore, err := eventstore.NewSQLiteStore(eventStorePath, logger)
+	if err != nil {
+		logger.Error("Failed to open event store", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer eStore.Close()
+
+	mStore, err := memory.NewSQLiteStore(memoryStorePath)
+	if err != nil {
+		logger.Error("Failed to open memory store", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer mStore.Close()
+
+	vStore, err := voyager.NewSQLiteVectorStore(vectorStorePath)
+	if err != nil {
+		logger.Error("Failed to open vector store", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer vStore.Close()
+
+	llmClient := llm.NewClient(llm.Config{
+		APIURL:     *llmURL,
+		APIKey:     *llmKey,
+		Model:      *llmModel,
+	})
+
+	critic := voyager.NewStateCriticWithLLM(llmClient)
+	curriculum := voyager.NewAutonomousCurriculum(llmClient, vStore, mStore, nil)
+	skillManager := voyager.NewSkillManager(vStore, llmClient)
+
+	logger.Info("Starting Offline Training Session")
+	observability.Metrics.OfflineTrainingRuns.Inc()
+
+	// 1. Get sessions to process
+	sessions := []string{*sessionID}
+	if *sessionID == "" {
+		// Mock: in a real impl we'd query all session IDs from the event store
+		sessions = []string{"minecraft-agent-01"} 
+	}
+
+	for _, sid := range sessions {
+		logger.Info("Training on session", slog.String("session_id", sid))
+		
+		events, err := eStore.GetStream(ctx, sid)
+		if err != nil {
+			logger.Warn("Failed to get event stream", slog.String("session_id", sid), slog.Any("error", err))
+			continue
+		}
+
+		// 2. Post-Mortem Death Review
+		processDeaths(ctx, sid, events, critic, mStore, logger)
+
+		// 3. Success Mining & Skill Extraction
+		processSuccesses(ctx, sid, events, curriculum, skillManager, logger)
+	}
+
+	logger.Info("Offline Training Session Complete")
+}
+
+func processDeaths(ctx context.Context, sid string, events []domain.DomainEvent, critic *voyager.StateCritic, mStore memory.Store, logger *slog.Logger) {
+	for i, ev := range events {
+		if ev.Type == domain.EventBotDeath {
+			logger.Info("POST-MORTEM: Bot death detected", slog.String("session_id", sid), slog.Int64("event_id", ev.ID))
+			
+			// Extract context: last 10 relevant events
+			start := i - 10
+			if start < 0 { start = 0 }
+			_ = events[start:i] // contextEvents - preserved for future post-mortem logic
+
+			// Reconstruct last known state
+			var lastState domain.GameState
+			for j := i - 1; j >= 0; j-- {
+				if events[j].Type == domain.EventTypeStateUpdated || events[j].Type == domain.EventTypeStateTick {
+					_ = json.Unmarshal(events[j].Payload, &lastState)
+					break
+				}
+			}
+
+			// Generate post-mortem rule
+			_, refl := critic.Evaluate(domain.ActionIntent{Action: "survival"}, lastState, lastState, domain.ExecutionResult{Success: false, Cause: "DEATH"}, 0)
+			
+			if refl != nil {
+				summary := fmt.Sprintf("DEATH POST-MORTEM: %s. Cause: %s. Fix: %s", refl.Failure, refl.Cause, refl.Fix)
+				logger.Info("Extracted learning from death", slog.String("summary", summary))
+				_ = mStore.SetSummary(ctx, sid, fmt.Sprintf("death_learning_%d", ev.ID), summary)
+				observability.Metrics.DeathReviewsCompleted.Inc()
+			}
+		}
+	}
+}
+
+func processSuccesses(ctx context.Context, sid string, events []domain.DomainEvent, curriculum *voyager.AutonomousCurriculum, skillManager *voyager.SkillManager, logger *slog.Logger) {
+	for i, ev := range events {
+		if ev.Type == domain.EventTypeTaskEnd {
+			var payload domain.TaskEndPayload
+			if err := json.Unmarshal(ev.Payload, &payload); err == nil && payload.Success {
+				// Only mine for "complex" or "long" successful tasks that aren't already skills
+				if payload.DurationMs > 5000 && payload.Action != "use_skill" && payload.Action != "idle" {
+					logger.Info("SUCCESS MINING: Potential skill detected", slog.String("action", payload.Action), slog.String("target", payload.Target))
+
+					// Find before/after states
+					var before, after domain.GameState
+					
+					// Re-find after state
+					for j := i; j < len(events); j++ {
+						if events[j].Type == domain.EventTypeStateUpdated {
+							_ = json.Unmarshal(events[j].Payload, &after)
+							break
+						}
+					}
+					// Re-find before state (based on TaskStart event ID)
+					for j := i - 1; j >= 0; j-- {
+						if events[j].Type == domain.EventTypeTaskStart {
+							// Found start, find state before it
+							for k := j - 1; k >= 0; k-- {
+								if events[k].Type == domain.EventTypeStateUpdated {
+									_ = json.Unmarshal(events[k].Payload, &before)
+									break
+								}
+							}
+							break
+						}
+					}
+
+					if before.Initialized && after.Initialized {
+						intent := domain.ActionIntent{
+							Action: payload.Action,
+							Target: payload.Target,
+							Count: 1, // heuristic
+							Rationale: "Offline success mining",
+						}
+						
+						res, err := curriculum.SynthesizeCode(ctx, intent, before, after)
+						if err == nil && res.JSCode != "" {
+							skillName := fmt.Sprintf("mined_%s_%s", payload.Action, payload.Target)
+							skill := voyager.ExecutableSkill{
+								Name: skillName,
+								Description: fmt.Sprintf("Mined skill for %s %s", payload.Action, payload.Target),
+								JSCode: res.JSCode,
+								Version: 1,
+								RequiredItems: res.RequiredItems,
+							}
+							if err := skillManager.SaveSkill(ctx, skill); err == nil {
+								logger.Info("Extracted new permanent skill", slog.String("name", skillName))
+								observability.Metrics.SkillsExtracted.Inc()
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+</file>
+
 <file path="internal\config\flags.go">
 package config
 
@@ -933,6 +1157,7 @@ type ScoreWeights struct {
 }
 
 type HumanizationConfig struct {
+	Enabled              bool    `json:"enabled"`
 	AttentionDecay       float64 `json:"attention_decay"`
 	HesitationBaseMs     int     `json:"hesitation_base_ms"`
 	NoiseLevel           float64 `json:"noise_level"`
@@ -975,6 +1200,7 @@ func DefaultFlags() FeatureFlags {
 			ExplorationBonus: 5.0,
 		},
 		Humanization: HumanizationConfig{
+			Enabled:              true,
 			AttentionDecay:       0.05,
 			HesitationBaseMs:     200,
 			NoiseLevel:           0.1,
@@ -1127,6 +1353,316 @@ func (f *DynamicFlags) Watch(ctx context.Context) {
 
 </file>
 
+<file path="internal\decision\commitment.go">
+package decision
+
+import (
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+type Commitment struct {
+	TaskID      string
+	MinDuration time.Duration
+	StartTime   time.Time
+}
+
+func shouldWaitForFreshState(cause string) bool {
+	switch cause {
+	case domain.CauseSurvivalPanic, domain.CausePanic, domain.CausePanicTriggered, domain.CauseUnlock:
+		return true
+	default:
+		return false
+	}
+}
+
+</file>
+
+<file path="internal\decision\evaluator.go">
+package decision
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+func (s *Service) runEvaluationLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.evalTrigger:
+			s.doEvaluateNextPlan(ctx)
+		}
+	}
+}
+
+func (s *Service) evaluateNextPlan() {
+	select {
+	case s.evalTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) doEvaluateNextPlan(ctx context.Context) {
+	state := s.stateProvider.GetCurrentState().State
+	if state.Health <= 0 {
+		return
+	}
+
+	// Near-Cheating: Predictive Nightfall Prep
+	nightfall := s.predictor.PredictNightfall(state)
+	if nightfall {
+		s.logger.Warn("Near-Cheating: Predicting nightfall, prioritizing shelter")
+	}
+
+	survivalOverride := hasImmediateThreat(state) ||
+		hasImmediateHazard(state) ||
+		(state.Health < domain.SurvivalCriticalHealth) ||
+		(state.Health < domain.DecisionHealthSafe && state.Food < domain.SurvivalMinFoodForHunt) ||
+		nightfall
+
+	if !survivalOverride {
+		if s.activeIntent.Load() != nil || s.planManager.HasActivePlan() || !s.execStatus.IsIdle() {
+			return
+		}
+	}
+
+	if currCommitment := s.commitment.Load(); currCommitment != nil {
+		if time.Since(currCommitment.StartTime) < currCommitment.MinDuration {
+			if state.Health >= domain.DecisionHealthSafe && len(state.Threats) == 0 && !nightfall {
+				return
+			}
+			s.logger.Info("Breaking commitment lock for critical survival event")
+		}
+	}
+
+	var plan domain.Plan
+
+	if survivalOverride {
+		s.logger.Warn("Survival priority override active")
+		plan = s.planner.reactivePlan(ctx, state)
+		if nightfall {
+			plan.Objective = "Seek shelter for nightfall"
+			plan.Tasks = append([]domain.Action{{
+				ID:        fmt.Sprintf("night-prep-%d", time.Now().UnixNano()),
+				Action:    "retreat",
+				Target:    domain.Target{Name: "safe_base"},
+				Priority:  90,
+				Rationale: "Near-Cheating: Psychic nightfall prediction",
+			}}, plan.Tasks...)
+		}
+	} else if isProgressionMode(state) && s.curriculum != nil {
+		s.logger.Info("Stable state detected, curriculum driving progression")
+
+		intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+		if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
+			if intent.Action == "use_skill" && len(intent.SkillSteps) > 0 {
+				s.logger.Info("Expanding composable skill", slog.String("skill", intent.Target), slog.Int("steps", len(intent.SkillSteps)))
+				plan = domain.Plan{
+					Objective:  intent.Rationale,
+					IsFallback: false,
+					Tasks:      make([]domain.Action, len(intent.SkillSteps)),
+				}
+				for i, step := range intent.SkillSteps {
+					plan.Tasks[i] = domain.Action{
+						ID:        fmt.Sprintf("%s-step-%d", intent.ID, i),
+						Action:    step.Action,
+						Target:    domain.Target{Name: step.Target, Type: "skill_step"},
+						Count:     step.Count,
+						Rationale: step.Rationale,
+						Priority:  75 - i,
+					}
+				}
+			} else {
+				plan = domain.Plan{
+					Objective:  intent.Rationale,
+					IsFallback: false,
+					Tasks: []domain.Action{
+						{
+							ID:        fmt.Sprintf("curr-%d", time.Now().UnixNano()),
+							Action:    intent.Action,
+							Target:    domain.Target{Name: intent.Target, Type: "curriculum"},
+							Count:     intent.Count,
+							Rationale: intent.Rationale,
+							Priority:  70,
+						},
+					},
+				}
+			}
+		} else {
+			plan = s.planner.FastPlan(ctx, state)
+		}
+	} else {
+		plan = s.planner.FastPlan(ctx, state)
+	}
+
+	if !Validate(&plan, state) {
+		plan.IsFallback = true
+		plan.Tasks = nil
+	}
+
+	if (plan.IsFallback || len(plan.Tasks) == 0) && s.curriculum != nil {
+		if plan.Objective != "Curriculum Fallback" && plan.Objective != "Curriculum" {
+			intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+			if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
+				plan = domain.Plan{
+					Objective:  "Curriculum Fallback",
+					IsFallback: true,
+					Tasks: []domain.Action{
+						{
+							ID:        fmt.Sprintf("curr-fb-%d", time.Now().UnixNano()),
+							Action:    intent.Action,
+							Target:    domain.Target{Name: intent.Target, Type: "inferred"},
+							Count:     intent.Count,
+							Rationale: intent.Rationale,
+							Priority:  50,
+						},
+					},
+				}
+			}
+		}
+	}
+
+	if len(plan.Tasks) == 0 {
+		return
+	}
+
+	s.planManager.SetPlan(&plan)
+	_ = s.planManager.Transition(domain.PlanStatusActive)
+	s.dispatchActivePlan(ctx)
+}
+
+func Validate(plan *domain.Plan, state domain.GameState) bool {
+	if plan == nil || len(plan.Tasks) == 0 {
+		return false
+	}
+
+	task := plan.Tasks[0]
+	hasPickaxe := false
+	hasCraftingTable := false
+
+	for _, item := range state.Inventory {
+		if strings.Contains(item.Name, "pickaxe") {
+			hasPickaxe = true
+		}
+		if item.Name == "crafting_table" {
+			hasCraftingTable = true
+		}
+	}
+
+	for _, poi := range state.POIs {
+		if poi.Name == "crafting_table" {
+			hasCraftingTable = true
+		}
+	}
+
+	switch task.Action {
+	case "eat":
+		if state.Food >= domain.DecisionFoodMax {
+			return false
+		}
+		hasFood := false
+		for _, item := range state.Inventory {
+			if domain.IsFood(item.Name) {
+				hasFood = true
+				break
+			}
+		}
+		return hasFood
+	case "craft":
+		if len(state.Inventory) == 0 {
+			return false
+		}
+		if strings.Contains(task.Target.Name, "pickaxe") && !hasCraftingTable {
+			return false
+		}
+	case "mine":
+		if !hasPickaxe {
+			return false
+		}
+	case "hunt":
+		if state.Health < domain.DecisionHealthHunt {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent) bool {
+	if intent == nil || intent.Action == "" {
+		return false
+	}
+
+	target := strings.ToLower(strings.TrimSpace(intent.Target))
+	switch intent.Action {
+	case "use_skill":
+		return target != ""
+	case "gather":
+		switch target {
+		case "", "none", "air", "water", "lava":
+			return false
+		}
+	case "eat":
+		for _, item := range state.Inventory {
+			if strings.EqualFold(item.Name, target) && item.Count > 0 && domain.IsFood(item.Name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return true
+}
+
+func isProgressionMode(state domain.GameState) bool {
+	return state.Health > 14 &&
+		state.Food > 10 &&
+		len(state.Threats) == 0 &&
+		!hasImmediateHazard(state)
+}
+
+func hasImmediateThreat(state domain.GameState) bool {
+	for _, threat := range state.Threats {
+		if threat.Distance <= domain.SurvivalMaxThreatDist {
+			return true
+		}
+	}
+	return false
+}
+
+func hasImmediateHazard(state domain.GameState) bool {
+	for _, feedback := range state.Feedback {
+		switch strings.ToLower(strings.TrimSpace(feedback.Cause)) {
+		case "lava_contact", "low_air", "burning", "recent_heavy_damage":
+			return true
+		}
+		if strings.EqualFold(feedback.Type, "hazard") {
+			return true
+		}
+	}
+
+	for _, zone := range state.DangerZones {
+		if zone.Risk < 0.85 {
+			continue
+		}
+		if state.Position.DistanceTo(zone.Center) <= 6.0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+</file>
+
 <file path="internal\decision\integration\integration_test.go">
 package integration
 
@@ -1138,6 +1674,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"strings"
 
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/decision"
@@ -1164,10 +1701,18 @@ func (m *MockLLM) Generate(ctx context.Context, systemPrompt, userContent string
 	if resp, ok := m.responses[systemPrompt+userContent]; ok {
 		return resp, nil
 	}
-	return `{"action": "explore", "target": "surface", "count": 1, "rationale": "mock"}`, nil
+	
+	if strings.Contains(systemPrompt, "Curriculum") || strings.Contains(systemPrompt, "autonomous Minecraft bot") {
+		return `{"action": "explore", "target": "surface", "count": 1, "rationale": "curriculum mock"}`, nil
+	}
+	
+	return `{"strategic_goal": "mock mission", "subgoals": ["mock step"], "objective": "mock", "candidates": [[{"action": "explore", "target": {"name": "surface", "type": "category"}, "count": 1, "rationale": "mock"}]]}`, nil
 }
 
 func (m *MockLLM) GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	if strings.Contains(systemPrompt, "Critic") {
+		return `{"failure": "mock failure", "cause": "mock cause", "fix": "mock fix", "score": 0.5}`, nil
+	}
 	return "mock text response", nil
 }
 
@@ -1301,6 +1846,659 @@ func TestEndToEndPlanning(t *testing.T) {
 	}
 	
 	_ = svc
+}
+
+</file>
+
+<file path="internal\decision\integration\scenarios_test.go">
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"david22573/synaptic-mc/internal/config"
+	"david22573/synaptic-mc/internal/decision"
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/eventstore"
+	"david22573/synaptic-mc/internal/planner"
+	"david22573/synaptic-mc/internal/strategy"
+	"david22573/synaptic-mc/internal/voyager"
+)
+
+func setupScenarioHarness(t *testing.T, initialState domain.GameState, llm *MockLLM) (*decision.Service, *domain.LocalEventBus, context.CancelFunc, *MockStateProvider, *domain.WorldModel) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	bus := domain.NewEventBus()
+
+	evaluator := strategy.NewEvaluatorWithLLM(llm)
+	critic := voyager.NewStateCritic()
+	worldModel := domain.NewWorldModel()
+
+	vStore, _ := voyager.NewSQLiteVectorStore(":memory:")
+	eStore, _ := eventstore.NewSQLiteStore(":memory:", logger)
+	curriculum := voyager.NewAutonomousCurriculum(llm, vStore, nil, worldModel)
+	skillManager := voyager.NewSkillManager(vStore, llm)
+
+	advPlanner := decision.NewAdvancedPlanner(llm, evaluator, critic, nil, eStore, worldModel, nil, logger, config.FeatureFlags{}, skillManager)
+	pm := decision.NewPlanManager()
+
+	stateProv := &MockStateProvider{state: initialState}
+	execStatus := &MockExecutionStatus{idle: true}
+	feedback := planner.NewFeedbackAnalyzer(worldModel, logger)
+
+	svc := decision.NewService(
+		ctx, "test-session", bus, advPlanner, pm, curriculum, critic,
+		stateProv, execStatus, worldModel, nil, feedback, skillManager, logger, config.FeatureFlags{},
+	)
+
+	return svc, bus, cancel, stateProv, worldModel
+}
+
+func TestScenario_Starvation(t *testing.T) {
+	llm := NewMockLLM()
+	initialState := domain.GameState{
+		Health:      20,
+		Food:        5, // Starvation level
+		Position:    domain.Vec3{X: 0, Y: 64, Z: 0},
+		Inventory:   []domain.Item{{Name: "apple", Count: 5}},
+		Initialized: true,
+	}
+
+	_, bus, cancel, _, _ := setupScenarioHarness(t, initialState, llm)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var capturedPlanEvent domain.DomainEvent
+
+	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		capturedPlanEvent = ev
+		wg.Done()
+	}))
+
+	bus.Publish(context.Background(), domain.DomainEvent{
+		Type:      domain.EventTypeStateUpdated,
+		Payload:   []byte(`{}`),
+		CreatedAt: time.Now(),
+	})
+	wg.Wait()
+
+	var plan domain.Plan
+	json.Unmarshal(capturedPlanEvent.Payload, &plan)
+
+	if plan.Tasks[0].Action != "eat" {
+		t.Errorf("Expected starvation to trigger 'eat' action, got: %s", plan.Tasks[0].Action)
+	}
+}
+
+func TestScenario_NightfallLowHealth(t *testing.T) {
+	llm := NewMockLLM()
+	initialState := domain.GameState{
+		Health:      8,     // Low health
+		Food:        20,
+		TimeOfDay:   12500, // Near-nightfall
+		Position:    domain.Vec3{X: 0, Y: 64, Z: 0},
+		Initialized: true,
+	}
+
+	_, bus, cancel, _, _ := setupScenarioHarness(t, initialState, llm)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var capturedPlanEvent domain.DomainEvent
+
+	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		capturedPlanEvent = ev
+		wg.Done()
+	}))
+
+	bus.Publish(context.Background(), domain.DomainEvent{
+		Type:      domain.EventTypeStateUpdated,
+		Payload:   []byte(`{}`),
+		CreatedAt: time.Now(),
+	})
+	wg.Wait()
+
+	var plan domain.Plan
+	json.Unmarshal(capturedPlanEvent.Payload, &plan)
+
+	if plan.Objective != "Seek shelter for nightfall" {
+		t.Errorf("Expected psychic nightfall prep, got objective: %s", plan.Objective)
+	}
+	if plan.Tasks[0].Action != "retreat" {
+		t.Errorf("Expected retreat action for nightfall prep, got: %s", plan.Tasks[0].Action)
+	}
+}
+
+func TestScenario_RepeatedStuckLoop(t *testing.T) {
+	llm := NewMockLLM()
+	initialState := domain.GameState{
+		Health:      13, // Stable but non-progression to force FastPlan usage
+		Food:        20,
+		Position:    domain.Vec3{X: 0, Y: 64, Z: 0},
+		Initialized: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	bus := domain.NewEventBus()
+	evaluator := strategy.NewEvaluatorWithLLM(llm)
+	critic := voyager.NewStateCritic()
+	worldModel := domain.NewWorldModel()
+	vStore, _ := voyager.NewSQLiteVectorStore(":memory:")
+	eStore, _ := eventstore.NewSQLiteStore(":memory:", logger)
+	curriculum := voyager.NewAutonomousCurriculum(llm, vStore, nil, worldModel)
+	skillManager := voyager.NewSkillManager(vStore, llm)
+	advPlanner := decision.NewAdvancedPlanner(llm, evaluator, critic, nil, eStore, worldModel, nil, logger, config.FeatureFlags{}, skillManager)
+	pm := decision.NewPlanManager()
+	stateProv := &MockStateProvider{state: initialState}
+	execStatus := &MockExecutionStatus{idle: true}
+	
+	// NIL feedback analyzer to ensure failure count accumulates on SAME objective
+	svc := decision.NewService(
+		ctx, "test-session", bus, advPlanner, pm, curriculum, critic,
+		stateProv, execStatus, worldModel, nil, nil, skillManager, logger, config.FeatureFlags{},
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	var lastPlan domain.Plan
+	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		_ = json.Unmarshal(ev.Payload, &lastPlan)
+		wg.Done()
+	}))
+
+	// 1. Initial Plan (Planner generates "mock")
+	bus.Publish(context.Background(), domain.DomainEvent{
+		Type:      domain.EventTypeStateUpdated,
+		Payload:   []byte(`{}`),
+		CreatedAt: time.Now(),
+	})
+	wg.Wait()
+
+	// 2. Fail the plan 5 times. 
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		taskEndPayload, _ := json.Marshal(domain.TaskEndPayload{
+			CommandID: lastPlan.Tasks[0].ID,
+			Status:    "FAILED",
+			Success:   false,
+			Cause:     domain.CauseStuckTerrain,
+			Action:    lastPlan.Tasks[0].Action,
+			Target:    lastPlan.Tasks[0].Target.Name,
+		})
+
+		bus.Publish(context.Background(), domain.DomainEvent{
+			Type:      domain.EventTypeTaskEnd,
+			Payload:   taskEndPayload,
+			CreatedAt: time.Now(),
+		})
+		wg.Wait()
+	}
+
+	if lastPlan.Objective != "Degraded Recovery state" {
+		t.Errorf("Expected plan objective to be degraded recovery, got: %s", lastPlan.Objective)
+	}
+	if lastPlan.Tasks[0].Action != "random_walk" {
+		t.Errorf("Expected action to be random_walk, got: %s", lastPlan.Tasks[0].Action)
+	}
+	
+	_ = svc
+}
+
+func TestScenario_PlannerTimeoutFallback(t *testing.T) {
+	llm := &MockLLM{responses: make(map[string]string)}
+	initialState := domain.GameState{
+		Health:      20,
+		Food:        20,
+		Position:    domain.Vec3{X: 0, Y: 64, Z: 0},
+		Initialized: true,
+	}
+
+	_, bus, cancel, _, _ := setupScenarioHarness(t, initialState, llm)
+	defer cancel()
+
+	llm.responses[""] = "ERROR: Timeout" 
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var capturedPlanEvent domain.DomainEvent
+
+	bus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
+		capturedPlanEvent = ev
+		wg.Done()
+	}))
+
+	bus.Publish(context.Background(), domain.DomainEvent{
+		Type:      domain.EventTypeStateUpdated,
+		Payload:   []byte(`{}`),
+		CreatedAt: time.Now(),
+	})
+	wg.Wait()
+
+	var plan domain.Plan
+	json.Unmarshal(capturedPlanEvent.Payload, &plan)
+
+	if plan.Objective == "" {
+		t.Errorf("Expected fallback plan objective, got empty")
+	}
+}
+
+</file>
+
+<file path="internal\decision\intent_runtime.go">
+package decision
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/observability"
+	"david22573/synaptic-mc/internal/voyager"
+)
+
+func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
+	// Performance Budgeting: Track state age
+	age := time.Since(event.CreatedAt).Milliseconds()
+	observability.Metrics.StateAgeMs.Observe(float64(age))
+
+	s.planner.SetMilestoneContext(s.getMilestoneContext())
+	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
+	if !s.planManager.HasActivePlan() {
+		s.evaluateNextPlan()
+	}
+}
+
+func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
+	var payload domain.TaskEndPayload
+
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return
+	}
+
+	// Performance Budgeting: Track task runtime
+	if payload.DurationMs > 0 {
+		observability.Metrics.TaskExecDuration.Observe(float64(payload.DurationMs))
+	}
+
+	success := payload.Status == "COMPLETED"
+	controlledStop := domain.IsControlledStop(payload.Cause)
+
+	intent := s.activeIntent.Load()
+	beforePtr := s.beforeState.Load()
+
+	if intent != nil && beforePtr != nil && intent.ID == payload.CommandID {
+		after := s.stateProvider.GetCurrentState().State
+
+		failureCount := 0
+		currentPlan := s.planManager.GetCurrent()
+		if currentPlan != nil {
+			failureCount = s.planner.GetFailureCount(currentPlan.Objective)
+		}
+
+		res := domain.ExecutionResult{
+			Success:  success,
+			Cause:    payload.Cause,
+			Progress: payload.Progress,
+			Action: domain.Action{
+				Action: payload.Action,
+				Target: domain.Target{Name: payload.Target},
+			},
+		}
+		var adaptedIntent *domain.ActionIntent
+		if s.feedback != nil {
+			adaptedIntent = s.feedback.Analyze(*intent, res)
+		}
+
+		successCritic, reflection := s.critic.Evaluate(*intent, *beforePtr, after, res, failureCount)
+		critique := ""
+		if reflection != nil {
+			critique = reflection.Failure
+			if reflection.Cause != "" {
+				critique += " (Cause: " + reflection.Cause + ")"
+			}
+		}
+
+		if success {
+			observability.Metrics.IncTask()
+			if intent.Action == "use_skill" {
+				observability.Metrics.IncSkillReuse()
+			}
+
+			// Track resources gathered
+			beforeInv := inventoryMap(*beforePtr)
+			afterInv := inventoryMap(after)
+			for item, count := range afterInv {
+				if diff := count - beforeInv[item]; diff > 0 {
+					observability.Metrics.AddResource(uint64(diff))
+				}
+			}
+		} else {
+			if res.Cause == domain.CauseBlocked || res.Cause == domain.CauseStuck || res.Cause == domain.CauseStuckTerrain {
+				observability.Metrics.IncPathFailure()
+				observability.Metrics.IncStuck()
+			}
+		}
+
+		if !success {
+			successCritic = false
+			critique = fmt.Sprintf("TS Failed: %s. %s", payload.Cause, critique)
+
+			if s.worldModel != nil {
+				s.worldModel.PenalizeAction(intent.Action, 1.0)
+				loc := domain.Location{X: beforePtr.Position.X, Y: beforePtr.Position.Y, Z: beforePtr.Position.Z}
+				s.worldModel.PenalizeZone(loc, 0.5)
+			}
+
+			if intent.Action == "use_skill" && s.skillManager != nil {
+				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, false, payload.DurationMs, payload.Cause)
+			}
+
+			currentPlan := s.planManager.GetCurrent()
+			if currentPlan != nil && s.memStore != nil {
+				obj := currentPlan.Objective
+				count := s.planner.GetFailureCount(obj)
+				go func(sid, o string, c int) {
+					dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+					defer cancel()
+					_ = s.memStore.SaveFailureCount(dbCtx, sid, o, c)
+				}(s.sessionID, obj, count)
+			}
+
+			if adaptedIntent != nil && adaptedIntent.ID != intent.ID {
+				s.logger.Info("FeedbackAnalyzer injected tactical fallback", slog.String("action", adaptedIntent.Action))
+				s.activeIntent.Store(adaptedIntent)
+				s.dispatchActiveIntent(ctx, adaptedIntent)
+				return
+			}
+		} else {
+			if s.worldModel != nil {
+				s.worldModel.RecordSuccess(intent.Action, intent.Target)
+			}
+
+			if intent.Action == "use_skill" && s.skillManager != nil {
+				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, true, payload.DurationMs, payload.Cause)
+			}
+
+			s.detectMilestones(beforePtr, &after)
+
+			if payload.Success && s.skillManager != nil {
+				synth, ok := s.curriculum.(voyager.CodeSynthesizer)
+				if ok {
+					beforeState := s.beforeState.Load()
+					afterState := s.stateProvider.GetCurrentState().State
+
+					if beforeState != nil {
+						intentVal := s.activeIntent.Load()
+						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
+							go func(intent domain.ActionIntent, before, after domain.GameState) {
+								ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+								defer cancel()
+
+								result, err := synth.SynthesizeCode(ctx, intent, before, after)
+								if err != nil {
+									s.logger.Warn("Skill synthesis failed", slog.String("action", intent.Action), slog.Any("error", err))
+									return
+								}
+								if result.JSCode == "" {
+									return
+								}
+
+								skillName := fmt.Sprintf("%s_%s", intent.Action, sanitizeSkillName(intent.Target))
+								skill := voyager.ExecutableSkill{
+									Name:          skillName,
+									Description:   fmt.Sprintf("%s %s (count: %d)", intent.Action, intent.Target, intent.Count),
+									JSCode:        result.JSCode,
+									RequiredItems: result.RequiredItems,
+									Version:       1,
+								}
+
+								if err := s.skillManager.SaveSkill(ctx, skill); err != nil {
+									s.logger.Warn("Failed to persist skill", slog.String("name", skillName), slog.Any("error", err))
+									return
+								}
+								s.logger.Info("Skill synthesized and saved", slog.String("name", skillName))
+							}(*intentVal, *beforeState, afterState)
+						}
+					}
+				}
+			}
+		}
+
+		s.mu.Lock()
+		newHistory := domain.TaskHistory{
+			Intent: *intent, Success: successCritic, Critique: critique, Reflection: reflection,
+		}
+		s.taskHistory = append(s.taskHistory, newHistory)
+
+		if len(s.taskHistory) > 200 {
+			s.taskHistory = s.taskHistory[len(s.taskHistory)-200:]
+		}
+		s.mu.Unlock()
+
+		if s.memStore != nil {
+			go func(h domain.TaskHistory) {
+				dbCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+				defer cancel()
+				if err := s.memStore.SaveTaskHistory(dbCtx, s.sessionID, []domain.TaskHistory{h}); err != nil {
+					s.logger.Error("Failed to persist task history", slog.Any("error", err))
+				}
+			}(newHistory)
+		}
+
+		s.activeIntent.Store(nil)
+		s.beforeState.Store(nil)
+	}
+
+	if !s.planManager.HasActivePlan() {
+		return
+	}
+
+	if !success && !controlledStop {
+		s.logger.Warn("Plan failed due to task failure", slog.String("failed_task", payload.CommandID))
+		s.commitment.Store(nil)
+
+		currentPlan := s.planManager.GetCurrent()
+		if currentPlan != nil {
+			s.planner.RecordFailure(currentPlan.Objective)
+		}
+
+		if s.planManager.NextFallback() {
+			s.logger.Info("Attempting fallback plan candidate")
+			_ = s.planManager.Transition(domain.PlanStatusActive)
+			s.dispatchActivePlan(ctx)
+			return
+		}
+
+		_ = s.planManager.Transition(domain.PlanStatusFailed)
+
+		s.bus.Publish(ctx, domain.DomainEvent{
+			SessionID: s.sessionID,
+			Type:      domain.EventTypePlanInvalidated,
+			Payload:   []byte(`{}`),
+			CreatedAt: time.Now(),
+		})
+		go s.evaluateNextPlan()
+		return
+	}
+
+	if controlledStop {
+		s.commitment.Store(nil)
+		if !shouldWaitForFreshState(payload.Cause) {
+			go s.evaluateNextPlan()
+		}
+		return
+	}
+
+	hasMoreTasks := s.planManager.PopTask(payload.CommandID)
+	if hasMoreTasks {
+		s.dispatchActivePlan(ctx)
+		return
+	}
+
+	currentPlan := s.planManager.GetCurrent()
+	if currentPlan != nil {
+		s.planner.RecordSuccess(currentPlan.Objective)
+		if s.memStore != nil {
+			go func(sid, o string) {
+				dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+				defer cancel()
+				_ = s.memStore.SaveFailureCount(dbCtx, sid, o, 0)
+			}(s.sessionID, currentPlan.Objective)
+		}
+	}
+
+	s.planner.ClearCurrentPlan()
+	_ = s.planManager.Transition(domain.PlanStatusCompleted)
+	go s.evaluateNextPlan()
+}
+
+func (s *Service) dispatchActivePlan(ctx context.Context) {
+	plan := s.planManager.GetCurrent()
+	if plan == nil || len(plan.Tasks) == 0 {
+		return
+	}
+
+	firstTask := plan.Tasks[0]
+
+	s.logger.Info("Dispatching active plan",
+		slog.String("strategic_goal", plan.StrategicGoal),
+		slog.Any("subgoals", plan.Subgoals),
+		slog.String("objective", plan.Objective),
+		slog.String("task_action", firstTask.Action),
+		slog.String("task_target", firstTask.Target.Name))
+
+	if len(plan.Tasks) == 1 {
+		s.planner.WarmNextPlan(ctx, s.sessionID, s.stateProvider.GetCurrentState().State)
+	}
+
+	s.commitment.Store(&Commitment{
+		TaskID:      firstTask.ID,
+		StartTime:   time.Now(),
+		MinDuration: 2 * time.Second,
+	})
+
+	s.activeIntent.Store(&domain.ActionIntent{
+		ID:        firstTask.ID,
+		Action:    firstTask.Action,
+		Target:    firstTask.Target.Name,
+		Count:     firstTask.Count,
+		Rationale: firstTask.Rationale,
+	})
+
+	currentState := s.stateProvider.GetCurrentState().State
+	s.beforeState.Store(&currentState)
+
+	payload, _ := json.Marshal(plan)
+	s.bus.Publish(ctx, domain.DomainEvent{
+		SessionID: s.sessionID,
+		Trace: domain.TraceContext{
+			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+			ActionID: firstTask.ID,
+		},
+		Type:      domain.EventTypePlanCreated,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+	})
+}
+
+func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.ActionIntent) {
+	if intent == nil {
+		return
+	}
+
+	s.commitment.Store(&Commitment{
+		TaskID:      intent.ID,
+		StartTime:   time.Now(),
+		MinDuration: 2 * time.Second,
+	})
+
+	plan := domain.Plan{
+		ID:        fmt.Sprintf("adapted-%d", time.Now().UnixNano()),
+		Objective: "Tactical Adaptation",
+		Tasks: []domain.Action{
+			{
+				ID:        intent.ID,
+				Action:    intent.Action,
+				Target:    domain.Target{Name: intent.Target, Type: "adapted"},
+				Count:     intent.Count,
+				Rationale: intent.Rationale,
+				Priority:  100,
+			},
+		},
+	}
+
+	payload, _ := json.Marshal(plan)
+	s.bus.Publish(ctx, domain.DomainEvent{
+		SessionID: s.sessionID,
+		Trace: domain.TraceContext{
+			TraceID:  fmt.Sprintf("tr-ad-%d", time.Now().UnixNano()),
+			ActionID: intent.ID,
+		},
+		Type:      domain.EventTypePlanCreated,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+	})
+}
+
+func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.DomainEvent) {
+	// Performance Budgeting: Track interruptions
+	if s.activeIntent.Load() != nil {
+		observability.Metrics.IncInterrupt()
+	}
+
+	s.commitment.Store(nil)
+	s.activeIntent.Store(nil)
+	s.beforeState.Store(nil)
+	s.planner.ClearCurrentPlan()
+	s.planManager.Clear()
+}
+
+func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
+	s.handlePlanInvalidated(ctx, event)
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		s.evaluateNextPlan()
+	}()
+}
+
+func sanitizeSkillName(target string) string {
+	target = strings.ToLower(strings.TrimSpace(target))
+	target = strings.ReplaceAll(target, " ", "_")
+	var b strings.Builder
+	for _, r := range target {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	result := b.String()
+	if result == "" {
+		return "unnamed"
+	}
+	return result
+}
+
+func inventoryMap(state domain.GameState) map[string]int {
+	m := make(map[string]int)
+	for _, item := range state.Inventory {
+		m[strings.ToLower(item.Name)] += item.Count
+	}
+	return m
 }
 
 </file>
@@ -1661,6 +2859,7 @@ import (
 	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/learning"
 	"david22573/synaptic-mc/internal/memory"
+	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/strategy"
 )
 
@@ -1753,8 +2952,10 @@ func NewAdvancedPlanner(
 }
 
 type multiCandidateResponse struct {
-	Objective  string            `json:"objective"`
-	Candidates [][]domain.Action `json:"candidates"`
+	StrategicGoal string            `json:"strategic_goal"`
+	Subgoals      []string          `json:"subgoals"`
+	Objective     string            `json:"objective"`
+	Candidates    [][]domain.Action `json:"candidates"`
 }
 
 func hashState(state domain.GameState) uint64 {
@@ -1867,7 +3068,10 @@ func (p *AdvancedPlanner) SlowReplanLoop(ctx context.Context, sessionID string) 
 
 			p.currentPlan.Store(plan)
 			lastPlannedState = *activeState
-			p.logger.Info("Background replan complete", slog.String("objective", plan.Objective))
+			p.logger.Info("Background replan complete",
+				slog.String("strategic_goal", plan.StrategicGoal),
+				slog.Any("subgoals", plan.Subgoals),
+				slog.String("objective", plan.Objective))
 			if p.onPlanReady != nil {
 				go p.onPlanReady()
 			}
@@ -1895,6 +3099,16 @@ func (p *AdvancedPlanner) FastPlan(ctx context.Context, state domain.GameState) 
 		if fails > 3 {
 			p.logger.Warn("Plan stuck in failure loop, degrading behavior", slog.String("objective", current.Objective), slog.Int("failures", fails))
 			p.currentPlan.Store(nil)
+			return p.degradedPlan(state, fails)
+		}
+	} else {
+		// Even if no LLM plan is active, check if the reactive fallback itself is failing
+		p.failMu.Lock()
+		fails := p.failures["Reactive Fallback Plan"]
+		p.failMu.Unlock()
+
+		if fails > 3 {
+			p.logger.Warn("Reactive fallback stuck in failure loop, degrading behavior", slog.Int("failures", fails))
 			return p.degradedPlan(state, fails)
 		}
 	}
@@ -1956,7 +3170,7 @@ func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameSta
 		currentZoneCost = p.worldModel.GetZoneCost(domain.Location{X: state.Position.X, Y: state.Position.Y, Z: state.Position.Z})
 	}
 
-	knownNodes := []memory.WorldNode{}
+	knownNodes := []domain.WorldNode{}
 	if p.memStore != nil {
 		knownNodes, _ = p.memStore.GetNearbyNodes(ctx, state.Position, 5)
 	}
@@ -1987,7 +3201,7 @@ func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameSta
 			Priority:  priority,
 			Rationale: fmt.Sprintf("Reactive fast-path fallback: Survival Critical (Zone Cost: %.1f)", currentZoneCost),
 		})
-	case state.Health < domain.DecisionHealthSafe && hasFood:
+	case (state.Health < domain.DecisionHealthSafe || state.Food < 14.0) && hasFood:
 		action := "eat"
 		weight := getWeight(action)
 		tasks = append(tasks, domain.Action{
@@ -1995,7 +3209,7 @@ func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameSta
 			Action:    action,
 			Target:    domain.Target{Name: "best_food", Type: "item"},
 			Priority:  int(95 + (weight * 5)),
-			Rationale: "Reactive fast-path fallback: Recover health with available food",
+			Rationale: "Reactive fast-path fallback: Recover health/food with available items",
 		})
 	case state.Health < domain.SurvivalCriticalHealth || state.Food < 12.0:
 		// Prioritize actions that have been successful
@@ -2033,7 +3247,7 @@ func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameSta
 	// Use known POIs if we are stuck or idle
 	if len(tasks) == 0 {
 		for _, node := range knownNodes {
-			if node.Type == "chest" && state.Food < 15.0 {
+			if node.Kind == "chest" && state.Food < 15.0 {
 				tasks = append(tasks, domain.Action{
 					ID:        fmt.Sprintf("react-poi-%d", time.Now().UnixNano()),
 					Action:    "retrieve",
@@ -2058,8 +3272,10 @@ func (p *AdvancedPlanner) reactivePlan(ctx context.Context, state domain.GameSta
 	}
 
 	return domain.Plan{
-		Objective: "Reactive Fallback Plan",
-		Tasks:     tasks,
+		StrategicGoal: "Survival & Stabilization",
+		Subgoals:      []string{"React to immediate threats", "Recover vital stats", "Maintain situational awareness"},
+		Objective:     "Reactive Fallback Plan",
+		Tasks:         tasks,
 	}
 }
 
@@ -2084,6 +3300,9 @@ func isFoodBlock(name string) bool {
 }
 
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
+	start := time.Now()
+	observability.Metrics.IncReplan()
+
 	lastEventID, err := p.store.GetLastEventID(ctx, sessionID)
 	if err != nil {
 		p.logger.Warn("Failed to get last event ID, using 0", slog.Any("error", err))
@@ -2095,7 +3314,6 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 	sfKey := cacheKey
 
 	if entry, ok := p.planCache.Get(cacheKey); ok {
-		// Only invalidate cache if older than 30s OR state changed significantly
 		if time.Since(entry.createdAt) > 30*time.Second {
 			p.planCache.Remove(cacheKey)
 			goto cacheMiss
@@ -2108,6 +3326,7 @@ func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string,
 
 		if fails == 0 {
 			p.logger.Info("Using cached plan for stable state", slog.String("objective", cachedPlan.Objective))
+			observability.Metrics.PlannerDuration.Observe(float64(time.Since(start).Milliseconds()))
 			return p.clonePlanWithNewIDs(cachedPlan), nil
 		}
 	}
@@ -2179,7 +3398,6 @@ cacheMiss:
 			stats = make(map[string]*learning.ActionStats)
 		}
 
-		// Periodically save snapshot to bound delta processing time
 		if statsLastID > 0 && statsLastID%100 == 0 {
 			go func(sid string, lid int64, s map[string]*learning.ActionStats) {
 				data, _ := json.Marshal(s)
@@ -2231,7 +3449,7 @@ cacheMiss:
 			score float64
 		}
 		for _, candidate := range parsed.Candidates {
-			score := p.scoreCandidate(candidate, state, stats, failureCount)
+			score := p.scoreCandidate(ctx, candidate, state, stats, failureCount)
 			scored = append(scored, struct {
 				tasks []domain.Action
 				score float64
@@ -2243,9 +3461,11 @@ cacheMiss:
 		})
 
 		finalPlan := &domain.Plan{
-			ID:        fmt.Sprintf("plan-%d", time.Now().UnixNano()),
-			Objective: parsed.Objective,
-			Tasks:     scored[0].tasks,
+			ID:            fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			StrategicGoal: parsed.StrategicGoal,
+			Subgoals:      parsed.Subgoals,
+			Objective:     parsed.Objective,
+			Tasks:         scored[0].tasks,
 		}
 
 		for i := 1; i < len(scored); i++ {
@@ -2265,6 +3485,7 @@ cacheMiss:
 		return nil, err
 	}
 
+	observability.Metrics.PlannerDuration.Observe(float64(time.Since(start).Milliseconds()))
 	return p.clonePlanWithNewIDs(val.(*domain.Plan)), nil
 }
 
@@ -2276,9 +3497,11 @@ func (p *AdvancedPlanner) WarmNextPlan(ctx context.Context, sessionID string, st
 
 func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Plan {
 	clone := &domain.Plan{
-		ID:        fmt.Sprintf("cached-plan-%d", time.Now().UnixNano()),
-		Objective: original.Objective,
-		Tasks:     make([]domain.Action, len(original.Tasks)),
+		ID:            fmt.Sprintf("cached-plan-%d", time.Now().UnixNano()),
+		StrategicGoal: original.StrategicGoal,
+		Subgoals:      original.Subgoals,
+		Objective:     original.Objective,
+		Tasks:         make([]domain.Action, len(original.Tasks)),
 	}
 
 	now := time.Now().UnixNano()
@@ -2299,638 +3522,173 @@ func (p *AdvancedPlanner) clonePlanWithNewIDs(original *domain.Plan) *domain.Pla
 	return clone
 }
 
-func (p *AdvancedPlanner) scoreCandidate(tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats, failureCount int) float64 {
+func (p *AdvancedPlanner) scoreCandidate(ctx context.Context, tasks []domain.Action, state domain.GameState, stats map[string]*learning.ActionStats, failureCount int) float64 {
 	if len(tasks) == 0 {
 		return 0
 	}
 
-	score := 100.0
-	weights := p.flags.Weights
-
-	penalty := math.Min(float64(failureCount)*15.0, 60.0)
-	score -= penalty
-
-	explorationBonus := weights.ExplorationBonus
-	if failureCount >= 3 {
-		explorationBonus *= 4.0
-	} else if failureCount >= 2 {
-		explorationBonus *= 2.5
-	}
-
-	hasExplored := false
+	var totalReward float64
+	var totalUnlock float64
 	var totalRisk float64
+	var totalCost float64
+	urgency := p.calculateUrgency(state)
 
 	for _, t := range tasks {
-		if t.Action == "hunt" {
-			totalRisk += weights.RiskPenalty
-		}
-		if t.Action == "mine" {
-			totalRisk += (weights.RiskPenalty / 2.0)
-		}
+		reward, unlock := domain.GetItemUtility(t.Target.Name)
+		totalReward += reward
+		totalUnlock += unlock
 
-		if stat, ok := stats[t.Action]; ok && stat.Attempts > 0 {
-			probability := stat.SuccessRate
-			score += (probability * weights.SuccessWeight)
-			score -= ((1.0 - probability) * (weights.SuccessWeight + 10.0))
-		} else if !hasExplored {
-			score += explorationBonus
-			hasExplored = true
+		actionRisk := 0.0
+		if t.Action == "hunt" {
+			actionRisk = 20.0
+		} else if t.Action == "mine" {
+			actionRisk = 10.0
 		}
+		
+		if p.worldModel != nil {
+			zoneCost := p.worldModel.GetZoneCost(domain.Location{X: state.Position.X, Y: state.Position.Y, Z: state.Position.Z})
+			actionRisk += zoneCost * 5.0
+		}
+		totalRisk += actionRisk
+
+		totalCost += p.estimateDistanceCost(ctx, t, state)
+		
+		routeScore := p.scoreRoute(ctx, state.Position, t, state)
+		totalReward += routeScore * 0.1 
 	}
 
-	score -= (totalRisk / float64(len(tasks)))
+	penalty := math.Min(float64(failureCount)*25.0, 80.0)
+	score := totalReward + totalUnlock - totalRisk - totalCost + urgency - penalty
 
-	if score < 10 {
-		score = 10
+	if score < 0 {
+		score = 0
 	}
 
 	return score
 }
 
+func (p *AdvancedPlanner) scoreRoute(ctx context.Context, from domain.Vec3, action domain.Action, state domain.GameState) float64 {
+	targetPos := from 
+	if p.memStore != nil {
+		nodes, _ := p.memStore.GetNearbyNodes(ctx, from, 5)
+		for _, n := range nodes {
+			if strings.Contains(strings.ToLower(n.Name), strings.ToLower(action.Target.Name)) {
+				targetPos = n.Pos
+				break
+			}
+		}
+	}
+
+	dist := from.DistanceTo(targetPos)
+	cost := 0.0
+	if p.worldModel != nil {
+		cost = p.worldModel.GetZoneCost(domain.Location{X: targetPos.X, Y: targetPos.Y, Z: targetPos.Z})
+	}
+	
+	return 100.0 - (dist * 0.1) - (cost * 20.0)
+}
+
+func (p *AdvancedPlanner) calculateUrgency(state domain.GameState) float64 {
+	urgency := 0.0
+	if state.Health < 10 {
+		urgency += (10 - state.Health) * 10.0
+	}
+	if state.Food < 10 {
+		urgency += (10 - state.Food) * 5.0
+	}
+	if len(state.Threats) > 0 {
+		urgency += 20.0
+	}
+	return urgency
+}
+
+func (p *AdvancedPlanner) estimateDistanceCost(ctx context.Context, action domain.Action, state domain.GameState) float64 {
+	if p.memStore != nil && action.Target.Name != "" {
+		nodes, _ := p.memStore.GetNearbyNodes(ctx, state.Position, 10)
+		for _, n := range nodes {
+			if strings.Contains(strings.ToLower(n.Name), strings.ToLower(action.Target.Name)) {
+				dx, dy, dz := n.Pos.X-state.Position.X, n.Pos.Y-state.Position.Y, n.Pos.Z-state.Position.Z
+				dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+				return dist * 0.1 
+			}
+		}
+	}
+	return 5.0
+}
+
 </file>
 
-<file path="internal\decision\service.go">
+<file path="internal\decision\predictor.go">
 package decision
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log/slog"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
-	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/memory"
-	"david22573/synaptic-mc/internal/planner"
-	"david22573/synaptic-mc/internal/voyager"
 )
 
-type StateProvider interface {
-	GetCurrentState() domain.VersionedState
+// StrategyPredictor handles future-state forecasting for decision making.
+type StrategyPredictor struct {
+	memStore memory.Store
 }
 
-type ExecutionStatus interface {
-	IsIdle() bool
+func NewStrategyPredictor(m memory.Store) *StrategyPredictor {
+	return &StrategyPredictor{memStore: m}
 }
 
-type Commitment struct {
-	TaskID      string
-	MinDuration time.Duration
-	StartTime   time.Time
-}
-
-type Service struct {
-	ctx           context.Context
-	sessionID     string
-	bus           domain.EventBus
-	planner       *AdvancedPlanner
-	planManager   *PlanManager
-	curriculum    voyager.Curriculum
-	critic        voyager.Critic
-	stateProvider StateProvider
-	execStatus    ExecutionStatus
-	worldModel    *domain.WorldModel
-	memStore      memory.Store
-	feedback      *planner.FeedbackAnalyzer
-	logger        *slog.Logger
-	flags         config.FeatureFlags
-	skillManager  *voyager.SkillManager
-
-	mu            sync.Mutex
-	evalTrigger   chan struct{}
-	activeIntent  atomic.Pointer[domain.ActionIntent]
-	beforeState   atomic.Pointer[domain.GameState]
-	taskHistory   []domain.TaskHistory
-	milestones    []domain.ProgressionMilestone
-
-	commitment atomic.Pointer[Commitment]
-}
-
-func shouldWaitForFreshState(cause string) bool {
-	switch cause {
-	case domain.CauseSurvivalPanic, domain.CausePanic, domain.CausePanicTriggered, domain.CauseUnlock:
-		return true
-	default:
-		return false
-	}
-}
-
-func hasImmediateThreat(state domain.GameState) bool {
-	for _, threat := range state.Threats {
-		if threat.Distance <= domain.SurvivalMaxThreatDist {
-			return true
-		}
-	}
-	return false
-}
-
-func hasImmediateHazard(state domain.GameState) bool {
-	for _, feedback := range state.Feedback {
-		switch strings.ToLower(strings.TrimSpace(feedback.Cause)) {
-		case "lava_contact", "low_air", "burning", "recent_heavy_damage":
-			return true
-		}
-		if strings.EqualFold(feedback.Type, "hazard") {
-			return true
-		}
-	}
-
-	for _, zone := range state.DangerZones {
-		if zone.Risk < 0.85 {
-			continue
-		}
-		if state.Position.DistanceTo(zone.Center) <= 6.0 {
-			return true
-		}
-	}
-
-	return false
-}
-
-func isValidCurriculumIntent(state domain.GameState, intent *domain.ActionIntent) bool {
-	if intent == nil || intent.Action == "" {
-		return false
-	}
-
-	target := strings.ToLower(strings.TrimSpace(intent.Target))
-	switch intent.Action {
-	case "use_skill":
-		return target != ""
-	case "gather":
-		switch target {
-		case "", "none", "air", "water", "lava":
-			return false
-		}
-	case "eat":
+// ForecastInventory predicts if the bot will run out of resources during a plan.
+func (p *StrategyPredictor) ForecastInventory(plan domain.Plan, state domain.GameState) string {
+	// Simple forecasting logic
+	if strings.Contains(strings.ToLower(plan.Objective), "mine") {
+		hasPickaxe := false
 		for _, item := range state.Inventory {
-			if strings.EqualFold(item.Name, target) && item.Count > 0 && domain.IsFood(item.Name) {
-				return true
-			}
-		}
-		return false
-	}
-
-	return true
-}
-
-func NewService(
-	ctx context.Context,
-	sessionID string,
-	bus domain.EventBus,
-	advPlanner *AdvancedPlanner,
-	pm *PlanManager,
-	curriculum voyager.Curriculum,
-	critic voyager.Critic,
-	stateProvider StateProvider,
-	execStatus ExecutionStatus,
-	worldModel *domain.WorldModel,
-	memStore memory.Store,
-	feedback *planner.FeedbackAnalyzer,
-	skillManager *voyager.SkillManager,
-	logger *slog.Logger,
-	flags config.FeatureFlags,
-) *Service {
-	s := &Service{
-		ctx:           ctx,
-		sessionID:     sessionID,
-		bus:           bus,
-		planner:       advPlanner,
-		planManager:   pm,
-		curriculum:    curriculum,
-		critic:        critic,
-		stateProvider: stateProvider,
-		execStatus:    execStatus,
-		worldModel:    worldModel,
-		memStore:      memStore,
-		feedback:      feedback,
-		logger:        logger.With(slog.String("component", "decision_service")),
-		flags:         flags,
-		evalTrigger:   make(chan struct{}, 1),
-		taskHistory:   make([]domain.TaskHistory, 0),
-		milestones:    make([]domain.ProgressionMilestone, 0),
-		skillManager:  skillManager,
-	}
-
-	// Load persistent state
-	if memStore != nil {
-		history, err := memStore.GetTaskHistory(ctx, sessionID, 50)
-		if err == nil {
-			s.taskHistory = history
-			s.logger.Info("Loaded task history from persistent store", slog.Int("count", len(history)))
-		}
-
-		milestones, err := memStore.GetMilestones(ctx, sessionID)
-		if err == nil {
-			s.milestones = milestones
-			s.logger.Info("Loaded milestones from persistent store", slog.Int("count", len(milestones)))
-		}
-
-		failures, err := memStore.GetFailureCounts(ctx, sessionID)
-		if err == nil {
-			s.planner.SetFailures(failures)
-			s.logger.Info("Loaded plan failure counts from persistent store", slog.Int("count", len(failures)))
-		}
-	}
-
-	bus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
-	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
-	bus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
-	bus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
-
-	// Link planner background completions to service evaluations
-	advPlanner.SetOnPlanReady(func() {
-		s.logger.Info("Background plan ready, requesting evaluation")
-		s.evaluateNextPlan()
-	})
-
-	// Evaluation background loop
-	go s.runEvaluationLoop(ctx)
-
-	// Jumpstart background loop: ensures the bot doesn't stay idle if events are missed
-	// or if the state is stable but no plan is active.
-	go func() {
-		ticker := time.NewTicker(12 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if !s.planManager.HasActivePlan() && s.activeIntent.Load() == nil && s.execStatus.IsIdle() {
-					s.logger.Info("Jumpstart: bot is idle, forcing evaluation")
-					s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
-					s.evaluateNextPlan()
-				}
-			}
-		}
-	}()
-
-	return s
-}
-
-func Validate(plan *domain.Plan, state domain.GameState) bool {
-	if plan == nil || len(plan.Tasks) == 0 {
-		return false
-	}
-
-	// Only validate the FIRST task. We re-plan after each task completion anyway.
-	// Validating future tasks against the current state is too restrictive.
-	task := plan.Tasks[0]
-
-	hasPickaxe := false
-	hasCraftingTable := false
-
-	for _, item := range state.Inventory {
-		if strings.Contains(item.Name, "pickaxe") {
-			hasPickaxe = true
-		}
-		if item.Name == "crafting_table" {
-			hasCraftingTable = true
-		}
-	}
-
-	for _, poi := range state.POIs {
-		if poi.Name == "crafting_table" {
-			hasCraftingTable = true
-		}
-	}
-
-	switch task.Action {
-	case "eat":
-		if state.Food >= domain.DecisionFoodMax {
-			return false
-		}
-		// Check if we actually have food
-		hasFood := false
-		for _, item := range state.Inventory {
-			if domain.IsFood(item.Name) {
-				hasFood = true
+			if strings.Contains(item.Name, "pickaxe") {
+				hasPickaxe = true
 				break
 			}
 		}
-		return hasFood
-	case "craft":
-		if len(state.Inventory) == 0 {
-			return false
-		}
-		if strings.Contains(task.Target.Name, "pickaxe") && !hasCraftingTable {
-			return false
-		}
-	case "mine":
 		if !hasPickaxe {
-			return false
-		}
-	case "hunt":
-		if state.Health < domain.DecisionHealthHunt {
-			return false
+			return "INVENTORY_CRITICAL: Mining planned but no pickaxe in inventory"
 		}
 	}
-
-	return true
+	return ""
 }
 
-func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
-	s.planner.SetMilestoneContext(s.getMilestoneContext())
-	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
-	if !s.planManager.HasActivePlan() {
-		s.evaluateNextPlan()
-	}
+// PredictNightfall checks if the bot needs to seek shelter.
+func (p *StrategyPredictor) PredictNightfall(state domain.GameState) bool {
+	// Minecraft night starts around 13000
+	return state.TimeOfDay > 11000 && state.TimeOfDay < 13000
 }
 
-func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
-	var payload domain.TaskEndPayload
+// RouteScorer evaluates travel paths based on known world nodes and safety.
+type RouteScorer struct{}
 
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return
-	}
-
-	success := payload.Status == "COMPLETED"
-	controlledStop := domain.IsControlledStop(payload.Cause)
-
-	intent := s.activeIntent.Load()
-	beforePtr := s.beforeState.Load()
-
-	if intent != nil && beforePtr != nil && intent.ID == payload.CommandID {
-		after := s.stateProvider.GetCurrentState().State
-
-		failureCount := 0
-		currentPlan := s.planManager.GetCurrent()
-		if currentPlan != nil {
-			failureCount = s.planner.GetFailureCount(currentPlan.Objective)
-		}
-
-		// Phase 5.5: Analyze feedback for tactical adaptation
-		res := domain.ExecutionResult{
-			Success:  success,
-			Cause:    payload.Cause,
-			Progress: payload.Progress,
-			Action: domain.Action{
-				Action: payload.Action,
-				Target: domain.Target{Name: payload.Target},
-			},
-		}
-		adaptedIntent := s.feedback.Analyze(*intent, res)
-
-		successCritic, critique := s.critic.Evaluate(*intent, *beforePtr, after, res, failureCount)
-
-		if !success {
-			successCritic = false
-			critique = fmt.Sprintf("TS Failed: %s. %s", payload.Cause, critique)
-
-			// Learn from failure: penalize the action and the location
-			if s.worldModel != nil {
-				s.worldModel.PenalizeAction(intent.Action, 1.0)
-				loc := domain.Location{X: beforePtr.Position.X, Y: beforePtr.Position.Y, Z: beforePtr.Position.Z}
-				s.worldModel.PenalizeZone(loc, 0.5)
-			}
-
-			// A-1: Record skill failure if applicable
-			if intent.Action == "use_skill" && s.skillManager != nil {
-				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, false)
-			}
-
-			// A-4: Persist failure count for current plan objective
-			currentPlan := s.planManager.GetCurrent()
-			if currentPlan != nil && s.memStore != nil {
-				obj := currentPlan.Objective
-				count := s.planner.GetFailureCount(obj)
-				go func(sid, o string, c int) {
-					dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
-					defer cancel()
-					_ = s.memStore.SaveFailureCount(dbCtx, sid, o, c)
-				}(s.sessionID, obj, count)
-			}
-
-			// If analyzer provided a tactical fallback, inject it immediately
-			if adaptedIntent != nil && adaptedIntent.ID != intent.ID {
-				s.logger.Info("FeedbackAnalyzer injected tactical fallback", slog.String("action", adaptedIntent.Action))
-				s.activeIntent.Store(adaptedIntent)
-				s.dispatchActiveIntent(ctx, adaptedIntent)
-				return
-			}
-		} else {
-			// Learn from success: reward the action
-			if s.worldModel != nil {
-				s.worldModel.RecordSuccess(intent.Action, intent.Target)
-			}
-
-			// A-1: Record skill success if applicable
-			if intent.Action == "use_skill" && s.skillManager != nil {
-				_ = s.skillManager.RecordSkillResult(ctx, intent.Target, true)
-			}
-
-			// Milestone detection
-			s.detectMilestones(beforePtr, &after)
-
-			if payload.Success && s.skillManager != nil {
-				// Type-assert the curriculum to check if it can synthesize code.
-				// This avoids changing the Curriculum interface.
-				synth, ok := s.curriculum.(voyager.CodeSynthesizer)
-				if ok {
-					beforeState := s.beforeState.Load()
-					afterState := s.stateProvider.GetCurrentState().State
-
-					if beforeState != nil {
-						intentVal := s.activeIntent.Load()
-						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
-							// Run synthesis in background so it doesn't block the planning loop.
-							go func(intent domain.ActionIntent, before, after domain.GameState) {
-								ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
-								defer cancel()
-
-								jsCode, err := synth.SynthesizeCode(ctx, intent, before, after)
-								if err != nil {
-									s.logger.Warn("Skill synthesis failed", slog.String("action", intent.Action), slog.Any("error", err))
-									return
-								}
-								if jsCode == "" {
-									return
-								}
-
-								skillName := fmt.Sprintf("%s_%s", intent.Action, sanitizeSkillName(intent.Target))
-								skill := voyager.ExecutableSkill{
-									Name:        skillName,
-									Description: fmt.Sprintf("%s %s (count: %d)", intent.Action, intent.Target, intent.Count),
-									JSCode:      jsCode,
-								}
-
-								if err := s.skillManager.SaveSkill(ctx, skill); err != nil {
-									s.logger.Warn("Failed to persist skill", slog.String("name", skillName), slog.Any("error", err))
-									return
-								}
-								s.logger.Info("Skill synthesized and saved", slog.String("name", skillName))
-							}(*intentVal, *beforeState, afterState)
-						}
-					}
-				}
-			}
-		}
-
-		s.mu.Lock()
-		newHistory := domain.TaskHistory{
-			Intent: *intent, Success: successCritic, Critique: critique,
-		}
-		s.taskHistory = append(s.taskHistory, newHistory)
-
-		// Trim in-memory history to 200 entries max
-		if len(s.taskHistory) > 200 {
-			s.taskHistory = s.taskHistory[len(s.taskHistory)-200:]
-		}
-		s.mu.Unlock()
-
-		// Persist to SQLite
-		if s.memStore != nil {
-			go func(h domain.TaskHistory) {
-				dbCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-				defer cancel()
-				if err := s.memStore.SaveTaskHistory(dbCtx, s.sessionID, []domain.TaskHistory{h}); err != nil {
-					s.logger.Error("Failed to persist task history", slog.Any("error", err))
-				}
-			}(newHistory)
-		}
-
-		s.activeIntent.Store(nil)
-		s.beforeState.Store(nil)
-	}
-
-	if !s.planManager.HasActivePlan() {
-		return
-	}
-
-	if !success && !controlledStop {
-		s.logger.Warn("Plan failed due to task failure", slog.String("failed_task", payload.CommandID))
-		s.commitment.Store(nil)
-
-		currentPlan := s.planManager.GetCurrent()
-		if currentPlan != nil {
-			s.planner.RecordFailure(currentPlan.Objective)
-		}
-
-		if s.planManager.NextFallback() {
-			s.logger.Info("Attempting fallback plan candidate")
-			_ = s.planManager.Transition(domain.PlanStatusActive)
-			s.dispatchActivePlan(ctx)
-			return
-		}
-
-		_ = s.planManager.Transition(domain.PlanStatusFailed)
-
-		s.bus.Publish(ctx, domain.DomainEvent{
-			SessionID: s.sessionID,
-			Type:      domain.EventTypePlanInvalidated,
-			Payload:   []byte(`{}`), // FIX: Prevent EOF unmarshal error on UI broadcast
-			CreatedAt: time.Now(),
-		})
-		go s.evaluateNextPlan()
-		return
-	}
-
-	if controlledStop {
-		s.commitment.Store(nil)
-		if !shouldWaitForFreshState(payload.Cause) {
-			go s.evaluateNextPlan()
-		}
-		return
-	}
-
-	// FIX: Use thread-safe PopTask to progress the plan, avoiding the manual slice race condition
-	hasMoreTasks := s.planManager.PopTask(payload.CommandID)
-	if hasMoreTasks {
-		s.dispatchActivePlan(ctx)
-		return
-	}
-
-	currentPlan := s.planManager.GetCurrent()
-	if currentPlan != nil {
-		s.planner.RecordSuccess(currentPlan.Objective)
-		// A-4: Reset persistent failure count on success
-		if s.memStore != nil {
-			go func(sid, o string) {
-				dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
-				defer cancel()
-				_ = s.memStore.SaveFailureCount(dbCtx, sid, o, 0)
-			}(s.sessionID, currentPlan.Objective)
-		}
-	}
-
-	// FIX: Tell the planner we finished the plan so it stops serving stale cached pointers
-	s.planner.ClearCurrentPlan()
-
-	_ = s.planManager.Transition(domain.PlanStatusCompleted)
-	go s.evaluateNextPlan()
+func (s *RouteScorer) ScoreRoute(ctx context.Context, from, to domain.Vec3, world *domain.WorldModel) float64 {
+	dist := from.DistanceTo(to)
+	
+	// Higher zone cost = lower score
+	cost := world.GetZoneCost(domain.Location{X: to.X, Y: to.Y, Z: to.Z})
+	
+	// Simple heuristic: distance + danger penalty
+	return 100.0 - (dist * 0.1) - (cost * 20.0)
 }
 
-func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.ActionIntent) {
-	if intent == nil {
-		return
-	}
+</file>
 
-	s.commitment.Store(&Commitment{
-		TaskID:      intent.ID,
-		StartTime:   time.Now(),
-		MinDuration: 2 * time.Second,
-	})
+<file path="internal\decision\progression.go">
+package decision
 
-	// Wrap the single intent into a plan for the wire
-	plan := domain.Plan{
-		ID:        fmt.Sprintf("adapted-%d", time.Now().UnixNano()),
-		Objective: "Tactical Adaptation",
-		Tasks: []domain.Action{
-			{
-				ID:        intent.ID,
-				Action:    intent.Action,
-				Target:    domain.Target{Name: intent.Target, Type: "adapted"},
-				Count:     intent.Count,
-				Rationale: intent.Rationale,
-				Priority:  100,
-			},
-		},
-	}
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
 
-	payload, _ := json.Marshal(plan)
-	s.bus.Publish(ctx, domain.DomainEvent{
-		SessionID: s.sessionID,
-		Trace: domain.TraceContext{
-			TraceID:  fmt.Sprintf("tr-ad-%d", time.Now().UnixNano()),
-			ActionID: intent.ID,
-		},
-		Type:      domain.EventTypePlanCreated,
-		Payload:   payload,
-		CreatedAt: time.Now(),
-	})
-}
-
-func (s *Service) handlePlanInvalidated(ctx context.Context, event domain.DomainEvent) {
-	s.commitment.Store(nil)
-	s.activeIntent.Store(nil)
-	s.beforeState.Store(nil)
-	s.planner.ClearCurrentPlan()
-	s.planManager.Clear()
-}
-
-func (s *Service) handleBotRespawn(ctx context.Context, event domain.DomainEvent) {
-	s.handlePlanInvalidated(ctx, event)
-	go func() {
-		time.Sleep(1500 * time.Millisecond)
-		s.evaluateNextPlan()
-	}()
-}
-
-func (s *Service) RequestEvaluation() {
-	s.evaluateNextPlan()
-}
-
-func (s *Service) getTaskHistory() []domain.TaskHistory {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	historyCopy := make([]domain.TaskHistory, len(s.taskHistory))
-	copy(historyCopy, s.taskHistory)
-	return historyCopy
-}
+	"david22573/synaptic-mc/internal/domain"
+)
 
 var techTree = []string{
 	"crafting_table",
@@ -3005,7 +3763,7 @@ func (s *Service) getMilestoneContext() string {
 		unlocked = append(unlocked, m.Name)
 	}
 
-	// Simple next goal derivation
+	// Next goal derivation
 	nextGoal := ""
 	for _, item := range techTree {
 		found := false
@@ -3025,222 +3783,169 @@ func (s *Service) getMilestoneContext() string {
 		strings.Join(unlocked, ", "), nextGoal)
 }
 
-func isProgressionMode(state domain.GameState) bool {
-	// Progression mode active when survival is stable:
-	// health > 14 (enough to survive a surprise),
-	// food > 10 (not starving),
-	// no immediate threats.
-	return state.Health > 14 &&
-		state.Food > 10 &&
-		len(state.Threats) == 0 &&
-		!hasImmediateHazard(state)
+func (s *Service) getTaskHistory() []domain.TaskHistory {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	historyCopy := make([]domain.TaskHistory, len(s.taskHistory))
+	copy(historyCopy, s.taskHistory)
+	return historyCopy
 }
 
-func (s *Service) runEvaluationLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.evalTrigger:
-			s.doEvaluateNextPlan(ctx)
+</file>
+
+<file path="internal\decision\service.go">
+package decision
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"david22573/synaptic-mc/internal/config"
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/memory"
+	"david22573/synaptic-mc/internal/planner"
+	"david22573/synaptic-mc/internal/voyager"
+)
+
+type StateProvider interface {
+	GetCurrentState() domain.VersionedState
+}
+
+type ExecutionStatus interface {
+	IsIdle() bool
+}
+
+type Service struct {
+	ctx           context.Context
+	sessionID     string
+	bus           domain.EventBus
+	planner       *AdvancedPlanner
+	planManager   *PlanManager
+	curriculum    voyager.Curriculum
+	critic        voyager.Critic
+	stateProvider StateProvider
+	execStatus    ExecutionStatus
+	worldModel    *domain.WorldModel
+	memStore      memory.Store
+	feedback      *planner.FeedbackAnalyzer
+	logger        *slog.Logger
+	flags         config.FeatureFlags
+	skillManager  *voyager.SkillManager
+
+	predictor     *StrategyPredictor
+	routeScorer   *RouteScorer
+
+	mu            sync.Mutex
+	evalTrigger   chan struct{}
+	activeIntent  atomic.Pointer[domain.ActionIntent]
+	beforeState   atomic.Pointer[domain.GameState]
+	taskHistory   []domain.TaskHistory
+	milestones    []domain.ProgressionMilestone
+
+	commitment atomic.Pointer[Commitment]
+}
+
+func NewService(
+	ctx context.Context,
+	sessionID string,
+	bus domain.EventBus,
+	advPlanner *AdvancedPlanner,
+	pm *PlanManager,
+	curriculum voyager.Curriculum,
+	critic voyager.Critic,
+	stateProvider StateProvider,
+	execStatus ExecutionStatus,
+	worldModel *domain.WorldModel,
+	memStore memory.Store,
+	feedback *planner.FeedbackAnalyzer,
+	skillManager *voyager.SkillManager,
+	logger *slog.Logger,
+	flags config.FeatureFlags,
+) *Service {
+	s := &Service{
+		ctx:           ctx,
+		sessionID:     sessionID,
+		bus:           bus,
+		planner:       advPlanner,
+		planManager:   pm,
+		curriculum:    curriculum,
+		critic:        critic,
+		stateProvider: stateProvider,
+		execStatus:    execStatus,
+		worldModel:    worldModel,
+		memStore:      memStore,
+		feedback:      feedback,
+		logger:        logger.With(slog.String("component", "decision_service")),
+		flags:         flags,
+		evalTrigger:   make(chan struct{}, 1),
+		taskHistory:   make([]domain.TaskHistory, 0),
+		milestones:    make([]domain.ProgressionMilestone, 0),
+		skillManager:  skillManager,
+		predictor:     NewStrategyPredictor(memStore),
+		routeScorer:   &RouteScorer{},
+	}
+
+	// Load persistent state
+	if memStore != nil {
+		history, err := memStore.GetTaskHistory(ctx, sessionID, 50)
+		if err == nil {
+			s.taskHistory = history
+			s.logger.Info("Loaded task history from persistent store", slog.Int("count", len(history)))
+		}
+
+		milestones, err := memStore.GetMilestones(ctx, sessionID)
+		if err == nil {
+			s.milestones = milestones
+			s.logger.Info("Loaded milestones from persistent store", slog.Int("count", len(milestones)))
+		}
+
+		failures, err := memStore.GetFailureCounts(ctx, sessionID)
+		if err == nil {
+			s.planner.SetFailures(failures)
+			s.logger.Info("Loaded plan failure counts from persistent store", slog.Int("count", len(failures)))
 		}
 	}
-}
 
-func (s *Service) evaluateNextPlan() {
-	select {
-	case s.evalTrigger <- struct{}{}:
-	default:
-		// already queued
-	}
-}
+	bus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
+	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+	bus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
+	bus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
 
-func (s *Service) doEvaluateNextPlan(ctx context.Context) {
-	state := s.stateProvider.GetCurrentState().State
-	if state.Health <= 0 {
-		return
-	}
+	// Link planner background completions to service evaluations
+	advPlanner.SetOnPlanReady(func() {
+		s.logger.Info("Background plan ready, requesting evaluation")
+		s.evaluateNextPlan()
+	})
 
-	survivalOverride := hasImmediateThreat(state) ||
-		hasImmediateHazard(state) ||
-		(state.Health < domain.SurvivalCriticalHealth) ||
-		(state.Health < domain.DecisionHealthSafe && state.Food < domain.SurvivalMinFoodForHunt)
+	// Evaluation background loop
+	go s.runEvaluationLoop(ctx)
 
-	// Keep the current plan/task flowing unless survival needs to interrupt it.
-	if !survivalOverride {
-		if s.activeIntent.Load() != nil || s.planManager.HasActivePlan() || !s.execStatus.IsIdle() {
-			return
-		}
-	}
-
-	if currCommitment := s.commitment.Load(); currCommitment != nil {
-		if time.Since(currCommitment.StartTime) < currCommitment.MinDuration {
-			if state.Health >= domain.DecisionHealthSafe && len(state.Threats) == 0 {
+	// Jumpstart background loop
+	go func() {
+		ticker := time.NewTicker(12 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
-			s.logger.Info("Breaking commitment lock for critical survival event")
-		}
-	}
-
-	var plan domain.Plan
-
-	if survivalOverride {
-		s.logger.Warn("Survival priority override active")
-		plan = s.planner.reactivePlan(ctx, state)
-	} else if isProgressionMode(state) && s.curriculum != nil {
-		s.logger.Info("Stable state detected, curriculum driving progression")
-
-		intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
-		if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
-			if intent.Action == "use_skill" && len(intent.SkillSteps) > 0 {
-				s.logger.Info("Expanding composable skill", slog.String("skill", intent.Target), slog.Int("steps", len(intent.SkillSteps)))
-				plan = domain.Plan{
-					Objective:  intent.Rationale,
-					IsFallback: false,
-					Tasks:      make([]domain.Action, len(intent.SkillSteps)),
-				}
-				for i, step := range intent.SkillSteps {
-					plan.Tasks[i] = domain.Action{
-						ID:        fmt.Sprintf("%s-step-%d", intent.ID, i),
-						Action:    step.Action,
-						Target:    domain.Target{Name: step.Target, Type: "skill_step"},
-						Count:     step.Count,
-						Rationale: step.Rationale,
-						Priority:  75 - i, // Slightly declining priority for later steps
-					}
-				}
-			} else {
-				plan = domain.Plan{
-					Objective:  intent.Rationale,
-					IsFallback: false,
-					Tasks: []domain.Action{
-						{
-							ID:        fmt.Sprintf("curr-%d", time.Now().UnixNano()), // FIX: Force unique ID to avoid idempotency drops from LLM hallucinated loops
-							Action:    intent.Action,
-							Target:    domain.Target{Name: intent.Target, Type: "curriculum"},
-							Count:     intent.Count,
-							Rationale: intent.Rationale,
-							Priority:  70,
-						},
-					},
-				}
-			}
-		} else {
-			if err != nil {
-				s.logger.Error("Curriculum failed to propose task, falling back to tactical planner", slog.Any("error", err))
-			} else {
-				s.logger.Info("Curriculum provided no intent, using tactical planner")
-			}
-			plan = s.planner.FastPlan(ctx, state)
-		}
-	} else {
-		s.logger.Info("Evaluating next tactical objective")
-		plan = s.planner.FastPlan(ctx, state)
-	}
-
-	if !Validate(&plan, state) {
-		s.logger.Warn("Generated plan failed validation, falling back to curriculum", slog.String("objective", plan.Objective))
-		plan.IsFallback = true
-		plan.Tasks = nil
-	}
-
-	if (plan.IsFallback || len(plan.Tasks) == 0) && s.curriculum != nil {
-		// Only trigger fallback if we didn't just try curriculum (or if it's a critical fallback)
-		if plan.Objective != "Curriculum Fallback" && plan.Objective != "Curriculum" {
-			s.logger.Info("Planner failed or empty, using curriculum as fallback")
-
-			intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
-			if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
-				plan = domain.Plan{
-					Objective:  "Curriculum Fallback",
-					IsFallback: true,
-					Tasks: []domain.Action{
-						{
-							ID:        fmt.Sprintf("curr-fb-%d", time.Now().UnixNano()), // FIX: Force unique ID
-							Action:    intent.Action,
-							Target:    domain.Target{Name: intent.Target, Type: "inferred"},
-							Count:     intent.Count,
-							Rationale: intent.Rationale,
-							Priority:  50,
-						},
-					},
+			case <-ticker.C:
+				if !s.planManager.HasActivePlan() && s.activeIntent.Load() == nil && s.execStatus.IsIdle() {
+					s.logger.Info("Jumpstart: bot is idle, forcing evaluation")
+					s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
+					s.evaluateNextPlan()
 				}
 			}
 		}
-	}
+	}()
 
-	if len(plan.Tasks) == 0 {
-		if !survivalOverride {
-			s.logger.Debug("Planner warming up, waiting for background or curiosity loop")
-		}
-		return
-	}
-
-	s.planManager.SetPlan(&plan)
-	_ = s.planManager.Transition(domain.PlanStatusActive)
-	s.dispatchActivePlan(ctx)
+	return s
 }
 
-func (s *Service) dispatchActivePlan(ctx context.Context) {
-	plan := s.planManager.GetCurrent()
-	if plan == nil || len(plan.Tasks) == 0 {
-		return
-	}
-
-	firstTask := plan.Tasks[0]
-
-	// Pre-fetch trigger for the NEXT plan if we're starting the last task of the current plan.
-	if len(plan.Tasks) == 1 {
-		s.logger.Debug("Last task in plan starting; warming next plan")
-		s.planner.WarmNextPlan(ctx, s.sessionID, s.stateProvider.GetCurrentState().State)
-	}
-
-	s.commitment.Store(&Commitment{
-		TaskID:      firstTask.ID,
-		StartTime:   time.Now(),
-		MinDuration: 2 * time.Second,
-	})
-
-	s.activeIntent.Store(&domain.ActionIntent{
-		ID:        firstTask.ID,
-		Action:    firstTask.Action,
-		Target:    firstTask.Target.Name,
-		Count:     firstTask.Count,
-		Rationale: firstTask.Rationale,
-	})
-
-	currentState := s.stateProvider.GetCurrentState().State
-	s.beforeState.Store(&currentState)
-
-	payload, _ := json.Marshal(plan)
-	s.bus.Publish(ctx, domain.DomainEvent{
-		SessionID: s.sessionID,
-		Trace: domain.TraceContext{
-			TraceID:  fmt.Sprintf("tr-%d", time.Now().UnixNano()),
-			ActionID: firstTask.ID,
-		},
-		Type:      domain.EventTypePlanCreated,
-		Payload:   payload,
-		CreatedAt: time.Now(),
-	})
-}
-
-// sanitizeSkillName converts an arbitrary target string into a valid skill name.
-func sanitizeSkillName(target string) string {
-	target = strings.ToLower(strings.TrimSpace(target))
-	target = strings.ReplaceAll(target, " ", "_")
-	// Remove any characters that aren't alphanumeric or underscore.
-	var b strings.Builder
-	for _, r := range target {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
-			b.WriteRune(r)
-		}
-	}
-	result := b.String()
-	if result == "" {
-		return "unnamed"
-	}
-	return result
+func (s *Service) RequestEvaluation() {
+	s.evaluateNextPlan()
 }
 
 </file>
@@ -3412,6 +4117,12 @@ const (
 	CauseFailed          = "FAILED"
 	CauseDistracted      = "DISTRACTED"
 	CauseAbortedDuringHesitation = "ABORTED_DURING_HESITATION"
+	CauseLagDesync      = "LAG_DESYNC"
+	CauseFallingRisk    = "FALLING_RISK"
+	CauseStuckTerrain   = "STUCK_TERRAIN"
+	CauseBlockedMob     = "BLOCKED_MOB"
+	CauseNoTool         = "NO_TOOL"
+	CauseUnreachable    = "UNREACHABLE"
 	CauseUnknown         = "UNKNOWN"
 )
 
@@ -3491,6 +4202,72 @@ func NormalizeEventType(s string) EventType {
 
 </file>
 
+<file path="internal\domain\goal.go">
+package domain
+
+import (
+	"strings"
+)
+
+// GoalUtility defines the base rewards and unlock values for items.
+type GoalUtility struct {
+	BaseReward  float64
+	UnlockValue float64
+	IsResource  bool
+}
+
+var itemUtilities = map[string]GoalUtility{
+	"log":             {BaseReward: 5, UnlockValue: 10, IsResource: true},
+	"oak_log":         {BaseReward: 5, UnlockValue: 10, IsResource: true},
+	"birch_log":       {BaseReward: 5, UnlockValue: 10, IsResource: true},
+	"planks":          {BaseReward: 2, UnlockValue: 15, IsResource: true},
+	"stick":           {BaseReward: 1, UnlockValue: 5, IsResource: true},
+	"crafting_table":  {BaseReward: 0, UnlockValue: 50, IsResource: false},
+	"wooden_pickaxe":  {BaseReward: 0, UnlockValue: 60, IsResource: false},
+	"cobblestone":     {BaseReward: 4, UnlockValue: 20, IsResource: true},
+	"stone_pickaxe":   {BaseReward: 0, UnlockValue: 80, IsResource: false},
+	"iron_ore":        {BaseReward: 10, UnlockValue: 40, IsResource: true},
+	"raw_iron":        {BaseReward: 10, UnlockValue: 0, IsResource: true},
+	"iron_ingot":      {BaseReward: 20, UnlockValue: 100, IsResource: true},
+	"iron_pickaxe":    {BaseReward: 0, UnlockValue: 150, IsResource: false},
+	"diamond_ore":     {BaseReward: 50, UnlockValue: 200, IsResource: true},
+	"diamond":         {BaseReward: 100, UnlockValue: 500, IsResource: true},
+	"coal_ore":        {BaseReward: 5, UnlockValue: 10, IsResource: true},
+	"coal":            {BaseReward: 5, UnlockValue: 0, IsResource: true},
+	"beef":            {BaseReward: 8, UnlockValue: 0, IsResource: true},
+	"cooked_beef":     {BaseReward: 15, UnlockValue: 0, IsResource: true},
+	"porkchop":        {BaseReward: 8, UnlockValue: 0, IsResource: true},
+	"cooked_porkchop": {BaseReward: 15, UnlockValue: 0, IsResource: true},
+	"mutton":          {BaseReward: 8, UnlockValue: 0, IsResource: true},
+	"cooked_mutton":   {BaseReward: 15, UnlockValue: 0, IsResource: true},
+	"chicken":         {BaseReward: 5, UnlockValue: 0, IsResource: true},
+	"cooked_chicken":  {BaseReward: 10, UnlockValue: 0, IsResource: true},
+	"apple":           {BaseReward: 5, UnlockValue: 0, IsResource: true},
+}
+
+// GetItemUtility returns the reward and unlock value for a given target name.
+func GetItemUtility(target string) (float64, float64) {
+	target = strings.ToLower(strings.TrimSpace(target))
+	if u, ok := itemUtilities[target]; ok {
+		return u.BaseReward, u.UnlockValue
+	}
+	
+	// Fallback for general categories
+	if strings.Contains(target, "log") || strings.Contains(target, "wood") {
+		return 5, 10
+	}
+	if strings.Contains(target, "ore") {
+		return 10, 20
+	}
+	if strings.Contains(target, "pickaxe") {
+		return 0, 50
+	}
+	
+	return 1, 0
+}
+
+</file>
+
 <file path="internal\domain\intent.go">
 // internal/domain/intent.go
 package domain
@@ -3528,9 +4305,18 @@ type ProgressionMilestone struct {
 
 // TaskHistory stores the full lifecycle of a task for Phase 4 Vector Memory.
 type TaskHistory struct {
-	Intent   ActionIntent
-	Success  bool
-	Critique string
+	Intent     ActionIntent `json:"intent"`
+	Success    bool         `json:"success"`
+	Critique   string       `json:"critique"` // Legacy field for plain-text logs
+	Reflection *Reflection  `json:"reflection,omitempty"`
+}
+
+// Reflection provides detailed structured feedback on task execution.
+type Reflection struct {
+	Failure string  `json:"failure"`
+	Cause   string  `json:"cause"`
+	Fix     string  `json:"fix"`
+	Score   float64 `json:"score"` // Confidence score 0.0 - 1.0
 }
 
 </file>
@@ -3598,10 +4384,17 @@ import "context"
 
 // ExecutableSkill replaces the old StoredSkill intent-sequence concept.
 type ExecutableSkill struct {
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	JSCode      string  `json:"js_code"`
-	Confidence  float64 `json:"confidence"`
+	Name           string   `json:"name"`
+	Description    string   `json:"description"`
+	JSCode         string   `json:"js_code"`
+	Confidence     float64  `json:"confidence"`
+	Version        int      `json:"version"`
+	AvgTime        float64  `json:"avg_time_ms"`
+	RequiredItems  []string `json:"required_items"`
+	FailureCauses  []string `json:"failure_causes"`
+	ContextTags    []string `json:"context_tags"`
+	TotalRuns      int      `json:"total_runs"`
+	TotalSuccesses int      `json:"total_successes"`
 }
 
 type SkillRecord struct {
@@ -3648,13 +4441,14 @@ const (
 )
 
 type TaskEndPayload struct {
-	Success   bool    `json:"success"`
-	Status    string  `json:"status"`
-	Action    string  `json:"action"`
-	Target    string  `json:"target"`
-	CommandID string  `json:"command_id"`
-	Cause     string  `json:"cause"`
-	Progress  float64 `json:"progress"`
+	Success    bool    `json:"success"`
+	Status     string  `json:"status"`
+	Action     string  `json:"action"`
+	Target     string  `json:"target"`
+	CommandID  string  `json:"command_id"`
+	Cause      string  `json:"cause"`
+	Progress   float64 `json:"progress"`
+	DurationMs int64   `json:"duration_ms"`
 }
 
 type ExecutionResult struct {
@@ -3794,6 +4588,8 @@ type Plan struct {
 	Status        PlanStatus `json:"status"`
 	CreatedAt     time.Time  `json:"created_at"`
 	InvalidatedAt *time.Time `json:"invalidated_at,omitempty"`
+	StrategicGoal string     `json:"strategic_goal"`
+	Subgoals      []string   `json:"subgoals"`
 	Objective     string     `json:"objective"`
 	Tasks         []Action   `json:"tasks"`
 	Fallbacks     [][]Action `json:"fallbacks,omitempty"` // Week 4: Multi-Plan Fallback
@@ -4114,6 +4910,26 @@ type Location struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
 	Z float64 `json:"z"`
+}
+
+type WorldNode struct {
+	ID    string  `json:"id"`
+	Name  string  `json:"name"`
+	Kind  string  `json:"kind"` // cave, village, tree_cluster, furnace_base, safe_base, resource_zone, danger_area
+	Pos   Vec3    `json:"pos"`
+	Score float64 `json:"score"`
+}
+
+type Edge struct {
+	FromID string  `json:"from_id"`
+	ToID   string  `json:"to_id"`
+	Cost   float64 `json:"cost"` // e.g., representing travel route difficulty
+	Risk   float64 `json:"risk"`
+}
+
+type Region struct {
+	Name  string   `json:"name"`
+	Nodes []string `json:"nodes"`
 }
 
 // WorldModel acts as the bot's short-term spatial and tactical memory.
@@ -4889,6 +5705,25 @@ func (e *TaskExecutionEngine) handleFailure(ctx context.Context, action domain.A
 	}
 }
 
+func (e *TaskExecutionEngine) RunEmergencyPolicy(ctx context.Context, action domain.Action) {
+	e.logger.Warn("EMERGENCY: Running immediate survival policy", slog.String("action", action.Action))
+	
+	// 1. Interrupt Current
+	_ = e.AbortCurrent(ctx, "emergency_interrupt")
+
+	// 2. Immediate Dispatch (bypass normal queue/locks if necessary, but here we just call controller)
+	go func() {
+		// Create a separate background context for the emergency action to ensure it completes
+		emergencyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		err := e.controller.Dispatch(emergencyCtx, action)
+		if err != nil {
+			e.logger.Error("Emergency policy dispatch failed", slog.Any("error", err))
+		}
+	}()
+}
+
 func (e *TaskExecutionEngine) OnTaskStart(actionID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -5479,6 +6314,76 @@ func TestControllerManager_Close(t *testing.T) {
 
 </file>
 
+<file path="internal\execution\prep.go">
+package execution
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// PrepOrchestrator handles proactive actions like food farming and pre-escape.
+type PrepOrchestrator struct {
+	logger *slog.Logger
+	engine *TaskExecutionEngine
+}
+
+func NewPrepOrchestrator(engine *TaskExecutionEngine, logger *slog.Logger) *PrepOrchestrator {
+	return &PrepOrchestrator{
+		engine: engine,
+		logger: logger.With(slog.String("component", "prep_orchestrator")),
+	}
+}
+
+// CheckProactiveFarming triggers a farming task if food is getting low but not yet critical.
+func (o *PrepOrchestrator) CheckProactiveFarming(ctx context.Context, state domain.GameState) {
+	if state.Food < 16 && state.Food >= 12 && o.engine.IsIdle() {
+		o.logger.Info("Triggering proactive food farming")
+		action := domain.Action{
+			ID:        fmt.Sprintf("prep-farm-%d", time.Now().UnixNano()),
+			Action:    "gather",
+			Target:    domain.Target{Name: "food_source", Type: "category"},
+			Priority:  40,
+			Rationale: "Proactive farming based on declining food levels",
+		}
+		o.engine.ExecuteAsync(ctx, action)
+	}
+}
+
+// PreEscape initiates a retreat before danger becomes lethal.
+func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState) {
+	dangerRising := false
+	threatCount := 0
+	for _, t := range state.Threats {
+		if t.Distance < 10 {
+			threatCount++
+		}
+	}
+	
+	// If 2+ mobs are approaching and health isn't full, escape early
+	if threatCount >= 2 && state.Health < 18 {
+		dangerRising = true
+	}
+
+	if dangerRising {
+		o.logger.Warn("Danger rising: initiating pre-escape")
+		action := domain.Action{
+			ID:        fmt.Sprintf("prep-escape-%d", time.Now().UnixNano()),
+			Action:    "retreat",
+			Target:    domain.Target{Name: "safe_zone"},
+			Priority:  90,
+			Rationale: "Predictive escape: threat density increasing",
+		}
+		o.engine.RunEmergencyPolicy(ctx, action)
+	}
+}
+
+</file>
+
 <file path="internal\execution\service.go">
 // internal/execution/service.go
 package execution
@@ -5493,6 +6398,7 @@ import (
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/humanization"
+	"david22573/synaptic-mc/internal/observability"
 )
 
 type StateProvider interface {
@@ -5520,6 +6426,8 @@ type ControlService struct {
 
 	lastEvolve time.Time
 	evolveMu   sync.Mutex
+
+	prep *PrepOrchestrator
 }
 
 func NewControlService(
@@ -5543,11 +6451,13 @@ func NewControlService(
 		logger:       logger.With(slog.String("component", "control_service")),
 		failures:     make(map[string]*FailureRecord),
 		activeTimers: make(map[string]*time.Timer),
+		prep:         NewPrepOrchestrator(engine, logger),
 	}
 
 	// Plans arrive from the slower, async pipeline
 	evBus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(s.handlePlanCreated))
 	evBus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
+	evBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
 
 	// Execution events bypass queues via the realtime pipeline
 	rtBus.Subscribe(domain.EventTypeTaskStart, domain.FuncHandler(s.handleTaskStart))
@@ -5558,6 +6468,14 @@ func NewControlService(
 	rtBus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
 
 	return s
+}
+
+func (s *ControlService) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
+	state := s.stateProv.GetCurrentState().State
+
+	// Near-Cheating: Proactive Prep
+	s.prep.CheckProactiveFarming(ctx, state)
+	s.prep.PreEscape(ctx, state)
 }
 
 func (s *ControlService) SetReflexActive(active bool) {
@@ -5651,11 +6569,23 @@ func (s *ControlService) handlePlanInvalidated(ctx context.Context, event domain
 
 func (s *ControlService) handlePanic(ctx context.Context, event domain.DomainEvent) {
 	s.SetReflexActive(true)
+	observability.Metrics.IncInterrupt()
 	_ = s.taskManager.Halt(ctx, "panic_triggered")
 	s.clearAllWatchdogs()
+
+	// Run Emergency Policy (Reflexive)
+	emergencyAction := domain.Action{
+		ID:        fmt.Sprintf("panic-reflex-%d", time.Now().UnixNano()),
+		Action:    "emergency_reflex",
+		Target:    domain.Target{Name: "survival"},
+		Priority:  1000, // Absolute highest priority
+		Rationale: "High-priority survival reflex triggered by sensor data",
+	}
+	s.engine.RunEmergencyPolicy(ctx, emergencyAction)
 }
 
 func (s *ControlService) handleBotDeath(ctx context.Context, event domain.DomainEvent) {
+	observability.Metrics.IncDeath()
 	s.stabilityMu.Lock()
 	s.stability.ReflexActive = false
 	s.stability.DeathCount++
@@ -6699,6 +7629,8 @@ import (
 
 // Config holds the tuning parameters for the humanization engine.
 type Config struct {
+	Enabled bool
+
 	// AttentionDecay is the rate at which focus drops per second (0.0 to 1.0)
 	AttentionDecay float64
 
@@ -6728,6 +7660,7 @@ type Config struct {
 
 func MapToHumanizationConfig(c config.HumanizationConfig) Config {
 	return Config{
+		Enabled:                 c.Enabled,
 		AttentionDecay:          c.AttentionDecay,
 		HesitationBase:          time.Duration(c.HesitationBaseMs) * time.Millisecond,
 		NoiseLevel:              c.NoiseLevel,
@@ -6813,9 +7746,23 @@ func (e *Engine) UpdateConfig(cfg Config) {
 	e.state.mu.Unlock()
 }
 
+const CriticalPriorityThreshold = 900
+
 func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 	var scheduled []ScheduledAction
 	now := time.Now()
+
+	// If humanization is disabled globally, bypass all noise/delays
+	if !e.cfg.Enabled {
+		for _, task := range plan.Tasks {
+			scheduled = append(scheduled, ScheduledAction{
+				Action:    task,
+				ExecuteAt: now,
+			})
+		}
+		return scheduled
+	}
+
 	currentDelay := time.Duration(0)
 
 	approvedTasks := e.intentModel.Apply(plan.Tasks, e.state, ctx)
@@ -6853,15 +7800,20 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 	}
 
 	for _, task := range approvedTasks {
+		// Performance Rule: Never delay emergency reactions for realism
+		if task.Priority >= CriticalPriorityThreshold {
+			scheduled = append(scheduled, ScheduledAction{
+				Action:    task, // No noise, no jitter, pure intent
+				ExecuteAt: now,  // Immediate
+			})
+			continue
+		}
+
 		if task.Priority == 0 {
 			task.Priority = 5
 		}
 
 		noisyTask := ApplyNoise(task, ctx, e.state, e.cfg)
-
-		// Phase 7: Hesitation moved to cognitive decision layer (planner.go)
-		// to avoid stalling physical execution with stale world states.
-		// We still use currentDelay for sequential task spacing.
 
 		scheduled = append(scheduled, ScheduledAction{
 			Action:    noisyTask,
@@ -7736,16 +8688,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type WorldNode struct {
-	Name string
-	Type string
-	Pos  domain.Vec3
-}
-
 type Store interface {
-	MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error
+	MarkWorldNode(ctx context.Context, node domain.WorldNode) error
 	GetKnownWorld(ctx context.Context, pos domain.Vec3) (string, error)
-	GetNearbyNodes(ctx context.Context, pos domain.Vec3, limit int) ([]WorldNode, error)
+	GetNearbyNodes(ctx context.Context, pos domain.Vec3, limit int) ([]domain.WorldNode, error)
+	AddEdge(ctx context.Context, fromID, toID string, cost, risk float64) error
+	AddRegion(ctx context.Context, name string, nodeIDs []string) error
+	GetRegions(ctx context.Context) ([]domain.Region, error)
 	SetSummary(ctx context.Context, sessionID, key, value string) error
 	GetSummary(ctx context.Context, sessionID string) (string, error)
 	SaveTaskHistory(ctx context.Context, sessionID string, history []domain.TaskHistory) error
@@ -7786,11 +8735,27 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	CREATE TABLE IF NOT EXISTS world_nodes (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
-		type TEXT NOT NULL,
+		kind TEXT NOT NULL,
 		x REAL,
 		y REAL,
 		z REAL,
+		score REAL DEFAULT 0.0,
 		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS world_edges (
+		from_id TEXT NOT NULL,
+		to_id TEXT NOT NULL,
+		cost REAL DEFAULT 1.0,
+		risk REAL DEFAULT 0.0,
+		PRIMARY KEY (from_id, to_id),
+		FOREIGN KEY (from_id) REFERENCES world_nodes(id),
+		FOREIGN KEY (to_id) REFERENCES world_nodes(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS world_regions (
+		name TEXT PRIMARY KEY,
+		node_ids TEXT NOT NULL -- stored as JSON array
 	);
 
 	CREATE TABLE IF NOT EXISTS task_history (
@@ -7799,6 +8764,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		intent_json TEXT NOT NULL,
 		success BOOLEAN NOT NULL,
 		critique TEXT NOT NULL,
+		reflection_json TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	
@@ -7820,6 +8786,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply memory schema: %w", err)
 	}
+
+	// Migrations for Graph Memory
+	_, _ = db.Exec("ALTER TABLE world_nodes ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown'")
+	_, _ = db.Exec("ALTER TABLE world_nodes ADD COLUMN score REAL DEFAULT 0.0")
+	_, _ = db.Exec("ALTER TABLE world_edges ADD COLUMN risk REAL DEFAULT 0.0")
 
 	return &SQLiteStore{db: db}, nil
 }
@@ -7856,13 +8827,19 @@ func (s *SQLiteStore) SaveTaskHistory(ctx context.Context, sessionID string, his
 	}
 	defer tx.Rollback()
 
-	query := `INSERT INTO task_history (session_id, intent_json, success, critique) VALUES (?, ?, ?, ?)`
+	query := `INSERT INTO task_history (session_id, intent_json, success, critique, reflection_json) VALUES (?, ?, ?, ?, ?)`
 	for _, h := range history {
 		intentJSON, err := json.Marshal(h.Intent)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, query, sessionID, string(intentJSON), h.Success, h.Critique); err != nil {
+		var reflJSON sql.NullString
+		if h.Reflection != nil {
+			b, _ := json.Marshal(h.Reflection)
+			reflJSON.String = string(b)
+			reflJSON.Valid = true
+		}
+		if _, err := tx.ExecContext(ctx, query, sessionID, string(intentJSON), h.Success, h.Critique, reflJSON); err != nil {
 			return err
 		}
 	}
@@ -7871,7 +8848,7 @@ func (s *SQLiteStore) SaveTaskHistory(ctx context.Context, sessionID string, his
 }
 
 func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limit int) ([]domain.TaskHistory, error) {
-	query := `SELECT intent_json, success, critique FROM task_history WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`
+	query := `SELECT intent_json, success, critique, reflection_json FROM task_history WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, query, sessionID, limit)
 	if err != nil {
 		return nil, err
@@ -7882,11 +8859,15 @@ func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limi
 	for rows.Next() {
 		var h domain.TaskHistory
 		var intentJSON string
-		if err := rows.Scan(&intentJSON, &h.Success, &h.Critique); err != nil {
+		var reflJSON sql.NullString
+		if err := rows.Scan(&intentJSON, &h.Success, &h.Critique, &reflJSON); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(intentJSON), &h.Intent); err != nil {
 			return nil, err
+		}
+		if reflJSON.Valid {
+			_ = json.Unmarshal([]byte(reflJSON.String), &h.Reflection)
 		}
 		history = append(history, h)
 	}
@@ -7899,21 +8880,23 @@ func (s *SQLiteStore) GetTaskHistory(ctx context.Context, sessionID string, limi
 	return history, nil
 }
 
-func (s *SQLiteStore) MarkWorldNode(ctx context.Context, name, nodeType string, pos domain.Vec3) error {
-	// Create a positional composite key so the bot can remember thousands of unique blocks
-	id := fmt.Sprintf("%s_%d_%d_%d", name, int(pos.X), int(pos.Y), int(pos.Z))
+func (s *SQLiteStore) MarkWorldNode(ctx context.Context, node domain.WorldNode) error {
+	if node.ID == "" {
+		node.ID = fmt.Sprintf("%s_%d_%d_%d", node.Name, int(node.Pos.X), int(node.Pos.Y), int(node.Pos.Z))
+	}
 
 	query := `
-	INSERT INTO world_nodes (id, name, type, x, y, z, last_seen) 
-	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO world_nodes (id, name, kind, x, y, z, score, last_seen) 
+	VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT(id) DO UPDATE SET 
+		score = excluded.score,
 		last_seen=CURRENT_TIMESTAMP;`
-	_, err := s.db.ExecContext(ctx, query, id, name, nodeType, pos.X, pos.Y, pos.Z)
+	_, err := s.db.ExecContext(ctx, query, node.ID, node.Name, node.Kind, node.Pos.X, node.Pos.Y, node.Pos.Z, node.Score)
 	return err
 }
 
 func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (string, error) {
-	query := `SELECT name, type, x, y, z, last_seen FROM world_nodes`
+	query := `SELECT name, kind, x, y, z, score, last_seen FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return "KNOWN WORLD: empty", nil
@@ -7921,18 +8904,19 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 	defer rows.Close()
 
 	type nodeDist struct {
-		Name string
-		Type string
-		Dist float64
-		Pos  domain.Vec3
+		Name  string
+		Kind  string
+		Dist  float64
+		Pos   domain.Vec3
+		Score float64
 	}
 	var nodes []nodeDist
 
 	for rows.Next() {
 		var n nodeDist
 		var lastSeen time.Time
-		if err := rows.Scan(&n.Name, &n.Type, &n.Pos.X, &n.Pos.Y, &n.Pos.Z, &lastSeen); err == nil {
-			if n.Type == "hazard" && time.Since(lastSeen) > 30*time.Minute {
+		if err := rows.Scan(&n.Name, &n.Kind, &n.Pos.X, &n.Pos.Y, &n.Pos.Z, &n.Score, &lastSeen); err == nil {
+			if n.Kind == "hazard" && time.Since(lastSeen) > 30*time.Minute {
 				continue // Decay old death zones
 			}
 			dx, dy, dz := n.Pos.X-botPos.X, n.Pos.Y-botPos.Y, n.Pos.Z-botPos.Z
@@ -7960,13 +8944,14 @@ func (s *SQLiteStore) GetKnownWorld(ctx context.Context, botPos domain.Vec3) (st
 
 	for i := 0; i < limit; i++ {
 		n := nodes[i]
-		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f)\n", n.Type, n.Name, n.Dist, n.Pos.X, n.Pos.Y, n.Pos.Z))
+		out.WriteString(fmt.Sprintf("- [%s] %s (%.0fm away at %.0f, %.0f, %.0f) | Score: %.1f\n", n.Kind, n.Name, n.Dist, n.Pos.X, n.Pos.Y, n.Pos.Z, n.Score))
 	}
+
 	return strings.TrimSpace(out.String()), nil
 }
 
-func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, limit int) ([]WorldNode, error) {
-	query := `SELECT name, type, x, y, z FROM world_nodes`
+func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, limit int) ([]domain.WorldNode, error) {
+	query := `SELECT id, name, kind, x, y, z, score FROM world_nodes`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -7974,14 +8959,14 @@ func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, li
 	defer rows.Close()
 
 	type nodeDist struct {
-		node WorldNode
+		node domain.WorldNode
 		dist float64
 	}
 	var nodes []nodeDist
 
 	for rows.Next() {
-		var n WorldNode
-		if err := rows.Scan(&n.Name, &n.Type, &n.Pos.X, &n.Pos.Y, &n.Pos.Z); err == nil {
+		var n domain.WorldNode
+		if err := rows.Scan(&n.ID, &n.Name, &n.Kind, &n.Pos.X, &n.Pos.Y, &n.Pos.Z, &n.Score); err == nil {
 			dx, dy, dz := n.Pos.X-botPos.X, n.Pos.Y-botPos.Y, n.Pos.Z-botPos.Z
 			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
 			nodes = append(nodes, nodeDist{node: n, dist: dist})
@@ -7998,11 +8983,45 @@ func (s *SQLiteStore) GetNearbyNodes(ctx context.Context, botPos domain.Vec3, li
 		nodes = nodes[:limit]
 	}
 
-	result := make([]WorldNode, len(nodes))
+	result := make([]domain.WorldNode, len(nodes))
 	for i, nd := range nodes {
 		result[i] = nd.node
 	}
 	return result, nil
+}
+
+func (s *SQLiteStore) AddEdge(ctx context.Context, fromID, toID string, cost, risk float64) error {
+	query := `INSERT INTO world_edges (from_id, to_id, cost, risk) VALUES (?, ?, ?, ?) ON CONFLICT(from_id, to_id) DO UPDATE SET cost = excluded.cost, risk = excluded.risk`
+	_, err := s.db.ExecContext(ctx, query, fromID, toID, cost, risk)
+	return err
+}
+
+func (s *SQLiteStore) AddRegion(ctx context.Context, name string, nodeIDs []string) error {
+	idsJSON, _ := json.Marshal(nodeIDs)
+	query := `INSERT INTO world_regions (name, node_ids) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET node_ids = excluded.node_ids`
+	_, err := s.db.ExecContext(ctx, query, name, string(idsJSON))
+	return err
+}
+
+func (s *SQLiteStore) GetRegions(ctx context.Context) ([]domain.Region, error) {
+	query := `SELECT name, node_ids FROM world_regions`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var regions []domain.Region
+	for rows.Next() {
+		var r domain.Region
+		var idsJSON string
+		if err := rows.Scan(&r.Name, &idsJSON); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(idsJSON), &r.Nodes)
+		regions = append(regions, r)
+	}
+	return regions, nil
 }
 
 func (s *SQLiteStore) SetSummary(ctx context.Context, sessionID, key, value string) error {
@@ -8391,6 +9410,8 @@ func (c *UIClient) writePump() {
 package observability
 
 import (
+	"sync/atomic"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -8413,6 +9434,97 @@ type SystemMetrics struct {
 	ReflexTriggers prometheus.Counter
 	FailureLoops   prometheus.Counter
 	DroppedEvents  prometheus.Counter
+
+	// Hard Performance Budgeting Metrics
+	PlannerDuration    prometheus.Histogram
+	TaskExecDuration   prometheus.Histogram
+	StateAgeMs         prometheus.Histogram
+	ReplanCount        prometheus.Counter
+	TaskInterruptCount prometheus.Counter
+	EventQueueLag      prometheus.Histogram
+
+	// Scientific Dashboard Metrics (Counters)
+	DeathsTotal            prometheus.Counter
+	TasksCompletedTotal    prometheus.Counter
+	ResourcesGatheredTotal prometheus.Counter
+	PathFailuresTotal      prometheus.Counter
+	SkillReuseTotal        prometheus.Counter
+	SurvivalTimeSeconds    prometheus.Counter
+
+	// Internal Atomic tracking for JSON dashboard (high-ROI simplicity)
+	deaths     atomic.Uint64
+	tasks      atomic.Uint64
+	resources  atomic.Uint64
+	paths      atomic.Uint64
+	skills     atomic.Uint64
+	survival   atomic.Uint64
+	replans    atomic.Uint64
+	interrupts atomic.Uint64
+	stuck      atomic.Uint64
+
+	// Offline Trainer Metrics
+	OfflineTrainingRuns   prometheus.Counter
+	SkillsExtracted       prometheus.Counter
+	DeathReviewsCompleted prometheus.Counter
+}
+
+func (s *SystemMetrics) IncDeath() {
+	s.DeathsTotal.Inc()
+	s.deaths.Add(1)
+}
+
+func (s *SystemMetrics) IncTask() {
+	s.TasksCompletedTotal.Inc()
+	s.tasks.Add(1)
+}
+
+func (s *SystemMetrics) AddResource(n uint64) {
+	s.ResourcesGatheredTotal.Add(float64(n))
+	s.resources.Add(n)
+}
+
+func (s *SystemMetrics) IncPathFailure() {
+	s.PathFailuresTotal.Inc()
+	s.paths.Add(1)
+}
+
+func (s *SystemMetrics) IncSkillReuse() {
+	s.SkillReuseTotal.Inc()
+	s.skills.Add(1)
+}
+
+func (s *SystemMetrics) AddSurvivalTime(seconds uint64) {
+	s.SurvivalTimeSeconds.Add(float64(seconds))
+	s.survival.Add(seconds)
+}
+
+func (s *SystemMetrics) IncReplan() {
+	s.ReplanCount.Inc()
+	s.replans.Add(1)
+}
+
+func (s *SystemMetrics) IncInterrupt() {
+	s.TaskInterruptCount.Inc()
+	s.interrupts.Add(1)
+}
+
+func (s *SystemMetrics) IncStuck() {
+	s.StuckEvents.Inc()
+	s.stuck.Add(1)
+}
+
+func (s *SystemMetrics) GetStats() map[string]any {
+	return map[string]any{
+		"deaths":             s.deaths.Load(),
+		"tasks_completed":    s.tasks.Load(),
+		"resources_gathered": s.resources.Load(),
+		"path_failures":      s.paths.Load(),
+		"skill_reuse":        s.skills.Load(),
+		"survival_time":      s.survival.Load(),
+		"replan_count":       s.replans.Load(),
+		"interrupt_count":    s.interrupts.Load(),
+		"stuck_events":       s.stuck.Load(),
+	}
 }
 
 var Metrics = &SystemMetrics{
@@ -8479,6 +9591,73 @@ var Metrics = &SystemMetrics{
 		Name: "agent_dropped_events_total",
 		Help: "Number of events dropped due to worker saturation",
 	}),
+
+	// Performance Budgeting
+	PlannerDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "agent_planner_duration_ms",
+		Help:    "Time taken to generate a full LLM plan",
+		Buckets: []float64{100, 500, 1000, 2500, 5000, 10000},
+	}),
+	TaskExecDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "agent_task_exec_duration_ms",
+		Help:    "Actual time taken to execute a task in TS",
+		Buckets: []float64{500, 1000, 5000, 10000, 30000, 60000},
+	}),
+	StateAgeMs: promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "agent_state_age_ms",
+		Help:    "Latency between state tick and decision processing",
+		Buckets: []float64{10, 50, 100, 250, 500},
+	}),
+	ReplanCount: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_replan_total",
+		Help: "Total number of background replans triggered",
+	}),
+	TaskInterruptCount: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_task_interrupt_total",
+		Help: "Number of times a running task was aborted by the planner",
+	}),
+	EventQueueLag: promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "agent_event_queue_lag_ms",
+		Help:    "Latency between event creation and worker processing",
+		Buckets: []float64{1, 5, 10, 25, 50, 100},
+	}),
+
+	DeathsTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_deaths_total",
+		Help: "Total number of bot deaths",
+	}),
+	TasksCompletedTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_tasks_completed_total",
+		Help: "Total number of successfully completed tasks",
+	}),
+	ResourcesGatheredTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_resources_gathered_total",
+		Help: "Total quantity of items/blocks collected",
+	}),
+	PathFailuresTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_path_failures_total",
+		Help: "Total number of pathfinding or blocked-path failures",
+	}),
+	SkillReuseTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_skill_reuse_total",
+		Help: "Total number of times a synthesized skill was executed",
+	}),
+	SurvivalTimeSeconds: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_survival_time_seconds_total",
+		Help: "Total cumulative time spent alive",
+	}),
+	OfflineTrainingRuns: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_offline_training_runs_total",
+		Help: "Total number of offline training sessions completed",
+	}),
+	SkillsExtracted: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_skills_extracted_total",
+		Help: "Number of permanent skills synthesized from success mining",
+	}),
+	DeathReviewsCompleted: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_death_reviews_total",
+		Help: "Number of post-mortem death analyses completed",
+	}),
 }
 
 </file>
@@ -8520,10 +9699,12 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 		return nil
 	}
 
-	f.logger.Info("Task failed, analyzing feedback",
-		slog.String("action", intent.Action),
-		slog.String("cause", res.Cause),
-		slog.Float64("progress", res.Progress))
+	if f.logger != nil {
+		f.logger.Info("Task failed, analyzing feedback",
+			slog.String("action", intent.Action),
+			slog.String("cause", res.Cause),
+			slog.Float64("progress", res.Progress))
+	}
 
 	// If we made significant progress before failing, update our local world weight
 	// so the planner knows this wasn't a total bust.
@@ -8533,18 +9714,48 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	// Capture JS stack traces for Iterative Prompting / Debugging
 	if strings.Contains(res.Cause, "stack") || strings.Contains(res.Cause, "Error") {
-		f.logger.Warn("JS Execution Error detected in feedback", slog.String("error", res.Cause))
+		if f.logger != nil {
+			f.logger.Warn("JS Execution Error detected in feedback", slog.String("error", res.Cause))
+		}
 		// We don't necessarily mutate the intent here, but the Critic will pick this up
 		// and add it to the taskHistory for LLM reflection.
 	}
 
 	switch res.Cause {
-	case domain.CauseBlocked, domain.CauseStuck:
-		// Bot is physically trapped or pathing is deadlocking.
+	case domain.CauseBlocked, domain.CauseStuck, domain.CauseStuckTerrain:
+		// Bot is physically trapped or terrain is too complex.
 		if f.world != nil && intent.TargetLocation != nil {
 			f.world.PenalizeZone(*intent.TargetLocation, 10.0)
 		}
+		// REPATH WIDE: Shift target and try a different angle
 		return f.generateFallback(intent)
+
+	case domain.CauseBlockedMob:
+		// KITE THEN RETRY: Reposition far away to draw mob, then resume
+		if f.logger != nil {
+			f.logger.Info("Blocked by mob, initiating kiting policy")
+		}
+		return &domain.ActionIntent{
+			ID:        "kite_" + intent.ID,
+			Action:    "retreat",
+			Target:    "nearby_safe_ground",
+			Count:     1,
+			Rationale: "RECOVERY: Blocked by mob. Kiting to clear path before retry.",
+		}
+
+	case domain.CauseNoTool:
+		// REPLAN CRAFT TOOL: Divert to crafting immediately
+		if f.logger != nil {
+			f.logger.Info("Missing tool, initiating crafting policy")
+		}
+		return f.generatePrerequisitePlan(intent)
+
+	case domain.CauseUnreachable:
+		// BLACKLIST NODE: Permanently penalize this specific target location
+		if f.world != nil && intent.TargetLocation != nil {
+			f.world.PenalizeZone(*intent.TargetLocation, 50.0) // Heavy penalty
+		}
+		return f.triggerReevaluation()
 
 	case domain.CauseTimeout:
 		if res.Progress > 0.1 {
@@ -8560,7 +9771,9 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	case "FALLBACK":
 		// Skill confidence low or manual fallback triggered.
-		f.logger.Info("Manual fallback triggered, dropping to macro re-evaluation")
+		if f.logger != nil {
+			f.logger.Info("Manual fallback triggered, dropping to macro re-evaluation")
+		}
 		return f.triggerReevaluation()
 
 	case domain.CauseMissingResource:
@@ -8616,7 +9829,9 @@ func (f *FeedbackAnalyzer) generateBackoff(failedIntent domain.ActionIntent) *do
 }
 
 func (f *FeedbackAnalyzer) triggerReevaluation() *domain.ActionIntent {
-	f.logger.Info("Task interrupted by survival gate. Triggering macro re-evaluation.")
+	if f.logger != nil {
+		f.logger.Info("Task interrupted by survival gate. Triggering macro re-evaluation.")
+	}
 	return nil
 }
 
@@ -8647,7 +9862,9 @@ func (f *FeedbackAnalyzer) generatePrerequisitePlan(failedIntent domain.ActionIn
 	}
 
 	if dep == nil {
-		f.logger.Warn("Unknown dependency map, dropping to macro strategy", slog.String("target", failedIntent.Target))
+		if f.logger != nil {
+			f.logger.Warn("Unknown dependency map, dropping to macro strategy", slog.String("target", failedIntent.Target))
+		}
 		return nil
 	}
 
@@ -8726,97 +9943,61 @@ func TestFeedbackAnalyzerBlockedWithoutTargetLocationUsesReposition(t *testing.T
 
 </file>
 
-<file path="internal\state\service.go">
+<file path="internal\state\reducer.go">
 package state
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"sync/atomic"
-	"time"
 
 	"david22573/synaptic-mc/internal/domain"
 )
 
-type Service struct {
-	bus          domain.EventBus
-	logger       *slog.Logger
-	stateVersion atomic.Uint64
-	currentState atomic.Pointer[domain.VersionedState]
-}
+// Reduce applies a domain event to the current state to produce a new authoritative state.
+// This centralizes all world memory merging and derived state logic.
+func Reduce(current domain.GameState, event domain.DomainEvent) domain.GameState {
+	switch event.Type {
+	case domain.EventTypeStateTick:
+		var newState domain.GameState
+		if err := json.Unmarshal(event.Payload, &newState); err != nil {
+			return current
+		}
 
-func NewService(bus domain.EventBus, logger *slog.Logger) *Service {
-	s := &Service{
-		bus:    bus,
-		logger: logger.With(slog.String("component", "state_service")),
+		newState.Initialized = true
+
+		// Track chunks visited from heartbeat
+		newState.RecordChunkVisit(int(newState.Position.X)>>4, int(newState.Position.Z)>>4)
+
+		// Preserve and merge long-lived world memory across ticks.
+		newState.DangerZones = mergeDangerZones(current.DangerZones, newState.DangerZones)
+		newState.VisitedChunks = mergeVisitedChunks(current.VisitedChunks, newState.VisitedChunks)
+		newState.TerrainRoughness = mergeTerrainRoughness(current.TerrainRoughness, newState.TerrainRoughness)
+
+		return newState
+
+	case domain.EventTypeTaskEnd:
+		var result struct {
+			Success  bool    `json:"success"`
+			Cause    string  `json:"cause"`
+			Progress float64 `json:"progress"`
+		}
+		if err := json.Unmarshal(event.Payload, &result); err != nil {
+			return current
+		}
+
+		// If we got stuck or pathfinding failed, permanently mark that area as bad for the planner
+		if !result.Success && (result.Cause == domain.CauseBlocked || result.Cause == domain.CauseStuck) {
+			// Copy slice to avoid race condition during mutation
+			next := current
+			next.DangerZones = append([]domain.DangerZone{}, current.DangerZones...)
+			next.VisitedChunks = append([]domain.ChunkCoord{}, current.VisitedChunks...)
+
+			next.MarkAreaRisky(next.Position, result.Cause, 0.85)
+			return next
+		}
 	}
 
-	// Initialize with an empty state so loads never panic
-	s.currentState.Store(&domain.VersionedState{})
-
-	// Wire up the bus listeners
-	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
-
-	// Phase 5: Listen for task completion to alter the world model	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
-
-	return s
-}
-
-func (s *Service) GetCurrentState() domain.VersionedState {
-	if ptr := s.currentState.Load(); ptr != nil {
-		return *ptr
-	}
-	return domain.VersionedState{}
-}
-
-func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent) {
-	var newState domain.GameState
-	if err := json.Unmarshal(event.Payload, &newState); err != nil {
-		s.logger.Error("Failed to unmarshal state payload", slog.Any("error", err))
-		return
-	}
-
-	newState.Initialized = true
-
-	// Phase 5: Build world model - Track chunks visited from heartbeat
-	newState.RecordChunkVisit(int(newState.Position.X)>>4, int(newState.Position.Z)>>4)
-
-	// Preserve and merge long-lived world memory across ticks.
-	curr := s.GetCurrentState()
-	newState.DangerZones = mergeDangerZones(curr.State.DangerZones, newState.DangerZones)
-	newState.VisitedChunks = mergeVisitedChunks(curr.State.VisitedChunks, newState.VisitedChunks)
-	newState.TerrainRoughness = mergeTerrainRoughness(curr.State.TerrainRoughness, newState.TerrainRoughness)
-
-	s.saveState(ctx, newState, event)
-}
-
-// Phase 5: Mutate state actively based on execution feedback
-func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
-	var result struct {
-		Success  bool    `json:"success"`
-		Cause    string  `json:"cause"`
-		Progress float64 `json:"progress"`
-	}
-	if err := json.Unmarshal(event.Payload, &result); err != nil {
-		return
-	}
-
-	// If we got stuck or pathfinding failed, permanently mark that area as bad for the planner
-	if !result.Success && (result.Cause == domain.CauseBlocked || result.Cause == domain.CauseStuck) {
-		curr := s.GetCurrentState()
-
-		// Copy slice to avoid race condition during mutation
-		newState := curr.State
-		newState.DangerZones = append([]domain.DangerZone{}, curr.State.DangerZones...)
-		newState.VisitedChunks = append([]domain.ChunkCoord{}, curr.State.VisitedChunks...)
-
-		s.logger.Info("Marking area as risky due to execution failure", slog.String("cause", result.Cause))
-		newState.MarkAreaRisky(newState.Position, result.Cause, 0.85)
-
-		s.saveState(ctx, newState, event)
-	}
+	return current
 }
 
 func mergeDangerZones(existing, incoming []domain.DangerZone) []domain.DangerZone {
@@ -8910,6 +10091,205 @@ func mergeTerrainRoughness(existing, incoming map[string]float64) map[string]flo
 	return merged
 }
 
+</file>
+
+<file path="internal\state\reducer_test.go">
+package state
+
+import (
+	"testing"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+func TestScenario_MemoryCorruptionReplay(t *testing.T) {
+	initialState := domain.GameState{
+		Health: 20,
+		Food:   20,
+		Position: domain.Vec3{X: 10, Y: 64, Z: 10},
+		Initialized: true,
+	}
+
+	// 1. Simulate malformed JSON payload
+	corruptEvent := domain.DomainEvent{
+		Type:    domain.EventTypeStateTick,
+		Payload: []byte(`{"health": "invalid_type", "food": {}}`),
+	}
+
+	// Reduce should handle the error and return the previous state
+	nextState := Reduce(initialState, corruptEvent)
+	if nextState.Health != 20 {
+		t.Errorf("Expected state to be preserved on malformed JSON, got health: %v", nextState.Health)
+	}
+
+	// 2. Simulate binary/corrupted payload
+	binaryCorrupt := domain.DomainEvent{
+		Type:    domain.EventTypeStateTick,
+		Payload: []byte{0xFF, 0xFE, 0xFD},
+	}
+
+	nextState2 := Reduce(nextState, binaryCorrupt)
+	if nextState2.Position.X != 10 {
+		t.Errorf("Expected state to be preserved on binary corruption, got pos.X: %v", nextState2.Position.X)
+	}
+}
+
+</file>
+
+<file path="internal\state\service.go">
+package state
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/memory"
+)
+
+type Service struct {
+	bus          domain.EventBus
+	memStore     memory.Store
+	logger       *slog.Logger
+	stateVersion atomic.Uint64
+	currentState atomic.Pointer[domain.VersionedState]
+
+	heatmap   *ThreatHeatmap
+	predictor *EnemyPredictor
+}
+
+func NewService(bus domain.EventBus, memStore memory.Store, logger *slog.Logger) *Service {
+	s := &Service{
+		bus:       bus,
+		memStore:  memStore,
+		logger:    logger.With(slog.String("component", "state_service")),
+		heatmap:   NewThreatHeatmap(),
+		predictor: NewEnemyPredictor(),
+	}
+
+	// Initialize with an empty state so loads never panic
+	s.currentState.Store(&domain.VersionedState{})
+
+	// Wire up the bus listeners
+	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
+
+	// Phase 5: Listen for task completion to alter the world model
+	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+
+	// Background Heatmap Decay
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		for range ticker.C {
+			s.heatmap.Decay()
+		}
+	}()
+
+	return s
+}
+
+func (s *Service) GetCurrentState() domain.VersionedState {
+	if ptr := s.currentState.Load(); ptr != nil {
+		return *ptr
+	}
+	return domain.VersionedState{}
+}
+
+func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent) {
+	curr := s.GetCurrentState()
+	newState := Reduce(curr.State, event)
+
+	// Near-Cheating: Record threats in heatmap
+	for _, t := range newState.Threats {
+		danger := 0.1
+		if t.Distance < 5 {
+			danger = 0.5
+		}
+		s.heatmap.RecordThreat(newState.Position, danger)
+	}
+
+	// Near-Cheating: Enemy Prediction (Mock)
+	_ = s.predictor.Predict(newState.Threats)
+
+	// World Memory Graph: Persist significant features
+	if s.memStore != nil {
+		for _, poi := range newState.POIs {
+			nodeType := ""
+			switch {
+			case strings.Contains(strings.ToLower(poi.Name), "village"):
+				nodeType = "village"
+			case strings.Contains(strings.ToLower(poi.Name), "cave"):
+				nodeType = "cave"
+			case strings.Contains(strings.ToLower(poi.Name), "chest") || strings.Contains(strings.ToLower(poi.Name), "bed"):
+				nodeType = "safe_base"
+			}
+
+			if nodeType != "" {
+				score := 10.0
+				if nodeType == "safe_base" {
+					score = 50.0
+				} else if nodeType == "village" {
+					score = 100.0
+				}
+				_ = s.memStore.MarkWorldNode(ctx, domain.WorldNode{
+					Name:  poi.Name,
+					Kind:  nodeType,
+					Pos:   poi.Position,
+					Score: score,
+				})
+			}
+		}
+	}
+
+	// Instant Reactions: High-priority survival check
+	isLava := false
+	isFalling := false
+	for _, fb := range newState.Feedback {
+		cause := strings.ToLower(fb.Cause)
+		if strings.Contains(cause, "lava") {
+			isLava = true
+		}
+		if strings.Contains(cause, "fall") {
+			isFalling = true
+		}
+	}
+	lowHealth := newState.Health < 8.0
+	surroundedCount := 0
+	for _, t := range newState.Threats {
+		if t.Distance < 4.0 {
+			surroundedCount++
+		}
+	}
+	surrounded := surroundedCount >= 3
+
+	if isLava || lowHealth || isFalling || surrounded {
+		s.bus.Publish(ctx, domain.DomainEvent{
+			SessionID: event.SessionID,
+			Type:      domain.EventTypePanic,
+			Payload:   []byte(fmt.Sprintf(`{"cause": "survival_critical", "is_lava": %v, "low_health": %v, "is_falling": %v, "is_surrounded": %v}`, isLava, lowHealth, isFalling, surrounded)),
+			CreatedAt: time.Now(),
+		})
+	}
+
+	s.saveState(ctx, newState, event)
+}
+
+// Phase 5: Mutate state actively based on execution feedback
+func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
+	curr := s.GetCurrentState()
+	nextState := Reduce(curr.State, event)
+
+	// If reducer added a danger zone or changed visited chunks, persist it
+	if len(nextState.DangerZones) != len(curr.State.DangerZones) || 
+	   len(nextState.VisitedChunks) != len(curr.State.VisitedChunks) {
+		s.saveState(ctx, nextState, event)
+	}
+}
+
 func (s *Service) saveState(ctx context.Context, newState domain.GameState, triggerEvent domain.DomainEvent) {
 	vState := domain.VersionedState{
 		Version: s.stateVersion.Add(1),
@@ -8996,6 +10376,86 @@ func TestMergeTerrainRoughnessIncomingOverrides(t *testing.T) {
 	if merged["0,0"] != 0.2 || merged["2,2"] != 0.3 {
 		t.Fatalf("unexpected merged terrain roughness: %+v", merged)
 	}
+}
+
+</file>
+
+<file path="internal\state\threat.go">
+package state
+
+import (
+	"fmt"
+	"math"
+	"sync"
+
+	"david22573/synaptic-mc/internal/domain"
+)
+
+// ThreatHeatmap tracks the spatial density of danger over time.
+type ThreatHeatmap struct {
+	mu    sync.RWMutex
+	cells map[string]float64 // key: "x,z" (chunk-sized cells), value: danger level 0.0-1.0
+}
+
+func NewThreatHeatmap() *ThreatHeatmap {
+	return &ThreatHeatmap{
+		cells: make(map[string]float64),
+	}
+}
+
+func (h *ThreatHeatmap) RecordThreat(pos domain.Vec3, danger float64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	key := getHeatmapKey(pos)
+	h.cells[key] = math.Min(1.0, h.cells[key]+danger)
+}
+
+func (h *ThreatHeatmap) Decay() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for k, v := range h.cells {
+		h.cells[k] = v * 0.95
+		if h.cells[k] < 0.01 {
+			delete(h.cells, k)
+		}
+	}
+}
+
+func (h *ThreatHeatmap) GetDanger(pos domain.Vec3) float64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cells[getHeatmapKey(pos)]
+}
+
+func getHeatmapKey(pos domain.Vec3) string {
+	// 8x8 meter cells for heatmap
+	cx := int(pos.X) >> 3
+	cz := int(pos.Z) >> 3
+	return fmt.Sprintf("%d,%d", cx, cz)
+}
+
+// EnemyPredictor forecasts mob movement to avoid collisions.
+type EnemyPredictor struct {
+	lastPositions map[string]domain.Vec3
+	mu            sync.Mutex
+}
+
+func NewEnemyPredictor() *EnemyPredictor {
+	return &EnemyPredictor{
+		lastPositions: make(map[string]domain.Vec3),
+	}
+}
+
+func (p *EnemyPredictor) Predict(threats []domain.Threat) map[string]domain.Vec3 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	predictions := make(map[string]domain.Vec3)
+	// Mock prediction logic: assumes mobs continue in same direction
+	// In a real impl, we'd need entity IDs from the state update
+	return predictions
 }
 
 </file>
@@ -9380,7 +10840,7 @@ import (
 	"time"
 )
 
-// NodeRunner treats the TS process as a disposable worker.
+// NodeRunner treats the TS process as a disposable worker with exponential backoff.
 type NodeRunner struct {
 	scriptPath string
 	logger     *slog.Logger
@@ -9399,8 +10859,11 @@ func (r *NodeRunner) Ping() {
 	r.lastPing.Store(time.Now().UnixNano())
 }
 
-// Start begins the process loop.
+// Start begins the process loop with exponential backoff.
 func (r *NodeRunner) Start(ctx context.Context) {
+	crashCount := 0
+	lastStartTime := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -9408,19 +10871,26 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		default:
 		}
 
-		r.Ping() // Reset on startup
+		// Reset crash counter if stable for 5 minutes
+		if crashCount > 0 && time.Since(lastStartTime) > 5*time.Minute {
+			r.logger.Info("Process stable for 5m, resetting crash counter", slog.Int("previous_crashes", crashCount))
+			crashCount = 0
+		}
 
-		// Resolve absolute path to make chdir bulletproof
+		r.Ping() // Reset on startup
+		lastStartTime = time.Now()
+
+		// Resolve absolute path
 		absScriptPath, err := filepath.Abs(r.scriptPath)
 		if err != nil {
-			r.logger.Error("Failed to resolve absolute path for TS script", slog.String("path", r.scriptPath), slog.Any("error", err))
+			r.logger.Error("Failed to resolve absolute path", slog.String("path", r.scriptPath), slog.Any("error", err))
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		workDir := filepath.Dir(absScriptPath)
-
-		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir))
+		r.logger.Info("Spawning Node.js bot process", slog.String("work_dir", workDir), slog.Int("attempt", crashCount+1))
+		
 		cmd := exec.CommandContext(ctx, "node", absScriptPath)
 		cmd.Dir = workDir
 		cmd.Stdout = r.loggerWriter("STDOUT")
@@ -9428,7 +10898,7 @@ func (r *NodeRunner) Start(ctx context.Context) {
 
 		if err := cmd.Start(); err != nil {
 			r.logger.Error("Failed to start TS process", slog.Any("error", err))
-			time.Sleep(5 * time.Second)
+			r.waitBeforeRestart(&crashCount)
 			continue
 		}
 
@@ -9437,7 +10907,6 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
-
 			for {
 				select {
 				case <-watchdogCtx.Done():
@@ -9445,7 +10914,7 @@ func (r *NodeRunner) Start(ctx context.Context) {
 				case <-ticker.C:
 					last := time.Unix(0, r.lastPing.Load())
 					if time.Since(last) > 45*time.Second {
-						r.logger.Warn("TS process starved (no state tick for 45s). Sending SIGKILL.")
+						r.logger.Warn("TS process starved (no state tick for 45s). SIGKILL.")
 						_ = cmd.Process.Kill()
 						return
 					}
@@ -9457,12 +10926,31 @@ func (r *NodeRunner) Start(ctx context.Context) {
 		cancelWatchdog()
 
 		if ctx.Err() != nil {
-			return // Shutting down cleanly
+			return
 		}
 
-		r.logger.Warn("TS process died or was killed. Restarting in 3 seconds...", slog.Any("error", err))
-		time.Sleep(3 * time.Second)
+		r.logger.Warn("TS process died or was killed", slog.Any("error", err))
+		r.waitBeforeRestart(&crashCount)
 	}
+}
+
+func (r *NodeRunner) waitBeforeRestart(crashCount *int) {
+	*crashCount++
+	
+	var delay time.Duration
+	switch *crashCount {
+	case 1:
+		delay = 1 * time.Second
+	case 2:
+		delay = 3 * time.Second
+	case 3:
+		delay = 10 * time.Second
+	default:
+		delay = 30 * time.Second // Cap at 30s
+	}
+
+	r.logger.Info("Waiting before restart", slog.Duration("delay", delay), slog.Int("crash_count", *crashCount))
+	time.Sleep(delay)
 }
 
 func (r *NodeRunner) loggerWriter(stream string) *streamWriter {
@@ -9481,7 +10969,6 @@ func (w *streamWriter) Write(p []byte) (n int, err error) {
 	if w.stream == "STDERR" {
 		w.logger.Warn("TS Engine Error", slog.String("msg", string(p)))
 	} else {
-		// FIX: Use Info level here so standard TS logs aren't swallowed by Go's default log filter
 		w.logger.Info("TS Engine Output", slog.String("msg", string(p)))
 	}
 	return len(p), nil
@@ -9495,6 +10982,7 @@ package voyager
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -9503,13 +10991,13 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 )
 
-// Critic interface — unchanged.
+// Critic interface — evaluates task outcomes.
 type Critic interface {
-	Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, string)
+	Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, *domain.Reflection)
 }
 
 // StateCritic evaluates task results. It now accepts an optional LLMClient;
-// if provided, failed tasks get LLM-generated critiques instead of generic messages.
+// if provided, failed tasks get LLM-generated reflections instead of generic messages.
 type StateCritic struct {
 	llm LLMClient // optional — set via NewStateCriticWithLLM
 }
@@ -9524,26 +11012,34 @@ func NewStateCriticWithLLM(client LLMClient) *StateCritic {
 }
 
 // Evaluate checks whether a task succeeded using state diffs, then optionally
-// calls the LLM for a nuanced critique on failure.
-func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, string) {
+// calls the LLM for a nuanced reflection on failure.
+func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) (bool, *domain.Reflection) {
 	// Fast-path: execution layer already reported failure with a cause.
 	if !result.Success {
-		baseCritique := fmt.Sprintf("Task '%s' failed. Cause: %s.", intent.Action, result.Cause)
+		refl := &domain.Reflection{
+			Failure: fmt.Sprintf("Task '%s' failed", intent.Action),
+			Cause:   result.Cause,
+			Score:   0.0,
+		}
 		if failureCount >= 2 {
-			baseCritique += fmt.Sprintf(" This is failure #%d — the current approach is deadlocked. Rethink the entire sequence.", failureCount)
+			refl.Fix = "Current approach is deadlocked. Try a completely different strategy or location."
 		}
 		// Enrich with LLM if available.
 		if c.llm != nil {
-			enriched := c.llmCritique(context.Background(), intent, before, after, result, failureCount)
-			if enriched != "" {
+			if enriched := c.llmReflection(context.Background(), intent, before, after, result, failureCount); enriched != nil {
 				return false, enriched
 			}
 		}
-		return false, baseCritique
+		return false, refl
 	}
 
 	if after.Health <= 0 {
-		return false, "Bot died during execution. Re-evaluate threat assessment and survival priorities."
+		return false, &domain.Reflection{
+			Failure: "Bot died during execution",
+			Cause:   "Lethal damage taken",
+			Fix:     "Prioritize armor or avoid hostiles in this area",
+			Score:   0.0,
+		}
 	}
 
 	// Heuristic state-diff checks (fast, no LLM needed for successes).
@@ -9551,76 +11047,102 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 	afterInv := inventoryMap(after)
 	target := strings.ToLower(strings.TrimSpace(intent.Target))
 
+	successRefl := &domain.Reflection{Score: 1.0}
+
 	switch intent.Action {
 	case "mine", "gather", "farm":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount >= bCount+intent.Count {
-			return true, fmt.Sprintf("Verified: gathered %d %s.", aCount-bCount, intent.Target)
+			return true, successRefl
 		}
 		if aCount > bCount {
-			return true, fmt.Sprintf("Partial: gathered %d %s (wanted %d).", aCount-bCount, intent.Target, intent.Count)
+			return true, &domain.Reflection{Score: 0.7, Cause: "Partial success: gathered fewer items than requested"}
 		}
-		critique := fmt.Sprintf("State diff failed: inventory for '%s' unchanged at %d. Item may have dropped without pickup.", intent.Target, bCount)
+		
+		refl := &domain.Reflection{
+			Failure: "Inventory unchanged",
+			Cause:   fmt.Sprintf("State diff for '%s' failed", intent.Target),
+			Fix:     "Ensure tools are correct and blocks are reachable",
+			Score:   0.0,
+		}
 		if c.llm != nil {
-			if enriched := c.llmCritique(context.Background(), intent, before, after, result, failureCount); enriched != "" {
+			if enriched := c.llmReflection(context.Background(), intent, before, after, result, failureCount); enriched != nil {
 				return false, enriched
 			}
 		}
-		return false, critique
+		return false, refl
 
 	case "craft":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Verified craft: %s increased %d→%d.", intent.Target, bCount, aCount)
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Craft state diff failed: '%s' count did not increase. Check prerequisites and crafting table proximity.", intent.Target)
+		return false, &domain.Reflection{
+			Failure: "Craft failed",
+			Cause:   "Inventory count did not increase",
+			Fix:     "Verify ingredients and proximity to crafting table",
+			Score:   0.0,
+		}
 
 	case "smelt":
 		expectedOutput := getSmeltOutput(target)
 		bCount := beforeInv[expectedOutput]
 		aCount := afterInv[expectedOutput]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Verified smelt: output '%s' increased.", expectedOutput)
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Smelt output '%s' not verified. Check furnace, fuel, and proximity.", expectedOutput)
+		return false, &domain.Reflection{
+			Failure: "Smelt failed",
+			Cause:   "Output item not detected",
+			Fix:     "Ensure fuel is in furnace and you are standing close enough to receive item",
+			Score:   0.0,
+		}
 
 	case "hunt":
 		if after.Health < before.Health && after.Health < 10 {
-			return true, "Hunt completed with critical damage taken — high risk."
+			return true, &domain.Reflection{Score: 0.5, Cause: "Hunt succeeded but with critical health loss"}
 		}
-		return true, "Hunt resolved — survival verified by health delta."
+		return true, successRefl
 
 	case "store":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount < bCount || target == "all" || target == "dump" {
-			return true, "Store verified: items removed from local inventory."
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Store failed: inventory count for '%s' unchanged.", intent.Target)
+		return false, &domain.Reflection{
+			Failure: "Store failed",
+			Cause:   "Items still in inventory",
+			Score:   0.0,
+		}
 
 	case "retrieve":
 		bCount := beforeInv[target]
 		aCount := afterInv[target]
 		if aCount > bCount {
-			return true, fmt.Sprintf("Retrieve verified: '%s' increased.", intent.Target)
+			return true, successRefl
 		}
-		return false, fmt.Sprintf("Retrieve failed: no increase in '%s'.", intent.Target)
+		return false, &domain.Reflection{
+			Failure: "Retrieve failed",
+			Cause:   "No new items in inventory",
+			Score:   0.0,
+		}
 
 	case "eat":
 		if after.Food > before.Food || after.Health > before.Health {
-			return true, "Eat verified: food/health delta is positive."
+			return true, successRefl
 		}
-		return false, "Eat failed: no change in food or health."
+		return false, &domain.Reflection{Failure: "Eat failed", Cause: "No change in food or health", Score: 0.0}
 
 	case "build":
 		beforeTotal := totalItems(beforeInv)
 		afterTotal := totalItems(afterInv)
 		if afterTotal < beforeTotal {
-			return true, fmt.Sprintf("Build verified: %d resources consumed.", beforeTotal-afterTotal)
+			return true, successRefl
 		}
-		return false, "Build failed: no resource consumption detected."
+		return false, &domain.Reflection{Failure: "Build failed", Cause: "No blocks consumed from inventory", Score: 0.0}
 
 	case "explore", "retreat":
 		dx := after.Position.X - before.Position.X
@@ -9628,32 +11150,37 @@ func (c *StateCritic) Evaluate(intent domain.ActionIntent, before, after domain.
 		dz := after.Position.Z - before.Position.Z
 		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
 		if dist > 3.0 {
-			return true, fmt.Sprintf("Movement verified: displaced %.1f blocks.", dist)
+			return true, successRefl
 		}
-		return false, "Stagnant position: bot moved less than 3 blocks. Pathing may be blocked."
+		return false, &domain.Reflection{Failure: "Stagnant position", Cause: "Bot moved less than 3 blocks", Fix: "Check for obstacles or stuck pathfinding", Score: 0.0}
 
 	case "use_skill":
-		// For synthesized skills, trust the execution result; no heuristic available.
-		return true, fmt.Sprintf("Skill '%s' executed without runtime error.", intent.Target)
+		return true, successRefl
 	}
 
-	return true, fmt.Sprintf("%s executed — general state integrity maintained.", intent.Action)
+	return true, successRefl
 }
 
-// llmCritique sends the full execution context to the LLM for a nuanced failure analysis.
-// Returns an empty string if the LLM call fails, so the caller can fall back to heuristic text.
-func (c *StateCritic) llmCritique(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) string {
+// llmReflection sends the full execution context to the LLM for a nuanced failure analysis.
+func (c *StateCritic) llmReflection(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState, result domain.ExecutionResult, failureCount int) *domain.Reflection {
 	if c.llm == nil {
-		return ""
+		return nil
 	}
 
-	systemPrompt := `You are the Critic for an autonomous Minecraft bot. Analyze why a task failed and give precise, actionable feedback.
+	systemPrompt := `You are the Ruthless Critic for an autonomous Minecraft bot. 
+Analyze why a task failed and return a JSON reflection object.
+Format:
+{
+  "failure": "concise description of the failure",
+  "cause": "root cause analysis (e.g., night travel no shield)",
+  "fix": "better next strategy (e.g., sleep before travel)",
+  "score": 0.0
+}
 Rules:
-- Be concise (2-4 sentences max).
+- Be brutally honest and precise.
 - Identify the root cause, not just the symptom.
-- If the failure repeats, suggest a completely different approach.
 - Do NOT suggest actions outside the available set: gather, craft, mine, smelt, hunt, explore, eat, retreat, store, retrieve, build, farm, use_skill.
-- Output plain text only — no JSON, no markdown.`
+- Output strictly JSON.`
 
 	userContent := fmt.Sprintf(`FAILED TASK:
 Action: %s | Target: %s | Count: %d
@@ -9667,7 +11194,7 @@ Inventory: %s
 STATE AFTER:
 Health: %.0f/20, Food: %.0f/20, Position: (%.0f, %.0f, %.0f)
 
-Why did this fail, and what should the bot do differently?`,
+Reflect on this failure.`,
 		intent.Action, intent.Target, intent.Count,
 		failureCount,
 		result.Cause,
@@ -9676,14 +11203,19 @@ Why did this fail, and what should the bot do differently?`,
 		after.Health, after.Food, after.Position.X, after.Position.Y, after.Position.Z,
 	)
 
-	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx2, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
 	response, err := c.llm.GenerateText(ctx2, systemPrompt, userContent)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(response)
+
+	var refl domain.Reflection
+	if err := json.Unmarshal([]byte(domain.CleanJSON(response)), &refl); err != nil {
+		return nil
+	}
+	return &refl
 }
 
 // GenerateRules is kept for interface compatibility but now delegates to the LLM.
@@ -9821,7 +11353,7 @@ type Curriculum interface {
 // CodeSynthesizer can be implemented by a Curriculum to generate executable JS programs.
 // Service checks for this interface via type assertion — it is not required by Curriculum.
 type CodeSynthesizer interface {
-	SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (string, error)
+	SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (CodeSynthesisResult, error)
 }
 
 // AutonomousCurriculum is the live implementation.
@@ -9860,7 +11392,11 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 		if m.Success {
 			status = "SUCCESS"
 		}
-		historyStrs = append(historyStrs, fmt.Sprintf("[%s] Intent: %s %d %s | Critic: %s", status, m.Intent.Action, m.Intent.Count, m.Intent.Target, m.Critique))
+		crit := m.Critique
+		if m.Reflection != nil && m.Reflection.Failure != "" {
+			crit = fmt.Sprintf("%s (Cause: %s, Fix: %s)", m.Reflection.Failure, m.Reflection.Cause, m.Reflection.Fix)
+		}
+		historyStrs = append(historyStrs, fmt.Sprintf("[%s] Intent: %s %d %s | Critic: %s", status, m.Intent.Action, m.Intent.Count, m.Intent.Target, crit))
 	}
 	historyContext := "No recent history."
 	if len(historyStrs) > 0 {
@@ -9879,7 +11415,26 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			for _, s := range skills {
 				var skill domain.ExecutableSkill
 				if err := json.Unmarshal([]byte(s.Code), &skill); err == nil && skill.Name != "" {
-					skillStrs = append(skillStrs, fmt.Sprintf("- Skill: %s (%s)", skill.Name, skill.Description))
+					// Fetch full metadata for the prompt
+					fullSkill, err := c.vector.RetrieveNamedSkill(ctx, skill.Name)
+					if err == nil && fullSkill != nil {
+						skill = *fullSkill
+					}
+					
+					meta := fmt.Sprintf("SuccessRate: %.1f%% (%d/%d), AvgTime: %.1fs, Version: %d", 
+						skill.Confidence*100, skill.TotalSuccesses, skill.TotalRuns, skill.AvgTime/1000.0, skill.Version)
+					
+					if len(skill.ContextTags) > 0 {
+						meta += fmt.Sprintf(", Context: [%s]", strings.Join(skill.ContextTags, ", "))
+					}
+					if len(skill.RequiredItems) > 0 {
+						meta += fmt.Sprintf(", Requires: [%s]", strings.Join(skill.RequiredItems, ", "))
+					}
+					if len(skill.FailureCauses) > 0 {
+						meta += fmt.Sprintf(", CommonFailures: %s", strings.Join(skill.FailureCauses, "|"))
+					}
+					
+					skillStrs = append(skillStrs, fmt.Sprintf("- Skill: %s (%s) | %s", skill.Name, skill.Description, meta))
 				}
 			}
 			if len(skillStrs) > 0 {
@@ -9969,10 +11524,19 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 // Curriculum interface itself doesn't change.
 // ────────────────────────────────────────────────────────────────────────────
 
+type CodeSynthesisResult struct {
+	JSCode        string
+	RequiredItems []string
+}
+
 // SynthesizeCode asks the LLM to write JavaScript that implements the given completed intent.
-// before/after are passed so the LLM can see what actually changed and write accurate code.
-func (c *AutonomousCurriculum) SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (string, error) {
+func (c *AutonomousCurriculum) SynthesizeCode(ctx context.Context, intent domain.ActionIntent, before, after domain.GameState) (CodeSynthesisResult, error) {
 	invDiff := buildInventoryDiff(before, after)
+	
+	// Identify required items (items that were used up or required to be there)
+	// For now, we assume items in inventory BEFORE that decreased in count might be required.
+	// But it's better to ask the LLM.
+	
 	positionDelta := fmt.Sprintf("moved %.1f blocks (%.1f, %.1f, %.1f) → (%.1f, %.1f, %.1f)",
 		distance(before.Position, after.Position),
 		before.Position.X, before.Position.Y, before.Position.Z,
@@ -9985,13 +11549,19 @@ Target: %s
 Count: %d
 Rationale: %s
 
-WHAT ACTUALLY HAPPENED (use this to write accurate code):
+WHAT ACTUALLY HAPPENED:
 Inventory change: %s
 Position: %s
 Health before/after: %.0f / %.0f
 
 Write JavaScript code that performs this task reliably for future runs.
-The code should handle the case where the target might not be immediately visible.`,
+Identify any items required to perform this task (e.g., ["wooden_pickaxe"]).
+
+Format your response as a JSON object:
+{
+  "js_code": "async (bot, goals, Vec3, signal) => { ... }",
+  "required_items": ["item1", "item2"]
+}`,
 		intent.Action,
 		intent.Target,
 		intent.Count,
@@ -10001,20 +11571,24 @@ The code should handle the case where the target might not be immediately visibl
 		before.Health, after.Health,
 	)
 
-	rawCode, err := c.client.GenerateText(ctx, codeSynthesisSystemPrompt, userContent)
+	rawResponse, err := c.client.Generate(ctx, codeSynthesisSystemPrompt, userContent)
 	if err != nil {
-		return "", fmt.Errorf("code synthesis llm failure: %w", err)
+		return CodeSynthesisResult{}, fmt.Errorf("code synthesis llm failure: %w", err)
 	}
 
-	// Strip any markdown fences the LLM might have added despite instructions.
-	code := domain.CleanJSON(rawCode) // reuse the JSON fence stripper
-	code = strings.TrimPrefix(code, "```javascript")
-	code = strings.TrimPrefix(code, "```js")
-	code = strings.TrimPrefix(code, "```")
-	code = strings.TrimSuffix(code, "```")
-	code = strings.TrimSpace(code)
+	var res struct {
+		JSCode        string   `json:"js_code"`
+		RequiredItems []string `json:"required_items"`
+	}
+	if err := json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &res); err != nil {
+		// Fallback to old behavior if JSON fails
+		return CodeSynthesisResult{JSCode: domain.CleanJSON(rawResponse)}, nil
+	}
 
-	return code, nil
+	return CodeSynthesisResult{
+		JSCode:        res.JSCode,
+		RequiredItems: res.RequiredItems,
+	}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -10104,10 +11678,17 @@ import (
 
 // ExecutableSkill represents a JS function stored in the vector database.
 type ExecutableSkill struct {
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	JSCode      string  `json:"js_code"`
-	Confidence  float64 `json:"confidence"`
+	Name           string   `json:"name"`
+	Description    string   `json:"description"`
+	JSCode         string   `json:"js_code"`
+	Confidence     float64  `json:"confidence"`
+	Version        int      `json:"version"`
+	AvgTime        float64  `json:"avg_time_ms"`
+	RequiredItems  []string `json:"required_items"`
+	FailureCauses  []string `json:"failure_causes"`
+	ContextTags    []string `json:"context_tags"`
+	TotalRuns      int      `json:"total_runs"`
+	TotalSuccesses int      `json:"total_successes"`
 }
 
 // SkillManager bridges the vector store and the decision planner.
@@ -10204,8 +11785,8 @@ func (sm *SkillManager) SaveSkill(ctx context.Context, skill ExecutableSkill) er
 	return sm.store.SaveSkill(ctx, skill.Description, string(codeBytes), emb)
 }
 
-func (sm *SkillManager) RecordSkillResult(ctx context.Context, name string, success bool) error {
-	return sm.store.RecordSkillResult(ctx, name, success)
+func (sm *SkillManager) RecordSkillResult(ctx context.Context, name string, success bool, durationMs int64, cause string) error {
+	return sm.store.RecordSkillResult(ctx, name, success, durationMs, cause)
 }
 
 </file>
@@ -10231,7 +11812,7 @@ type VectorStore interface {
 	SaveSkill(ctx context.Context, description string, code string, embedding []float32) error
 	RetrieveSkills(ctx context.Context, queryEmbedding []float32, limit int) ([]SkillRecord, error)
 	RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error)
-	RecordSkillResult(ctx context.Context, name string, success bool) error
+	RecordSkillResult(ctx context.Context, name string, success bool, durationMs int64, cause string) error
 	Close() error
 }
 
@@ -10264,6 +11845,11 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 		success_count INTEGER DEFAULT 0,
 		total_runs INTEGER DEFAULT 0,
 		total_successes INTEGER DEFAULT 0,
+		avg_time_ms REAL DEFAULT 0,
+		failure_causes TEXT DEFAULT '[]',
+		required_items TEXT DEFAULT '[]',
+		context_tags TEXT DEFAULT '[]',
+		version INTEGER DEFAULT 1,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_skills_bucket ON skills(bucket_id);`
@@ -10276,6 +11862,11 @@ func NewSQLiteVectorStore(dbPath string) (*SQLiteVectorStore, error) {
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN total_runs INTEGER DEFAULT 0")
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN total_successes INTEGER DEFAULT 0")
 	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN bucket_id INTEGER DEFAULT 0")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN avg_time_ms REAL DEFAULT 0")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN failure_causes TEXT DEFAULT '[]'")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN required_items TEXT DEFAULT '[]'")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN context_tags TEXT DEFAULT '[]'")
+	_, _ = db.Exec("ALTER TABLE skills ADD COLUMN version INTEGER DEFAULT 1")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_skills_bucket ON skills(bucket_id)")
 
 	return &SQLiteVectorStore{db: db}, nil
@@ -10313,33 +11904,74 @@ func (s *SQLiteVectorStore) SaveSkill(ctx context.Context, description string, c
 		name.Valid = true
 	}
 
+	tagsJSON, _ := json.Marshal(skill.ContextTags)
+
 	// When saving a newly synthesized skill, we start with 1 run/success to give it initial confidence
-	query := `INSERT INTO skills (name, description, code, embedding_json, bucket_id, success_count, total_runs, total_successes) 
-	          VALUES (?, ?, ?, ?, ?, 1, 1, 1) 
+	query := `INSERT INTO skills (name, description, code, bucket_id, embedding_json, success_count, total_runs, total_successes, version, context_tags) 
+	          VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?, ?) 
 	          ON CONFLICT(description) DO UPDATE SET 
 	          code=excluded.code, 
 	          embedding_json=excluded.embedding_json,
-	          bucket_id=excluded.bucket_id`
-	_, err := s.db.ExecContext(ctx, query, name, description, code, string(embeddingBytes), bucketID)
+	          bucket_id=excluded.bucket_id,
+	          version=skills.version + 1,
+	          context_tags=excluded.context_tags`
+	_, err := s.db.ExecContext(ctx, query, name, description, code, bucketID, string(embeddingBytes), skill.Version, string(tagsJSON))
 
 	return err
 }
 
-func (s *SQLiteVectorStore) RecordSkillResult(ctx context.Context, name string, success bool) error {
+func (s *SQLiteVectorStore) RecordSkillResult(ctx context.Context, name string, success bool, durationMs int64, cause string) error {
 	successInc := 0
 	if success {
 		successInc = 1
 	}
-	query := `UPDATE skills SET total_runs = total_runs + 1, total_successes = total_successes + ? WHERE name = ?`
-	_, err := s.db.ExecContext(ctx, query, successInc, name)
+
+	// 1. Get current metadata
+	query := `SELECT total_runs, avg_time_ms, failure_causes FROM skills WHERE name = ?`
+	var runs int
+	var avgTime float64
+	var causesJSON string
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&runs, &avgTime, &causesJSON)
+	if err != nil {
+		return err
+	}
+
+	// 2. Update stats
+	newAvgTime := (avgTime*float64(runs) + float64(durationMs)) / float64(runs+1)
+	
+	var causes []string
+	_ = json.Unmarshal([]byte(causesJSON), &causes)
+	if !success && cause != "" {
+		found := false
+		for _, c := range causes {
+			if c == cause {
+				found = true
+				break
+			}
+		}
+		if !found {
+			causes = append(causes, cause)
+			if len(causes) > 5 {
+				causes = causes[1:]
+			}
+		}
+	}
+	newCausesJSON, _ := json.Marshal(causes)
+
+	// 3. Persist
+	updateQuery := `UPDATE skills SET total_runs = total_runs + 1, total_successes = total_successes + ?, 
+	                avg_time_ms = ?, failure_causes = ? WHERE name = ?`
+	_, err = s.db.ExecContext(ctx, updateQuery, successInc, newAvgTime, string(newCausesJSON), name)
 	return err
 }
 
 func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string) (*domain.ExecutableSkill, error) {
-	query := `SELECT code, total_runs, total_successes FROM skills WHERE name = ?`
+	query := `SELECT code, total_runs, total_successes, avg_time_ms, failure_causes, required_items, context_tags, version FROM skills WHERE name = ?`
 	var code string
-	var runs, successes int
-	err := s.db.QueryRowContext(ctx, query, name).Scan(&code, &runs, &successes)
+	var runs, successes, version int
+	var avgTime float64
+	var causesJSON, itemsJSON, tagsJSON string
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&code, &runs, &successes, &avgTime, &causesJSON, &itemsJSON, &tagsJSON, &version)
 	if err != nil {
 		return nil, err
 	}
@@ -10355,6 +11987,13 @@ func (s *SQLiteVectorStore) RetrieveNamedSkill(ctx context.Context, name string)
 	} else {
 		skill.Confidence = 0.0
 	}
+	skill.TotalRuns = runs
+	skill.TotalSuccesses = successes
+	skill.AvgTime = avgTime
+	skill.Version = version
+	_ = json.Unmarshal([]byte(causesJSON), &skill.FailureCauses)
+	_ = json.Unmarshal([]byte(itemsJSON), &skill.RequiredItems)
+	_ = json.Unmarshal([]byte(tagsJSON), &skill.ContextTags)
 
 	return &skill, nil
 }
@@ -10363,9 +12002,10 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 	bucketID := getBucketID(queryEmbedding)
 
 	// Candidate selection: filter by bucket_id and prioritize high success
-	query := `SELECT description, code, embedding_json, total_runs, total_successes FROM skills 
+	// Statistical Ranking: Weight similarity by success rate
+	query := `SELECT description, code, embedding_json, total_runs, total_successes, avg_time_ms FROM skills 
 	          WHERE bucket_id = ?
-	          ORDER BY total_successes DESC LIMIT 500`
+	          ORDER BY (CAST(total_successes AS FLOAT) / MAX(total_runs, 1)) DESC, total_successes DESC LIMIT 500`
 
 	rows, err := s.db.QueryContext(ctx, query, bucketID)
 	if err != nil {
@@ -10384,7 +12024,8 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 
 		var desc, code, embJSON string
 		var runs, successes int
-		if err := rows.Scan(&desc, &code, &embJSON, &runs, &successes); err != nil {
+		var avgTime float64
+		if err := rows.Scan(&desc, &code, &embJSON, &runs, &successes, &avgTime); err != nil {
 			continue
 		}
 
@@ -10394,10 +12035,15 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 		}
 
 		sim := cosineSimilarity(queryEmbedding, embedding)
+		
+		// Evidence-based weighting: boost similarity for reliable skills
+		successRate := float32(successes) / float32(math.Max(float64(runs), 1))
+		weightedSim := sim * (0.5 + (0.5 * successRate))
+
 		records = append(records, SkillRecord{
 			Description: desc,
 			Code:        code,
-			Similarity:  sim,
+			Similarity:  weightedSim,
 		})
 	}
 
@@ -10407,23 +12053,27 @@ func (s *SQLiteVectorStore) RetrieveSkills(ctx context.Context, queryEmbedding [
 
 	// Fallback: if bucket is empty or too small, search all as a safety net (limited)
 	if len(records) < limit {
-		extraQuery := `SELECT description, code, embedding_json, total_runs, total_successes FROM skills 
+		extraQuery := `SELECT description, code, embedding_json, total_runs, total_successes, avg_time_ms FROM skills 
 		               WHERE bucket_id != ?
-		               ORDER BY total_successes DESC LIMIT ?`
+		               ORDER BY (CAST(total_successes AS FLOAT) / MAX(total_runs, 1)) DESC LIMIT ?`
 		extraRows, err := s.db.QueryContext(ctx, extraQuery, bucketID, limit*2)
 		if err == nil {
 			defer extraRows.Close()
 			for extraRows.Next() {
 				var desc, code, embJSON string
 				var runs, successes int
-				if err := extraRows.Scan(&desc, &code, &embJSON, &runs, &successes); err == nil {
+				var avgTime float64
+				if err := extraRows.Scan(&desc, &code, &embJSON, &runs, &successes, &avgTime); err == nil {
 					var embedding []float32
 					if err := json.Unmarshal([]byte(embJSON), &embedding); err == nil {
 						sim := cosineSimilarity(queryEmbedding, embedding)
+						successRate := float32(successes) / float32(math.Max(float64(runs), 1))
+						weightedSim := sim * (0.5 + (0.5 * successRate))
+						
 						records = append(records, SkillRecord{
 							Description: desc,
 							Code:        code,
-							Similarity:  sim,
+							Similarity:  weightedSim,
 						})
 					}
 				}
@@ -11228,6 +12878,64 @@ bootstrap().catch((err: Error) => {
 
 </file>
 
+<file path="js\lib\combat\controller.ts">
+// js/lib/combat/controller.ts
+import type { Bot } from "mineflayer";
+import { log } from "../logger.js";
+
+export class CombatController {
+    constructor(private bot: Bot) {}
+
+    public async disengage(): Promise<void> {
+        log.info("[Combat] Disengaging from combat");
+        this.bot.clearControlStates();
+        
+        if (!this.bot.entity) return;
+
+        // Find nearest threat
+        const threats = Object.values(this.bot.entities).filter(e => 
+            e.type === 'mob' && e.position.distanceTo(this.bot.entity.position) < 10
+        );
+
+        if (threats.length > 0) {
+            const nearest = threats.sort((a, b) => 
+                a.position.distanceTo(this.bot.entity.position) - b.position.distanceTo(this.bot.entity.position)
+            )[0];
+            
+            if (nearest) {
+                // Look away from threat
+                const dx = this.bot.entity.position.x - nearest.position.x;
+                const dz = this.bot.entity.position.z - nearest.position.z;
+                const yaw = Math.atan2(dx, dz);
+                await this.bot.look(yaw, 0, true);
+            }
+        }
+
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('sprint', true);
+        this.bot.setControlState('jump', true);
+
+        await new Promise(r => setTimeout(r, 2000));
+        this.bot.clearControlStates();
+    }
+
+    public async hitAndRun(target: any): Promise<void> {
+        if (!target) return;
+        
+        await this.bot.lookAt(target.position, true);
+        this.bot.attack(target);
+        
+        // Reflexive backoff after hit
+        this.bot.setControlState('back', true);
+        this.bot.setControlState('jump', true);
+        await new Promise(r => setTimeout(r, 500));
+        this.bot.setControlState('back', false);
+        this.bot.setControlState('jump', false);
+    }
+}
+
+</file>
+
 <file path="js\lib\config.ts">
 import * as dotenv from "dotenv";
 import * as fs from "fs";
@@ -11354,6 +13062,7 @@ import { ControlLoop } from "./loop.js";
 import { INTENT_EVALUATORS } from "../tasks/registry.js";
 import { log } from "../logger.js";
 import { Vec3 } from "vec3";
+import { CombatController } from "../combat/controller.js";
 import {
     getWorldControlOverrides,
     senseWorld,
@@ -11381,12 +13090,14 @@ export class BotController {
     public activeIntent: ActionIntent | null = null;
     public intentState: Record<string, any> = {};
     private loop: ControlLoop;
+    private combat: CombatController;
 
     constructor(
         public bot: Bot,
         private getThreats: () => ThreatInfo[] = () => [],
     ) {
         this.loop = new ControlLoop(this);
+        this.combat = new CombatController(bot);
     }
 
     public setIntent(intent: ActionIntent) {
@@ -11424,6 +13135,14 @@ export class BotController {
             interactTarget: null,
             clearPathfinder: false,
         };
+
+        // Combat disengage reflex
+        const closeThreats = perception.threats.filter(t => t.distance < 5);
+        if ((this.bot.health < 10 || closeThreats.length >= 3) && perception.intent?.action !== 'retreat') {
+            log.warn("[Reflex] Survival critical: triggering combat disengage");
+            this.combat.disengage(); // Fire and forget async
+            return this.mergeWorldReflexes(defaultPlan, perception.world);
+        }
 
         if (!perception.intent || !this.bot.entity) {
             return this.mergeWorldReflexes(defaultPlan, perception.world);
@@ -11557,10 +13276,12 @@ export class ControlLoop {
 // js/lib/control/runtime.ts
 import { Bot } from "mineflayer";
 import { applyWorldMovementReflexes, senseWorld } from "../utils/world.js";
+import { autoEat, emergencyFlee, preventFall, unstuckLogic } from "../movement/recovery.js";
 
 export class Runtime {
     private active = true;
     private lastJumpAt = 0;
+    private lastEatAt = 0;
 
     constructor(private bot: Bot) {}
 
@@ -11577,7 +13298,7 @@ export class Runtime {
             .catch(() => {});
 
         while (this.active && !signal.aborted) {
-            this.readStateAndAdjust();
+            await this.readStateAndAdjust();
             
             const isMoving = (this.bot as any).pathfinder?.isMoving();
             // Poll faster when moving (100ms), slower when stationary (250ms)
@@ -11587,11 +13308,28 @@ export class Runtime {
         return await taskPromise;
     }
 
-    private readStateAndAdjust() {
+    private async readStateAndAdjust() {
         if (!this.bot.entity) return;
 
         const isMoving = (this.bot as any).pathfinder?.isMoving();
         const world = senseWorld(this.bot);
+
+        // 1. Instant Reactions (Highest ROI)
+        
+        // Lava detection interrupt
+        if (world.panicCause === 'lava' || world.panicCause === 'fire') {
+            await emergencyFlee(this.bot, 2000);
+            return;
+        }
+
+        // Fall prevention
+        preventFall(this.bot);
+
+        // Auto Eat
+        if (this.bot.food < 14 && Date.now() - this.lastEatAt > 5000) {
+            this.lastEatAt = Date.now();
+            await autoEat(this.bot);
+        }
 
         if (!isMoving) {
             this.bot.setControlState("jump", false);
@@ -11614,6 +13352,11 @@ export class Runtime {
                     controls.left ||
                     controls.right,
             ) || isMoving;
+
+        // Unstuck Logic
+        if (wantsMotion && horizontalSpeed < 0.01 && collided) {
+            await unstuckLogic(this.bot);
+        }
 
         const shouldJump =
             world.movement.inWater ||
@@ -11689,6 +13432,34 @@ export class StuckError extends ExecutionError {
     constructor(message: string = "bot physically stuck during movement") {
         super(message, "STUCK", 0);
         this.name = "StuckError";
+    }
+}
+
+export class StuckTerrainError extends ExecutionError {
+    constructor(message: string = "STUCK_TERRAIN") {
+        super(message, "STUCK_TERRAIN", 0);
+        this.name = "StuckTerrainError";
+    }
+}
+
+export class BlockedMobError extends ExecutionError {
+    constructor(message: string = "BLOCKED_MOB") {
+        super(message, "BLOCKED_MOB", 0);
+        this.name = "BlockedMobError";
+    }
+}
+
+export class NoToolError extends ExecutionError {
+    constructor(message: string = "NO_TOOL") {
+        super(message, "NO_TOOL", 0);
+        this.name = "NoToolError";
+    }
+}
+
+export class UnreachableError extends ExecutionError {
+    constructor(message: string = "UNREACHABLE") {
+        super(message, "UNREACHABLE", 0);
+        this.name = "UnreachableError";
     }
 }
 
@@ -11959,6 +13730,90 @@ export async function applyHesitation(bot: Bot): Promise<void> {
 
 </file>
 
+<file path="js\lib\movement\navigation.ts">
+import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import { log } from "../logger.js";
+
+export interface SteerOptions {
+    lookahead?: number;
+    smoothness?: number;
+    antiSpin?: boolean;
+}
+
+export class Navigation {
+    private lastYaw = 0;
+    private lastJumpTime = 0;
+
+    constructor(private bot: Bot) {}
+
+    public steer(target: Vec3, opts: SteerOptions = {}): Record<string, boolean> {
+        const { smoothness = 0.3, antiSpin = true } = opts;
+        const controls = {
+            forward: false,
+            back: false,
+            left: false,
+            right: false,
+            jump: false,
+            sprint: false,
+        };
+
+        if (!this.bot.entity) return controls;
+
+        const pos = this.bot.entity.position;
+        const dx = target.x - pos.x;
+        const dz = target.z - pos.z;
+        const dy = target.y - pos.y;
+
+        let desiredYaw = Math.atan2(-dx, -dz);
+        const dist2d = Math.sqrt(dx * dx + dz * dz);
+        const desiredPitch = Math.atan2(dy, dist2d);
+
+        // Anti-Spin / Anti-Jitter logic
+        if (antiSpin) {
+            let yawDiff = desiredYaw - this.lastYaw;
+            while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+            while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+
+            // Clamp rotation speed for human-like movement
+            const maxRotation = 0.5; // rad per tick
+            if (Math.abs(yawDiff) > maxRotation) {
+                desiredYaw = this.lastYaw + Math.sign(yawDiff) * maxRotation;
+            }
+        }
+
+        // Path Smoothing: interpolate look
+        const smoothedYaw = this.lastYaw * (1 - smoothness) + desiredYaw * smoothness;
+        this.bot.look(smoothedYaw, desiredPitch, true);
+        this.lastYaw = smoothedYaw;
+
+        controls.forward = true;
+        controls.sprint = dist2d > 2.0;
+
+        // Jump Timing & Obstacle Prediction
+        const vel = this.bot.entity.velocity;
+        const horizontalSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+
+        const yaw = this.bot.entity.yaw;
+        const blockInFront = this.bot.blockAt(pos.offset(-Math.sin(yaw) * 1.5, 0, -Math.cos(yaw) * 1.5));
+        const blockAbove = this.bot.blockAt(pos.offset(-Math.sin(yaw) * 1.5, 1, -Math.cos(yaw) * 1.5));
+
+        const now = Date.now();
+        if (
+            blockInFront && blockInFront.boundingBox === "block" &&
+            (!blockAbove || blockAbove.name === "air") &&
+            now - this.lastJumpTime > 500
+        ) {
+            controls.jump = true;
+            this.lastJumpTime = now;
+        }
+
+        return controls;
+    }
+}
+
+</file>
+
 <file path="js\lib\movement\navigator.ts">
 // js/lib/movement/navigator.ts
 import type { Bot } from "mineflayer";
@@ -12209,6 +14064,83 @@ export function steerTowards(
 
 </file>
 
+<file path="js\lib\movement\pathfinder.ts">
+import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import pkg from "mineflayer-pathfinder";
+import { log } from "../logger.js";
+
+const { goals } = pkg;
+
+export interface PathResult {
+    path: Vec3[];
+    status: "success" | "noPath" | "timeout";
+}
+
+export class RollingPathfinder {
+    private currentPath: Vec3[] = [];
+    private lastPathTime = 0;
+    private isCalculating = false;
+
+    constructor(private bot: Bot) {}
+
+    public getPath(): Vec3[] {
+        return this.currentPath;
+    }
+
+    public async updatePath(goal: any): Promise<PathResult> {
+        if (this.isCalculating) {
+            return { path: this.currentPath, status: "success" };
+        }
+
+        // Limit repathing frequency to save CPU
+        const now = Date.now();
+        if (now - this.lastPathTime < 500 && this.currentPath.length > 0) {
+            return { path: this.currentPath, status: "success" };
+        }
+
+        this.isCalculating = true;
+        try {
+            // We use the pathfinder directly to get the raw path points
+            const results = (this.bot.pathfinder as any).getPathTo(goal);
+            if (results && results.path) {
+                this.currentPath = results.path.map((p: any) => new Vec3(p.x, p.y, p.z));
+                this.lastPathTime = Date.now();
+                return { path: this.currentPath, status: "success" };
+            }
+            return { path: [], status: "noPath" };
+        } catch (err) {
+            log.error("[Pathfinder] Path calculation failed", { error: err });
+            return { path: [], status: "noPath" };
+        } finally {
+            this.isCalculating = false;
+        }
+    }
+
+    public getNextWaypoint(lookahead: number = 3): Vec3 | null {
+        if (this.currentPath.length === 0) return null;
+        
+        // Find the index in the path closest to current bot position
+        const botPos = this.bot.entity.position;
+        let closestIdx = 0;
+        let minDist = Infinity;
+        
+        for (let i = 0; i < Math.min(this.currentPath.length, 10); i++) {
+            const dist = botPos.distanceTo(this.currentPath[i]);
+            if (dist < minDist) {
+                minDist = dist;
+                closestIdx = i;
+            }
+        }
+
+        // Return a point slightly ahead for smoothness
+        const targetIdx = Math.min(closestIdx + lookahead, this.currentPath.length - 1);
+        return this.currentPath[targetIdx];
+    }
+}
+
+</file>
+
 <file path="js\lib\movement\progress.ts">
 // js/lib/movement/progress.ts
 import { Vec3 } from "vec3";
@@ -12394,6 +14326,7 @@ export async function sideStepRecovery(
     bot.setControlState(left ? "left" : "right", true);
     bot.setControlState("forward", true);
     bot.setControlState("jump", true);
+    bot.setControlState("sprint", true);
 
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -12423,6 +14356,7 @@ export async function backOffRecovery(
     if (signal?.aborted) return;
 
     bot.setControlState("back", true);
+    bot.setControlState("sprint", false);
     if (Math.random() > 0.5) {
         bot.setControlState(Math.random() > 0.5 ? "left" : "right", true);
     }
@@ -12443,6 +14377,75 @@ export async function backOffRecovery(
             signal.addEventListener("abort", onAbort, { once: true });
         }
     });
+}
+
+export async function emergencyFlee(
+    bot: Bot,
+    durationMs: number = 3000,
+): Promise<void> {
+    bot.clearControlStates();
+    if (!bot.entity) return;
+
+    // Turn 180 degrees from current look
+    bot.look(bot.entity.yaw + Math.PI, bot.entity.pitch, true);
+    bot.setControlState("forward", true);
+    bot.setControlState("sprint", true);
+    bot.setControlState("jump", true);
+
+    return new Promise((resolve) => {
+        setTimeout(() => {
+            bot.clearControlStates();
+            resolve();
+        }, durationMs);
+    });
+}
+
+export async function autoEat(bot: Bot): Promise<void> {
+    const food = bot.inventory
+        .items()
+        .find((item) => item.name.includes("cooked") || item.name === "apple");
+    if (food) {
+        try {
+            await bot.equip(food, "hand");
+            await bot.consume();
+        } catch (err) {
+            // ignore eat errors
+        }
+    }
+}
+
+export function preventFall(bot: Bot) {
+    if (!bot.entity) return;
+    // Simple reflex: if vertical velocity is negative and large, try to sneak or water bucket (if we had one)
+    if (bot.entity.velocity.y < -0.6) {
+        bot.setControlState("sneak", true);
+    } else {
+        bot.setControlState("sneak", false);
+    }
+}
+
+export async function unstuckLogic(bot: Bot): Promise<void> {
+    bot.clearControlStates();
+    bot.setControlState("jump", true);
+    bot.setControlState("back", true);
+    await new Promise((r) => setTimeout(r, 500));
+    bot.setControlState("back", false);
+    bot.setControlState("left", Math.random() > 0.5);
+    await new Promise((r) => setTimeout(r, 500));
+    bot.clearControlStates();
+}
+
+export async function lagRecovery(bot: Bot): Promise<void> {
+    bot.clearControlStates();
+    bot.pathfinder.setGoal(null);
+    await bot.waitForTicks(10); // Wait 500ms for server catch-up
+}
+
+export async function fallRecovery(bot: Bot): Promise<void> {
+    if (!bot.entity) return;
+    bot.setControlState("sneak", true);
+    await bot.waitForTicks(20);
+    bot.setControlState("sneak", false);
 }
 
 export async function jumpRecovery(
@@ -15175,11 +17178,30 @@ export async function handleUseSkill(ctx: TaskContext): Promise<void> {
         );
     }
 
+    // Required items check
+    const requiredItems = (skillPayload as any).required_items || [];
+    if (requiredItems.length > 0) {
+        const inventory = bot.inventory.items().map(i => i.name);
+        const missing = requiredItems.filter((item: string) => !inventory.includes(item));
+        if (missing.length > 0) {
+            log.warn("[UseSkill] Missing required items for skill", {
+                skill: skillName,
+                missing,
+            });
+            throw new ExecutionError(
+                `Skill '${skillName}' missing requirements: ${missing.join(", ")}`,
+                "MISSING_RESOURCE",
+                0,
+            );
+        }
+    }
+
     log.info("[UseSkill] Executing skill", {
         skill: skillName,
         desc: skillPayload.description,
         codeLen: skillPayload.js_code.length,
         confidence,
+        version: (skillPayload as any).version,
     });
 
     // Compile and execute in a vm context.
@@ -16057,6 +18079,10 @@ import {
     NoTargetsNearbyError,
     isAbortError,
     ExecutionError,
+    UnreachableError,
+    BlockedMobError,
+    StuckTerrainError,
+    NoToolError,
 } from "../errors.js";
 import { steerTowards } from "../movement/navigator.js";
 import { applyWorldMovementReflexes, senseWorld } from "../utils/world.js";
@@ -16230,6 +18256,9 @@ export interface MoveOptions {
     stuckTimeoutMs?: number;
 }
 
+import { Navigation } from "../movement/navigation.js";
+import { RollingPathfinder } from "../movement/pathfinder.js";
+
 export function moveToGoal(
     bot: Bot,
     goal: any,
@@ -16239,18 +18268,16 @@ export function moveToGoal(
         signal,
         timeoutMs,
         stopMovement,
-        dynamic = false,
         stuckTimeoutMs = 2000,
     } = opts;
 
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
         if (signal?.aborted) {
             return reject(new TaskAbortError());
         }
 
-        if (goal.isEnd && goal.isEnd(bot.entity.position)) {
-            return resolve();
-        }
+        const pathfinder = new RollingPathfinder(bot);
+        const navigation = new Navigation(bot);
 
         let settled = false;
         let lastPos = bot.entity.position.clone();
@@ -16258,14 +18285,9 @@ export function moveToGoal(
         let ticksElapsed = 0;
         const timeoutTicks = Math.floor(timeoutMs / 50);
 
-        const listeners = new Map<string, any>();
-
         const cleanup = () => {
             bot.removeListener("physicsTick", onTick);
-            listeners.forEach((handler, event) =>
-                bot.removeListener(event as any, handler),
-            );
-            listeners.clear();
+            bot.clearControlStates();
         };
 
         const finish = (err?: Error) => {
@@ -16291,127 +18313,75 @@ export function moveToGoal(
                     : new TaskAbortError(),
             );
 
-        const onGoalReached = () => {
-            finish();
-        };
+        if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+        }
 
-        const onPathUpdate = (results: any) => {
-            if (results.status === "noPath") {
-                finish(new Error("no_path"));
-            } else if (results.status === "timeout") {
-                finish(new Error("pathfinder_timeout"));
-            }
-        };
-
-        const getGoalPos = (): Vec3 | null => {
-            if (goal.x !== undefined && goal.z !== undefined) {
-                return new Vec3(
-                    goal.x,
-                    goal.y ?? bot.entity.position.y,
-                    goal.z,
-                );
-            }
-            if ((goal as any).dest) {
-                const dest = (goal as any).dest;
-                return new Vec3(dest.x, dest.y, dest.z);
-            }
-            if ((goal as any).entity?.position) {
-                return (goal as any).entity.position;
-            }
-            return null;
-        };
-
-        const onTick = () => {
+        const onTick = async () => {
             if (settled) return;
             ticksElapsed++;
-            const world = senseWorld(bot);
 
             if (ticksElapsed > timeoutTicks) {
                 finish(new Error("timeout"));
                 return;
             }
 
-            const targetVec = getGoalPos();
+            // 1. Rolling Path Update
+            await pathfinder.updatePath(goal);
+            const waypoint = pathfinder.getNextWaypoint(3);
 
-            // Engine-synced stuck checking (~800ms intervals)
-            if (ticksElapsed % 16 === 0) {
+            if (!waypoint) {
+                // If no waypoint and not at goal, we might be lost
+                const distToGoal = bot.entity.position.distanceTo(goal);
+                if (distToGoal > 2) {
+                    stuckStrikes++;
+                    if (stuckStrikes > 40) finish(new UnreachableError(`Cannot find path to goal (${distToGoal.toFixed(1)}m away)`));
+                } else {
+                    finish();
+                }
+                return;
+            }
+
+            // 2. Predictive Steering
+            const controls = navigation.steer(waypoint);
+            for (const [state, active] of Object.entries(controls)) {
+                bot.setControlState(state as any, active);
+            }
+
+            // 3. Elite Stuck Detection (reason-based)
+            if (ticksElapsed % 10 === 0) {
                 const currentPos = bot.entity.position;
-                const distSinceLast = lastPos.distanceTo(currentPos);
+                const distMoved = lastPos.distanceTo(currentPos);
                 const vel = bot.entity.velocity;
                 const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-                // More lenient stuck detection: requires 3 strikes (~2.4s)
-                // Checks if we are trying to move (either via pathfinder or steering hijack)
-                const isTryingToMove =
-                    bot.pathfinder.isMoving() ||
-                    (targetVec && currentPos.distanceTo(targetVec) < 2.5);
-
-                if (
-                    isTryingToMove &&
-                    distSinceLast < 0.1 &&
-                    speed < 0.02 &&
-                    !world.movement.submerged
-                ) {
+                if (distMoved < 0.1 && speed < 0.05) {
                     stuckStrikes++;
                     if (stuckStrikes >= 3) {
-                        finish(
-                            new ExecutionError(
-                                "bot physically stuck during movement",
-                                "STUCK",
-                                0.0,
-                            ),
+                        // Classify the stuck reason
+                        const nearbyMobs = Object.values(bot.entities).filter(e => 
+                            e.type === 'mob' && e.position.distanceTo(currentPos) < 3
                         );
+                        
+                        if (nearbyMobs.length > 0) {
+                            finish(new BlockedMobError(`Path blocked by ${nearbyMobs[0].name}`));
+                        } else {
+                            finish(new StuckTerrainError("Physically stuck in complex terrain"));
+                        }
                     }
                 } else {
-                    // Decaying strikes to handle intermittent slow-downs
                     stuckStrikes = Math.max(0, stuckStrikes - 1);
                 }
                 lastPos = currentPos.clone();
             }
 
-            // Hijack the final approach with per-tick continuous steering
-            if (targetVec) {
-                const currentPos = bot.entity.position;
-                const distToGoal = currentPos.distanceTo(targetVec);
-
-                // If very close, override pathfinder completely with steering
-                if (distToGoal < 2.5) {
-                    if (world.movement.steepDropAhead && distToGoal > 1.1) {
-                        // Let pathfinder keep owning cliff-adjacent micro-positioning.
-                        // Cancelling it here can leave the bot frozen until timeout.
-                        return;
-                    }
-
-                    if (bot.pathfinder.isMoving()) {
-                        bot.pathfinder.setGoal(null);
-                    }
-
-                    steerTowards(bot, targetVec, 0.8, true);
-                    applyWorldMovementReflexes(bot, world);
-
-                    if (distToGoal < 1.0) {
-                        finish();
-                    }
-                }
+            // 4. Goal Check
+            if (bot.entity.position.distanceTo(goal) < 1.0) {
+                finish();
             }
         };
 
-        listeners.set("goal_reached", onGoalReached);
-        listeners.set("path_update", onPathUpdate);
-
-        if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-        }
-
-        bot.on("goal_reached", onGoalReached);
-        bot.on("path_update", onPathUpdate);
         bot.on("physicsTick", onTick);
-
-        try {
-            bot.pathfinder.setGoal(goal, dynamic);
-        } catch (err) {
-            finish(err instanceof Error ? err : new Error(String(err)));
-        }
     });
 }
 
@@ -16531,6 +18501,17 @@ export async function collectBlocks(
     signal.addEventListener("abort", onAbort, { once: true });
 
     try {
+        // Check for required tool before starting
+        const firstTarget = targets[0];
+        const harvestTool = bot.pathfinder.bestHarvestTool(firstTarget);
+        const canHarvest = firstTarget.canHarvest(bot.inventory.items().find(i => i.type === harvestTool?.type)?.type ?? null);
+        
+        // If the block requires a tool to drop items but we don't have it, throw NO_TOOL
+        // Note: logs can be harvested by hand, stone requires pickaxe.
+        if (firstTarget.material?.includes('stone') && !canHarvest) {
+            throw new NoToolError(`Missing tool to harvest ${firstTarget.name}`);
+        }
+
         await (bot as any).collectBlock.collect(targets.slice(0, count));
     } catch (err: any) {
         if (isAbortError(err) || signal.aborted) {
@@ -18338,10 +20319,110 @@ html, body {
 
 </file>
 
+<file path="ui\src\components\Metrics.svelte">
+<script lang="ts">
+    import { onMount } from 'svelte';
+
+    let stats = $state({
+        deaths: 0,
+        tasks_completed: 0,
+        resources_gathered: 0,
+        path_failures: 0,
+        skill_reuse: 0,
+        survival_time: 0
+    });
+
+    let startTime = Date.now();
+
+    async function fetchStats() {
+        try {
+            const res = await fetch('/api/stats');
+            if (res.ok) {
+                stats = await res.json();
+            }
+        } catch (err) {
+            console.error('Failed to fetch stats', err);
+        }
+    }
+
+    onMount(() => {
+        const interval = setInterval(fetchStats, 2000);
+        return () => clearInterval(interval);
+    });
+
+    function formatTime(seconds: number) {
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = seconds % 60;
+        return `${h}h ${m}m ${s}s`;
+    }
+
+    let hoursElapsed = $derived(Math.max((Date.now() - startTime) / 3600000, 0.01));
+    let deathsPerHour = $derived((stats.deaths / hoursElapsed).toFixed(2));
+    let tasksPerHour = $derived((stats.tasks_completed / hoursElapsed).toFixed(2));
+    let resourcesPerHour = $derived((stats.resources_gathered / hoursElapsed).toFixed(2));
+    let totalAttempts = $derived(stats.tasks_completed + stats.path_failures);
+    let stuckRate = $derived(totalAttempts > 0 ? ((stats.path_failures / totalAttempts) * 100).toFixed(1) : "0");
+</script>
+
+<div class="metrics-panel">
+    <h3>Scientific Performance</h3>
+    
+    <div class="grid">
+        <div class="stat">
+            <label>Survival Time</label>
+            <value>{formatTime(stats.survival_time)}</value>
+        </div>
+        <div class="stat">
+            <label>Deaths / Hour</label>
+            <value class:bad={Number(deathsPerHour) > 2}>{deathsPerHour}</value>
+        </div>
+        <div class="stat">
+            <label>Tasks / Hour</label>
+            <value>{tasksPerHour}</value>
+        </div>
+        <div class="stat">
+            <label>Resources / Hour</label>
+            <value>{resourcesPerHour}</value>
+        </div>
+        <div class="stat">
+            <label>Stuck Rate</label>
+            <value>{stuckRate}%</value>
+        </div>
+        <div class="stat">
+            <label>Skill Reuse</label>
+            <value>{stats.skill_reuse}</value>
+        </div>
+    </div>
+</div>
+
+<style>
+    .metrics-panel {
+        background: rgba(0, 0, 0, 0.5);
+        border: 1px solid #444;
+        padding: 1rem;
+        border-radius: 4px;
+        color: #eee;
+    }
+    h3 { margin-top: 0; color: #aaa; font-size: 0.9rem; text-transform: uppercase; }
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 1rem;
+    }
+    .stat { display: flex; flex-direction: column; }
+    label { font-size: 0.7rem; color: #888; }
+    value { font-family: monospace; font-size: 1.2rem; }
+    .bad { color: #ff5555; }
+</style>
+
+</file>
+
 <file path="ui\src\components\Sidebar.svelte">
 <script lang="ts">
     import { botStore, uiStore, clearEventLog } from "../lib/store.svelte";
     import ItemIcon from "./ItemIcon.svelte";
+    import Metrics from "./Metrics.svelte";
 
     let { isOpen = true } = $props();
 
@@ -18409,6 +20490,8 @@ html, body {
             </div>
         </div>
     </section>
+
+    <Metrics />
 
     <section class="card">
         <h3>🎒 Inventory ({inventory.length} items)</h3>
@@ -19422,10 +21505,10 @@ export default defineConfig({
 
 ```json
 {
-  "total_bytes": 562619,
-  "file_count": 108,
-  "estimated_tokens": 142880,
+  "total_bytes": 628178,
+  "file_count": 124,
+  "estimated_tokens": 159615,
   "mode": "full",
-  "generated_at": "2026-04-15T18:04:44.4798025-07:00"
+  "generated_at": "2026-04-16T01:21:59.9731436-07:00"
 }
 ```

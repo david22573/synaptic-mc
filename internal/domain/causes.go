@@ -18,6 +18,12 @@ const (
 	CauseFailed          = "FAILED"
 	CauseDistracted      = "DISTRACTED"
 	CauseAbortedDuringHesitation = "ABORTED_DURING_HESITATION"
+	CauseLagDesync      = "LAG_DESYNC"
+	CauseFallingRisk    = "FALLING_RISK"
+	CauseStuckTerrain   = "STUCK_TERRAIN"
+	CauseBlockedMob     = "BLOCKED_MOB"
+	CauseNoTool         = "NO_TOOL"
+	CauseUnreachable    = "UNREACHABLE"
 	CauseUnknown         = "UNKNOWN"
 )
 

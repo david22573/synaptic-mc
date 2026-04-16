@@ -19,13 +19,18 @@ type Service struct {
 	logger       *slog.Logger
 	stateVersion atomic.Uint64
 	currentState atomic.Pointer[domain.VersionedState]
+
+	heatmap   *ThreatHeatmap
+	predictor *EnemyPredictor
 }
 
 func NewService(bus domain.EventBus, memStore memory.Store, logger *slog.Logger) *Service {
 	s := &Service{
-		bus:      bus,
-		memStore: memStore,
-		logger:   logger.With(slog.String("component", "state_service")),
+		bus:       bus,
+		memStore:  memStore,
+		logger:    logger.With(slog.String("component", "state_service")),
+		heatmap:   NewThreatHeatmap(),
+		predictor: NewEnemyPredictor(),
 	}
 
 	// Initialize with an empty state so loads never panic
@@ -36,6 +41,14 @@ func NewService(bus domain.EventBus, memStore memory.Store, logger *slog.Logger)
 
 	// Phase 5: Listen for task completion to alter the world model
 	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+
+	// Background Heatmap Decay
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		for range ticker.C {
+			s.heatmap.Decay()
+		}
+	}()
 
 	return s
 }
@@ -48,16 +61,20 @@ func (s *Service) GetCurrentState() domain.VersionedState {
 }
 
 func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent) {
-	var newState domain.GameState
-	if err := json.Unmarshal(event.Payload, &newState); err != nil {
-		s.logger.Error("Failed to unmarshal state payload", slog.Any("error", err))
-		return
+	curr := s.GetCurrentState()
+	newState := Reduce(curr.State, event)
+
+	// Near-Cheating: Record threats in heatmap
+	for _, t := range newState.Threats {
+		danger := 0.1
+		if t.Distance < 5 {
+			danger = 0.5
+		}
+		s.heatmap.RecordThreat(newState.Position, danger)
 	}
 
-	newState.Initialized = true
-
-	// Phase 5: Build world model - Track chunks visited from heartbeat
-	newState.RecordChunkVisit(int(newState.Position.X)>>4, int(newState.Position.Z)>>4)
+	// Near-Cheating: Enemy Prediction (Mock)
+	_ = s.predictor.Predict(newState.Threats)
 
 	// World Memory Graph: Persist significant features
 	if s.memStore != nil {
@@ -73,16 +90,21 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 			}
 
 			if nodeType != "" {
-				_ = s.memStore.MarkWorldNode(ctx, poi.Name, nodeType, poi.Position)
+				score := 10.0
+				if nodeType == "safe_base" {
+					score = 50.0
+				} else if nodeType == "village" {
+					score = 100.0
+				}
+				_ = s.memStore.MarkWorldNode(ctx, domain.WorldNode{
+					Name:  poi.Name,
+					Kind:  nodeType,
+					Pos:   poi.Position,
+					Score: score,
+				})
 			}
 		}
 	}
-
-	// Preserve and merge long-lived world memory across ticks.
-	curr := s.GetCurrentState()
-	newState.DangerZones = mergeDangerZones(curr.State.DangerZones, newState.DangerZones)
-	newState.VisitedChunks = mergeVisitedChunks(curr.State.VisitedChunks, newState.VisitedChunks)
-	newState.TerrainRoughness = mergeTerrainRoughness(curr.State.TerrainRoughness, newState.TerrainRoughness)
 
 	// Instant Reactions: High-priority survival check
 	isLava := false
@@ -119,120 +141,14 @@ func (s *Service) handleStateTick(ctx context.Context, event domain.DomainEvent)
 
 // Phase 5: Mutate state actively based on execution feedback
 func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
-	var result struct {
-		Success  bool    `json:"success"`
-		Cause    string  `json:"cause"`
-		Progress float64 `json:"progress"`
+	curr := s.GetCurrentState()
+	nextState := Reduce(curr.State, event)
+
+	// If reducer added a danger zone or changed visited chunks, persist it
+	if len(nextState.DangerZones) != len(curr.State.DangerZones) || 
+	   len(nextState.VisitedChunks) != len(curr.State.VisitedChunks) {
+		s.saveState(ctx, nextState, event)
 	}
-	if err := json.Unmarshal(event.Payload, &result); err != nil {
-		return
-	}
-
-	// If we got stuck or pathfinding failed, permanently mark that area as bad for the planner
-	if !result.Success && (result.Cause == domain.CauseBlocked || result.Cause == domain.CauseStuck) {
-		curr := s.GetCurrentState()
-
-		// Copy slice to avoid race condition during mutation
-		newState := curr.State
-		newState.DangerZones = append([]domain.DangerZone{}, curr.State.DangerZones...)
-		newState.VisitedChunks = append([]domain.ChunkCoord{}, curr.State.VisitedChunks...)
-
-		s.logger.Info("Marking area as risky due to execution failure", slog.String("cause", result.Cause))
-		newState.MarkAreaRisky(newState.Position, result.Cause, 0.85)
-
-		s.saveState(ctx, newState, event)
-	}
-}
-
-func mergeDangerZones(existing, incoming []domain.DangerZone) []domain.DangerZone {
-	if len(existing) == 0 {
-		return append([]domain.DangerZone{}, incoming...)
-	}
-	if len(incoming) == 0 {
-		return append([]domain.DangerZone{}, existing...)
-	}
-
-	merged := make([]domain.DangerZone, 0, len(incoming)+len(existing))
-	seen := make(map[string]int, len(incoming)+len(existing))
-
-	add := func(zone domain.DangerZone) {
-		key := fmt.Sprintf(
-			"%s:%d:%d:%d",
-			zone.Reason,
-			int(zone.Center.X)/4,
-			int(zone.Center.Y)/4,
-			int(zone.Center.Z)/4,
-		)
-
-		if idx, ok := seen[key]; ok {
-			if zone.Risk > merged[idx].Risk {
-				merged[idx] = zone
-			}
-			return
-		}
-
-		seen[key] = len(merged)
-		merged = append(merged, zone)
-	}
-
-	for _, zone := range incoming {
-		add(zone)
-	}
-	for _, zone := range existing {
-		add(zone)
-	}
-
-	if len(merged) > 64 {
-		merged = merged[:64]
-	}
-
-	return merged
-}
-
-func mergeVisitedChunks(existing, incoming []domain.ChunkCoord) []domain.ChunkCoord {
-	if len(existing) == 0 {
-		return append([]domain.ChunkCoord{}, incoming...)
-	}
-	if len(incoming) == 0 {
-		return append([]domain.ChunkCoord{}, existing...)
-	}
-
-	merged := make([]domain.ChunkCoord, 0, len(existing)+len(incoming))
-	seen := make(map[string]struct{}, len(existing)+len(incoming))
-
-	add := func(chunk domain.ChunkCoord) {
-		key := fmt.Sprintf("%d,%d", chunk.X, chunk.Z)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		merged = append(merged, chunk)
-	}
-
-	for _, chunk := range existing {
-		add(chunk)
-	}
-	for _, chunk := range incoming {
-		add(chunk)
-	}
-
-	return merged
-}
-
-func mergeTerrainRoughness(existing, incoming map[string]float64) map[string]float64 {
-	if len(existing) == 0 && len(incoming) == 0 {
-		return nil
-	}
-
-	merged := make(map[string]float64, len(existing)+len(incoming))
-	for key, value := range existing {
-		merged[key] = value
-	}
-	for key, value := range incoming {
-		merged[key] = value
-	}
-
-	return merged
 }
 
 func (s *Service) saveState(ctx context.Context, newState domain.GameState, triggerEvent domain.DomainEvent) {

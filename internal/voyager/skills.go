@@ -13,14 +13,17 @@ import (
 
 // ExecutableSkill represents a JS function stored in the vector database.
 type ExecutableSkill struct {
-	Name          string   `json:"name"`
-	Description   string   `json:"description"`
-	JSCode        string   `json:"js_code"`
-	Confidence    float64  `json:"confidence"`
-	Version       int      `json:"version"`
-	AvgTime       float64  `json:"avg_time_ms"`
-	RequiredItems []string `json:"required_items"`
-	FailureCauses []string `json:"failure_causes"`
+	Name           string   `json:"name"`
+	Description    string   `json:"description"`
+	JSCode         string   `json:"js_code"`
+	Confidence     float64  `json:"confidence"`
+	Version        int      `json:"version"`
+	AvgTime        float64  `json:"avg_time_ms"`
+	RequiredItems  []string `json:"required_items"`
+	FailureCauses  []string `json:"failure_causes"`
+	ContextTags    []string `json:"context_tags"`
+	TotalRuns      int      `json:"total_runs"`
+	TotalSuccesses int      `json:"total_successes"`
 }
 
 // SkillManager bridges the vector store and the decision planner.

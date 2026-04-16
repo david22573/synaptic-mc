@@ -9,6 +9,10 @@ import {
     NoTargetsNearbyError,
     isAbortError,
     ExecutionError,
+    UnreachableError,
+    BlockedMobError,
+    StuckTerrainError,
+    NoToolError,
 } from "../errors.js";
 import { steerTowards } from "../movement/navigator.js";
 import { applyWorldMovementReflexes, senseWorld } from "../utils/world.js";
@@ -258,9 +262,10 @@ export function moveToGoal(
 
             if (!waypoint) {
                 // If no waypoint and not at goal, we might be lost
-                if (bot.entity.position.distanceTo(goal) > 2) {
+                const distToGoal = bot.entity.position.distanceTo(goal);
+                if (distToGoal > 2) {
                     stuckStrikes++;
-                    if (stuckStrikes > 40) finish(new Error("no_path"));
+                    if (stuckStrikes > 40) finish(new UnreachableError(`Cannot find path to goal (${distToGoal.toFixed(1)}m away)`));
                 } else {
                     finish();
                 }
@@ -273,7 +278,7 @@ export function moveToGoal(
                 bot.setControlState(state as any, active);
             }
 
-            // 3. Stuck Detection (using velocity and distance)
+            // 3. Elite Stuck Detection (reason-based)
             if (ticksElapsed % 10 === 0) {
                 const currentPos = bot.entity.position;
                 const distMoved = lastPos.distanceTo(currentPos);
@@ -283,7 +288,16 @@ export function moveToGoal(
                 if (distMoved < 0.1 && speed < 0.05) {
                     stuckStrikes++;
                     if (stuckStrikes >= 3) {
-                        finish(new ExecutionError("stuck", "STUCK", 0));
+                        // Classify the stuck reason
+                        const nearbyMobs = Object.values(bot.entities).filter(e => 
+                            e.type === 'mob' && e.position.distanceTo(currentPos) < 3
+                        );
+                        
+                        if (nearbyMobs.length > 0) {
+                            finish(new BlockedMobError(`Path blocked by ${nearbyMobs[0].name}`));
+                        } else {
+                            finish(new StuckTerrainError("Physically stuck in complex terrain"));
+                        }
                     }
                 } else {
                     stuckStrikes = Math.max(0, stuckStrikes - 1);
@@ -417,6 +431,17 @@ export async function collectBlocks(
     signal.addEventListener("abort", onAbort, { once: true });
 
     try {
+        // Check for required tool before starting
+        const firstTarget = targets[0];
+        const harvestTool = bot.pathfinder.bestHarvestTool(firstTarget);
+        const canHarvest = firstTarget.canHarvest(bot.inventory.items().find(i => i.type === harvestTool?.type)?.type ?? null);
+        
+        // If the block requires a tool to drop items but we don't have it, throw NO_TOOL
+        // Note: logs can be harvested by hand, stone requires pickaxe.
+        if (firstTarget.material?.includes('stone') && !canHarvest) {
+            throw new NoToolError(`Missing tool to harvest ${firstTarget.name}`);
+        }
+
         await (bot as any).collectBlock.collect(targets.slice(0, count));
     } catch (err: any) {
         if (isAbortError(err) || signal.aborted) {

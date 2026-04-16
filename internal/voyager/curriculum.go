@@ -103,10 +103,17 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 						skill = *fullSkill
 					}
 					
-					meta := fmt.Sprintf("Confidence: %.2f, AvgTime: %.1fs, Version: %d", 
-						skill.Confidence, skill.AvgTime/1000.0, skill.Version)
+					meta := fmt.Sprintf("SuccessRate: %.1f%% (%d/%d), AvgTime: %.1fs, Version: %d", 
+						skill.Confidence*100, skill.TotalSuccesses, skill.TotalRuns, skill.AvgTime/1000.0, skill.Version)
+					
+					if len(skill.ContextTags) > 0 {
+						meta += fmt.Sprintf(", Context: [%s]", strings.Join(skill.ContextTags, ", "))
+					}
+					if len(skill.RequiredItems) > 0 {
+						meta += fmt.Sprintf(", Requires: [%s]", strings.Join(skill.RequiredItems, ", "))
+					}
 					if len(skill.FailureCauses) > 0 {
-						meta += fmt.Sprintf(", RecentFailures: %s", strings.Join(skill.FailureCauses, "|"))
+						meta += fmt.Sprintf(", CommonFailures: %s", strings.Join(skill.FailureCauses, "|"))
 					}
 					
 					skillStrs = append(skillStrs, fmt.Sprintf("- Skill: %s (%s) | %s", skill.Name, skill.Description, meta))

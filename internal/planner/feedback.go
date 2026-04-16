@@ -34,10 +34,12 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 		return nil
 	}
 
-	f.logger.Info("Task failed, analyzing feedback",
-		slog.String("action", intent.Action),
-		slog.String("cause", res.Cause),
-		slog.Float64("progress", res.Progress))
+	if f.logger != nil {
+		f.logger.Info("Task failed, analyzing feedback",
+			slog.String("action", intent.Action),
+			slog.String("cause", res.Cause),
+			slog.Float64("progress", res.Progress))
+	}
 
 	// If we made significant progress before failing, update our local world weight
 	// so the planner knows this wasn't a total bust.
@@ -47,18 +49,48 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	// Capture JS stack traces for Iterative Prompting / Debugging
 	if strings.Contains(res.Cause, "stack") || strings.Contains(res.Cause, "Error") {
-		f.logger.Warn("JS Execution Error detected in feedback", slog.String("error", res.Cause))
+		if f.logger != nil {
+			f.logger.Warn("JS Execution Error detected in feedback", slog.String("error", res.Cause))
+		}
 		// We don't necessarily mutate the intent here, but the Critic will pick this up
 		// and add it to the taskHistory for LLM reflection.
 	}
 
 	switch res.Cause {
-	case domain.CauseBlocked, domain.CauseStuck:
-		// Bot is physically trapped or pathing is deadlocking.
+	case domain.CauseBlocked, domain.CauseStuck, domain.CauseStuckTerrain:
+		// Bot is physically trapped or terrain is too complex.
 		if f.world != nil && intent.TargetLocation != nil {
 			f.world.PenalizeZone(*intent.TargetLocation, 10.0)
 		}
+		// REPATH WIDE: Shift target and try a different angle
 		return f.generateFallback(intent)
+
+	case domain.CauseBlockedMob:
+		// KITE THEN RETRY: Reposition far away to draw mob, then resume
+		if f.logger != nil {
+			f.logger.Info("Blocked by mob, initiating kiting policy")
+		}
+		return &domain.ActionIntent{
+			ID:        "kite_" + intent.ID,
+			Action:    "retreat",
+			Target:    "nearby_safe_ground",
+			Count:     1,
+			Rationale: "RECOVERY: Blocked by mob. Kiting to clear path before retry.",
+		}
+
+	case domain.CauseNoTool:
+		// REPLAN CRAFT TOOL: Divert to crafting immediately
+		if f.logger != nil {
+			f.logger.Info("Missing tool, initiating crafting policy")
+		}
+		return f.generatePrerequisitePlan(intent)
+
+	case domain.CauseUnreachable:
+		// BLACKLIST NODE: Permanently penalize this specific target location
+		if f.world != nil && intent.TargetLocation != nil {
+			f.world.PenalizeZone(*intent.TargetLocation, 50.0) // Heavy penalty
+		}
+		return f.triggerReevaluation()
 
 	case domain.CauseTimeout:
 		if res.Progress > 0.1 {
@@ -74,7 +106,9 @@ func (f *FeedbackAnalyzer) Analyze(intent domain.ActionIntent, res domain.Execut
 
 	case "FALLBACK":
 		// Skill confidence low or manual fallback triggered.
-		f.logger.Info("Manual fallback triggered, dropping to macro re-evaluation")
+		if f.logger != nil {
+			f.logger.Info("Manual fallback triggered, dropping to macro re-evaluation")
+		}
 		return f.triggerReevaluation()
 
 	case domain.CauseMissingResource:
@@ -130,7 +164,9 @@ func (f *FeedbackAnalyzer) generateBackoff(failedIntent domain.ActionIntent) *do
 }
 
 func (f *FeedbackAnalyzer) triggerReevaluation() *domain.ActionIntent {
-	f.logger.Info("Task interrupted by survival gate. Triggering macro re-evaluation.")
+	if f.logger != nil {
+		f.logger.Info("Task interrupted by survival gate. Triggering macro re-evaluation.")
+	}
 	return nil
 }
 
@@ -161,7 +197,9 @@ func (f *FeedbackAnalyzer) generatePrerequisitePlan(failedIntent domain.ActionIn
 	}
 
 	if dep == nil {
-		f.logger.Warn("Unknown dependency map, dropping to macro strategy", slog.String("target", failedIntent.Target))
+		if f.logger != nil {
+			f.logger.Warn("Unknown dependency map, dropping to macro strategy", slog.String("target", failedIntent.Target))
+		}
 		return nil
 	}
 

@@ -11,6 +11,7 @@ import (
 
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/humanization"
+	"david22573/synaptic-mc/internal/observability"
 )
 
 type StateProvider interface {
@@ -38,6 +39,8 @@ type ControlService struct {
 
 	lastEvolve time.Time
 	evolveMu   sync.Mutex
+
+	prep *PrepOrchestrator
 }
 
 func NewControlService(
@@ -61,11 +64,13 @@ func NewControlService(
 		logger:       logger.With(slog.String("component", "control_service")),
 		failures:     make(map[string]*FailureRecord),
 		activeTimers: make(map[string]*time.Timer),
+		prep:         NewPrepOrchestrator(engine, logger),
 	}
 
 	// Plans arrive from the slower, async pipeline
 	evBus.Subscribe(domain.EventTypePlanCreated, domain.FuncHandler(s.handlePlanCreated))
 	evBus.Subscribe(domain.EventTypePlanInvalidated, domain.FuncHandler(s.handlePlanInvalidated))
+	evBus.Subscribe(domain.EventTypeStateUpdated, domain.FuncHandler(s.handleStateUpdated))
 
 	// Execution events bypass queues via the realtime pipeline
 	rtBus.Subscribe(domain.EventTypeTaskStart, domain.FuncHandler(s.handleTaskStart))
@@ -76,6 +81,14 @@ func NewControlService(
 	rtBus.Subscribe(domain.EventBotRespawn, domain.FuncHandler(s.handleBotRespawn))
 
 	return s
+}
+
+func (s *ControlService) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
+	state := s.stateProv.GetCurrentState().State
+
+	// Near-Cheating: Proactive Prep
+	s.prep.CheckProactiveFarming(ctx, state)
+	s.prep.PreEscape(ctx, state)
 }
 
 func (s *ControlService) SetReflexActive(active bool) {
@@ -169,6 +182,7 @@ func (s *ControlService) handlePlanInvalidated(ctx context.Context, event domain
 
 func (s *ControlService) handlePanic(ctx context.Context, event domain.DomainEvent) {
 	s.SetReflexActive(true)
+	observability.Metrics.IncInterrupt()
 	_ = s.taskManager.Halt(ctx, "panic_triggered")
 	s.clearAllWatchdogs()
 
@@ -177,13 +191,14 @@ func (s *ControlService) handlePanic(ctx context.Context, event domain.DomainEve
 		ID:        fmt.Sprintf("panic-reflex-%d", time.Now().UnixNano()),
 		Action:    "emergency_reflex",
 		Target:    domain.Target{Name: "survival"},
-		Priority:  1000,
+		Priority:  1000, // Absolute highest priority
 		Rationale: "High-priority survival reflex triggered by sensor data",
 	}
 	s.engine.RunEmergencyPolicy(ctx, emergencyAction)
 }
 
 func (s *ControlService) handleBotDeath(ctx context.Context, event domain.DomainEvent) {
+	observability.Metrics.IncDeath()
 	s.stabilityMu.Lock()
 	s.stability.ReflexActive = false
 	s.stability.DeathCount++

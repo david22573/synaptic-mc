@@ -44,9 +44,23 @@ func (e *Engine) UpdateConfig(cfg Config) {
 	e.state.mu.Unlock()
 }
 
+const CriticalPriorityThreshold = 900
+
 func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 	var scheduled []ScheduledAction
 	now := time.Now()
+
+	// If humanization is disabled globally, bypass all noise/delays
+	if !e.cfg.Enabled {
+		for _, task := range plan.Tasks {
+			scheduled = append(scheduled, ScheduledAction{
+				Action:    task,
+				ExecuteAt: now,
+			})
+		}
+		return scheduled
+	}
+
 	currentDelay := time.Duration(0)
 
 	approvedTasks := e.intentModel.Apply(plan.Tasks, e.state, ctx)
@@ -84,15 +98,20 @@ func (e *Engine) Process(plan domain.Plan, ctx Context) []ScheduledAction {
 	}
 
 	for _, task := range approvedTasks {
+		// Performance Rule: Never delay emergency reactions for realism
+		if task.Priority >= CriticalPriorityThreshold {
+			scheduled = append(scheduled, ScheduledAction{
+				Action:    task, // No noise, no jitter, pure intent
+				ExecuteAt: now,  // Immediate
+			})
+			continue
+		}
+
 		if task.Priority == 0 {
 			task.Priority = 5
 		}
 
 		noisyTask := ApplyNoise(task, ctx, e.state, e.cfg)
-
-		// Phase 7: Hesitation moved to cognitive decision layer (planner.go)
-		// to avoid stalling physical execution with stale world states.
-		// We still use currentDelay for sequential task spacing.
 
 		scheduled = append(scheduled, ScheduledAction{
 			Action:    noisyTask,

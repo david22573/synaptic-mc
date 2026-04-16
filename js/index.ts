@@ -477,7 +477,7 @@ async function executeIntent(intent: models.ActionIntent) {
     }
 }
 
-function pushState() {
+function pushState(force = false) {
     if (!client || !bot || !isBotSpawned) return;
 
     const now = Date.now();
@@ -496,7 +496,33 @@ function pushState() {
     const pz = hasValidPos ? Math.round(pos.z!) : 0;
 
     const sig = `${bot.health}|${bot.food}|${px},${py},${pz}|${inventoryItems}`;
-    if (sig === lastStateSig && now - lastStatePushTime < 2000) return;
+
+    // Meaningful change check for high-frequency pusher
+    let meaningful = force || !lastStateSig;
+    if (!meaningful) {
+        const lastParts = lastStateSig.split("|");
+        const lastHealth = Number(lastParts[0]);
+        const lastFood = Number(lastParts[1]);
+        const [lpx, lpy, lpz] = lastParts[2].split(",").map(Number);
+
+        const dist = Math.sqrt(
+            Math.pow(px - lpx, 2) +
+                Math.pow(py - lpy, 2) +
+                Math.pow(pz - lpz, 2)
+        );
+
+        // Meaningful if: stats changed, moved > 5 blocks, or threats present
+        if (
+            dist > 5 ||
+            Math.round(bot.health) !== Math.round(lastHealth) ||
+            Math.round(bot.food) !== Math.round(lastFood) ||
+            getThreats(bot).length > 0
+        ) {
+            meaningful = true;
+        }
+    }
+
+    if (!meaningful && now - lastStatePushTime < 3000) return;
 
     lastStateSig = sig;
     lastStatePushTime = now;
@@ -736,13 +762,13 @@ async function bootstrap() {
     runtimeConfig = await config.loadConfig();
     await connectWithRetry();
     
-    // Change-driven push + heartbeat
-    stateInterval = setInterval(pushState, 3000);
+    // Heartbeat push
+    stateInterval = setInterval(() => pushState(true), 3000);
     
     // High-frequency polling for change-driven pushes
     setInterval(() => {
         if (isBotSpawned && bot.entity) {
-            pushState();
+            pushState(false);
         }
     }, 250);
 }

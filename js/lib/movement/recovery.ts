@@ -232,6 +232,19 @@ export async function unstuckLogic(bot: Bot): Promise<void> {
     bot.clearControlStates();
 }
 
+export async function lagRecovery(bot: Bot): Promise<void> {
+    bot.clearControlStates();
+    bot.pathfinder.setGoal(null);
+    await bot.waitForTicks(10); // Wait 500ms for server catch-up
+}
+
+export async function fallRecovery(bot: Bot): Promise<void> {
+    if (!bot.entity) return;
+    bot.setControlState("sneak", true);
+    await bot.waitForTicks(20);
+    bot.setControlState("sneak", false);
+}
+
 export async function jumpRecovery(
     bot: Bot,
     durationMs: number = 1000,
