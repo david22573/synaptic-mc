@@ -30,6 +30,8 @@ type Store interface {
 	GetMilestones(ctx context.Context, sessionID string) ([]domain.ProgressionMilestone, error)
 	SaveFailureCount(ctx context.Context, sessionID, objective string, count int) error
 	GetFailureCounts(ctx context.Context, sessionID string) (map[string]int, error)
+	MarkChunkVisited(ctx context.Context, sessionID string, x, z int, rich, dangerous bool) error
+	GetExplorationBias(ctx context.Context, sessionID string, x, z int) (float64, error)
 	Close() error
 }
 
@@ -108,6 +110,17 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		count INTEGER DEFAULT 0,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (session_id, objective)
+	);
+	
+	CREATE TABLE IF NOT EXISTS visited_chunks (
+		session_id TEXT NOT NULL,
+		x INTEGER NOT NULL,
+		z INTEGER NOT NULL,
+		visit_count INTEGER DEFAULT 1,
+		is_resource_rich BOOLEAN DEFAULT 0,
+		is_dangerous BOOLEAN DEFAULT 0,
+		last_visited DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (session_id, x, z)
 	);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -417,6 +430,41 @@ func (s *SQLiteStore) GetFailureCounts(ctx context.Context, sessionID string) (m
 		failures[objective] = count
 	}
 	return failures, nil
+}
+
+func (s *SQLiteStore) MarkChunkVisited(ctx context.Context, sessionID string, x, z int, rich, dangerous bool) error {
+	query := `
+	INSERT INTO visited_chunks (session_id, x, z, visit_count, is_resource_rich, is_dangerous, last_visited) 
+	VALUES (?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(session_id, x, z) DO UPDATE SET 
+		visit_count = visit_count + 1,
+		is_resource_rich = excluded.is_resource_rich OR is_resource_rich,
+		is_dangerous = excluded.is_dangerous OR is_dangerous,
+		last_visited = CURRENT_TIMESTAMP;`
+	_, err := s.db.ExecContext(ctx, query, sessionID, x, z, rich, dangerous)
+	return err
+}
+
+func (s *SQLiteStore) GetExplorationBias(ctx context.Context, sessionID string, x, z int) (float64, error) {
+	query := `SELECT visit_count, is_resource_rich, is_dangerous FROM visited_chunks WHERE session_id = ? AND x = ? AND z = ?`
+	var visits int
+	var rich, dangerous bool
+	err := s.db.QueryRowContext(ctx, query, sessionID, x, z).Scan(&visits, &rich, &dangerous)
+	if err == sql.ErrNoRows {
+		return 1.0, nil // High bias for new areas
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	bias := 1.0 / float64(visits)
+	if rich {
+		bias *= 2.0
+	}
+	if dangerous {
+		bias *= 0.1
+	}
+	return bias, nil
 }
 
 func (s *SQLiteStore) Close() error {

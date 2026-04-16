@@ -1,7 +1,7 @@
-import { type TaskContext } from "../registry.js";
-import { collectBlocks, escapeTree, LOG_BLOCK_NAMES } from "../utils.js";
-import { Runtime } from "../../control/runtime.js";
-import { NoTargetsNearbyError, isAbortError } from "../../errors.js";
+import type { Bot } from "mineflayer";
+import { ActionPlan, Perception } from "../../control/controller.js";
+import { LOG_BLOCK_NAMES } from "../utils.js";
+import { Block } from "prismarine-block";
 
 function resolveGatherTargets(targetName: string): string[] {
     if (targetName === "log") {
@@ -20,25 +20,49 @@ function resolveGatherTargets(targetName: string): string[] {
     return [targetName];
 }
 
-export async function handleGather(ctx: TaskContext): Promise<void> {
-    const { bot, intent, signal } = ctx;
+export function evaluateGather(
+    bot: Bot,
+    perception: Perception,
+    plan: ActionPlan,
+): ActionPlan {
+    const { intent, state } = perception;
+    const targetName = intent?.target?.name?.toLowerCase();
 
-    const taskLogic = async () => {
-        await escapeTree(bot, signal);
+    if (!targetName) {
+        state.failed = true;
+        state.reason = "No target specified";
+        return plan;
+    }
 
-        const targetName = intent.target.name.toLowerCase();
-        const count = intent.count || 1;
-        const candidateNames = resolveGatherTargets(targetName);
+    // Resolve specific block targets
+    const candidateNames = resolveGatherTargets(targetName);
+    
+    // 1. Find nearest matching block
+    const block = bot.findBlock({
+        matching: (b: Block) => candidateNames.includes(b.name),
+        maxDistance: 48,
+    });
 
-        try {
-            await collectBlocks(bot, candidateNames, count, signal);
-        } catch (err: any) {
-            if (err instanceof NoTargetsNearbyError) {
-                throw new Error(`NO_${targetName.toUpperCase()}_NEARBY`);
-            }
-            throw err;
-        }
-    };
+    if (!block) {
+        state.failed = true;
+        state.reason = `No ${targetName} found nearby`;
+        return plan;
+    }
 
-    await new Runtime(bot).execute(taskLogic(), signal);
+    // 2. Continuous Pathing
+    plan.pathfindingGoal = { x: block.position.x, y: block.position.y, z: block.position.z };
+    plan.lookAt = block.position.offset(0.5, 0.5, 0.5);
+
+    // 3. Interaction Logic
+    const dist = bot.entity.position.distanceTo(block.position);
+    if (dist <= 4.5) {
+        plan.interact = "use"; // Placeholder for mining/harvesting
+        plan.interactTarget = block;
+        
+        // Basic mining: clear controls
+        plan.controls.forward = false;
+        plan.controls.sprint = false;
+    }
+
+    return plan;
 }

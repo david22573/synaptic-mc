@@ -26,10 +26,11 @@ export class ProgressTracker {
         return bot.entity.position.distanceTo(this.target);
     }
 
+    private lastYaw: number = 0;
+    private yawOscillationCount: number = 0;
+
     /**
-     * Checks if the bot is stuck by comparing current position and actual velocity.
-     * Uses a strike-based system to avoid false positives during legitimate slow movement
-     * (e.g., soul sand, cobwebs, or jumping up blocks).
+     * Checks if the bot is stuck by comparing current position, velocity, and yaw oscillation.
      */
     public checkStuck(bot: Bot): boolean {
         if (!bot.entity) return false;
@@ -41,15 +42,23 @@ export class ProgressTracker {
         const vel = bot.entity.velocity;
         const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
 
-        // More lenient: dist < 0.1 instead of 0.2
-        if (dist < 0.1 && speed < 0.02) {
+        const currentYaw = bot.entity.yaw;
+        const yawDelta = Math.abs(currentYaw - this.lastYaw);
+        this.lastYaw = currentYaw;
+
+        // Detect yaw oscillation (rapidly looking back and forth - often happens when stuck)
+        if (yawDelta > 0.5 && speed < 0.05) {
+            this.yawOscillationCount++;
+        } else {
+            this.yawOscillationCount = Math.max(0, this.yawOscillationCount - 1);
+        }
+
+        if ((dist < 0.1 && speed < 0.02) || this.yawOscillationCount > 10) {
             this.stuckStrikes++;
         } else {
-            // Decaying strikes instead of immediate reset
             this.stuckStrikes = Math.max(0, this.stuckStrikes - 1);
         }
 
-        // Higher strike threshold
         return this.stuckStrikes >= 5;
     }
 }

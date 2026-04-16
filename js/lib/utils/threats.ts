@@ -126,14 +126,14 @@ export function computeSafeRetreat(
         let isSafe = false;
 
         // Check for solid ground from slightly above to slightly below current elevation
-        for (let yOffset = 2; yOffset >= -5; yOffset--) {
-            const block = bot.blockAt(
-                botPos.offset(
-                    Math.cos(angle) * distance,
-                    yOffset,
-                    Math.sin(angle) * distance,
-                ),
+        // We limit yOffset to ensure we don't pick a target that is impossible to reach (e.g. on a high ledge)
+        for (let yOffset = 2; yOffset >= -4; yOffset--) {
+            const targetPos = botPos.offset(
+                Math.cos(angle) * distance,
+                yOffset,
+                Math.sin(angle) * distance,
             );
+            const block = bot.blockAt(targetPos);
 
             if (block && (block.name === "water" || block.name === "lava")) {
                 // Liquid hazard detected before solid ground, abort this angle
@@ -141,26 +141,20 @@ export function computeSafeRetreat(
             }
 
             if (block && block.boundingBox === "block") {
-                // Found a solid block. Ensure the block above it is air so we don't path into a wall
-                const above = bot.blockAt(
-                    botPos.offset(
-                        Math.cos(angle) * distance,
-                        yOffset + 1,
-                        Math.sin(angle) * distance,
-                    ),
-                );
+                // Found a solid block. Ensure TWO blocks above it are air (headroom)
+                const feet = bot.blockAt(targetPos.offset(0, 1, 0));
+                const head = bot.blockAt(targetPos.offset(0, 2, 0));
+                
                 if (
-                    above &&
-                    (above.name === "air" || above.name === "cave_air")
+                    feet && (feet.name === "air" || feet.name === "cave_air" || feet.name === "tall_grass" || feet.name === "grass") &&
+                    head && (head.name === "air" || head.name === "cave_air")
                 ) {
+                    // Valid standing spot found
                     isSafe = true;
-                    break;
+                    // Update return target to the actual standing spot y
+                    return { x: targetPos.x, y: targetPos.y + 1, z: targetPos.z };
                 }
             }
-        }
-
-        if (isSafe) {
-            return { x: tx, z: tz };
         }
     }
 

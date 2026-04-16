@@ -15,11 +15,12 @@ import (
 )
 
 type Config struct {
-	APIURL     string
-	APIKey     string
-	Model      string
-	EmbedModel string
-	MaxRetries int
+	APIURL      string
+	APIKey      string
+	StrongModel string
+	CheapModel  string
+	EmbedModel  string
+	MaxRetries  int
 }
 
 type StateSummary struct {
@@ -33,6 +34,10 @@ type Client struct {
 	config Config
 	http   *http.Client
 
+	// lastState stores the last compressed state sent to the LLM to calculate deltas
+	lastStateMu sync.Mutex
+	lastStates  map[string]string // sessionID -> lastCompressedJSON
+
 	// Circuit breaker state
 	mu          sync.Mutex
 	errorCount  int
@@ -45,7 +50,8 @@ var ErrCircuitOpen = fmt.Errorf("llm circuit is open")
 
 func NewClient(cfg Config) *Client {
 	return &Client{
-		config: cfg,
+		config:     cfg,
+		lastStates: make(map[string]string),
 		http: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -86,77 +92,122 @@ func (c *Client) recordError() {
 	}
 }
 
-// CompressState implements lossy compression of the world state and event history.
-// It prioritizes recent failure causes and critical variables over raw logs.
-// This version is strictly token-capped and only includes variables for immediate decisions.
-func (c *Client) CompressState(state domain.GameState, events []domain.DomainEvent) string {
+// CompressState implements mandatory delta compression and hard caps.
+func (c *Client) CompressState(sessionID string, state domain.GameState, events []domain.DomainEvent) string {
 	summary := StateSummary{
 		Failures:  make([]string, 0),
 		Variables: make(map[string]any),
 	}
 
-	const maxFailureChars = 64
-	const maxKeyItems = 10
+	const maxFailureCount = 3
+	const maxInvItems = 8
+	const maxThreats = 5
+	const maxPOIs = 8
 
-	// 1. Extract recent failures (last 3 unique reasons), truncated for token efficiency
+	// 1. Hard caps on collections
 	seenFailures := make(map[string]bool)
-	for i := len(events) - 1; i >= 0 && len(summary.Failures) < 3; i-- {
+	for i := len(events) - 1; i >= 0 && len(summary.Failures) < maxFailureCount; i-- {
 		ev := events[i]
 		if ev.Type == domain.EventTypeTaskEnd {
 			var payload domain.TaskEndPayload
 			if err := json.Unmarshal(ev.Payload, &payload); err == nil {
-				if !payload.Success && payload.Cause != "" {
-					cause := payload.Cause
-					if len(cause) > maxFailureChars {
-						cause = cause[:maxFailureChars-3] + "..."
-					}
-					if !seenFailures[cause] {
-						summary.Failures = append(summary.Failures, cause)
-						seenFailures[cause] = true
-					}
+				if !payload.Success && payload.Cause != "" && !seenFailures[payload.Cause] {
+					summary.Failures = append(summary.Failures, payload.Cause)
+					seenFailures[payload.Cause] = true
 				}
 				if summary.LastAction == "" {
-					action := payload.Action
-					if len(action) > 32 {
-						action = action[:29] + "..."
-					}
-					summary.LastAction = action
+					summary.LastAction = payload.Action
 					summary.Outcome = payload.Status
 				}
 			}
 		}
 	}
 
-	// 2. Extract critical state variables
-	summary.Variables["health"] = int(state.Health)
+	summary.Variables["hp"] = int(state.Health)
 	summary.Variables["food"] = int(state.Food)
-	summary.Variables["pos"] = fmt.Sprintf("%.0f,%.0f,%.0f", state.Position.X, state.Position.Y, state.Position.Z)
+	summary.Variables["pos"] = fmt.Sprintf("%.0f,%.0f", state.Position.X, state.Position.Z)
 
-	if len(state.Inventory) > 0 {
-		inv := make([]string, 0, maxKeyItems)
-		for _, item := range state.Inventory {
-			if item.Count > 0 {
-				inv = append(inv, fmt.Sprintf("%s:%d", item.Name, item.Count))
-			}
-			if len(inv) >= maxKeyItems {
-				break
-			}
+	inv := make(map[string]int)
+	for i, item := range state.Inventory {
+		if i >= maxInvItems {
+			break
 		}
-		summary.Variables["inv"] = inv
+		inv[item.Name] = item.Count
+	}
+	summary.Variables["inv"] = inv
+
+	thr := make([]string, 0, maxThreats)
+	for i, t := range state.Threats {
+		if i >= maxThreats {
+			break
+		}
+		thr = append(thr, fmt.Sprintf("%s@%.0fm", t.Name, t.Distance))
+	}
+	if len(thr) > 0 {
+		summary.Variables["threats"] = thr
 	}
 
-	if len(state.Threats) > 0 {
-		summary.Variables["threats"] = len(state.Threats)
+	poi := make([]string, 0, maxPOIs)
+	for i, p := range state.POIs {
+		if i >= maxPOIs {
+			break
+		}
+		poi = append(poi, p.Name)
+	}
+	if len(poi) > 0 {
+		summary.Variables["pois"] = poi
 	}
 
-	// 3. Serialize to compact JSON
-	b, _ := json.Marshal(summary)
-	return string(b)
+	currentJSON, _ := json.Marshal(summary)
+	currentStr := string(currentJSON)
+
+	c.lastStateMu.Lock()
+	defer c.lastStateMu.Unlock()
+
+	lastStr := c.lastStates[sessionID]
+	c.lastStates[sessionID] = currentStr
+
+	if lastStr == "" {
+		return currentStr
+	}
+
+	// Calculate Delta (simple hash check for now to save tokens if "no_change")
+	if currentStr == lastStr {
+		return "no_change"
+	}
+
+	return currentStr
 }
 
-func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+func (s *StateSummary) HealthValue() int {
+	if v, ok := s.Variables["hp"].(int); ok {
+		return v
+	}
+	if v, ok := s.Variables["hp"].(float64); ok {
+		return int(v)
+	}
+	return 0
+}
+
+type ResponseFormat struct {
+	Type       string      `json:"type"`
+	JSONSchema *JSONSchema `json:"json_schema,omitempty"`
+}
+
+type JSONSchema struct {
+	Name   string         `json:"name"`
+	Strict bool           `json:"strict"`
+	Schema map[string]any `json:"schema"`
+}
+
+func (c *Client) GenerateWithFormat(ctx context.Context, systemPrompt, userContent string, format *ResponseFormat, useStrongModel bool) (string, error) {
 	if c.IsCircuitOpen() {
 		return "", ErrCircuitOpen
+	}
+
+	model := c.config.CheapModel
+	if useStrongModel {
+		model = c.config.StrongModel
 	}
 
 	type message struct {
@@ -164,16 +215,18 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 		Content string `json:"content"`
 	}
 	type request struct {
-		Model    string    `json:"model"`
-		Messages []message `json:"messages"`
+		Model          string          `json:"model"`
+		Messages       []message       `json:"messages"`
+		ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 	}
 
 	reqBody := request{
-		Model: c.config.Model,
+		Model: model,
 		Messages: []message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userContent},
 		},
+		ResponseFormat: format,
 	}
 
 	data, _ := json.Marshal(reqBody)
@@ -182,10 +235,12 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 		return "", err
 	}
 
+	// 45 second timeout for slow model providers
+	client := &http.Client{Timeout: 45 * time.Second}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		c.recordError()
 		return "", err
@@ -220,8 +275,12 @@ func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string)
 	return res.Choices[0].Message.Content, nil
 }
 
+func (c *Client) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	return c.GenerateWithFormat(ctx, systemPrompt, userContent, nil, true)
+}
+
 func (c *Client) GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	return c.Generate(ctx, systemPrompt, userContent)
+	return c.GenerateWithFormat(ctx, systemPrompt, userContent, nil, false)
 }
 
 func (c *Client) CreateEmbedding(ctx context.Context, input string) ([]float32, error) {

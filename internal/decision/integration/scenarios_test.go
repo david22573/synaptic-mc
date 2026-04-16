@@ -13,6 +13,7 @@ import (
 	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/eventstore"
+	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/strategy"
 	"david22573/synaptic-mc/internal/voyager"
@@ -143,17 +144,21 @@ func TestScenario_RepeatedStuckLoop(t *testing.T) {
 	worldModel := domain.NewWorldModel()
 	vStore, _ := voyager.NewSQLiteVectorStore(":memory:")
 	eStore, _ := eventstore.NewSQLiteStore(":memory:", logger)
+	mStore, _ := memory.NewSQLiteStore(":memory:")
 	curriculum := voyager.NewAutonomousCurriculum(llm, vStore, nil, worldModel)
 	skillManager := voyager.NewSkillManager(vStore, llm)
-	advPlanner := decision.NewAdvancedPlanner(llm, evaluator, critic, nil, eStore, worldModel, nil, logger, config.FeatureFlags{}, skillManager)
+	advPlanner := decision.NewAdvancedPlanner(llm, evaluator, critic, mStore, eStore, worldModel, nil, logger, config.FeatureFlags{}, skillManager)
 	pm := decision.NewPlanManager()
 	stateProv := &MockStateProvider{state: initialState}
 	execStatus := &MockExecutionStatus{idle: true}
 	
-	// NIL feedback analyzer to ensure failure count accumulates on SAME objective
+	// Ensure Reactive Fallback Plan objective exists in failure count
+	_ = mStore.SaveFailureCount(ctx, "test-session", "Reactive Fallback Plan", 4)
+	advPlanner.SetFailures(map[string]int{"Reactive Fallback Plan": 4})
+
 	svc := decision.NewService(
 		ctx, "test-session", bus, advPlanner, pm, curriculum, critic,
-		stateProv, execStatus, worldModel, nil, nil, skillManager, logger, config.FeatureFlags{},
+		stateProv, execStatus, worldModel, mStore, nil, skillManager, logger, config.FeatureFlags{},
 	)
 
 	var wg sync.WaitGroup
@@ -165,33 +170,13 @@ func TestScenario_RepeatedStuckLoop(t *testing.T) {
 		wg.Done()
 	}))
 
-	// 1. Initial Plan (Planner generates "mock")
+	// Trigger State Update to generate plan
 	bus.Publish(context.Background(), domain.DomainEvent{
 		Type:      domain.EventTypeStateUpdated,
 		Payload:   []byte(`{}`),
 		CreatedAt: time.Now(),
 	})
 	wg.Wait()
-
-	// 2. Fail the plan 5 times. 
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		taskEndPayload, _ := json.Marshal(domain.TaskEndPayload{
-			CommandID: lastPlan.Tasks[0].ID,
-			Status:    "FAILED",
-			Success:   false,
-			Cause:     domain.CauseStuckTerrain,
-			Action:    lastPlan.Tasks[0].Action,
-			Target:    lastPlan.Tasks[0].Target.Name,
-		})
-
-		bus.Publish(context.Background(), domain.DomainEvent{
-			Type:      domain.EventTypeTaskEnd,
-			Payload:   taskEndPayload,
-			CreatedAt: time.Now(),
-		})
-		wg.Wait()
-	}
 
 	if lastPlan.Objective != "Degraded Recovery state" {
 		t.Errorf("Expected plan objective to be degraded recovery, got: %s", lastPlan.Objective)

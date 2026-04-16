@@ -36,7 +36,10 @@ func TestPlanManager(t *testing.T) {
 	}
 
 	// Test PopTask
-	hasMore := pm.PopTask("task-1")
+	hasMore, matched := pm.PopTask("task-1")
+	if !matched {
+		t.Error("Expected task-1 to match")
+	}
 	if !hasMore {
 		t.Error("Expected more tasks after popping first task")
 	}
@@ -56,7 +59,10 @@ func TestPlanManager(t *testing.T) {
 	}
 
 	// Popping the last task
-	hasMore = pm.PopTask("fallback-1")
+	hasMore, matched = pm.PopTask("fallback-1")
+	if !matched {
+		t.Error("Expected fallback-1 to match")
+	}
 	if hasMore {
 		t.Error("Expected no more tasks after popping last task")
 	}

@@ -8,6 +8,7 @@ import (
 
 type Commitment struct {
 	TaskID      string
+	Objective   string
 	MinDuration time.Duration
 	StartTime   time.Time
 }

@@ -1,8 +1,6 @@
 import { Bot } from "mineflayer";
 import { ActionPlan, Perception } from "../../control/controller.js";
 import { findNearestEntity } from "../primitives.js";
-import { TaskContext } from "../registry.js";
-import { Runtime } from "../../control/runtime.js";
 
 const WEAPON_SCORES: Record<string, number> = {
     netherite_sword: 10,
@@ -48,13 +46,6 @@ function ensureBestEquipment(bot: Bot, state: Record<string, unknown>) {
             bot.equip(shield.type, "off-hand").catch(() => {});
         }
     }
-}
-
-export async function handleHunt(ctx: TaskContext): Promise<void> {
-    const { bot, intent, signal } = ctx;
-    // Controller-based continuous hunt will handle the actual execution.
-    // This wrapper is just to keep the legacy FSM compatibility for now if needed.
-    await new Runtime(bot).execute(new Promise(() => {}), signal);
 }
 
 export function evaluateHunt(
@@ -111,30 +102,59 @@ export function evaluateHunt(
     const weaponCooldown = state.weaponCooldown || 0;
     const canAttack = Date.now() > weaponCooldown;
 
-    if (dist > 3.0) {
+    // Advanced Kiting & Strafe Logic
+    if (dist > 4.0) {
         plan.controls.forward = true;
         plan.controls.sprint = true;
-    } else if (dist < 2.0 && !canAttack) {
+    } else if (dist < 2.5) {
         plan.controls.back = true;
         plan.controls.forward = false;
+        plan.controls.sprint = false;
     }
 
-    if (dist <= 4.0 && bot.entity.onGround) {
+    // Circle Strafe
+    if (dist <= 5.0) {
+        if (!state.strafeDir || Math.random() < 0.05) {
+            state.strafeDir = Math.random() > 0.5 ? "left" : "right";
+        }
+        plan.controls[state.strafeDir as string] = true;
+    }
+
+    // Bunny hop for crits and dodging
+    if (dist <= 4.0 && bot.entity.onGround && Math.random() < 0.2) {
         plan.controls.jump = true;
     }
 
+    // Shield Logic
+    const offhand = bot.inventory.slots[45];
+    if (offhand && offhand.name === "shield") {
+        const isTargetAttacking = (target.metadata[14] as any) === 1; // Basic animation check
+        if (isTargetAttacking || (dist < 3.0 && !canAttack)) {
+            bot.activateItem(true);
+            state.shieldActive = true;
+        } else {
+            bot.deactivateItem();
+            state.shieldActive = false;
+        }
+    }
+
     if (dist <= 3.5 && canAttack) {
-        if (bot.entity.velocity.y < -0.1 || !bot.entity.onGround) {
+        // Critical hit timing
+        const isFalling = bot.entity.velocity.y < -0.1;
+        if (isFalling || !bot.entity.onGround) {
             plan.interact = "attack";
             plan.interactTarget = target;
 
             const heldItem = bot.heldItem;
             const cdTime = heldItem?.name.includes("axe") ? 1050 : 650;
             state.weaponCooldown = Date.now() + cdTime;
-
-            if (bot.inventory.slots[45]?.name === "shield") {
-                bot.activateItem(true);
-                setTimeout(() => bot.deactivateItem(), cdTime - 100);
+            
+            // Momentarily drop shield to attack
+            if (state.shieldActive) {
+                bot.deactivateItem();
+                setTimeout(() => {
+                    if (state.shieldActive) bot.activateItem(true);
+                }, 100);
             }
         }
     }

@@ -10,8 +10,6 @@ interface BotWithController extends Bot {
     controller: BotController;
 }
 
-import { handleGather } from "./handlers/gather.js";
-import { handleHunt } from "./handlers/hunt.js";
 import { handleCraft } from "./handlers/craft.js";
 import { handleBuild } from "./handlers/build.js";
 import { handleExplore } from "./handlers/explore.js";
@@ -253,12 +251,6 @@ export async function runTask(
 
         // --- LEGACY FSM ROUTER ---
         switch (intent.action) {
-            case "gather":
-                await handleGather(taskCtx);
-                break;
-            case "hunt":
-                await handleHunt(taskCtx);
-                break;
             case "craft":
                 await handleCraft(taskCtx);
                 break;
@@ -439,39 +431,6 @@ export async function runTask(
                     if (onWake) bot.removeListener("wake", onWake);
                     if (onAbort) signal.removeEventListener("abort", onAbort);
                 }
-                break;
-            }
-            case "retreat": {
-                await escapeTree(bot, signal);
-                const threats = taskCtx.getThreats ? taskCtx.getThreats() : [];
-                const pos = taskCtx.computeSafeRetreat
-                    ? taskCtx.computeSafeRetreat(threats)
-                    : {
-                          x: bot.entity.position.x + 5,
-                          z: bot.entity.position.z + 5,
-                      };
-
-                log.info("Retreating to safe position", {
-                    threatCount: threats.length,
-                    target: pos,
-                });
-
-                // Force sprint and jump for maximum escape speed
-                bot.setControlState("sprint", true);
-                bot.setControlState("jump", true);
-
-                await navigateWithFallbacks(
-                    bot,
-                    new goals.GoalNearXZ(pos.x, pos.z, 2),
-                    {
-                        signal,
-                        timeoutMs: 30000, // Increased timeout for long retreats
-                        stopMovement,
-                    },
-                );
-                bot.setControlState("sprint", false);
-                bot.setControlState("jump", false);
-                await waitForMs(1000, signal);
                 break;
             }
             case "interact":

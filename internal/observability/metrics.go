@@ -30,6 +30,7 @@ type SystemMetrics struct {
 	// Hard Performance Budgeting Metrics
 	PlannerDuration    prometheus.Histogram
 	TaskExecDuration   prometheus.Histogram
+	TaskDispatchTotal  prometheus.Counter
 	StateAgeMs         prometheus.Histogram
 	ReplanCount        prometheus.Counter
 	TaskInterruptCount prometheus.Counter
@@ -53,6 +54,7 @@ type SystemMetrics struct {
 	replans    atomic.Uint64
 	interrupts atomic.Uint64
 	stuck      atomic.Uint64
+	dispatches atomic.Uint64
 
 	// Offline Trainer Metrics
 	OfflineTrainingRuns   prometheus.Counter
@@ -100,17 +102,33 @@ func (s *SystemMetrics) IncInterrupt() {
 	s.interrupts.Add(1)
 }
 
+func (s *SystemMetrics) IncDispatch() {
+	s.TaskDispatchTotal.Inc()
+	s.dispatches.Add(1)
+}
+
 func (s *SystemMetrics) IncStuck() {
 	s.StuckEvents.Inc()
 	s.stuck.Add(1)
 }
 
 func (s *SystemMetrics) GetStats() map[string]any {
+	tasks := s.tasks.Load()
+	paths := s.paths.Load()
+	dispatches := s.dispatches.Load()
+
+	failureRate := 0.0
+	if dispatches > 0 {
+		failureRate = float64(paths) / float64(dispatches)
+	}
+
 	return map[string]any{
 		"deaths":             s.deaths.Load(),
-		"tasks_completed":    s.tasks.Load(),
+		"tasks_completed":    tasks,
+		"task_dispatch":      dispatches,
+		"failure_rate":       failureRate,
 		"resources_gathered": s.resources.Load(),
-		"path_failures":      s.paths.Load(),
+		"path_failures":      paths,
 		"skill_reuse":        s.skills.Load(),
 		"survival_time":      s.survival.Load(),
 		"replan_count":       s.replans.Load(),
@@ -194,6 +212,10 @@ var Metrics = &SystemMetrics{
 		Name:    "agent_task_exec_duration_ms",
 		Help:    "Actual time taken to execute a task in TS",
 		Buckets: []float64{500, 1000, 5000, 10000, 30000, 60000},
+	}),
+	TaskDispatchTotal: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agent_task_dispatch_total",
+		Help: "Total number of tasks dispatched by the supervisor",
 	}),
 	StateAgeMs: promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "agent_state_age_ms",

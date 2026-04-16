@@ -6,11 +6,10 @@ import { INTENT_EVALUATORS } from "../tasks/registry.js";
 import { log } from "../logger.js";
 import { Vec3 } from "vec3";
 import { CombatController } from "../combat/controller.js";
-import {
-    getWorldControlOverrides,
-    senseWorld,
-    type WorldAwareness,
-} from "../utils/world.js";
+import { RollingPathfinder } from "../movement/pathfinder.js";
+import { steerTowards } from "../movement/navigator.js";
+import { getWorldControlOverrides, senseWorld, type WorldAwareness } from "../utils/world.js";
+import { ProgressTracker } from "../movement/progress.js";
 
 export interface Perception {
     pos: Vec3;
@@ -27,6 +26,7 @@ export interface ActionPlan {
     interact: "attack" | "use" | null;
     interactTarget: any | null;
     clearPathfinder: boolean;
+    pathfindingGoal: any | null; // New field for continuous pathing
 }
 
 export class BotController {
@@ -34,6 +34,9 @@ export class BotController {
     public intentState: Record<string, any> = {};
     private loop: ControlLoop;
     private combat: CombatController;
+    private pathfinder: RollingPathfinder;
+    private lastDisengageAt: number = 0;
+    private progress: ProgressTracker | null = null;
 
     constructor(
         public bot: Bot,
@@ -41,14 +44,28 @@ export class BotController {
     ) {
         this.loop = new ControlLoop(this);
         this.combat = new CombatController(bot);
+        this.pathfinder = new RollingPathfinder(bot);
     }
 
     public setIntent(intent: ActionIntent) {
+        const now = Date.now();
+
+        if (now - this.lastDisengageAt < 2000) {
+            if (intent.action !== 'retreat' && intent.action !== 'random_walk') {
+                log.warn(`[Reflex] Ignoring intent swap to '${intent.action}' during active escape`);
+                return;
+            }
+        }
+
         log.info(`Swapping intent -> ${intent.action}`);
         this.activeIntent = intent;
         this.intentState = { completed: false, failed: false, reason: "" };
         this.bot.clearControlStates();
-        this.bot.pathfinder.setGoal(null);
+        
+        if (this.bot.pathfinder && this.bot.pathfinder.goal) {
+            this.bot.pathfinder.setGoal(null);
+        }
+        this.progress = null; // Reset progress tracking for new intent
     }
 
     public sense(): Perception {
@@ -77,13 +94,33 @@ export class BotController {
             interact: null,
             interactTarget: null,
             clearPathfinder: false,
+            pathfindingGoal: null,
         };
 
-        // Combat disengage reflex
+        const now = Date.now();
         const closeThreats = perception.threats.filter(t => t.distance < 5);
-        if ((this.bot.health < 10 || closeThreats.length >= 3) && perception.intent?.action !== 'retreat') {
-            log.warn("[Reflex] Survival critical: triggering combat disengage");
-            this.combat.disengage(); // Fire and forget async
+
+        // Survival Reflex
+        if (this.bot.health < 10 || closeThreats.length >= 3) {
+            if (now - this.lastDisengageAt > 2000) {
+                this.lastDisengageAt = now;
+                log.warn("[Reflex] Survival critical: triggering mechanical disengage");
+
+                const nearest = closeThreats.sort((a, b) => a.distance - b.distance)[0];
+                if (nearest && nearest.position && this.bot.entity) {
+                    const dx = this.bot.entity.position.x - nearest.position.x;
+                    const dz = this.bot.entity.position.z - nearest.position.z;
+                    const yaw = Math.atan2(dx, dz);
+                    this.bot.look(yaw, 0, true).catch(() => {});
+                }
+            }
+        }
+
+        if (now - this.lastDisengageAt < 2000) {
+            defaultPlan.controls.forward = true;
+            defaultPlan.controls.sprint = true;
+            defaultPlan.controls.jump = true;
+            defaultPlan.clearPathfinder = true;
             return this.mergeWorldReflexes(defaultPlan, perception.world);
         }
 
@@ -93,32 +130,61 @@ export class BotController {
 
         const evaluator = INTENT_EVALUATORS[perception.intent.action];
         if (!evaluator) {
-            log.warn(
-                `No continuous evaluator found for intent: ${perception.intent.action}`,
-            );
             return this.mergeWorldReflexes(defaultPlan, perception.world);
         }
 
+        // 1. Evaluate Intent
         const plan = evaluator(this.bot, perception, defaultPlan);
+
+        // 2. Proactive Stuck Detection (Roadmap Item 8)
+        if (this.activeIntent && (plan.controls.forward || plan.pathfindingGoal)) {
+            if (!this.progress) {
+                this.progress = new ProgressTracker(this.bot, this.bot.entity.position.clone());
+            }
+            if (this.progress.checkStuck(this.bot)) {
+                log.warn("[Stuck] Bot detected as stuck. Applying recovery ladder.");
+                
+                // Recovery Ladder
+                if (Math.random() < 0.3) {
+                    plan.controls.jump = true;
+                } else if (Math.random() < 0.6) {
+                    plan.controls.left = Math.random() > 0.5;
+                    plan.controls.right = !plan.controls.left;
+                } else {
+                    // Force a repath by clearing current path
+                    plan.clearPathfinder = true;
+                }
+            }
+        }
+
+        // 3. Handle Continuous Pathing (Roadmap Item 7)
+        if (plan.pathfindingGoal) {
+            // Update rolling path
+            this.pathfinder.updatePath(plan.pathfindingGoal);
+            const waypoint = this.pathfinder.getNextWaypoint();
+            if (waypoint) {
+                // Determine motor inputs toward waypoint
+                const steering = steerTowards(this.bot, waypoint, 1.0, false);
+                plan.controls = { ...plan.controls, ...steering };
+            }
+        }
+
         return this.mergeWorldReflexes(plan, perception.world);
     }
 
     public async act(plan: ActionPlan) {
-        if (plan.clearPathfinder && this.bot.pathfinder.goal) {
+        if (plan.clearPathfinder && this.bot.pathfinder && this.bot.pathfinder.goal) {
             this.bot.pathfinder.setGoal(null);
         }
 
-        // Sync mechanical inputs
         for (const [control, state] of Object.entries(plan.controls)) {
             this.bot.setControlState(control as any, state);
         }
 
-        // Continuous fluid aiming (Fire and forget, don't block the tick)
         if (plan.lookAt) {
             this.bot.lookAt(plan.lookAt, true).catch(() => {});
         }
 
-        // Interaction frame
         if (plan.interact === "attack" && plan.interactTarget) {
             this.bot.attack(plan.interactTarget);
         } else if (plan.interact === "use" && plan.interactTarget) {
@@ -129,6 +195,7 @@ export class BotController {
     public start() {
         this.loop.start();
     }
+
     public stop() {
         this.loop.stop();
     }
@@ -138,6 +205,7 @@ export class BotController {
         world: WorldAwareness,
     ): ActionPlan {
         const overrides = getWorldControlOverrides(this.bot, world);
+
         if (
             Object.keys(overrides.controls).length === 0 &&
             !overrides.clearPathfinder &&
@@ -165,6 +233,7 @@ export class BotController {
             },
             lookAt: overrides.lookAt || plan.lookAt,
             clearPathfinder: plan.clearPathfinder || overrides.clearPathfinder,
+            pathfindingGoal: plan.pathfindingGoal,
         };
     }
 }

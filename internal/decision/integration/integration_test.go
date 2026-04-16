@@ -13,6 +13,7 @@ import (
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/decision"
 	"david22573/synaptic-mc/internal/domain"
+	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/voyager"
 	"david22573/synaptic-mc/internal/strategy"
@@ -30,6 +31,10 @@ func NewMockLLM() *MockLLM {
 }
 
 func (m *MockLLM) Generate(ctx context.Context, systemPrompt, userContent string) (string, error) {
+	return m.GenerateWithFormat(ctx, systemPrompt, userContent, nil)
+}
+
+func (m *MockLLM) GenerateWithFormat(ctx context.Context, systemPrompt, userContent string, format *llm.ResponseFormat) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if resp, ok := m.responses[systemPrompt+userContent]; ok {

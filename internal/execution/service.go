@@ -24,13 +24,12 @@ type ControlService struct {
 	engine      *TaskExecutionEngine
 	taskManager *TaskManager
 	ctrlManager *ControllerManager
+	supervisor  *Supervisor
 	humanizer   *humanization.Engine
 	stateProv   StateProvider
 	logger      *slog.Logger
 
 	// Control Layer State
-	failures    map[string]*FailureRecord
-	failuresMu  sync.RWMutex
 	stability   StabilityState
 	stabilityMu sync.RWMutex
 
@@ -49,6 +48,7 @@ func NewControlService(
 	engine *TaskExecutionEngine,
 	tm *TaskManager,
 	cm *ControllerManager,
+	supervisor *Supervisor,
 	humanizer *humanization.Engine,
 	sp StateProvider,
 	logger *slog.Logger,
@@ -59,10 +59,10 @@ func NewControlService(
 		engine:       engine,
 		taskManager:  tm,
 		ctrlManager:  cm,
+		supervisor:   supervisor,
 		humanizer:    humanizer,
 		stateProv:    sp,
 		logger:       logger.With(slog.String("component", "control_service")),
-		failures:     make(map[string]*FailureRecord),
 		activeTimers: make(map[string]*time.Timer),
 		prep:         NewPrepOrchestrator(engine, logger),
 	}
@@ -134,18 +134,11 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 	if len(plan.Tasks) > 0 {
 		task := plan.Tasks[0]
 
-		s.failuresMu.RLock()
-		if record, exists := s.failures[task.ID]; exists {
-			// Check if the specific task is currently in a retry backoff window
-			// Base backoff: 1s per failure count
-			backoff := time.Duration(record.Count) * time.Second
-			if time.Since(record.LastFailure) < backoff {
-				s.failuresMu.RUnlock()
-				s.logger.Warn("Plan backoff active: skipping task", slog.String("task_id", task.ID))
-				return
-			}
+		// Use Supervisor as mandatory gate
+		if !s.supervisor.Dispatch(ctx, task) {
+			s.logger.Debug("Supervisor denied task dispatch", slog.String("task_id", task.ID))
+			return
 		}
-		s.failuresMu.RUnlock()
 
 		// Update psychological state tick
 		s.evolveMu.Lock()
@@ -255,15 +248,6 @@ func (s *ControlService) handleTaskStart(ctx context.Context, event domain.Domai
 
 	inFlight := s.engine.GetInFlight()
 	if inFlight != nil && inFlight.ID == payload.CommandID {
-		s.failuresMu.Lock()
-		if _, exists := s.failures[payload.CommandID]; !exists {
-			s.failures[payload.CommandID] = &FailureRecord{
-				IntentID: payload.CommandID,
-				Action:   *inFlight,
-			}
-		}
-		s.failuresMu.Unlock()
-
 		s.engine.mu.RLock()
 		execCfg := s.engine.cfg
 		s.engine.mu.RUnlock()
@@ -337,32 +321,31 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 			return // already handled by watchdog or duplicate
 		}
 
-		s.failuresMu.Lock()
-		record, exists := s.failures[payload.CommandID]
-		if !exists {
-			record = &FailureRecord{IntentID: payload.CommandID}
-			s.failures[payload.CommandID] = record
-		}
-		record.Count++
-		record.LastFailure = time.Now()
+		s.supervisor.HandleTaskEnd(payload)
+
+		// Get retry stats from supervisor
+		attempts, _ := s.supervisor.state.GetRetryStats(payload.Action)
 
 		res := domain.ExecutionResult{
 			Success:  false,
 			Cause:    payload.Cause,
 			Progress: payload.Progress,
-			Action:   record.Action,
+			Action: domain.Action{
+				Action: payload.Action,
+				Target: domain.Target{Name: payload.Target},
+			},
 		}
 
 		// Evaluate if we should retry, degrade, or abort based on failure cause/progress
-		directive := s.ctrlManager.EvaluateFailure(res, record.Count)
-		actionToRetry := record.Action
-		s.failuresMu.Unlock()
+		directive := s.ctrlManager.EvaluateFailure(res, attempts)
+		actionToRetry := res.Action
+		actionToRetry.ID = payload.CommandID
 
 		s.ctrlManager.RecordResult(res)
 
 		// Phase 6: Update humanizer with performance feedback
 		successRate := s.ctrlManager.GetSuccessRate()
-		s.humanizer.State().UpdateFeedback(record.Count, successRate)
+		s.humanizer.State().UpdateFeedback(attempts, successRate)
 
 		s.logger.Warn("Task failed, applying adaptation strategy",
 			slog.String("task_id", payload.CommandID),
@@ -393,11 +376,6 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 		}
 
 	} else {
-		// Clean up failure history for this specific ID on success or controlled stop
-		s.failuresMu.Lock()
-		delete(s.failures, payload.CommandID)
-		s.failuresMu.Unlock()
-
 		if success {
 			s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
 

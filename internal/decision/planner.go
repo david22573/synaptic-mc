@@ -22,6 +22,7 @@ import (
 	"david22573/synaptic-mc/internal/domain"
 	"david22573/synaptic-mc/internal/humanization"
 	"david22573/synaptic-mc/internal/learning"
+	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
 	"david22573/synaptic-mc/internal/strategy"
@@ -32,13 +33,62 @@ var baseSystemRules string
 
 type LLMClient interface {
 	Generate(ctx context.Context, systemPrompt, userContent string) (string, error)
+	GenerateWithFormat(ctx context.Context, systemPrompt, userContent string, format *llm.ResponseFormat, useStrongModel bool) (string, error)
 	GenerateText(ctx context.Context, systemPrompt, userContent string) (string, error)
-	CompressState(state domain.GameState, events []domain.DomainEvent) string
+	CompressState(sessionID string, state domain.GameState, events []domain.DomainEvent) string
 	CreateEmbedding(ctx context.Context, input string) ([]float32, error)
 }
 
 type RuleExtractor interface {
 	GenerateRules(ctx context.Context, sessionID string) string
+}
+
+var planResponseFormat = &llm.ResponseFormat{
+	Type: "json_schema",
+	JSONSchema: &llm.JSONSchema{
+		Name:   "multi_candidate_plan",
+		Strict: true,
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"strategic_goal": map[string]any{"type": "string"},
+				"subgoals": map[string]any{
+					"type": "array",
+					"items": map[string]any{"type": "string"},
+				},
+				"objective": map[string]any{"type": "string"},
+				"candidates": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"id":        map[string]any{"type": "string"},
+								"action":    map[string]any{"type": "string"},
+								"target":    map[string]any{
+									"type": "object",
+									"properties": map[string]any{
+										"name": map[string]any{"type": "string"},
+										"type": map[string]any{"type": "string"},
+									},
+									"required": []string{"name", "type"},
+									"additionalProperties": false,
+								},
+								"count":     map[string]any{"type": "integer"},
+								"priority":  map[string]any{"type": "integer"},
+								"rationale": map[string]any{"type": "string"},
+							},
+							"required": []string{"action", "target", "rationale"},
+							"additionalProperties": false,
+						},
+					},
+				},
+			},
+			"required": []string{"strategic_goal", "subgoals", "objective", "candidates"},
+			"additionalProperties": false,
+		},
+	},
 }
 
 type AdvancedPlanner struct {
@@ -130,19 +180,26 @@ type multiCandidateResponse struct {
 func hashState(state domain.GameState) uint64 {
 	h := fnv.New64a()
 
-	healthBucket := int(state.Health) / 4
+	// Semantic Bucketing for Cache Stability
+	healthBucket := int(state.Health) / 4 // 0-4, 5-8, etc.
 	foodBucket := int(state.Food) / 4
-	threatLevel := len(state.Threats)
-	chunkX := int(state.Position.X) >> 4
-	chunkZ := int(state.Position.Z) >> 4
+	threatBucket := len(state.Threats)
+	if threatBucket > 3 {
+		threatBucket = 3 // Cap threat bucket
+	}
+	
+	// Significant position change (approx chunk level)
+	chunkX := int(state.Position.X) / 16
+	chunkZ := int(state.Position.Z) / 16
 
-	str := fmt.Sprintf("h:%d|f:%d|t:%d|cx:%d|cz:%d", healthBucket, foodBucket, threatLevel, chunkX, chunkZ)
+	str := fmt.Sprintf("h:%d|f:%d|t:%d|cx:%d|cz:%d", healthBucket, foodBucket, threatBucket, chunkX, chunkZ)
 	h.Write([]byte(str))
 
+	// Inventory stage (important items only for hashing)
 	var items []string
 	for _, item := range state.Inventory {
-		if item.Count > 0 {
-			items = append(items, fmt.Sprintf("%s:%d", item.Name, item.Count))
+		if item.Count > 0 && (strings.Contains(item.Name, "log") || strings.Contains(item.Name, "pickaxe") || strings.Contains(item.Name, "sword") || strings.Contains(item.Name, "food")) {
+			items = append(items, item.Name)
 		}
 	}
 	sort.Strings(items)
@@ -158,7 +215,8 @@ func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState)
 		return true
 	}
 
-	if time.Since(p.lastPlannedAt) < 30*time.Second {
+	// Optimization: Lower polling rate to every 10 seconds unless massive health drop
+	if time.Since(p.lastPlannedAt) < 10*time.Second && curr.Health > prev.Health-4 {
 		return false
 	}
 
@@ -558,14 +616,17 @@ cacheMiss:
 			}
 		}
 
-		systemPrompt := fmt.Sprintf("%s\n\n%s\n\n%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
+		// PREFIX CACHING OPTIMIZATION:
+		// Put static/long-lived data first so the provider can cache the top of the prompt.
+		// baseSystemRules, milestoneContext, availableSkillsDocs are relatively static.
+		systemPrompt := fmt.Sprintf("%s\n\n%s\n\n%s\n\n%s\n\n%s\n\nLONG_TERM_MEMORY:\n%s\n\n%s\n\nPRIMARY STRATEGY: %s\nSECONDARY STRATEGY: %s\nAll tasks MUST align with these strategies.",
 			baseSystemRules,
+			availableSkillsDocs,
 			p.milestoneContext,
-			tacticalFeedback,
 			learnedRules,
+			tacticalFeedback,
 			longTermMem,
 			knownWorld,
-			availableSkillsDocs,
 			directive.PrimaryGoal,
 			directive.SecondaryGoal,
 		)
@@ -590,17 +651,33 @@ cacheMiss:
 		}
 
 		events, _ := p.store.GetRecentStream(ctx, sessionID, 100)
-		historySummary := p.client.CompressState(state, events)
+		historySummary := p.client.CompressState(sessionID, state, events)
 		userContent = fmt.Sprintf("%s\n\nEXECUTION_HISTORY_SUMMARY:\n%s", userContent, historySummary)
 
-		rawResponse, err := p.client.Generate(ctx, systemPrompt, userContent)
+		rawResponse, err := p.client.GenerateWithFormat(ctx, systemPrompt, userContent, planResponseFormat, true)
 		if err != nil {
 			return nil, fmt.Errorf("llm api failure: %w", err)
 		}
 
 		var parsed multiCandidateResponse
 		if err := json.Unmarshal([]byte(domain.CleanJSON(rawResponse)), &parsed); err != nil {
-			return nil, fmt.Errorf("llm schema violation: %w", err)
+			p.logger.Error("LLM hallucinated bad JSON, using hardcoded fallback", 
+				slog.String("raw", rawResponse),
+				slog.Any("error", err))
+			
+			// Return a safe emergency fallback plan instead of an error
+			return &domain.Plan{
+				ID:            fmt.Sprintf("hallucination-fb-%d", time.Now().UnixNano()),
+				StrategicGoal: "Emergency Stabilization",
+				Objective:     "LLM Parse Failure Recovery",
+				Tasks: []domain.Action{{
+					ID:        fmt.Sprintf("panic-retreat-%d", time.Now().UnixNano()),
+					Action:    "retreat",
+					Target:    domain.Target{Name: "safe_zone", Type: "none"},
+					Priority:  100,
+					Rationale: "LLM output was invalid JSON; forcing mechanical escape.",
+				}},
+			}, nil
 		}
 
 		if len(parsed.Candidates) == 0 {

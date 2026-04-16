@@ -14,15 +14,65 @@ import (
 )
 
 func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEvent) {
-	// Performance Budgeting: Track state age
-	age := time.Since(event.CreatedAt).Milliseconds()
-	observability.Metrics.StateAgeMs.Observe(float64(age))
+	state := s.stateProvider.GetCurrentState().State
 
-	s.planner.SetMilestoneContext(s.getMilestoneContext())
-	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
-	if !s.planManager.HasActivePlan() && s.execStatus.IsIdle() {
-		s.evaluateNextPlan()
+	// PROACTIVE: Break commitment lock for survival panics only if cooldown allows
+	if hasImmediateThreat(state) || hasImmediateHazard(state) || state.Health < domain.SurvivalCriticalHealth {
+		s.mu.Lock()
+		if time.Since(s.lastOverrideTime) >= s.overrideCooldown {
+			s.lastOverrideTime = time.Now()
+			s.mu.Unlock()
+			s.logger.Warn("Survival priority override active, breaking lock")
+			s.commitment.Store(nil)
+			s.evaluateNextPlan()
+			return
+		}
+		s.mu.Unlock()
 	}
+
+	// Trigger Discipline: Only replan on meaningful state changes
+	if s.shouldReplan(state) {
+		s.planner.SetMilestoneContext(s.getMilestoneContext())
+		s.planner.TriggerReplan(state)
+
+		if !s.planManager.HasActivePlan() && s.execStatus.IsIdle() {
+			s.evaluateNextPlan()
+		}
+	}
+}
+
+func (s *Service) shouldReplan(state domain.GameState) bool {
+	before := s.beforeState.Load()
+	if before == nil {
+		return true
+	}
+
+	// 1. Danger resolved
+	if len(before.Threats) > 0 && len(state.Threats) == 0 {
+		return true
+	}
+
+	// 2. Health/Food milestone (bucketed)
+	if int(state.Health)/2 != int(before.Health)/2 || int(state.Food)/2 != int(before.Food)/2 {
+		return true
+	}
+
+	// 3. TimeOfDay change (significant - transition to night/day)
+	if (state.TimeOfDay < 12000 && before.TimeOfDay >= 12000) || (state.TimeOfDay >= 12000 && before.TimeOfDay < 12000) {
+		return true
+	}
+
+	// 4. Large position change (> 50 blocks)
+	if state.Position.DistanceTo(before.Position) > 50 {
+		return true
+	}
+
+	// 5. Significant inventory change (new item type)
+	if len(state.Inventory) != len(before.Inventory) {
+		return true
+	}
+
+	return false
 }
 
 func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
@@ -38,6 +88,12 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 	}
 
 	success := payload.Status == "COMPLETED"
+	if success {
+		s.modeManager.RecordSuccess()
+	} else if !domain.IsControlledStop(payload.Cause) {
+		s.modeManager.RecordFailure()
+	}
+
 	controlledStop := domain.IsControlledStop(payload.Cause)
 
 	intent := s.activeIntent.Load()
@@ -309,6 +365,7 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 
 	s.commitment.Store(&Commitment{
 		TaskID:      firstTask.ID,
+		Objective:   plan.Objective,
 		StartTime:   time.Now(),
 		MinDuration: 2 * time.Second,
 	})
@@ -344,6 +401,7 @@ func (s *Service) dispatchActiveIntent(ctx context.Context, intent *domain.Actio
 
 	s.commitment.Store(&Commitment{
 		TaskID:      intent.ID,
+		Objective:   "Tactical Adaptation",
 		StartTime:   time.Now(),
 		MinDuration: 2 * time.Second,
 	})
