@@ -99,21 +99,22 @@ func (pm *PlanManager) SetPlan(plan *domain.Plan) {
 	pm.current = newPlan
 }
 
-// FIX: Safe, locked mutation for task progression
-func (pm *PlanManager) PopTask(taskID string) bool {
+// PopTask removes the current task if taskID matches. 
+// Returns (hasMoreTasks, matched).
+func (pm *PlanManager) PopTask(taskID string) (bool, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	if pm.current == nil || len(pm.current.Tasks) == 0 {
-		return false
+		return false, false
 	}
 
 	if pm.current.Tasks[0].ID != taskID {
-		return false // stale event, don't advance
+		return false, false // stale event, don't advance
 	}
 
 	pm.current.Tasks = pm.current.Tasks[1:]
-	return len(pm.current.Tasks) > 0
+	return len(pm.current.Tasks) > 0, true
 }
 
 func (pm *PlanManager) NextFallback() bool {

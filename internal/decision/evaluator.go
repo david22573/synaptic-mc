@@ -62,6 +62,8 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 	}
 
 	var plan domain.Plan
+	var proposedIntent *domain.ActionIntent
+	var proposeErr error
 
 	if survivalOverride {
 		s.logger.Warn("Survival priority override active")
@@ -79,18 +81,18 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 	} else if isProgressionMode(state) && s.curriculum != nil {
 		s.logger.Info("Stable state detected, curriculum driving progression")
 
-		intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
-		if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
-			if intent.Action == "use_skill" && len(intent.SkillSteps) > 0 {
-				s.logger.Info("Expanding composable skill", slog.String("skill", intent.Target), slog.Int("steps", len(intent.SkillSteps)))
+		proposedIntent, proposeErr = s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+		if proposeErr == nil && proposedIntent != nil && isValidCurriculumIntent(state, proposedIntent) {
+			if proposedIntent.Action == "use_skill" && len(proposedIntent.SkillSteps) > 0 {
+				s.logger.Info("Expanding composable skill", slog.String("skill", proposedIntent.Target), slog.Int("steps", len(proposedIntent.SkillSteps)))
 				plan = domain.Plan{
-					Objective:  intent.Rationale,
+					Objective:  proposedIntent.Rationale,
 					IsFallback: false,
-					Tasks:      make([]domain.Action, len(intent.SkillSteps)),
+					Tasks:      make([]domain.Action, len(proposedIntent.SkillSteps)),
 				}
-				for i, step := range intent.SkillSteps {
+				for i, step := range proposedIntent.SkillSteps {
 					plan.Tasks[i] = domain.Action{
-						ID:        fmt.Sprintf("%s-step-%d", intent.ID, i),
+						ID:        fmt.Sprintf("%s-step-%d", proposedIntent.ID, i),
 						Action:    step.Action,
 						Target:    domain.Target{Name: step.Target, Type: "skill_step"},
 						Count:     step.Count,
@@ -100,15 +102,15 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 				}
 			} else {
 				plan = domain.Plan{
-					Objective:  intent.Rationale,
+					Objective:  proposedIntent.Rationale,
 					IsFallback: false,
 					Tasks: []domain.Action{
 						{
 							ID:        fmt.Sprintf("curr-%d", time.Now().UnixNano()),
-							Action:    intent.Action,
-							Target:    domain.Target{Name: intent.Target, Type: "curriculum"},
-							Count:     intent.Count,
-							Rationale: intent.Rationale,
+							Action:    proposedIntent.Action,
+							Target:    domain.Target{Name: proposedIntent.Target, Type: "curriculum"},
+							Count:     proposedIntent.Count,
+							Rationale: proposedIntent.Rationale,
 							Priority:  70,
 						},
 					},
@@ -128,7 +130,14 @@ func (s *Service) doEvaluateNextPlan(ctx context.Context) {
 
 	if (plan.IsFallback || len(plan.Tasks) == 0) && s.curriculum != nil {
 		if plan.Objective != "Curriculum Fallback" && plan.Objective != "Curriculum" {
-			intent, err := s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+			intent := proposedIntent
+			err := proposeErr
+
+			// If we haven't tried ProposeTask yet (e.g. survivalOverride was true), try it now
+			if intent == nil && err == nil {
+				intent, err = s.curriculum.ProposeTask(ctx, state, s.getTaskHistory(), s.getMilestoneContext(), s.sessionID, s.flags.CurriculumHorizon)
+			}
+
 			if err == nil && intent != nil && isValidCurriculumIntent(state, intent) {
 				plan = domain.Plan{
 					Objective:  "Curriculum Fallback",

@@ -49,6 +49,9 @@ type Service struct {
 	taskHistory   []domain.TaskHistory
 	milestones    []domain.ProgressionMilestone
 
+	synthesisCache map[string]bool
+	synthMu        sync.Mutex
+
 	commitment atomic.Pointer[Commitment]
 }
 
@@ -70,26 +73,27 @@ func NewService(
 	flags config.FeatureFlags,
 ) *Service {
 	s := &Service{
-		ctx:           ctx,
-		sessionID:     sessionID,
-		bus:           bus,
-		planner:       advPlanner,
-		planManager:   pm,
-		curriculum:    curriculum,
-		critic:        critic,
-		stateProvider: stateProvider,
-		execStatus:    execStatus,
-		worldModel:    worldModel,
-		memStore:      memStore,
-		feedback:      feedback,
-		logger:        logger.With(slog.String("component", "decision_service")),
-		flags:         flags,
-		evalTrigger:   make(chan struct{}, 1),
-		taskHistory:   make([]domain.TaskHistory, 0),
-		milestones:    make([]domain.ProgressionMilestone, 0),
-		skillManager:  skillManager,
-		predictor:     NewStrategyPredictor(memStore),
-		routeScorer:   &RouteScorer{},
+		ctx:            ctx,
+		sessionID:      sessionID,
+		bus:            bus,
+		planner:        advPlanner,
+		planManager:    pm,
+		curriculum:     curriculum,
+		critic:         critic,
+		stateProvider:  stateProvider,
+		execStatus:     execStatus,
+		worldModel:     worldModel,
+		memStore:       memStore,
+		feedback:       feedback,
+		logger:         logger.With(slog.String("component", "decision_service")),
+		flags:          flags,
+		evalTrigger:    make(chan struct{}, 1),
+		taskHistory:    make([]domain.TaskHistory, 0),
+		milestones:     make([]domain.ProgressionMilestone, 0),
+		skillManager:   skillManager,
+		predictor:      NewStrategyPredictor(memStore),
+		routeScorer:    &RouteScorer{},
+		synthesisCache: make(map[string]bool),
 	}
 
 	// Load persistent state

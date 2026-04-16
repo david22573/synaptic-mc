@@ -154,7 +154,7 @@ func hashState(state domain.GameState) uint64 {
 }
 
 func (p *AdvancedPlanner) stateChangedSignificantly(prev, curr domain.GameState) bool {
-	if prev.Health == 0 {
+	if !prev.Initialized {
 		return true
 	}
 

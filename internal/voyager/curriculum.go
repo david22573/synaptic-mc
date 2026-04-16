@@ -160,7 +160,8 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 	var parseErr error
 	var errorHint string
 
-	for attempt := 0; attempt < 3; attempt++ {
+	// Reduced retry loop: 1 initial attempt + 1 retry on parse failure
+	for attempt := 0; attempt < 2; attempt++ {
 		currentPrompt := baseUserContent
 		if errorHint != "" {
 			currentPrompt += "\n\n" + errorHint
@@ -168,6 +169,7 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 
 		rawResponse, genErr := c.client.Generate(ctx, curriculumSystemPrompt, currentPrompt)
 		if genErr != nil {
+			// Do not retry on hard LLM API failures (e.g. context length, quota)
 			return nil, fmt.Errorf("llm api failure: %w", genErr)
 		}
 
@@ -185,13 +187,14 @@ func (c *AutonomousCurriculum) ProposeTask(ctx context.Context, state domain.Gam
 			}
 			break
 		}
-		// LOG FAILURE FOR DEBUGGING
-		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nRaw Response: %s\nParse Error: %v\n", attempt, rawResponse, parseErr)
+		
+		// Only retry on parse failures with an error hint to the LLM
+		fmt.Printf("[DEBUG] Curriculum LLM Parse Failure (Attempt %d):\nParse Error: %v\n", attempt, parseErr)
 		errorHint = fmt.Sprintf("SYSTEM: Your last response failed to parse as JSON or missed the required 'action' field. Error: %v. You must return strictly valid JSON.", parseErr)
 	}
 
 	if parseErr != nil || intent.Action == "" {
-		return nil, fmt.Errorf("failed to generate valid intent after 3 attempts: %w", parseErr)
+		return nil, fmt.Errorf("failed to generate valid intent: %w", parseErr)
 	}
 	if intent.ID == "" {
 		intent.ID = fmt.Sprintf("intent-%d", time.Now().UnixNano())

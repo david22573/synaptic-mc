@@ -20,7 +20,7 @@ func (s *Service) handleStateUpdated(ctx context.Context, event domain.DomainEve
 
 	s.planner.SetMilestoneContext(s.getMilestoneContext())
 	s.planner.TriggerReplan(s.stateProvider.GetCurrentState().State)
-	if !s.planManager.HasActivePlan() {
+	if !s.planManager.HasActivePlan() && s.execStatus.IsIdle() {
 		s.evaluateNextPlan()
 	}
 }
@@ -147,6 +147,16 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 					if beforeState != nil {
 						intentVal := s.activeIntent.Load()
 						if intentVal != nil && intentVal.Action != "" && intentVal.Action != "idle" && intentVal.Action != "use_skill" {
+							// Synthesis Deduplication: Only synthesize a skill once per action/target pair per session
+							key := fmt.Sprintf("%s:%s", intentVal.Action, intentVal.Target)
+							s.synthMu.Lock()
+							if s.synthesisCache[key] {
+								s.synthMu.Unlock()
+								return
+							}
+							s.synthesisCache[key] = true
+							s.synthMu.Unlock()
+
 							go func(intent domain.ActionIntent, before, after domain.GameState) {
 								ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
 								defer cancel()
@@ -246,21 +256,34 @@ func (s *Service) handleTaskEnd(ctx context.Context, event domain.DomainEvent) {
 		return
 	}
 
-	hasMoreTasks := s.planManager.PopTask(payload.CommandID)
+	// Fetch current plan before popping to check length for WarmNextPlan
+	currentActivePlan := s.planManager.GetCurrent()
+
+	hasMoreTasks, matched := s.planManager.PopTask(payload.CommandID)
+	if !matched {
+		return // Stale event, ignore to prevent accidental plan abandonment
+	}
+
 	if hasMoreTasks {
 		s.dispatchActivePlan(ctx)
 		return
 	}
 
-	currentPlan := s.planManager.GetCurrent()
-	if currentPlan != nil {
-		s.planner.RecordSuccess(currentPlan.Objective)
+	if currentActivePlan != nil {
+		s.planner.RecordSuccess(currentActivePlan.Objective)
+		
+		// Only warm the next plan if this was a substantial (multi-task) plan that just finished.
+		// Single-task reactive/curriculum plans trigger immediate re-evaluations anyway.
+		if len(currentActivePlan.Tasks) > 1 {
+			s.planner.WarmNextPlan(ctx, s.sessionID, s.stateProvider.GetCurrentState().State)
+		}
+
 		if s.memStore != nil {
 			go func(sid, o string) {
 				dbCtx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 				defer cancel()
 				_ = s.memStore.SaveFailureCount(dbCtx, sid, o, 0)
-			}(s.sessionID, currentPlan.Objective)
+			}(s.sessionID, currentActivePlan.Objective)
 		}
 	}
 
@@ -283,10 +306,6 @@ func (s *Service) dispatchActivePlan(ctx context.Context) {
 		slog.String("objective", plan.Objective),
 		slog.String("task_action", firstTask.Action),
 		slog.String("task_target", firstTask.Target.Name))
-
-	if len(plan.Tasks) == 1 {
-		s.planner.WarmNextPlan(ctx, s.sessionID, s.stateProvider.GetCurrentState().State)
-	}
 
 	s.commitment.Store(&Commitment{
 		TaskID:      firstTask.ID,
