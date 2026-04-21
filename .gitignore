@@ -42,5 +42,5 @@ synaptic-mc
 
 # Runtime State
 data/
-server
+bin/server
 data/
