@@ -339,11 +339,8 @@ func (tm *TaskManager) Complete(ctx context.Context, taskID string, success bool
 		}
 
 		if tm.ctrlManager != nil {
-			if idm := tm.ctrlManager.GetIdempotent(); idm != nil {
-				idm.Clear(taskID)
-			}
+			// Idempotency is now managed internally by the wsActor
 		}
-
 		tm.queue = make(ActionPriorityQueue, 0, 10)
 		heap.Init(&tm.queue)
 

@@ -270,8 +270,8 @@ async function connectWithRetry(maxAttempts = 10) {
         catch (e) { }
     }
     bot = mineflayer.createBot({
-        host: "127.0.0.1",
-        port: 25565,
+        host: process.env.MC_HOST || "david22573.aternos.me",
+        port: process.env.MC_PORT ? parseInt(process.env.MC_PORT) : 25565,
         username: "CraftBot",
         version: "1.19",
     });

@@ -53,7 +53,7 @@ func NewClient(cfg Config) *Client {
 		config:     cfg,
 		lastStates: make(map[string]string),
 		http: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 120 * time.Second,
 		},
 	}
 }
@@ -235,8 +235,8 @@ func (c *Client) GenerateWithFormat(ctx context.Context, systemPrompt, userConte
 		return "", err
 	}
 
-	// 45 second timeout for slow model providers
-	client := &http.Client{Timeout: 45 * time.Second}
+	// 120 second timeout for slow model providers
+	client := &http.Client{Timeout: 120 * time.Second}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 

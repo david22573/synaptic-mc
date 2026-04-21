@@ -155,7 +155,7 @@ func (e *Evaluator) cachedLLMDirective(state domain.GameState) (Directive, bool)
 func (e *Evaluator) llmDirective(state domain.GameState) (Directive, bool) {
 	userContent := buildStrategyContext(state)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	raw, err := e.llm.Generate(ctx, strategySystemPrompt, userContent)

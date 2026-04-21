@@ -2,7 +2,8 @@ package domain
 
 import (
 	"context"
-	"sync"
+
+	"github.com/anthdm/hollywood/actor"
 )
 
 // EventHandler defines how components react to domain events.
@@ -23,97 +24,39 @@ type EventBus interface {
 	Subscribe(eventType EventType, handler EventHandler)
 }
 
-// subscriber wraps a handler with its own dedicated queue to ensure ordering and isolation.
-type subscriber struct {
-	handler EventHandler
-	buffer  []DomainEvent
-	mu      sync.Mutex
-	cond    *sync.Cond
+// ActorEventBus wraps Hollywood's native event stream to satisfy EventBus interface.
+type ActorEventBus struct {
+	engine *actor.Engine
 }
 
-func (s *subscriber) push(ev DomainEvent, critical bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// For non-critical events, we drop if the buffer is already large to prevent OOM.
-	if !critical && len(s.buffer) > 1024 {
-		return
+func NewActorEventBus(engine *actor.Engine) *ActorEventBus {
+	return &ActorEventBus{
+		engine: engine,
 	}
-
-	s.buffer = append(s.buffer, ev)
-	s.cond.Signal()
 }
 
-func (s *subscriber) run() {
-	for {
-		s.mu.Lock()
-		for len(s.buffer) == 0 {
-			s.cond.Wait()
+// Publish drops the event directly into Hollywood's high-performance stream.
+func (b *ActorEventBus) Publish(ctx context.Context, ev DomainEvent) {
+	b.engine.BroadcastEvent(ev)
+}
+
+// Subscribe supports legacy components that still expect a standard callback.
+func (b *ActorEventBus) Subscribe(eventType EventType, handler EventHandler) {
+	// Hollywood v1 does not expose the raw subscription list easily for func-based subs
+	// without an actor. We spawn a proxy actor for legacy func handlers.
+	b.engine.SpawnFunc(func(ctx *actor.Context) {
+		switch msg := ctx.Message().(type) {
+		case actor.Started:
+			ctx.Engine().Subscribe(ctx.PID())
+		case DomainEvent:
+			if msg.Type == eventType || eventType == "" {
+				handler.HandleEvent(context.Background(), msg)
+			}
 		}
-		ev := s.buffer[0]
-		s.buffer = s.buffer[1:]
-		s.mu.Unlock()
-
-		// Use Background context for now as event handlers are decoupled from the publish context.
-		// However, we ensure they process events sequentially.
-		s.handler.HandleEvent(context.Background(), ev)
-	}
+	}, "event_sub_proxy")
 }
 
-// LocalEventBus provides a robust, asynchronous event bus.
-// It guarantees sequential delivery per subscriber and prevents critical event loss.
-type LocalEventBus struct {
-	mu          sync.RWMutex
-	subscribers map[EventType][]*subscriber
-}
-
-func NewEventBus() *LocalEventBus {
-	return &LocalEventBus{
-		subscribers: make(map[EventType][]*subscriber),
-	}
-}
-
-// IsCritical returns true if the event type must be delivered reliably to ensure system consistency.
-func IsCritical(et EventType) bool {
-	switch et {
-	case EventTypeTaskStart, EventTypeTaskEnd,
-		EventTypePlanCreated, EventTypePlanInvalidated,
-		EventTypePlanCompleted, EventTypePlanFailed,
-		EventTypePanic, EventTypePanicResolved,
-		EventBotDeath, EventBotRespawn,
-		EventTypeStateUpdated:
-		return true
-	default:
-		return false
-	}
-}
-
-func (b *LocalEventBus) Publish(ctx context.Context, event DomainEvent) {
-	b.mu.RLock()
-	subs, ok := b.subscribers[event.Type]
-	b.mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	critical := IsCritical(event.Type)
-
-	for _, s := range subs {
-		s.push(event, critical)
-	}
-}
-
-func (b *LocalEventBus) Subscribe(eventType EventType, handler EventHandler) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	s := &subscriber{
-		handler: handler,
-		buffer:  make([]DomainEvent, 0, 10),
-	}
-	s.cond = sync.NewCond(&s.mu)
-	
-	b.subscribers[eventType] = append(b.subscribers[eventType], s)
-	go s.run()
+// SubscribeActor allows new actors to route events directly into their mailboxes.
+func (b *ActorEventBus) SubscribeActor(pid *actor.PID) {
+	b.engine.Subscribe(pid)
 }

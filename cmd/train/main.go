@@ -60,9 +60,10 @@ func main() {
 	defer vStore.Close()
 
 	llmClient := llm.NewClient(llm.Config{
-		APIURL:     *llmURL,
-		APIKey:     *llmKey,
-		Model:      *llmModel,
+		APIURL:      *llmURL,
+		APIKey:      *llmKey,
+		StrongModel: *llmModel,
+		CheapModel:  *llmModel,
 	})
 
 	critic := voyager.NewStateCriticWithLLM(llmClient)

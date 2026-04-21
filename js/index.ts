@@ -596,13 +596,13 @@ async function connectWithRetry(maxAttempts = 10) {
         }
     }
 
-    const mcVersion = process.env.MC_VERSION || undefined;
-
+    const mcHost = process.env.MC_HOST || "david22573.aternos.me";
+    const mcPort = process.env.MC_PORT ? parseInt(process.env.MC_PORT) : 25565;
     bot = mineflayer.createBot({
-        host: "127.0.0.1",
-        port: 25565,
+        host: mcHost,
+        port: mcPort,
         username: "SynapticBot",
-        version: mcVersion,
+        version: "1.19",
         hideErrors: true,
         logErrors: false,
     });

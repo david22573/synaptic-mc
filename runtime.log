@@ -1,0 +1,9 @@
+{"time":"2026-04-21T15:01:00.24171988-07:00","level":"INFO","msg":"Feature flags hot-reloaded from file","component":"config_watcher","file":"config.json"}
+{"time":"2026-04-21T15:01:00.269343759-07:00","level":"INFO","msg":"Starting HTTP server","addr":":8080"}
+{"time":"2026-04-21T15:01:00.27542487-07:00","level":"INFO","msg":"Starting UI hub"}
+{"time":"2026-04-21T15:01:00.2757635-07:00","level":"INFO","msg":"Starting Dynamic Config Watcher"}
+{"time":"2026-04-21T15:01:00.275793642-07:00","level":"INFO","msg":"Starting Planner slow loop"}
+{"time":"2026-04-21T15:01:00.275813339-07:00","level":"INFO","msg":"Starting TS supervisor"}
+{"time":"2026-04-21T15:01:00.275899427-07:00","level":"INFO","msg":"Spawning Node.js bot process","component":"ts_supervisor","work_dir":"/home/davidmiguel22573/Github/synaptic-mc/js/dist","attempt":1}
+{"time":"2026-04-21T15:01:00.277854148-07:00","level":"INFO","msg":"Starting Task Execution Engine"}
+{"time":"2026-04-21T15:01:00.277913268-07:00","level":"INFO","msg":"Starting Task Manager Queue"}

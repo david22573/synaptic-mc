@@ -48,28 +48,28 @@
     
     <div class="grid">
         <div class="stat">
-            <label>Survival Time</label>
-            <value>{formatTime(stats.survival_time)}</value>
+            <span class="label">Survival Time</span>
+            <div class="value">{formatTime(stats.survival_time)}</div>
         </div>
         <div class="stat">
-            <label>Deaths / Hour</label>
-            <value class:bad={Number(deathsPerHour) > 2}>{deathsPerHour}</value>
+            <span class="label">Deaths / Hour</span>
+            <div class="value" class:bad={Number(deathsPerHour) > 2}>{deathsPerHour}</div>
         </div>
         <div class="stat">
-            <label>Tasks / Hour</label>
-            <value>{tasksPerHour}</value>
+            <span class="label">Tasks / Hour</span>
+            <div class="value">{tasksPerHour}</div>
         </div>
         <div class="stat">
-            <label>Resources / Hour</label>
-            <value>{resourcesPerHour}</value>
+            <span class="label">Resources / Hour</span>
+            <div class="value">{resourcesPerHour}</div>
         </div>
         <div class="stat">
-            <label>Stuck Rate</label>
-            <value>{stuckRate}%</value>
+            <span class="label">Stuck Rate</span>
+            <div class="value">{stuckRate}%</div>
         </div>
         <div class="stat">
-            <label>Skill Reuse</label>
-            <value>{stats.skill_reuse}</value>
+            <span class="label">Skill Reuse</span>
+            <div class="value">{stats.skill_reuse}</div>
         </div>
     </div>
 </div>
@@ -89,7 +89,7 @@
         gap: 1rem;
     }
     .stat { display: flex; flex-direction: column; }
-    label { font-size: 0.7rem; color: #888; }
-    value { font-family: monospace; font-size: 1.2rem; }
+    .label { font-size: 0.7rem; color: #888; }
+    .value { font-family: monospace; font-size: 1.2rem; }
     .bad { color: #ff5555; }
 </style>

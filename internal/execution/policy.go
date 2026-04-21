@@ -29,6 +29,41 @@ var DefaultRetryPolicy = RetryPolicy{
 	Multiplier:     2.0,
 }
 
+type Strategy string
+
+const (
+	StrategyRetrySame      Strategy = "retry_same"
+	StrategyRetryDifferent Strategy = "retry_different"
+	StrategyDegrade        Strategy = "degrade"
+	StrategyAbort          Strategy = "abort"
+)
+
+type FailureDirective struct {
+	Strategy Strategy
+	Delay    time.Duration
+	Fallback string
+}
+
+func EvaluateFailure(res domain.ExecutionResult, attempts int) FailureDirective {
+	delay := time.Duration(attempts) * 2 * time.Second
+	if attempts > 3 {
+		return FailureDirective{Strategy: StrategyAbort}
+	}
+	class := ClassifyFailure(res.Cause)
+	switch class {
+	case FailureRecoverable:
+		return FailureDirective{Strategy: StrategyRetrySame, Delay: delay}
+	case FailureEnvironmental:
+		return FailureDirective{Strategy: StrategyRetryDifferent, Delay: delay}
+	case FailureFatal:
+		return FailureDirective{Strategy: StrategyAbort}
+	case FailurePreempted:
+		return FailureDirective{Strategy: StrategyAbort}
+	default:
+		return FailureDirective{Strategy: StrategyRetrySame, Delay: delay}
+	}
+}
+
 func ClassifyFailure(cause string) FailureClass {
 	switch cause {
 	case "timeout", "network_error":

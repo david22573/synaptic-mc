@@ -11,17 +11,17 @@ import (
 
 // PrepOrchestrator handles proactive actions like food farming and pre-escape.
 type PrepOrchestrator struct {
-	logger               *slog.Logger
-	engine               *TaskExecutionEngine
-	arbiter              *ActionArbiter
-	lastEscapeDispatch   time.Time
-	escapeCooldown       time.Duration
+	logger             *slog.Logger
+	engine             *TaskExecutionEngine
+	supervisor         *ExecutionSupervisor
+	lastEscapeDispatch time.Time
+	escapeCooldown     time.Duration
 }
 
-func NewPrepOrchestrator(engine *TaskExecutionEngine, arbiter *ActionArbiter, logger *slog.Logger) *PrepOrchestrator {
+func NewPrepOrchestrator(engine *TaskExecutionEngine, supervisor *ExecutionSupervisor, logger *slog.Logger) *PrepOrchestrator {
 	return &PrepOrchestrator{
 		engine:         engine,
-		arbiter:        arbiter,
+		supervisor:     supervisor,
 		logger:         logger.With(slog.String("component", "prep_orchestrator")),
 		escapeCooldown: 5 * time.Second,
 	}
@@ -38,9 +38,9 @@ func (o *PrepOrchestrator) CheckProactiveFarming(ctx context.Context, state doma
 			Priority:  40,
 			Rationale: "Proactive farming based on declining food levels",
 		}
-		
+
 		// Phase 4: Single Writer Action Bus
-		o.arbiter.Request(ctx, action)
+		o.supervisor.Request(ctx, action)
 	}
 }
 
@@ -53,7 +53,7 @@ func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState
 			threatCount++
 		}
 	}
-	
+
 	// If 2+ mobs are approaching and health isn't full, escape early
 	if threatCount >= 2 && state.Health < 18 {
 		dangerRising = true
@@ -73,8 +73,8 @@ func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState
 			Priority:  90,
 			Rationale: "Predictive escape: threat density increasing",
 		}
-		
+
 		// Phase 4: Single Writer Action Bus
-		o.arbiter.Request(ctx, action)
+		o.supervisor.Request(ctx, action)
 	}
 }

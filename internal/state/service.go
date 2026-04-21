@@ -36,11 +36,9 @@ func NewService(bus domain.EventBus, memStore memory.Store, logger *slog.Logger)
 	// Initialize with an empty state so loads never panic
 	s.currentState.Store(&domain.VersionedState{})
 
-	// Wire up the bus listeners
-	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
-
-	// Phase 5: Listen for task completion to alter the world model
-	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+	if bus != nil {
+		s.subscribe(bus)
+	}
 
 	// Background Heatmap Decay
 	go func() {
@@ -53,6 +51,18 @@ func NewService(bus domain.EventBus, memStore memory.Store, logger *slog.Logger)
 	return s
 }
 
+func (s *Service) SetEventBus(bus domain.EventBus) {
+	s.bus = bus
+	s.subscribe(bus)
+}
+
+func (s *Service) subscribe(bus domain.EventBus) {
+	// Wire up the bus listeners
+	bus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(s.handleStateTick))
+
+	// Phase 5: Listen for task completion to alter the world model
+	bus.Subscribe(domain.EventTypeTaskEnd, domain.FuncHandler(s.handleTaskEnd))
+}
 func (s *Service) GetCurrentState() domain.VersionedState {
 	if ptr := s.currentState.Load(); ptr != nil {
 		return *ptr

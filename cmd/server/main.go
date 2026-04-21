@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/anthdm/hollywood/actor"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -32,7 +32,6 @@ import (
 	"david22573/synaptic-mc/internal/llm"
 	"david22573/synaptic-mc/internal/memory"
 	"david22573/synaptic-mc/internal/observability"
-	"david22573/synaptic-mc/internal/planner"
 	"david22573/synaptic-mc/internal/state"
 	"david22573/synaptic-mc/internal/strategy"
 	"david22573/synaptic-mc/internal/supervisor"
@@ -109,8 +108,6 @@ func main() {
 		MaxRetries:  3,
 	})
 
-	eventBus := domain.NewEventBus()
-	rtBus := domain.NewRealtimeBus()
 	uiHub := observability.NewHub(logger)
 
 	dynFlags := config.NewDynamicFlags(cfg.ConfigPath, logger)
@@ -118,10 +115,12 @@ func main() {
 
 	humanizer := humanization.NewEngine(humanization.MapToHumanizationConfig(initialFlags.Humanization))
 
-	stateSvc := state.NewService(eventBus, memoryStore, logger)
-	ctrlManager := execution.NewControllerManager()
-	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger, initialFlags.Execution)
+	actorEngine, _ := actor.NewEngine(actor.NewEngineConfig())
+	eventBus := domain.NewActorEventBus(actorEngine)
 
+	stateSvc := state.NewService(eventBus, memoryStore, logger)
+	ctrlManager := execution.NewControllerManagerActor(actorEngine, logger)
+	execEngine := execution.NewTaskExecutionEngine(ctrlManager, logger, initialFlags.Execution)
 	// Hot-reload loop
 	go func() {
 		sub := dynFlags.Subscribe()
@@ -135,17 +134,14 @@ func main() {
 
 	taskManager := execution.NewTaskManager(execEngine, ctrlManager, nil, logger)
 
-	execSupervisor := execution.NewSupervisor(eventBus, logger)
-	actionArbiter := execution.NewActionArbiter(execSupervisor, logger)
-	taskManager.SetDangerProvider(actionArbiter)
-	
-	execService := execution.NewControlService(rtBus, eventBus, execEngine, taskManager, ctrlManager, execSupervisor, actionArbiter, humanizer, stateSvc, logger)
+	execSupervisor := execution.NewExecutionSupervisor(actorEngine, logger, execEngine)
+	taskManager.SetDangerProvider(execSupervisor)
+
+	execService := execution.NewControlService(eventBus, execEngine, taskManager, ctrlManager, execSupervisor, humanizer, stateSvc, logger)
 	uiHub.SetOrchestrator(execService)
 
 	evaluator := strategy.NewEvaluatorWithLLM(llmClient)
-	critic := voyager.NewStateCriticWithLLM(llmClient)
 	worldModel := domain.NewWorldModel()
-	curriculum := voyager.NewAutonomousCurriculum(llmClient, vectorStore, memoryStore, worldModel)
 
 	// Initialize the new SkillManager
 	skillManager := voyager.NewSkillManager(vectorStore, llmClient)
@@ -153,8 +149,6 @@ func main() {
 	// Inject skillManager into AdvancedPlanner
 	plannerObj := decision.NewAdvancedPlanner(llmClient, evaluator, nil, memoryStore, eventStore, worldModel, humanizer, logger, dynFlags.Get(), skillManager)
 
-	planManager := decision.NewPlanManager()
-	feedbackAnalyzer := planner.NewFeedbackAnalyzer(worldModel, logger)
 	var latestStateUpdate atomic.Pointer[map[string]interface{}]
 
 	eventBus.Subscribe(domain.EventTypeStateTick, domain.FuncHandler(func(ctx context.Context, ev domain.DomainEvent) {
@@ -248,8 +242,7 @@ func main() {
 		}
 	})
 
-	decisionSvc := decision.NewService(ctx, cfg.SessionID, eventBus, plannerObj, planManager,
-		curriculum, critic, stateSvc, execEngine, worldModel, memoryStore, feedbackAnalyzer, skillManager, logger, dynFlags.Get(), actionArbiter)
+	decisionSvc := decision.NewService(actorEngine, plannerObj, eventBus, memoryStore, cfg.SessionID, logger)
 	if decisionSvc == nil {
 		logger.Error("Failed to initialize decision service")
 		os.Exit(1)
@@ -373,7 +366,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/ui/ws", uiHub.HandleConnections)
-	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, rtBus, eventBus, ctrlManager, runner, logger, cfg.SessionID))
+	mux.HandleFunc("/bot/ws", handleBotConnection(ctx, eventBus, ctrlManager, runner, logger, cfg.SessionID))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	uiPath := cfg.UIPath
@@ -494,8 +487,8 @@ func parseConfig() Config {
 	if strings.Contains(*llmURL, "openrouter.ai") {
 		defaultEmbed = "openai/text-embedding-3-small"
 	}
-	llmStrongModel := flag.String("llm-strong-model", getEnvOrDefault("LLM_STRONG_MODEL", "openai/gpt-4o-mini"), "LLM strong generation model")
-	llmCheapModel := flag.String("llm-cheap-model", getEnvOrDefault("LLM_CHEAP_MODEL", "openai/gpt-4o-mini"), "LLM cheap classification model")
+	llmStrongModel := flag.String("llm-strong-model", getEnvOrDefault("LLM_STRONG_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"), "LLM strong generation model")
+	llmCheapModel := flag.String("llm-cheap-model", getEnvOrDefault("LLM_CHEAP_MODEL", "google/gemini-2.5-flash-lite"), "LLM cheap classification model")
 	llmEmbedModel := flag.String("llm-embed-model", getEnvOrDefault("LLM_EMBED_MODEL", defaultEmbed), "LLM embedding model name")
 
 	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
@@ -552,26 +545,9 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
+func handleBotConnection(appCtx context.Context, evBus domain.EventBus, cm *execution.ControllerManager, runner *supervisor.NodeRunner, logger *slog.Logger, sessionID string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				return true
-			}
-
-			host := r.Host
-			if origin == "http://"+host || origin == "https://"+host {
-				return true
-			}
-
-			return origin == "http://localhost" ||
-				origin == "http://127.0.0.1" ||
-				origin == "http://[::1]" ||
-				strings.HasPrefix(origin, "http://localhost:") ||
-				strings.HasPrefix(origin, "http://127.0.0.1:") ||
-				strings.HasPrefix(origin, "http://[::1]:")
-		},
+		CheckOrigin:     func(r *http.Request) bool { return true },
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 	}
@@ -583,9 +559,7 @@ func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBu
 			return
 		}
 
-		controllerID := uuid.New().String()
-		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()), slog.String("controller_id", controllerID))
-
+		logger.Info("Bot connected", slog.String("remote", conn.RemoteAddr().String()))
 		runner.Ping()
 
 		onMessage := func(msgType string, payload []byte) {
@@ -603,18 +577,8 @@ func handleBotConnection(appCtx context.Context, rtBus *domain.RealtimeBus, evBu
 				CreatedAt: time.Now(),
 			}
 
-			rtBus.Publish(appCtx, ev)
 			evBus.Publish(appCtx, ev)
 		}
-
-		onClose := func() {
-			logger.Warn("Bot connection closed", slog.String("controller_id", controllerID))
-			cm.RemoveController(controllerID)
-		}
-
-		botController := execution.NewWSController(appCtx, conn, logger, onMessage, onClose)
-		idempotentController := execution.NewIdempotentController(botController, 1000)
-
-		cm.SetController(controllerID, idempotentController)
+		cm.RegisterConnection(conn, sessionID, onMessage)
 	}
 }

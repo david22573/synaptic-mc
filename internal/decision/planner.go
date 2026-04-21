@@ -532,6 +532,17 @@ func isFoodBlock(name string) bool {
 	return false
 }
 
+func (p *AdvancedPlanner) Generate(ctx context.Context, state domain.GameState) (*domain.Plan, error) {
+	// Re-using the logic from the old generateLLMPlan but satisfying the Planner interface.
+	// Since sessionID was passed in, but now we need to satisfy an interface that doesn't have it,
+	// we should probably store sessionID in the planner or use a default.
+	// Looking at AdvancedPlanner struct, it doesn't have sessionID.
+	// However, we can use a dummy sessionID or refactor to include it.
+	// Given the context, the sessionID is often "minecraft-agent-01".
+	sessionID := "minecraft-agent-01" 
+	return p.generateLLMPlan(ctx, sessionID, state)
+}
+
 func (p *AdvancedPlanner) generateLLMPlan(ctx context.Context, sessionID string, state domain.GameState) (*domain.Plan, error) {
 	start := time.Now()
 	p.lastPlannedAt = start

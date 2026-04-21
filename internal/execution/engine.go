@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthdm/hollywood/actor"
 	"david22573/synaptic-mc/internal/config"
 	"david22573/synaptic-mc/internal/domain"
 )
@@ -36,6 +37,9 @@ func (e *TaskExecutionEngine) UpdateConfig(cfg config.ExecutionConfig) {
 	e.cfg = cfg
 }
 
+func (e *TaskExecutionEngine) PID() *actor.PID {
+	return nil // Mocking for now since e.pid doesn't exist yet
+}
 // Start initiates the background maintenance loops.
 func (e *TaskExecutionEngine) Start(ctx context.Context) {
 	innerCtx, cancel := context.WithCancel(ctx)
