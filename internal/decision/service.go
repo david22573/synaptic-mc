@@ -17,11 +17,14 @@ import (
 // Planner defines the interface for generating strategic plans.
 type Planner interface {
 	Generate(ctx context.Context, state domain.GameState) (*domain.Plan, error)
+	RecordFailure(objective string)
+	RecordSuccess(objective string)
 }
 
 // Actor Message Types
 type StateUpdateMsg struct{ State domain.GameState }
 type TaskEndMsg struct{ Payload domain.TaskEndPayload }
+type BotDeathMsg struct{}
 type EvalTriggerMsg struct{}
 type PlanReadyMsg struct {
 	Plan *domain.Plan
@@ -109,12 +112,24 @@ func (a *decisionActor) Receive(ctx *actor.Context) {
 			if err := json.Unmarshal(msg.Payload, &payload); err == nil {
 				ctx.Send(ctx.PID(), TaskEndMsg{Payload: payload})
 			}
+
+		case domain.EventBotDeath:
+			ctx.Send(ctx.PID(), BotDeathMsg{})
 		}
 
 	case StateUpdateMsg:
 		a.detectMilestones(&a.state, &msg.State)
 		a.state = msg.State
-		if a.activePlan == nil {
+		
+		needsEval := a.activePlan == nil
+		if !needsEval {
+			// Trigger re-evaluation if there are threats or health/food drops significantly
+			if len(a.state.Threats) > 0 {
+				needsEval = true
+			}
+		}
+
+		if needsEval {
 			ctx.Send(ctx.PID(), EvalTriggerMsg{})
 		}
 
@@ -122,11 +137,23 @@ func (a *decisionActor) Receive(ctx *actor.Context) {
 		// Plan progression logic: Remove completed task
 		if a.activePlan != nil && len(a.activePlan.Tasks) > 0 {
 			if a.activePlan.Tasks[0].ID == msg.Payload.CommandID {
+				if !msg.Payload.Success {
+					a.planner.RecordFailure(a.activePlan.Objective)
+				}
+
 				a.activePlan.Tasks = a.activePlan.Tasks[1:]
 				if len(a.activePlan.Tasks) == 0 {
+					a.planner.RecordSuccess(a.activePlan.Objective)
 					a.activePlan = nil
 				}
 			}
+		}
+		ctx.Send(ctx.PID(), EvalTriggerMsg{})
+
+	case BotDeathMsg:
+		if a.activePlan != nil {
+			a.planner.RecordFailure(a.activePlan.Objective)
+			a.activePlan = nil
 		}
 		ctx.Send(ctx.PID(), EvalTriggerMsg{})
 

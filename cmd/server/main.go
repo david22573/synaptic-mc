@@ -339,6 +339,12 @@ func main() {
 		})
 	})
 
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(observability.Metrics.GetStats())
+	})
+
 	// GET /api/skills/{name} — returns the stored executable skill by name.
 	// Used by the TypeScript use_skill handler to fetch compiled JS.
 	mux.HandleFunc("/api/skills/", func(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +499,7 @@ func parseConfig() Config {
 
 	sessionID := flag.String("session", getEnvOrDefault("SESSION_ID", "minecraft-agent-01"), "Session ID")
 	dataDir := flag.String("data-dir", getEnvOrDefault("DATA_DIR", "data"), "Data directory path")
-	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "./js/index.ts"), "Path to the compiled TS bot index.js")
+	botScript := flag.String("bot-script", getEnvOrDefault("BOT_SCRIPT_PATH", "./js/dist/index.js"), "Path to the compiled TS bot index.js")
 	hesitationMs := flag.Int("hesitation-ms", getEnvInt("HESITATION_MS", 180), "Base hesitation delay in milliseconds")
 	noiseLevel := flag.Float64("noise-level", getEnvFloat("NOISE_LEVEL", 0.03), "Humanization noise level (0.0-1.0)")
 	configPath := flag.String("config", getEnvOrDefault("CONFIG_PATH", "config.json"), "Path to hot-reloadable feature flags JSON")

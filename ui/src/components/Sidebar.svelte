@@ -210,6 +210,28 @@
         right: 0;
     }
 
+    @media (max-width: 768px) {
+        .sidebar {
+            width: 320px;
+            right: -320px;
+            padding: 1rem;
+            gap: 0.75rem;
+        }
+        .objective {
+            font-size: 1rem;
+        }
+        .inventory-grid {
+            grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+        }
+    }
+
+    @media (max-width: 480px) {
+        .sidebar {
+            width: 280px;
+            right: -280px;
+        }
+    }
+
     .sidebar::-webkit-scrollbar {
         width: 6px;
     }

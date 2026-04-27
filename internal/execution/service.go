@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,21 +110,31 @@ func (s *ControlService) handlePlanCreated(ctx context.Context, event domain.Dom
 		return
 	}
 
+	var plan domain.Plan
+	if err := json.Unmarshal(event.Payload, &plan); err != nil {
+		s.logger.Error("Failed to unmarshal plan", slog.Any("error", err))
+		return
+	}
+
 	s.engine.mu.RLock()
 	execCfg := s.engine.cfg
 	s.engine.mu.RUnlock()
 
 	// Death loop protection: If we died recently and many times, ignore plans for a bit
+	// UNLESS they are emergency/degraded plans intended to break the loop.
 	deathLoopThreshold := time.Duration(execCfg.DeathLoopThresholdMs) * time.Millisecond
 	if deathCount >= 3 && time.Since(lastDeath) < deathLoopThreshold {
-		s.logger.Warn("Death loop protection active: dropping new plan", slog.Int("death_count", deathCount))
-		return
-	}
+		isRecovery := strings.Contains(strings.ToLower(plan.Objective), "degraded") ||
+			strings.Contains(strings.ToLower(plan.Objective), "recovery") ||
+			strings.Contains(strings.ToLower(plan.Objective), "emergency")
 
-	var plan domain.Plan
-	if err := json.Unmarshal(event.Payload, &plan); err != nil {
-		s.logger.Error("Failed to unmarshal plan", slog.Any("error", err))
-		return
+		if !isRecovery {
+			s.logger.Warn("Death loop protection active: dropping new plan",
+				slog.Int("death_count", deathCount),
+				slog.String("objective", plan.Objective))
+			return
+		}
+		s.logger.Info("Allowing recovery plan through death loop protection", slog.String("objective", plan.Objective))
 	}
 
 	if len(plan.Tasks) > 0 {
@@ -376,6 +387,10 @@ func (s *ControlService) handleTaskEnd(ctx context.Context, event domain.DomainE
 
 	} else {
 		if success {
+			s.stabilityMu.Lock()
+			s.stability.DeathCount = 0
+			s.stabilityMu.Unlock()
+
 			s.ctrlManager.RecordResult(domain.ExecutionResult{Success: true, Progress: 1.0, Cause: ""})
 
 			// Phase 6: Update humanizer with success feedback

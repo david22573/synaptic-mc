@@ -15,13 +15,26 @@ interface Logger {
 
 function formatLog(level: string, msg: string, meta: LogMeta = {}): string {
     const { trace, ...rest } = meta;
+    
+    // Handle Error objects in meta
+    const cleanedMeta: Record<string, unknown> = { ...rest };
+    for (const [key, value] of Object.entries(cleanedMeta)) {
+        if (value instanceof Error) {
+            cleanedMeta[key] = {
+                message: value.message,
+                stack: value.stack,
+                name: value.name
+            };
+        }
+    }
+
     return JSON.stringify({
         level,
         msg,
         trace_id: trace?.trace_id,
         action_id: trace?.action_id,
         milestone_id: trace?.milestone_id,
-        ...rest,
+        ...cleanedMeta,
         timestamp: new Date().toISOString(),
     });
 }

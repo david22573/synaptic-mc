@@ -124,7 +124,7 @@ func (a *supervisorActor) evaluateRequest(ctx context.Context, task domain.Actio
 	}
 
 	// 2. Survival Hysteresis
-	if a.dangerState == state.DangerEscape && GetPriority(task.Action) < 100 {
+	if a.dangerState == state.DangerEscape && GetEffectivePriority(task) < 100 {
 		return false
 	}
 
@@ -151,7 +151,7 @@ func (a *supervisorActor) evaluateRequest(ctx context.Context, task domain.Actio
 	minHold := 0 * time.Second
 	canPreempt := true
 
-	priority := GetPriority(task.Action)
+	priority := GetEffectivePriority(task)
 	if priority >= 100 {
 		timeout = 5 * time.Second
 		minHold = 2 * time.Second

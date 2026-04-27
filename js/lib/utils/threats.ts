@@ -31,11 +31,13 @@ const HOSTILE_MOBS = new Set([
 
 export function getThreats(bot: Bot): models.ThreatInfo[] {
     const threats: models.ThreatInfo[] = [];
+    if (!bot.entity || !bot.entity.position) return threats;
+
     const botPos = bot.entity.position;
 
     for (const id in bot.entities) {
         const e = bot.entities[id];
-        if (!e || !e.isValid || e === bot.entity) continue;
+        if (!e || !e.isValid || e === bot.entity || !e.position) continue;
 
         if (
             (e.type !== "mob" && e.type !== "hostile") ||

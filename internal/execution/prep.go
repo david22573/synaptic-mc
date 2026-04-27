@@ -48,14 +48,18 @@ func (o *PrepOrchestrator) CheckProactiveFarming(ctx context.Context, state doma
 func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState) {
 	dangerRising := false
 	threatCount := 0
+	minDist := 100.0
 	for _, t := range state.Threats {
-		if t.Distance < 10 {
+		if t.Distance < 12 {
 			threatCount++
+			if t.Distance < minDist {
+				minDist = t.Distance
+			}
 		}
 	}
 
-	// If 2+ mobs are approaching and health isn't full, escape early
-	if threatCount >= 2 && state.Health < 18 {
+	// If any mob is within 8 blocks, or 2+ are within 12, or 1 mob and health isn't full
+	if minDist < 8.0 || threatCount >= 2 || (threatCount >= 1 && state.Health < 19) {
 		dangerRising = true
 	}
 
@@ -65,13 +69,16 @@ func (o *PrepOrchestrator) PreEscape(ctx context.Context, state domain.GameState
 		}
 		o.lastEscapeDispatch = time.Now()
 
-		o.logger.Warn("Danger rising: initiating pre-escape")
+		o.logger.Warn("Danger rising: initiating proactive escape", 
+			slog.Int("threat_count", threatCount), 
+			slog.Float64("min_dist", minDist))
+		
 		action := domain.Action{
 			ID:        fmt.Sprintf("prep-escape-%d", time.Now().UnixNano()),
 			Action:    "retreat",
 			Target:    domain.Target{Name: "safe_zone"},
-			Priority:  90,
-			Rationale: "Predictive escape: threat density increasing",
+			Priority:  110, // Override survival tasks threshold (100)
+			Rationale: "Predictive escape: threat density increasing or mob too close",
 		}
 
 		// Phase 4: Single Writer Action Bus

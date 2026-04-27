@@ -91,3 +91,11 @@ func GetPriority(action string) int {
 		return 10  // Tier 4: Background
 	}
 }
+
+func GetEffectivePriority(task domain.Action) int {
+	base := GetPriority(task.Action)
+	if task.Priority > base {
+		return task.Priority
+	}
+	return base
+}

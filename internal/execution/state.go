@@ -45,7 +45,7 @@ func (s *ExecutionState) AcquireLease(task domain.Action, timeout time.Duration,
 		}
 
 		// 3. Check Priority
-		if GetPriority(task.Action) <= GetPriority(s.activeTask.Action) {
+		if GetEffectivePriority(task) <= GetEffectivePriority(*s.activeTask) {
 			return false
 		}
 	}

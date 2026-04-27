@@ -596,13 +596,13 @@ async function connectWithRetry(maxAttempts = 10) {
         }
     }
 
-    const mcHost = process.env.MC_HOST || "david22573.aternos.me";
+    const mcHost = process.env.MC_HOST || "localhost";
     const mcPort = process.env.MC_PORT ? parseInt(process.env.MC_PORT) : 25565;
     bot = mineflayer.createBot({
         host: mcHost,
         port: mcPort,
         username: "SynapticBot",
-        version: "1.19",
+        version: "1.20.4",
         hideErrors: true,
         logErrors: false,
     });
@@ -712,9 +712,6 @@ async function connectWithRetry(maxAttempts = 10) {
 
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.thinkTimeout = 20000;
-
-        // Auto-satiate for testing to ensure sprinting isn't blocked by hunger
-        bot.chat("/effect give @s saturation infinite 255 true");
 
         survival.start();
         controller.start();

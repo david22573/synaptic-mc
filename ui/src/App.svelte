@@ -57,7 +57,7 @@
 </script>
 
 <main class="fullscreen">
-    {#if botStore.connectionStatus === "connected"}
+    {#if viewerUrl !== "about:blank"}
         <iframe
             bind:this={viewerIframe}
             src={viewerUrl}
@@ -67,7 +67,7 @@
     {:else}
         <div class="viewer-iframe placeholder">
             <span class="indicator connecting"></span>
-            <p>Waiting for bot to initialize viewer on port 3000...</p>
+            <p>Initializing viewer...</p>
         </div>
     {/if}
 
@@ -258,6 +258,43 @@
 
     .sidebar-toggle.sidebar-closed {
         right: 10px;
+    }
+
+    /* Mobile Responsive Overrides */
+    @media (max-width: 768px) {
+        .floating-header {
+            top: 0.5rem;
+            left: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            max-width: calc(100vw - 80px);
+        }
+
+        .floating-header h1 {
+            font-size: 1rem;
+        }
+
+        .coords-badge {
+            font-size: 0.75rem;
+        }
+
+        .raw-coords {
+            display: none;
+        }
+
+        .sidebar-toggle {
+            right: 330px; /* Match mobile sidebar width */
+            top: 0.5rem;
+        }
+
+        .sidebar-toggle.sidebar-closed {
+            right: 0.5rem;
+        }
+    }
+
+    @media (max-width: 480px) {
+        .sidebar-toggle {
+            right: 290px;
+        }
     }
 
     .mc-tooltip {

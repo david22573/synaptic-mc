@@ -35,7 +35,7 @@ export class RollingPathfinder {
         this.isCalculating = true;
         try {
             // We use the pathfinder directly to get the raw path points
-            const results = (this.bot.pathfinder as any).getPathTo(goal);
+            const results = (this.bot.pathfinder as any).getPathTo(this.bot.pathfinder.movements, goal);
             if (results && results.path) {
                 this.currentPath = results.path.map((p: any) => new Vec3(p.x, p.y, p.z));
                 this.lastPathTime = Date.now();

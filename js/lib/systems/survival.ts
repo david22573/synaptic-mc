@@ -62,11 +62,33 @@ export class SurvivalSystem {
         return this.isPanicking;
     }
 
-    private checkSurvival() {
+    private async checkSurvival() {
         const threats = getThreats(this.bot);
         const world = senseWorld(this.bot, threats);
 
-        const criticalMobNames = new Set(["creeper", "skeleton", "witch"]);
+        const criticalMobNames = new Set(["creeper", "skeleton", "witch", "pillager"]);
+
+        // OOGA BOOGA REFLEX 1: Immediate Shield
+        const archers = threats.filter(t => (t.name === "skeleton" || t.name === "pillager") && t.distance < 15);
+        const crowded = threats.filter(t => t.distance < 4).length >= 2;
+        
+        if (archers.length > 0 || crowded) {
+            const shield = this.bot.inventory.items().find(i => i.name === 'shield');
+            if (shield) {
+                await this.bot.equip(shield, 'off-hand').catch(() => {});
+                this.bot.activateItem(true); // Block
+            }
+        } else {
+            this.bot.deactivateItem(); // Stop blocking
+        }
+
+        // OOGA BOOGA REFLEX 2: Cornered Swing
+        const veryClose = threats.find(t => t.distance < 2.5);
+        if (veryClose && veryClose.entity) {
+            const sword = this.bot.inventory.items().find(i => i.name.includes('sword') || i.name.includes('axe'));
+            if (sword) await this.bot.equip(sword, 'hand').catch(() => {});
+            this.bot.attack(veryClose.entity as any);
+        }
 
         // React earlier when health is already compromised or a high-risk mob is close.
         const immediateThreats = threats.filter(
@@ -74,7 +96,7 @@ export class SurvivalSystem {
                 t.distance < 20 &&
                 (
                     (t.threatScore ?? 0) > 5 ||
-                    this.bot.health <= 12 ||
+                    this.bot.health <= 14 ||
                     criticalMobNames.has(t.name)
                 ) &&
                 t.name !== "low_health_no_food" &&
@@ -97,22 +119,24 @@ export class SurvivalSystem {
                 Date.now() +
                 (world.panicCause === "lava" || world.panicCause === "drowning"
                     ? 8000
-                    : 15000);
+                    : 12000);
 
             log.warn(
-                "SENSOR: Critical Threat Detected. Interrupting TS execution loop.",
+                "SENSOR: Critical Threat Detected. OOGA BOOGA body reflexes active.",
                 {
                     cause: panicCause,
                     health: Math.round(this.bot.health),
-                    distance:
-                        topThreat?.distance !== undefined
-                            ? Math.round(topThreat.distance)
-                            : 0,
+                    threats: immediateThreats.length,
                 },
             );
 
             this.config.onPanicStart?.(panicCause);
             this.config.onInterrupt(`panic_${panicCause}`);
+            
+            // OOGA BOOGA REFLEX 3: Force sprint-jump away
+            this.bot.setControlState('sprint', true);
+            this.bot.setControlState('jump', true);
+            
         } else if (
             this.isPanicking &&
             Date.now() > this.panicCooldownUntil &&
@@ -120,7 +144,8 @@ export class SurvivalSystem {
         ) {
             // Coast is clear and cooldown finished. Drop the panic lock.
             this.isPanicking = false;
-            log.info("SENSOR: Threat passed; releasing panic lock.");
+            log.info("SENSOR: Threat passed; body returning control to brain.");
+            this.bot.deactivateItem();
             this.config.onPanicEnd?.("safe");
         }
     }

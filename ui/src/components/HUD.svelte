@@ -56,25 +56,25 @@
     <div class="mc-hud-container">
         <div class="mc-bars">
             <div class="mc-bar health-bar">
-                {#each Array(emptyHearts) as _}
+                {#each Array.from({ length: emptyHearts }) as _}
                     <div class="icon-container empty"><div class="heart empty"></div></div>
                 {/each}
                 {#if hasHalfHeart}
                     <div class="icon-container"><div class="heart half"></div></div>
                 {/if}
-                {#each Array(fullHearts) as _}
+                {#each Array.from({ length: fullHearts }) as _}
                     <div class="icon-container"><div class="heart full"></div></div>
                 {/each}
             </div>
 
             <div class="mc-bar food-bar">
-                {#each Array(fullFood) as _}
+                {#each Array.from({ length: fullFood }) as _}
                     <div class="icon-container"><div class="food full"></div></div>
                 {/each}
                 {#if hasHalfFood}
                     <div class="icon-container"><div class="food half"></div></div>
                 {/if}
-                {#each Array(emptyFood) as _}
+                {#each Array.from({ length: emptyFood }) as _}
                     <div class="icon-container empty"><div class="food empty"></div></div>
                 {/each}
             </div>
@@ -200,6 +200,31 @@
     @keyframes pulse {
         from { box-shadow: 0 0 4px #ff0000; }
         to { box-shadow: 0 0 16px #ff0000; }
+    }
+
+    @media (max-width: 768px) {
+        .mc-hud-container {
+            transform: scale(0.85);
+            transform-origin: bottom center;
+        }
+        .mc-alert-banner {
+            top: 60px;
+            font-size: 12px;
+            padding: 4px 10px;
+            max-width: 85vw;
+        }
+    }
+
+    @media (max-width: 480px) {
+        .mc-hud-container {
+            transform: scale(0.7);
+        }
+        .mc-bars {
+            width: 300px;
+        }
+        .mc-xp-container {
+            width: 300px;
+        }
     }
 
     .mc-hud-container {
